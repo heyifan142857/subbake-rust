@@ -1,5 +1,6 @@
-use crate::entities::{BatchTranslationResult, Usage};
+use crate::entities::{BatchTranslationResult, SubtitleSegment, Usage};
 use crate::error::CoreResult;
+use crate::storage::RuntimePaths;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -79,3 +80,22 @@ pub trait DashboardSink {
 pub struct NoopDashboard;
 
 impl DashboardSink for NoopDashboard {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchShardKind {
+    Translated,
+    Reviewed,
+}
+
+pub trait RuntimeStore {
+    fn paths(&self) -> &RuntimePaths;
+    fn ensure_layout(&self) -> CoreResult<()>;
+    fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()>;
+    fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
+    fn save_batch_segments(
+        &self,
+        kind: BatchShardKind,
+        batch_index: usize,
+        segments: &[SubtitleSegment],
+    ) -> CoreResult<()>;
+}

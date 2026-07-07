@@ -11,5 +11,6 @@ pub use fs::{
 };
 pub use mock::MockBackend;
 pub use providers::{BackendConfig, build_backend};
-pub use runtime_store::{BatchShardKind, FileRuntimeStore};
+pub use runtime_store::FileRuntimeStore;
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
+pub use subbake_core::ports::BatchShardKind;

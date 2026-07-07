@@ -3,13 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_core::entities::SubtitleSegment;
+use subbake_core::error::{CoreError, CoreResult};
+use subbake_core::ports::{BatchShardKind, RuntimeStore};
 use subbake_core::storage::{JsonValue, RuntimePaths, canonical_json};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchShardKind {
-    Translated,
-    Reviewed,
-}
 
 #[derive(Debug, Clone)]
 pub struct FileRuntimeStore {
@@ -21,11 +17,21 @@ impl FileRuntimeStore {
         Self { paths }
     }
 
-    pub fn paths(&self) -> &RuntimePaths {
+    pub fn batch_shard_path(&self, kind: BatchShardKind, batch_index: usize) -> PathBuf {
+        let root = match kind {
+            BatchShardKind::Translated => &self.paths.translated_batches_dir,
+            BatchShardKind::Reviewed => &self.paths.reviewed_batches_dir,
+        };
+        root.join(format!("{batch_index:04}.json"))
+    }
+}
+
+impl RuntimeStore for FileRuntimeStore {
+    fn paths(&self) -> &RuntimePaths {
         &self.paths
     }
 
-    pub fn ensure_layout(&self) -> io::Result<()> {
+    fn ensure_layout(&self) -> CoreResult<()> {
         for directory in [
             &self.paths.root_dir,
             &self.paths.run_dir,
@@ -35,28 +41,28 @@ impl FileRuntimeStore {
             &self.paths.reviewed_batches_dir,
             &self.paths.agent_logs_dir,
         ] {
-            fs::create_dir_all(directory)?;
+            fs::create_dir_all(directory).map_err(storage_error)?;
         }
         Ok(())
     }
 
-    pub fn save_glossary(&self, entries: &[(String, String)]) -> io::Result<()> {
+    fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()> {
         write_json_verified(&self.paths.glossary_path, &string_map_json(entries))
     }
 
-    pub fn save_translation_memory(&self, entries: &[(String, String)]) -> io::Result<()> {
+    fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()> {
         write_json_verified(
             &self.paths.translation_memory_path,
             &string_map_json(entries),
         )
     }
 
-    pub fn save_batch_segments(
+    fn save_batch_segments(
         &self,
         kind: BatchShardKind,
         batch_index: usize,
         segments: &[SubtitleSegment],
-    ) -> io::Result<PathBuf> {
+    ) -> CoreResult<()> {
         let path = self.batch_shard_path(kind, batch_index);
         let payload = JsonValue::Object(vec![
             ("batch_index".to_owned(), JsonValue::from(batch_index)),
@@ -65,16 +71,7 @@ impl FileRuntimeStore {
                 JsonValue::Array(segments.iter().map(segment_json).collect()),
             ),
         ]);
-        write_json_verified(&path, &payload)?;
-        Ok(path)
-    }
-
-    pub fn batch_shard_path(&self, kind: BatchShardKind, batch_index: usize) -> PathBuf {
-        let root = match kind {
-            BatchShardKind::Translated => &self.paths.translated_batches_dir,
-            BatchShardKind::Reviewed => &self.paths.reviewed_batches_dir,
-        };
-        root.join(format!("{batch_index:04}.json"))
+        write_json_verified(&path, &payload)
     }
 }
 
@@ -108,12 +105,12 @@ fn option_string_json(value: &Option<String>) -> JsonValue {
         .unwrap_or(JsonValue::Null)
 }
 
-fn write_json_verified(path: &Path, payload: &JsonValue) -> io::Result<()> {
+fn write_json_verified(path: &Path, payload: &JsonValue) -> CoreResult<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(storage_error)?;
     }
     let serialized = canonical_json(payload);
     let temp_path = path.with_file_name(format!(
@@ -122,16 +119,20 @@ fn write_json_verified(path: &Path, payload: &JsonValue) -> io::Result<()> {
             .and_then(|value| value.to_str())
             .unwrap_or("runtime")
     ));
-    fs::write(&temp_path, serialized.as_bytes())?;
-    fs::rename(&temp_path, path)?;
-    let written = fs::read_to_string(path)?;
+    fs::write(&temp_path, serialized.as_bytes()).map_err(storage_error)?;
+    fs::rename(&temp_path, path).map_err(storage_error)?;
+    let written = fs::read_to_string(path).map_err(storage_error)?;
     if written != serialized {
-        return Err(io::Error::other(format!(
+        return Err(CoreError::Data(format!(
             "write verification failed for {}",
             path.display()
         )));
     }
     Ok(())
+}
+
+fn storage_error(error: io::Error) -> CoreError {
+    CoreError::Data(error.to_string())
 }
 
 #[cfg(test)]
@@ -184,7 +185,8 @@ mod tests {
             identifier: Some("1".to_owned()),
             settings: None,
         };
-        let path = store
+        let path = store.batch_shard_path(BatchShardKind::Translated, 3);
+        store
             .save_batch_segments(BatchShardKind::Translated, 3, &[segment])
             .expect("save shard");
         let content = fs::read_to_string(&path).expect("read shard");
