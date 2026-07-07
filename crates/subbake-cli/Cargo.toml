@@ -1,0 +1,23 @@
+[package]
+name = "subbake-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sbake"
+path = "src/main.rs"
+
+[lib]
+name = "subbake_cli"
+path = "src/lib.rs"
+
+[dependencies]
+subbake-adapters = { path = "../subbake-adapters" }
+subbake-agent = { path = "../subbake-agent" }
+subbake-core = { path = "../subbake-core" }
+
+[lints]
+workspace = true

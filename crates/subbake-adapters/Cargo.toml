@@ -1,0 +1,13 @@
+[package]
+name = "subbake-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+subbake-core = { path = "../subbake-core" }
+
+[lints]
+workspace = true
