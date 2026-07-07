@@ -82,6 +82,7 @@ pub fn translate_batch(args: BatchArgs) -> io::Result<()> {
         let translate_args = TranslateArgs {
             subtitle: file.clone(),
             output: None,
+            config_path: args.config_path.clone(),
             settings: args.translate.settings.clone(),
             json: false,
         };

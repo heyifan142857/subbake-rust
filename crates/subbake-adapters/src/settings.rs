@@ -20,6 +20,22 @@ pub struct TranslationSettings {
     pub glossary_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TranslationSettingsPatch {
+    pub output_format: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub source_language: Option<String>,
+    pub target_language: Option<String>,
+    pub batch_size: Option<usize>,
+    pub bilingual: Option<bool>,
+    pub fast_mode: Option<bool>,
+    pub final_review: Option<bool>,
+    pub dry_run: Option<bool>,
+    pub runtime_dir: Option<PathBuf>,
+    pub glossary_path: Option<PathBuf>,
+}
+
 impl Default for TranslationSettings {
     fn default() -> Self {
         Self {
@@ -40,6 +56,50 @@ impl Default for TranslationSettings {
 }
 
 impl TranslationSettings {
+    pub fn with_patch(mut self, patch: TranslationSettingsPatch) -> Self {
+        self.apply_patch(patch);
+        self
+    }
+
+    pub fn apply_patch(&mut self, patch: TranslationSettingsPatch) {
+        if let Some(value) = patch.output_format {
+            self.output_format = Some(value);
+        }
+        if let Some(value) = patch.provider {
+            self.provider = value;
+        }
+        if let Some(value) = patch.model {
+            self.model = value;
+        }
+        if let Some(value) = patch.source_language {
+            self.source_language = value;
+        }
+        if let Some(value) = patch.target_language {
+            self.target_language = value;
+        }
+        if let Some(value) = patch.batch_size {
+            self.batch_size = value;
+        }
+        if let Some(value) = patch.bilingual {
+            self.bilingual = value;
+        }
+        if let Some(value) = patch.fast_mode {
+            self.fast_mode = value;
+        }
+        if let Some(value) = patch.final_review {
+            self.final_review = value;
+        }
+        if let Some(value) = patch.dry_run {
+            self.dry_run = value;
+        }
+        if let Some(value) = patch.runtime_dir {
+            self.runtime_dir = Some(value);
+        }
+        if let Some(value) = patch.glossary_path {
+            self.glossary_path = Some(value);
+        }
+    }
+
     pub fn backend_config(&self) -> BackendConfig {
         BackendConfig::new(self.provider.clone(), self.model.clone())
     }
@@ -109,5 +169,19 @@ mod tests {
         assert_eq!(options.target_language, "English");
         assert!(options.bilingual);
         assert_eq!(options.output_format.as_deref(), Some("txt"));
+    }
+
+    #[test]
+    fn applies_patch_over_defaults() {
+        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
+            provider: Some("openai".to_owned()),
+            batch_size: Some(12),
+            final_review: Some(false),
+            ..TranslationSettingsPatch::default()
+        });
+
+        assert_eq!(settings.provider, "openai");
+        assert_eq!(settings.batch_size, 12);
+        assert!(!settings.final_review);
     }
 }
