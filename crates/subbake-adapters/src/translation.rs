@@ -1,5 +1,6 @@
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use subbake_core::PipelineResult;
 use subbake_core::formats::RenderOptions;
@@ -23,6 +24,21 @@ pub struct TranslationRequest {
 pub struct TranslationOutcome {
     pub result: PipelineResult,
     pub output_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchTranslationRequest {
+    pub root: PathBuf,
+    pub recursive: bool,
+    pub overwrite: bool,
+    pub settings: TranslationSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchTranslationOutcome {
+    pub processed: usize,
+    pub skipped: Vec<PathBuf>,
+    pub outputs: Vec<PathBuf>,
 }
 
 pub fn translate_subtitle(request: TranslationRequest) -> io::Result<TranslationOutcome> {
@@ -73,6 +89,74 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
         result,
         output_path: Some(output_path),
     })
+}
+
+pub fn translate_subtitle_batch(
+    request: BatchTranslationRequest,
+) -> io::Result<BatchTranslationOutcome> {
+    let files = discover_subtitle_files(&request.root, request.recursive)?;
+    let mut processed = 0usize;
+    let mut skipped = Vec::new();
+    let mut outputs = Vec::new();
+
+    for input_path in files {
+        let output_path = default_output_path(
+            &input_path,
+            request.settings.output_format(),
+            request.settings.bilingual,
+        )?;
+        if output_path.exists() && !request.overwrite && !request.settings.dry_run {
+            skipped.push(input_path);
+            continue;
+        }
+
+        let outcome = translate_subtitle(TranslationRequest {
+            input_path,
+            output_path: None,
+            settings: request.settings.clone(),
+        })?;
+        if let Some(output_path) = outcome.output_path {
+            outputs.push(output_path);
+        }
+        processed += 1;
+    }
+
+    Ok(BatchTranslationOutcome {
+        processed,
+        skipped,
+        outputs,
+    })
+}
+
+fn discover_subtitle_files(dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    discover_subtitle_files_inner(dir, recursive, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn discover_subtitle_files_inner(
+    dir: &Path,
+    recursive: bool,
+    files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && recursive {
+            discover_subtitle_files_inner(&path, recursive, files)?;
+        } else if path.is_file() && is_supported_subtitle_path(&path) && !is_generated_output(&path)
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_generated_output(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|stem| stem.ends_with(".translated") || stem.ends_with(".bilingual"))
 }
 
 #[cfg(test)]
@@ -131,6 +215,30 @@ mod tests {
 
         assert!(outcome.result.dry_run);
         assert!(!output_exists);
+    }
+
+    #[test]
+    fn batch_skips_existing_outputs() {
+        let root = temp_root("batch-skip");
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("clip.txt");
+        fs::write(&input_path, "hello\n").expect("write input");
+        let output_path = root.join("clip.translated.txt");
+        fs::write(&output_path, "existing\n").expect("write output");
+
+        let outcome = translate_subtitle_batch(BatchTranslationRequest {
+            root: root.clone(),
+            recursive: false,
+            overwrite: false,
+            settings: TranslationSettings::default(),
+        })
+        .expect("batch translate");
+        let output = fs::read_to_string(&output_path).expect("read output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(outcome.processed, 0);
+        assert_eq!(outcome.skipped, vec![input_path]);
+        assert_eq!(output, "existing\n");
     }
 
     fn temp_root(label: &str) -> PathBuf {

@@ -1,9 +1,8 @@
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use subbake_adapters::{
-    TranslationRequest, default_output_path, is_supported_subtitle_path, translate_subtitle,
+    BatchTranslationRequest, TranslationRequest, translate_subtitle, translate_subtitle_batch,
 };
 
 use crate::args::{BatchArgs, TranslateArgs};
@@ -42,37 +41,25 @@ pub fn translate_file(args: TranslateArgs) -> io::Result<Option<PathBuf>> {
 }
 
 pub fn translate_batch(args: BatchArgs) -> io::Result<()> {
-    let files = discover_subtitle_files(&args.dir, args.recursive)?;
-    if files.is_empty() {
+    let outcome = translate_subtitle_batch(BatchTranslationRequest {
+        root: args.dir,
+        recursive: args.recursive,
+        overwrite: args.overwrite,
+        settings: args.translate.settings,
+    })?;
+    if outcome.processed == 0 && outcome.skipped.is_empty() {
         println!("No subtitle files found.");
         return Ok(());
     }
-
-    let mut processed = 0usize;
-    let mut skipped = 0usize;
-    for file in files {
-        let translate_args = TranslateArgs {
-            subtitle: file.clone(),
-            output: None,
-            config_path: args.config_path.clone(),
-            settings: args.translate.settings.clone(),
-            json: false,
-        };
-        let output_path = default_output_path(
-            &translate_args.subtitle,
-            translate_args.settings.output_format(),
-            translate_args.settings.bilingual,
-        )?;
-        if output_path.exists() && !args.overwrite && !args.translate.settings.dry_run {
-            println!("Skipped existing output: {}", output_path.display());
-            skipped += 1;
-            continue;
-        }
-        translate_file(translate_args)?;
-        processed += 1;
+    for path in &outcome.skipped {
+        println!("Skipped existing output for: {}", path.display());
     }
 
-    println!("Batch result: {processed} processed, {skipped} skipped, 0 failed");
+    println!(
+        "Batch result: {} processed, {} skipped, 0 failed",
+        outcome.processed,
+        outcome.skipped.len()
+    );
     Ok(())
 }
 
@@ -105,35 +92,4 @@ fn print_dry_run(args: &TranslateArgs, planned_batches: &[subbake_core::BatchPla
             batch.index, batch.size, batch.first_id, batch.last_id
         );
     }
-}
-
-fn discover_subtitle_files(dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    discover_subtitle_files_inner(dir, recursive, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-fn discover_subtitle_files_inner(
-    dir: &Path,
-    recursive: bool,
-    files: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && recursive {
-            discover_subtitle_files_inner(&path, recursive, files)?;
-        } else if path.is_file() && is_supported_subtitle_path(&path) && !is_generated_output(&path)
-        {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn is_generated_output(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .is_some_and(|stem| stem.ends_with(".translated") || stem.ends_with(".bilingual"))
 }

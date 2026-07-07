@@ -15,4 +15,7 @@ pub use providers::{BackendConfig, build_backend};
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
 pub use subbake_core::ports::BatchShardKind;
-pub use translation::{TranslationOutcome, TranslationRequest, translate_subtitle};
+pub use translation::{
+    BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
+    translate_subtitle, translate_subtitle_batch,
+};
