@@ -1,3 +1,9 @@
+use std::io;
+
+pub mod args;
+pub mod commands;
+pub mod output;
+
 pub fn command_names() -> &'static [&'static str] {
     &[
         "agent",
@@ -9,4 +15,8 @@ pub fn command_names() -> &'static [&'static str] {
         "runtime",
         "whisper",
     ]
+}
+
+pub fn run(args: Vec<String>) -> io::Result<()> {
+    commands::dispatch(args)
 }

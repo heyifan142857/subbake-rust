@@ -44,6 +44,27 @@ pub trait LlmBackend {
     }
 }
 
+impl<T> LlmBackend for Box<T>
+where
+    T: LlmBackend + ?Sized,
+{
+    fn provider_name(&self) -> &str {
+        (**self).provider_name()
+    }
+
+    fn model_name(&self) -> &str {
+        (**self).model_name()
+    }
+
+    fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        (**self).generate_json(messages)
+    }
+
+    fn check_credentials(&self) -> CoreResult<(bool, String)> {
+        (**self).check_credentials()
+    }
+}
+
 pub trait DashboardSink {
     fn set_total_steps(&mut self, _total_steps: usize) {}
     fn mark_running(&mut self, _stage: &str) {}
