@@ -3,67 +3,39 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    build_backend, default_output_path, is_supported_subtitle_path, read_document,
-    render_and_write_document,
+    TranslationRequest, default_output_path, is_supported_subtitle_path, translate_subtitle,
 };
-use subbake_core::formats::RenderOptions;
-use subbake_core::pipeline::SubtitlePipeline;
-use subbake_core::ports::NoopDashboard;
 
 use crate::args::{BatchArgs, TranslateArgs};
 use crate::output::result_json;
 
 pub fn translate_file(args: TranslateArgs) -> io::Result<Option<PathBuf>> {
-    if !is_supported_subtitle_path(&args.subtitle) {
-        return Err(io::Error::other(
-            "`translate` accepts subtitle files only; use `pipeline` for combined media workflows",
-        ));
-    }
-
-    let document = read_document(&args.subtitle)?;
-    let output_path = match args.output.clone() {
-        Some(path) => path,
-        None => default_output_path(
-            &args.subtitle,
-            args.settings.output_format(),
-            args.settings.bilingual,
-        )?,
-    };
-
-    let options = args
-        .settings
-        .to_pipeline_options(args.subtitle.clone(), Some(output_path.clone()));
-    let backend = build_backend(&args.settings.backend_config()).map_err(io::Error::other)?;
-    let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options);
-    let run = pipeline.run_document(&document).map_err(io::Error::other)?;
-
+    let outcome = translate_subtitle(TranslationRequest {
+        input_path: args.subtitle.clone(),
+        output_path: args.output.clone(),
+        settings: args.settings.clone(),
+    })?;
     if args.settings.dry_run {
-        print_dry_run(&args, &run.result.planned_batches);
+        print_dry_run(&args, &outcome.result.planned_batches);
         return Ok(None);
     }
 
-    let render_options =
-        RenderOptions::new(args.settings.bilingual, args.settings.output_format.clone());
-    render_and_write_document(
-        &document,
-        &run.translated_segments,
-        &output_path,
-        &render_options,
-    )?;
+    let output_path = outcome
+        .output_path
+        .clone()
+        .ok_or_else(|| io::Error::other("translation completed without an output path"))?;
 
     if args.json {
-        let mut result = run.result;
-        result.output_path = Some(output_path.clone());
-        println!("{}", result_json(&result));
+        println!("{}", result_json(&outcome.result));
     } else {
         println!("Output: {}", output_path.display());
         println!(
             "Usage: {} in / {} out / {} total",
-            run.result.usage.input_tokens,
-            run.result.usage.output_tokens,
-            run.result.usage.total_tokens
+            outcome.result.usage.input_tokens,
+            outcome.result.usage.output_tokens,
+            outcome.result.usage.total_tokens
         );
-        println!("Batches: {} translated", run.result.batches_translated);
+        println!("Batches: {} translated", outcome.result.batches_translated);
     }
 
     Ok(Some(output_path))

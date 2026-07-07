@@ -4,6 +4,7 @@ pub mod mock;
 pub mod providers;
 pub mod runtime_store;
 pub mod settings;
+pub mod translation;
 
 pub use config::{load_translation_settings_patch, parse_translation_settings_patch};
 pub use fs::{
@@ -14,3 +15,4 @@ pub use providers::{BackendConfig, build_backend};
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
 pub use subbake_core::ports::BatchShardKind;
+pub use translation::{TranslationOutcome, TranslationRequest, translate_subtitle};
