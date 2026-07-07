@@ -80,14 +80,22 @@ pub fn render(
 
         let segment = &segments[index];
         let mut cue_lines = Vec::new();
-        if let Some(identifier) = segment.identifier.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(identifier) = segment
+            .identifier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             cue_lines.push(identifier.to_owned());
         }
 
         let start = segment.start.as_deref().unwrap_or_default();
         let end = segment.end.as_deref().unwrap_or_default();
         let mut timing_line = format!("{start} {TIMESTAMP_SEPARATOR} {end}");
-        if let Some(settings) = segment.settings.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(settings) = segment
+            .settings
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             timing_line.push(' ');
             timing_line.push_str(settings);
         }

@@ -40,7 +40,10 @@ pub trait LlmBackend {
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
-        Ok((true, format!("{} provider is configured.", self.provider_name())))
+        Ok((
+            true,
+            format!("{} provider is configured.", self.provider_name()),
+        ))
     }
 }
 

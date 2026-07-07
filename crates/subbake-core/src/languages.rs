@@ -1,6 +1,11 @@
 pub fn normalize_language_name(value: &str, allow_auto: bool) -> String {
     let key = normalize_key(value);
-    if allow_auto && matches!(key.as_str(), "" | "auto" | "detect" | "auto-detect" | "autodetect") {
+    if allow_auto
+        && matches!(
+            key.as_str(),
+            "" | "auto" | "detect" | "auto-detect" | "autodetect"
+        )
+    {
         return "Auto".to_owned();
     }
 

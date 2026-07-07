@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{SubtitleDocument, SubtitleSegment};
 use subbake_core::formats::{
-    RenderOptions, normalize_format, parse_document_text, render_document, supported_format_from_path,
+    RenderOptions, normalize_format, parse_document_text, render_document,
+    supported_format_from_path,
 };
 
 pub fn is_supported_subtitle_path(path: &Path) -> bool {
@@ -23,7 +24,10 @@ pub fn render_and_write_document(
     options: &RenderOptions,
 ) -> io::Result<String> {
     let rendered = render_document(document, translations, options).map_err(io::Error::other)?;
-    if let Some(parent) = output_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     fs::write(output_path, rendered.as_bytes())?;
@@ -45,7 +49,9 @@ pub fn default_output_path(
     let target_format = match output_format {
         Some(value) => normalize_format(value).map_err(io::Error::other)?,
         None => supported_format_from_path(input_path)
-            .ok_or_else(|| io::Error::other(format!("unsupported format: {}", input_path.display())))?
+            .ok_or_else(|| {
+                io::Error::other(format!("unsupported format: {}", input_path.display()))
+            })?
             .to_owned(),
     };
     let suffix = if bilingual { "bilingual" } else { "translated" };

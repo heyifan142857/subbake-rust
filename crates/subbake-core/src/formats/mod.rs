@@ -31,7 +31,11 @@ pub fn supported_format_from_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-pub fn parse_document_text(path: &Path, text: &str, format: Option<&str>) -> CoreResult<SubtitleDocument> {
+pub fn parse_document_text(
+    path: &Path,
+    text: &str,
+    format: Option<&str>,
+) -> CoreResult<SubtitleDocument> {
     let format = match format {
         Some(value) => normalize_format(value)?,
         None => supported_format_from_path(path)

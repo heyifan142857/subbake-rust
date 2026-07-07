@@ -87,9 +87,12 @@ pub fn build_runtime_paths(
     target_language: &str,
     fast_mode: bool,
 ) -> RuntimePaths {
-    let root_dir = runtime_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| input_path.parent().unwrap_or_else(|| Path::new(".")).join(".subbake"));
+    let root_dir = runtime_dir.map(Path::to_path_buf).unwrap_or_else(|| {
+        input_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".subbake")
+    });
     let safe_stem = slugify(
         input_path
             .file_stem()
@@ -100,7 +103,9 @@ pub fn build_runtime_paths(
         "path".to_owned(),
         JsonValue::String(input_path.to_string_lossy().to_string()),
     )]))[..12];
-    let run_dir = root_dir.join("runs").join(format!("{safe_stem}-{input_key}"));
+    let run_dir = root_dir
+        .join("runs")
+        .join(format!("{safe_stem}-{input_key}"));
     let language_pair = language_pair_slug(source_language, target_language);
     let translation_memory_mode = if fast_mode { "fast" } else { "standard" };
 
@@ -135,12 +140,21 @@ pub fn build_translation_fingerprint(
     input_signature: &InputSignature,
 ) -> String {
     stable_hash(&JsonValue::Object(vec![
-        ("version".to_owned(), JsonValue::Number(TRANSLATION_FINGERPRINT_VERSION.to_string())),
+        (
+            "version".to_owned(),
+            JsonValue::Number(TRANSLATION_FINGERPRINT_VERSION.to_string()),
+        ),
         (
             "input_signature".to_owned(),
             JsonValue::Object(vec![
-                ("sha1".to_owned(), JsonValue::String(input_signature.sha1.clone())),
-                ("size".to_owned(), JsonValue::Number(input_signature.size.to_string())),
+                (
+                    "sha1".to_owned(),
+                    JsonValue::String(input_signature.sha1.clone()),
+                ),
+                (
+                    "size".to_owned(),
+                    JsonValue::Number(input_signature.size.to_string()),
+                ),
                 (
                     "mtime_ns".to_owned(),
                     input_signature
@@ -161,9 +175,15 @@ pub fn build_translation_fingerprint(
                     .unwrap_or_default(),
             ),
         ),
-        ("provider".to_owned(), JsonValue::String(options.provider.clone())),
+        (
+            "provider".to_owned(),
+            JsonValue::String(options.provider.clone()),
+        ),
         ("model".to_owned(), JsonValue::String(options.model.clone())),
-        ("batch_size".to_owned(), JsonValue::Number(options.batch_size.to_string())),
+        (
+            "batch_size".to_owned(),
+            JsonValue::Number(options.batch_size.to_string()),
+        ),
         ("fast_mode".to_owned(), JsonValue::Bool(options.fast_mode)),
         (
             "source_language".to_owned(),
@@ -178,9 +198,15 @@ pub fn build_translation_fingerprint(
 
 pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
     stable_hash(&JsonValue::Object(vec![
-        ("version".to_owned(), JsonValue::Number(RENDER_FINGERPRINT_VERSION.to_string())),
+        (
+            "version".to_owned(),
+            JsonValue::Number(RENDER_FINGERPRINT_VERSION.to_string()),
+        ),
         ("bilingual".to_owned(), JsonValue::Bool(options.bilingual)),
-        ("final_review".to_owned(), JsonValue::Bool(options.final_review)),
+        (
+            "final_review".to_owned(),
+            JsonValue::Bool(options.final_review),
+        ),
         (
             "output_format".to_owned(),
             options
@@ -200,15 +226,16 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
     ]))
 }
 
-pub fn build_request_hash(
-    provider: &str,
-    model: &str,
-    stage: &str,
-    messages: JsonValue,
-) -> String {
+pub fn build_request_hash(provider: &str, model: &str, stage: &str, messages: JsonValue) -> String {
     stable_hash(&JsonValue::Object(vec![
-        ("version".to_owned(), JsonValue::Number(CACHE_VERSION.to_string())),
-        ("provider".to_owned(), JsonValue::String(provider.to_lowercase())),
+        (
+            "version".to_owned(),
+            JsonValue::Number(CACHE_VERSION.to_string()),
+        ),
+        (
+            "provider".to_owned(),
+            JsonValue::String(provider.to_lowercase()),
+        ),
         ("model".to_owned(), JsonValue::String(model.to_owned())),
         ("stage".to_owned(), JsonValue::String(stage.to_owned())),
         ("messages".to_owned(), messages),

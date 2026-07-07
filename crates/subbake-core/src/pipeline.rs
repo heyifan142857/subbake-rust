@@ -129,8 +129,14 @@ fn build_translation_messages(
 ) -> Vec<ChatMessage> {
     let mut user = String::new();
     user.push_str("CONTEXT_START\n");
-    user.push_str(&format!("source_language={}\n", escape_field(&options.source_language)));
-    user.push_str(&format!("target_language={}\n", escape_field(&options.target_language)));
+    user.push_str(&format!(
+        "source_language={}\n",
+        escape_field(&options.source_language)
+    ));
+    user.push_str(&format!(
+        "target_language={}\n",
+        escape_field(&options.target_language)
+    ));
     user.push_str(&format!("batch_index={batch_index}\n"));
     user.push_str(&format!("fast={}\n", options.fast_mode));
     user.push_str("CONTEXT_END\n");
@@ -179,7 +185,7 @@ pub fn unescape_field(value: &str) -> CoreResult<String> {
             Some(other) => {
                 return Err(CoreError::Data(format!(
                     "unsupported escape sequence \\{other}"
-                )))
+                )));
             }
             None => return Err(CoreError::Data("trailing escape character".to_owned())),
         }

@@ -60,7 +60,10 @@ impl LlmBackend for MockBackend {
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
-        Ok((true, "Mock provider does not require credentials.".to_owned()))
+        Ok((
+            true,
+            "Mock provider does not require credentials.".to_owned(),
+        ))
     }
 }
 
@@ -73,9 +76,9 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
 
     let mut lines = Vec::new();
     for raw_line in body.lines().filter(|line| !line.trim().is_empty()) {
-        let (id, text) = raw_line
-            .split_once('\t')
-            .ok_or_else(|| CoreError::Backend("mock batch line is missing tab separator".to_owned()))?;
+        let (id, text) = raw_line.split_once('\t').ok_or_else(|| {
+            CoreError::Backend("mock batch line is missing tab separator".to_owned())
+        })?;
         let text = unescape_field(text)?;
         let translation = if text.trim().is_empty() {
             String::new()

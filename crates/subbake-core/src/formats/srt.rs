@@ -45,7 +45,11 @@ pub fn render(segments: &[SubtitleSegment], _bilingual: bool) -> CoreResult<Stri
         let start = segment.start.as_deref().unwrap_or_default();
         let end = segment.end.as_deref().unwrap_or_default();
         let mut timing_line = format!("{start} {TIMESTAMP_SEPARATOR} {end}");
-        if let Some(settings) = segment.settings.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(settings) = segment
+            .settings
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             timing_line.push(' ');
             timing_line.push_str(settings);
         }

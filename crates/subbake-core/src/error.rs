@@ -15,9 +15,15 @@ pub enum CoreError {
 impl Display for CoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            CoreError::UnsupportedFormat(value) => write!(formatter, "unsupported subtitle format: {value}"),
-            CoreError::MalformedSubtitle(value) => write!(formatter, "malformed subtitle document: {value}"),
-            CoreError::InvalidTranslation(value) => write!(formatter, "invalid translation result: {value}"),
+            CoreError::UnsupportedFormat(value) => {
+                write!(formatter, "unsupported subtitle format: {value}")
+            }
+            CoreError::MalformedSubtitle(value) => {
+                write!(formatter, "malformed subtitle document: {value}")
+            }
+            CoreError::InvalidTranslation(value) => {
+                write!(formatter, "invalid translation result: {value}")
+            }
             CoreError::Backend(value) => write!(formatter, "backend error: {value}"),
             CoreError::Data(value) => write!(formatter, "data error: {value}"),
         }

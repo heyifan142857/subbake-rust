@@ -15,7 +15,11 @@ pub fn run(args: &[String]) -> io::Result<()> {
         match args[index].as_str() {
             "--provider" => provider = required_value(args, &mut index, "--provider")?,
             "--model" => model = required_value(args, &mut index, "--model")?,
-            other => return Err(io::Error::other(format!("unknown provider option `{other}`"))),
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown provider option `{other}`"
+                )));
+            }
         }
         index += 1;
     }

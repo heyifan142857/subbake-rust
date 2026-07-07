@@ -34,7 +34,8 @@ pub const TOOL_SPECS: &[ToolSpec] = &[
 ];
 
 pub fn start_agent() -> String {
-    "SubBake agent is scaffolded in Rust. Full interactive behavior is pending migration.".to_owned()
+    "SubBake agent is scaffolded in Rust. Full interactive behavior is pending migration."
+        .to_owned()
 }
 
 pub fn resume_agent(session_id: Option<&str>) -> String {
