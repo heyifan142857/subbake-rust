@@ -2,6 +2,7 @@ pub mod config;
 pub mod fs;
 pub mod mock;
 pub mod providers;
+pub mod runtime_store;
 pub mod settings;
 
 pub use config::{load_translation_settings_patch, parse_translation_settings_patch};
@@ -10,4 +11,5 @@ pub use fs::{
 };
 pub use mock::MockBackend;
 pub use providers::{BackendConfig, build_backend};
+pub use runtime_store::{BatchShardKind, FileRuntimeStore};
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
