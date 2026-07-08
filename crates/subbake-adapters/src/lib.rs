@@ -13,7 +13,9 @@ pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };
 pub use mock::MockBackend;
-pub use providers::{BackendConfig, build_backend};
+pub use providers::{
+    BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend, check_provider,
+};
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
 pub use subbake_core::ports::BatchShardKind;

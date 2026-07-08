@@ -9,6 +9,18 @@ pub struct BackendConfig {
     pub model: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCheckRequest {
+    pub config: BackendConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCheckOutcome {
+    pub provider: String,
+    pub model: String,
+    pub message: String,
+}
+
 impl BackendConfig {
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -25,6 +37,20 @@ pub fn build_backend(config: &BackendConfig) -> CoreResult<Box<dyn LlmBackend>> 
             "provider `{provider}` adapter is pending migration"
         ))),
     }
+}
+
+pub fn check_provider(request: ProviderCheckRequest) -> CoreResult<ProviderCheckOutcome> {
+    let backend = build_backend(&request.config)?;
+    let (ok, message) = backend.check_credentials()?;
+    if !ok {
+        return Err(CoreError::Backend(message));
+    }
+
+    Ok(ProviderCheckOutcome {
+        provider: backend.provider_name().to_owned(),
+        model: backend.model_name().to_owned(),
+        message,
+    })
 }
 
 #[cfg(test)]
@@ -46,5 +72,17 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("pending migration"));
+    }
+
+    #[test]
+    fn checks_mock_provider() {
+        let outcome = check_provider(ProviderCheckRequest {
+            config: BackendConfig::new("mock", "mock-zh"),
+        })
+        .expect("mock provider should check");
+
+        assert_eq!(outcome.provider, "mock");
+        assert_eq!(outcome.model, "mock-zh");
+        assert!(!outcome.message.is_empty());
     }
 }

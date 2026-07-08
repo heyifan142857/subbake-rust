@@ -2,7 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    TranscriptionFormat, TranscriptionSettings, TranslationSettings, WhisperAction,
+    BackendConfig, TranscriptionFormat, TranscriptionSettings, TranslationSettings, WhisperAction,
     load_translation_settings_patch,
 };
 
@@ -34,6 +34,11 @@ pub struct TranscribeArgs {
     pub media_path: PathBuf,
     pub output: Option<PathBuf>,
     pub settings: TranscriptionSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderArgs {
+    pub config: BackendConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +219,32 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
     }
 
     Ok(parsed)
+}
+
+pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
+    if args.first().is_none_or(|value| value != "check") {
+        return Err(io::Error::other("provider requires `check`"));
+    }
+
+    let mut provider = "mock".to_owned();
+    let mut model = "mock-zh".to_owned();
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" => provider = required_value(args, &mut index, "--provider")?,
+            "--model" => model = required_value(args, &mut index, "--model")?,
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown provider option `{other}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ProviderArgs {
+        config: BackendConfig::new(provider, model),
+    })
 }
 
 pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
@@ -412,6 +443,15 @@ mod tests {
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
         assert_eq!(parsed.settings.model.as_deref(), Some("base"));
         assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
+    }
+
+    #[test]
+    fn parse_provider_check_defaults_to_mock() {
+        let args = vec!["check".to_owned()];
+
+        let parsed = parse_provider_args(&args).expect("provider check should parse");
+
+        assert_eq!(parsed.config, BackendConfig::new("mock", "mock-zh"));
     }
 
     #[test]

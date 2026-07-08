@@ -28,6 +28,12 @@ fn transcribe_reports_pending_backend() {
 }
 
 #[test]
+fn provider_check_uses_mock_backend() {
+    subbake_cli::run(vec!["provider".to_owned(), "check".to_owned()])
+        .expect("mock provider should check");
+}
+
+#[test]
 fn whisper_status_is_available_without_installation() {
     subbake_cli::run(vec!["whisper".to_owned(), "status".to_owned()])
         .expect("whisper status should not require installed backend");

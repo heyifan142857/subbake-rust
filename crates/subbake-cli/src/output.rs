@@ -2,7 +2,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    BatchTranslationOutcome, TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
+    BatchTranslationOutcome, ProviderCheckOutcome, TranscriptionOutcome, TranslationOutcome,
+    WhisperOutcome,
 };
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
 
@@ -21,6 +22,11 @@ pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
 
 pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
     println!("Output: {}", outcome.output_path.display());
+}
+
+pub fn print_provider_check_outcome(outcome: &ProviderCheckOutcome) {
+    println!("Provider check passed.");
+    println!("{}", outcome.message);
 }
 
 pub fn print_whisper_outcome(outcome: &WhisperOutcome) {
