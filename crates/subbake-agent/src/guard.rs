@@ -168,30 +168,47 @@ impl FileGuard {
     // ------------------------------------------------------------------
 
     /// Resolve a user-supplied path to an absolute path under the project root,
-    /// rejecting any path that contains a protected component.
+    /// rejecting paths that escape the project root or contain protected components.
     fn resolve(&self, user_path: &Path) -> std::io::Result<PathBuf> {
-        let absolute = if user_path.is_absolute() {
-            user_path.to_path_buf()
-        } else {
-            self.project_root.join(user_path)
-        };
-        // Canonicalize if possible (file might not exist yet, so try parent).
-        let safe = if absolute.exists() {
-            absolute.canonicalize().unwrap_or(absolute)
-        } else if let Some(parent) = absolute.parent() {
-            if parent.exists() {
-                let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-                canonical_parent.join(
-                    absolute.file_name().unwrap_or_default(),
-                )
+        // Normalise `..` components so `root/../etc/passwd` is caught below.
+        let anchored = normalize_path(
+            if user_path.is_absolute() {
+                user_path.to_path_buf()
             } else {
-                absolute
+                self.project_root.join(user_path)
+            },
+        );
+
+        // ── Escape guard: anchor must be under project_root ──
+        let root_canon = self.project_root.canonicalize().unwrap_or_else(|_| self.project_root.clone());
+        if !anchored.starts_with(&root_canon) {
+            return Err(std::io::Error::other(format!(
+                "path escapes project root `{}`: {}",
+                root_canon.display(),
+                anchored.display(),
+            )));
+        }
+
+        // Canonicalize existing paths; for new files canonicalize the parent.
+        let safe = if anchored.exists() {
+            anchored.canonicalize().map_err(|e| {
+                std::io::Error::other(format!("resolve existing path: {e}"))
+            })?
+        } else if let Some(parent) = anchored.parent() {
+            if parent.exists() {
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    std::io::Error::other(format!("resolve parent: {e}"))
+                })?;
+                canonical_parent.join(anchored.file_name().unwrap_or_default())
+            } else {
+                // Parent doesn't exist yet — trust the escape check above.
+                anchored
             }
         } else {
-            absolute
+            anchored
         };
 
-        // Check for protected components.
+        // Check for protected components (e.g. .git, .subbake).
         for component in safe.components() {
             if let Some(name) = component.as_os_str().to_str()
                 && PROTECTED_PATH_PARTS.contains(&name) {
@@ -279,6 +296,24 @@ fn nanos_since_epoch() -> u128 {
         .as_nanos()
 }
 
+/// Remove `..` and `.` components from a path without touching the filesystem.
+/// Mirrors `std::fs::canonicalize` but works for non-existent paths.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::CurDir => {
+                // skip
+            }
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +332,16 @@ mod tests {
         let result = guard.create_file(path, "hello").expect("create");
         assert_eq!(result.action, FileOpAction::Create);
         assert_eq!(guard.read_file(path).expect("read"), "hello");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_path_traversal_via_dotdot() {
+        let (root, guard) = setup();
+        let err = guard
+            .create_file(Path::new("../etc/passwd"), "data")
+            .expect_err("path traversal should be rejected");
+        assert!(err.to_string().contains("escapes project root"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -342,6 +387,19 @@ mod tests {
         assert_eq!(result.action, FileOpAction::Renamed);
         assert!(root.join("b.txt").exists());
         assert!(!root.join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_absolute_path_outside_root() {
+        let (root, guard) = setup();
+        // Even though /tmp exists, the guard's project_root is a subdir,
+        // so an absolute path pointing outside should be rejected.
+        let err = guard
+            .create_file(Path::new("/tmp/outside-root.txt"), "data")
+            .expect_err("should reject path outside project root");
+        let msg = err.to_string();
+        assert!(msg.contains("escapes project root"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
