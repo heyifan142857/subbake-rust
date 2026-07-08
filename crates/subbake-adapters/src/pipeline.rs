@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use crate::fs::is_supported_subtitle_path;
 use crate::settings::TranslationSettings;
+use crate::transcription::{
+    TranscriptionRequest, TranscriptionSettings, transcribe_media,
+};
 use crate::translation::{TranslationOutcome, TranslationRequest, translate_subtitle};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,13 +30,22 @@ pub fn run_pipeline(request: PipelineRequest) -> io::Result<PipelineOutcome> {
         return Ok(PipelineOutcome::Subtitle(outcome));
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "pipeline transcription is pending migration for {}; subtitle inputs are supported",
-            request.input_path.display()
-        ),
-    ))
+    // Media input: transcribe first, then translate the result.
+    let transcription_out = transcribe_media(TranscriptionRequest {
+        media_path: request.input_path.clone(),
+        output_path: None,
+        settings: TranscriptionSettings::default(),
+    })?;
+    let transcribed_path = transcription_out.output_path;
+
+    // Build TranslationRequest — use the transcription output as input.
+    let translation_out = translate_subtitle(TranslationRequest {
+        input_path: transcribed_path,
+        output_path: request.output_path,
+        settings: request.settings,
+    })?;
+
+    Ok(PipelineOutcome::Subtitle(translation_out))
 }
 
 #[cfg(test)]
@@ -71,16 +83,19 @@ mod tests {
     }
 
     #[test]
-    fn media_inputs_report_pending_transcription() {
+    fn media_input_chains_transcription_then_translation() {
+        // Use .wav to skip ffmpeg; a non-existent file means the pipeline tries
+        // transcription (= no longer "pending migration").
         let error = run_pipeline(PipelineRequest {
-            input_path: PathBuf::from("movie.mp4"),
+            input_path: PathBuf::from("audio.wav"),
             output_path: None,
             settings: TranslationSettings::default(),
         })
-        .expect_err("media pipeline should be pending");
+        .expect_err("media pipeline should try transcription");
 
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("transcription is pending"));
+        let msg = error.to_string();
+        assert!(!msg.contains("pending migration"),
+            "media path should no longer return pending migration: {msg}");
     }
 
     fn temp_root(label: &str) -> PathBuf {

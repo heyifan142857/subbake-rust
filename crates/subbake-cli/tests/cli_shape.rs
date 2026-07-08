@@ -12,19 +12,22 @@ fn cli_exposes_redesigned_commands() {
 }
 
 #[test]
-fn pipeline_reports_pending_transcription_for_media_inputs() {
+fn pipeline_media_input_attempts_transcription() {
     let error = subbake_cli::run(vec!["pipeline".to_owned(), "movie.mp4".to_owned()])
-        .expect_err("media pipeline should be pending");
+        .expect_err("media pipeline should attempt transcription");
 
-    assert!(error.to_string().contains("transcription is pending"));
+    let msg = error.to_string();
+    // The old stub said "pending migration"; now it tries real transcription.
+    assert!(!msg.contains("pending migration"), "should no longer be a stub: {msg}");
 }
 
 #[test]
-fn transcribe_reports_pending_backend() {
+fn transcribe_media_attempts_transcription() {
     let error = subbake_cli::run(vec!["transcribe".to_owned(), "movie.mp4".to_owned()])
-        .expect_err("transcription backend should be pending");
+        .expect_err("transcribe should try real backend");
 
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let msg = error.to_string();
+    assert!(!msg.contains("pending migration"), "should no longer be a stub: {msg}");
 }
 
 #[test]
