@@ -5,6 +5,7 @@ use crate::args::{
     parse_transcribe_args, parse_translate_args, parse_whisper_args,
 };
 
+mod agent;
 mod pipeline;
 mod provider;
 mod runtime;
@@ -19,7 +20,7 @@ pub fn dispatch(args: Vec<String>) -> io::Result<()> {
     }
 
     match args[0].as_str() {
-        "agent" => run_agent(&args[1..]),
+        "agent" => agent::run(&args[1..]),
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),
@@ -48,20 +49,4 @@ fn print_help() {
     for name in crate::command_names() {
         println!("  {name}");
     }
-}
-
-fn run_agent(args: &[String]) -> io::Result<()> {
-    if args.first().is_some_and(|value| value == "resume") {
-        println!(
-            "{}",
-            subbake_agent::resume_agent(args.get(1).map(String::as_str))
-        );
-    } else if args.is_empty() {
-        println!("{}", subbake_agent::start_agent());
-    } else {
-        return Err(io::Error::other(
-            "unsupported agent command; use `agent resume [SESSION_ID]`",
-        ));
-    }
-    Ok(())
 }

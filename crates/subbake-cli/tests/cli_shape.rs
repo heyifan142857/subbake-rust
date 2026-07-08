@@ -34,6 +34,14 @@ fn provider_check_uses_mock_backend() {
 }
 
 #[test]
+fn agent_rejects_unknown_subcommand() {
+    let error = subbake_cli::run(vec!["agent".to_owned(), "bogus".to_owned()])
+        .expect_err("unknown agent command should fail");
+
+    assert!(error.to_string().contains("agent resume"));
+}
+
+#[test]
 fn runtime_clean_requires_confirmation() {
     let error = subbake_cli::run(vec![
         "runtime".to_owned(),
