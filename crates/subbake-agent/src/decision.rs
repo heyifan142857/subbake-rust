@@ -9,8 +9,13 @@
 //!      - `respond` / `ask_user` / step-limit exit.
 
 use std::io;
+use std::path::PathBuf;
 
 use serde_json::{json, Value as JsonValue};
+use subbake_adapters::{
+    TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
+    transcribe_media, translate_subtitle,
+};
 use subbake_core::ports::{ChatMessage, LlmBackend};
 
 use crate::engine::AgentEngine;
@@ -354,26 +359,101 @@ impl AgentEngine {
     /// Execute a tool by name with arguments. Returns a text summary.
     fn run_tool(&self, name: &str, args: &JsonValue) -> io::Result<String> {
         match name {
+            // -- Browse tools --
             "list_files" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let files = self.guard.list_files(std::path::Path::new(dir))?;
+                let files = self.guard.list_files(PathBuf::from(dir).as_path())?;
                 Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
             }
+            "search_files" => {
+                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                let files = self.guard.search_files(PathBuf::from(dir).as_path(), pat)?;
+                Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+            }
+            "read_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                self.guard.read_file(PathBuf::from(path).as_path())
+            }
+            "read_file_preview" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let content = self.guard.read_file(PathBuf::from(path).as_path())?;
+                let preview: String = content.chars().take(2000).collect();
+                Ok(if preview.len() < content.len() {
+                    format!("{preview}\n… (truncated)")
+                } else {
+                    preview
+                })
+            }
+            "candidate_subtitles" => {
+                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let files = self.guard.search_files(PathBuf::from(dir).as_path(), ".srt")?;
+                Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+            }
+            "recent_translations" => {
+                // Scan session events for translate_file/final_tool_call records.
+                let session = self.session.as_ref();
+                let events = session.map(|s| &s.events).map(|v| v.as_slice()).unwrap_or(&[]);
+                let mut out = Vec::new();
+                for event in events.iter().rev().take(20) {
+                    if event.kind == "translate_file" || event.kind == "final_tool_call" {
+                        out.push(event.text.clone());
+                    }
+                }
+                Ok(out.join("\n"))
+            }
+
+            // -- Translate --
             "translate_file" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("input");
-                Ok(format!("[translating {path}]"))
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let input = self.project_root.join(path);
+                let request = TranslationRequest {
+                    input_path: input,
+                    output_path: None,
+                    settings: TranslationSettings::default(),
+                };
+                let outcome = translate_subtitle(request)?;
+                Ok(format!("Translated: {}", outcome.output_path.map(|p| p.display().to_string()).unwrap_or_default()))
             }
+            "translate_series" => {
+                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+                let input = self.project_root.join(dir);
+                let request = subbake_adapters::BatchTranslationRequest {
+                    root: input,
+                    recursive: args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false),
+                    overwrite: args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false),
+                    settings: TranslationSettings::default(),
+                };
+                let outcome = subbake_adapters::translate_subtitle_batch(request)?;
+                Ok(format!("Translated {} files, skipped {}.", outcome.processed, outcome.skipped.len()))
+            }
+
+            // -- Transcribe --
             "transcribe_audio" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("input");
-                Ok(format!("[transcribing {path}]"))
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let input = self.project_root.join(path);
+                let request = TranscriptionRequest {
+                    media_path: input,
+                    output_path: None,
+                    settings: TranscriptionSettings::default(),
+                };
+                match transcribe_media(request) {
+                    Ok(outcome) => Ok(format!("Transcribed: {}", outcome.output_path.display())),
+                    Err(e) => Ok(format!("Transcription needs setup: {e}")),
+                }
             }
-            "diagnose_path" | "read_file" | "search_files" | "recent_translations"
-            | "candidate_subtitles" | "read_file_preview" | "diagnose_text" => {
-                Ok(format!("[{name}: not yet wired]"))
+
+            // -- Diagnose --
+            "diagnose_path" | "diagnose_text" => {
+                Ok(format!("[{name} not yet implemented]"))
             }
-            _ => {
-                Ok(format!("[{name}: not yet wired]"))
+
+            // -- Profile --
+            "switch_profile" | "list_profiles" => {
+                Ok(format!("[{name} not yet wired]"))
             }
+
+            other => Ok(format!("[{other} not yet wired]")),
         }
     }
 }
