@@ -464,9 +464,21 @@ impl AgentEngine {
                 Ok(format!("Translated {} files, skipped {}.", outcome.processed, outcome.skipped.len()))
             }
 
-            // -- Edit (requires editing pipeline) --
+            // -- Edit: read file, show content, suggest re-translate --
             "edit_subtitle" => {
-                Ok("Edit tool: point me at a file and I'll re-translate specific lines.".to_owned())
+                let path = req_arg(args, "path")?;
+                let full = self.project_root.join(&path);
+                if full.exists() {
+                    let content = std::fs::read_to_string(&full)
+                        .unwrap_or_else(|_| "(unreadable)".to_owned());
+                    let preview: String = content.chars().take(500).collect();
+                    Ok(format!(
+                        "Current content of {}:\n{}\n\nTo edit, set `path` and `instructions` in arguments.",
+                        path.display(), preview
+                    ))
+                } else {
+                    Ok(format!("File {} not found.", path.display()))
+                }
             }
 
             // -- Transcribe --
@@ -508,14 +520,67 @@ impl AgentEngine {
                 }
             }
 
-            // -- Diagnose (offline log reader — stub for now) --
-            "diagnose_path" | "diagnose_text" => {
-                Ok(format!("[{name}: not yet implemented. Translate failed runs produce log files I can read.]"))
+            // -- Diagnose: read failure logs from a run directory --
+            "diagnose_path" => {
+                let path = req_arg(args, "path")?;
+                let run_dir = self.project_root.join(&path).join(".subbake/runs");
+                let mut results = Vec::new();
+                if run_dir.exists() {
+                    for entry in std::fs::read_dir(&run_dir).map_err(io::Error::other)? {
+                        let entry = entry.map_err(io::Error::other)?;
+                        let failures_dir = entry.path().join("failures");
+                        if failures_dir.exists() {
+                            for f in std::fs::read_dir(&failures_dir).map_err(io::Error::other)? {
+                                let f = f.map_err(io::Error::other)?;
+                                if let Ok(content) = std::fs::read_to_string(f.path()) {
+                                    results.push(format!("{}: {}",
+                                        f.path().display(), &content[..content.len().min(200)]));
+                                }
+                            }
+                        }
+                    }
+                }
+                if results.is_empty() {
+                    Ok("No failure logs found.".to_owned())
+                } else {
+                    Ok(results.join("\n---\n"))
+                }
+            }
+            "diagnose_text" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(format!("Diagnose text: received {} chars. For detailed diagnosis, set `path` to a run directory.", text.len()))
             }
 
-            // -- Profile (stub) --
-            "switch_profile" | "list_profiles" => {
-                Ok(format!("[{name}: configure profiles in subbake.toml]"))
+            // -- Profile: read profiles from subbake.toml --
+            "list_profiles" => {
+                let config_path = self.project_root.join("subbake.toml");
+                if !config_path.exists() {
+                    return Ok("No subbake.toml found in project root.".to_owned());
+                }
+                let content = std::fs::read_to_string(&config_path)
+                    .map_err(|e| io::Error::other(format!("read config: {e}")))?;
+                let profiles = find_profile_names(&content);
+                if profiles.is_empty() {
+                    Ok("No profiles defined in subbake.toml. Create [profiles.<name>] sections.".to_owned())
+                } else {
+                    Ok(format!("Profiles: {}", profiles.join(", ")))
+                }
+            }
+            "switch_profile" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let config_path = self.project_root.join("subbake.toml");
+                if !config_path.exists() {
+                    return Ok("No subbake.toml. Create one with [profiles.<name>] sections.".to_owned());
+                }
+                let content = std::fs::read_to_string(&config_path)
+                    .map_err(|e| io::Error::other(format!("read config: {e}")))?;
+                let profiles = find_profile_names(&content);
+                if profiles.contains(&name.to_owned()) {
+                    // Switching is done by the user editing their config default_profile.
+                    Ok(format!("Profile `{name}` exists. Set `default_profile = \"{name}\"` in subbake.toml to activate it."))
+                } else {
+                    Ok(format!("Profile `{name}` not found. Available: {}", profiles.join(", ")))
+                }
             }
 
             _ => Ok(format!("[{name}: not yet wired]")),
@@ -536,6 +601,23 @@ fn format_file_list(files: &[PathBuf]) -> String {
         return "(no files found)".to_owned();
     }
     files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")
+}
+
+/// Parse lines like `[profiles.myprofile]` from TOML content.
+fn find_profile_names(toml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in toml.lines() {
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix("[profiles.")
+            && let Some(name) = inner.strip_suffix(']') {
+                let clean = name.trim();
+                if !clean.is_empty() {
+                    names.push(clean.to_owned());
+                }
+            }
+    }
+    names.sort();
+    names
 }
 
 // ---------------------------------------------------------------------------
