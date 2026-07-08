@@ -227,7 +227,6 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
     let mut provider = "mock".to_owned();
     let mut model = "mock-zh".to_owned();
     let mut api_key = None;
-    let mut api_key_env = None;
     let mut base_url = None;
     let mut index = 1usize;
     while index < args.len() {
@@ -235,9 +234,6 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
             "--provider" => provider = required_value(args, &mut index, "--provider")?,
             "--model" => model = required_value(args, &mut index, "--model")?,
             "--api-key" => api_key = Some(required_value(args, &mut index, "--api-key")?),
-            "--api-key-env" => {
-                api_key_env = Some(required_value(args, &mut index, "--api-key-env")?)
-            }
             "--base-url" => base_url = Some(required_value(args, &mut index, "--base-url")?),
             other => {
                 return Err(io::Error::other(format!(
@@ -248,9 +244,8 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
         index += 1;
     }
 
-    // Resolve API key: direct value > configured env var > provider-default env var
+    // Resolve API key: explicit value > provider-default env var
     let resolved_api_key = api_key
-        .or_else(|| resolve_env_var(api_key_env.as_deref()))
         .or_else(|| resolve_env_var(default_api_key_env(&provider)));
 
     Ok(ProviderArgs {
@@ -272,6 +267,10 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
         .ok_or_else(|| io::Error::other(format!("runtime {command} requires a target")))?;
     let mut runtime_dir = None;
     let mut yes = false;
+    let mut clean_runs = false;
+    let mut clean_cache = false;
+    let mut clean_glossary = false;
+    let mut clean_all = false;
     let mut index = 2usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -279,6 +278,10 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
                 runtime_dir = Some(required_path(args, &mut index, "--runtime-dir")?)
             }
             "--yes" if command == "clean" => yes = true,
+            "--runs" if command == "clean" => clean_runs = true,
+            "--cache" if command == "clean" => clean_cache = true,
+            "--glossary" if command == "clean" => clean_glossary = true,
+            "--all" if command == "clean" => clean_all = true,
             other => {
                 return Err(io::Error::other(format!(
                     "unknown runtime option `{other}`"
@@ -290,7 +293,13 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
 
     let action = match command.as_str() {
         "inspect" => RuntimeAction::Inspect,
-        "clean" => RuntimeAction::Clean { yes },
+        "clean" => RuntimeAction::Clean {
+            yes,
+            clean_runs,
+            clean_cache,
+            clean_glossary,
+            all: clean_all,
+        },
         _ => return Err(io::Error::other("runtime requires `inspect` or `clean`")),
     };
 
@@ -373,13 +382,6 @@ fn parse_translation_setting_option(
         "--provider" => settings.provider = required_value(args, index, option)?,
         "--model" => settings.model = required_value(args, index, option)?,
         "--api-key" => settings.api_key = Some(required_value(args, index, option)?),
-        "--api-key-env" => {
-            // Resolve --api-key-env to direct value eagerly
-            let name = required_value(args, index, option)?;
-            if settings.api_key.is_none() {
-                settings.api_key = resolve_env_var(Some(&name));
-            }
-        }
         "--base-url" => settings.base_url = Some(required_value(args, index, option)?),
         "--source-lang" => settings.source_language = required_value(args, index, option)?,
         "--target-lang" => settings.target_language = required_value(args, index, option)?,
@@ -564,15 +566,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_provider_check_accepts_api_key_sources() {
+    fn parse_provider_check_accepts_api_key_and_base_url() {
         let args = vec![
             "check".to_owned(),
             "--provider".to_owned(),
             "openai".to_owned(),
             "--model".to_owned(),
             "gpt".to_owned(),
-            "--api-key-env".to_owned(),
-            "OPENAI_API_KEY".to_owned(),
+            "--api-key".to_owned(),
+            "sk-test".to_owned(),
             "--base-url".to_owned(),
             "https://example.test/v1".to_owned(),
         ];
@@ -580,10 +582,7 @@ mod tests {
         let parsed = parse_provider_args(&args).expect("provider check should parse");
 
         assert_eq!(parsed.config.provider, "openai");
-        assert_eq!(
-            parsed.config.api_key.as_deref(),
-            None // env var is not resolved because it's not set in test env
-        );
+        assert_eq!(parsed.config.api_key.as_deref(), Some("sk-test"));
         assert_eq!(
             parsed.config.base_url.as_deref(),
             Some("https://example.test/v1")
@@ -602,7 +601,16 @@ mod tests {
 
         let parsed = parse_runtime_args(&args).expect("runtime args should parse");
 
-        assert_eq!(parsed.action, RuntimeAction::Clean { yes: true });
+        assert_eq!(
+            parsed.action,
+            RuntimeAction::Clean {
+                yes: true,
+                clean_runs: false,
+                clean_cache: false,
+                clean_glossary: false,
+                all: false,
+            }
+        );
         assert_eq!(parsed.target_path, PathBuf::from("clip.srt"));
         assert_eq!(parsed.runtime_dir, Some(PathBuf::from(".subbake")));
     }

@@ -14,7 +14,13 @@ pub struct RuntimeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAction {
     Inspect,
-    Clean { yes: bool },
+    Clean {
+        yes: bool,
+        clean_runs: bool,
+        clean_cache: bool,
+        clean_glossary: bool,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +46,13 @@ pub fn run_runtime(request: RuntimeRequest) -> io::Result<RuntimeOutcome> {
         RuntimeAction::Inspect => Ok(RuntimeOutcome::Inspection(Box::new(RuntimeInspection {
             paths,
         }))),
-        RuntimeAction::Clean { yes } => clean_runtime(paths, yes),
+        RuntimeAction::Clean {
+            yes,
+            clean_runs,
+            clean_cache,
+            clean_glossary,
+            all,
+        } => clean_runtime(paths, yes, clean_runs, clean_cache, clean_glossary, all),
     }
 }
 
@@ -55,22 +67,48 @@ fn runtime_paths(request: &RuntimeRequest) -> RuntimePaths {
     )
 }
 
-fn clean_runtime(paths: RuntimePaths, yes: bool) -> io::Result<RuntimeOutcome> {
+fn clean_runtime(
+    paths: RuntimePaths,
+    yes: bool,
+    clean_runs: bool,
+    clean_cache: bool,
+    clean_glossary: bool,
+    all: bool,
+) -> io::Result<RuntimeOutcome> {
     if !yes {
         return Err(io::Error::other(
             "runtime clean requires --yes in the current non-interactive implementation",
         ));
     }
 
-    let removed = if paths.root_dir.exists() {
+    if !paths.root_dir.exists() {
+        return Ok(RuntimeOutcome::Clean(RuntimeCleanOutcome {
+            root_dir: paths.root_dir,
+            removed: false,
+        }));
+    }
+
+    let should_remove_all = all || (!clean_runs && !clean_cache && !clean_glossary);
+    if should_remove_all {
         fs::remove_dir_all(&paths.root_dir)?;
-        true
-    } else {
-        false
-    };
+        return Ok(RuntimeOutcome::Clean(RuntimeCleanOutcome {
+            root_dir: paths.root_dir,
+            removed: true,
+        }));
+    }
+
+    if clean_runs && paths.run_dir.exists() {
+        fs::remove_dir_all(&paths.run_dir)?;
+    }
+    if clean_cache && paths.cache_dir.exists() {
+        fs::remove_dir_all(&paths.cache_dir)?;
+    }
+    if clean_glossary && paths.glossary_path.exists() {
+        fs::remove_file(&paths.glossary_path)?;
+    }
     Ok(RuntimeOutcome::Clean(RuntimeCleanOutcome {
         root_dir: paths.root_dir,
-        removed,
+        removed: true,
     }))
 }
 
@@ -100,7 +138,13 @@ mod tests {
     #[test]
     fn clean_requires_yes() {
         let error = run_runtime(RuntimeRequest {
-            action: RuntimeAction::Clean { yes: false },
+            action: RuntimeAction::Clean {
+                yes: false,
+                clean_runs: false,
+                clean_cache: false,
+                clean_glossary: false,
+                all: true,
+            },
             target_path: PathBuf::from("clip.srt"),
             runtime_dir: None,
         })
@@ -116,7 +160,13 @@ mod tests {
         fs::create_dir_all(runtime_dir.join("cache")).expect("create runtime");
 
         let outcome = run_runtime(RuntimeRequest {
-            action: RuntimeAction::Clean { yes: true },
+            action: RuntimeAction::Clean {
+                yes: true,
+                clean_runs: false,
+                clean_cache: false,
+                clean_glossary: false,
+                all: true,
+            },
             target_path: root.join("clip.srt"),
             runtime_dir: Some(runtime_dir.clone()),
         })

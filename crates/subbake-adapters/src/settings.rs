@@ -28,7 +28,6 @@ pub struct TranslationSettingsPatch {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
-    pub api_key_env: Option<String>,
     pub base_url: Option<String>,
     pub source_language: Option<String>,
     pub target_language: Option<String>,
@@ -80,12 +79,6 @@ impl TranslationSettings {
         }
         if let Some(value) = patch.api_key {
             self.api_key = Some(value);
-        }
-        if let Some(value) = patch.api_key_env {
-            // Resolve api_key_env to api_key eagerly, but only if no direct api_key was set.
-            if self.api_key.is_none() {
-                self.api_key = resolve_env_var(Some(&value));
-            }
         }
         if let Some(value) = patch.base_url {
             self.base_url = Some(value);
@@ -235,28 +228,4 @@ mod tests {
         assert_eq!(config.base_url.as_deref(), Some("https://example.test/v1"));
     }
 
-    #[test]
-    fn apply_patch_resolves_api_key_env() {
-        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
-            api_key_env: Some("OPENAI_API_KEY".to_owned()),
-            provider: Some("openai".to_owned()),
-            ..TranslationSettingsPatch::default()
-        });
-
-        // api_key_env should be resolved eagerly in apply_patch.
-        // If OPENAI_API_KEY is not set in test env, api_key remains None.
-        assert_eq!(settings.api_key, std::env::var("OPENAI_API_KEY").ok());
-    }
-
-    #[test]
-    fn apply_patch_direct_api_key_overrides_api_key_env() {
-        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
-            api_key: Some("explicit-key".to_owned()),
-            api_key_env: Some("OPENAI_API_KEY".to_owned()),
-            ..TranslationSettingsPatch::default()
-        });
-
-        // direct api_key wins over api_key_env
-        assert_eq!(settings.api_key.as_deref(), Some("explicit-key"));
-    }
 }

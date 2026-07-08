@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 pub const DEFAULT_BATCH_SIZE: usize = 30;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSegment {
     pub id: String,
     pub text: String,
@@ -33,7 +35,7 @@ pub struct GlossaryEntry {
     pub target: String,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,

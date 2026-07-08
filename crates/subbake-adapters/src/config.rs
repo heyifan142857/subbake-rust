@@ -54,7 +54,6 @@ fn apply_key_value(
         "provider" => patch.provider = Some(value.into_string(key)?),
         "model" => patch.model = Some(value.into_string(key)?),
         "api_key" => patch.api_key = Some(value.into_string(key)?),
-        "api_key_env" => patch.api_key_env = Some(value.into_string(key)?),
         "base_url" => patch.base_url = Some(value.into_string(key)?),
         "source_language" | "source_lang" => patch.source_language = Some(value.into_string(key)?),
         "target_language" | "target_lang" => patch.target_language = Some(value.into_string(key)?),
@@ -180,7 +179,6 @@ mod tests {
             [defaults]
             provider = "mock"
             model = "mock-en"
-            api_key_env = "OPENAI_API_KEY"
             base_url = "https://example.test/v1"
             target_language = "English"
             batch_size = 8
@@ -192,7 +190,6 @@ mod tests {
 
         assert_eq!(patch.provider.as_deref(), Some("mock"));
         assert_eq!(patch.model.as_deref(), Some("mock-en"));
-        assert_eq!(patch.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
         assert_eq!(patch.base_url.as_deref(), Some("https://example.test/v1"));
         assert_eq!(patch.target_language.as_deref(), Some("English"));
         assert_eq!(patch.batch_size, Some(8));

@@ -1,4 +1,8 @@
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
 use crate::languages::language_pair_slug;
@@ -29,7 +33,7 @@ pub struct InputSignature {
     pub mtime_ns: Option<u128>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeSnapshot {
     pub translated_segments: Vec<SubtitleSegment>,
     pub reviewed_segments: Vec<SubtitleSegment>,
@@ -384,6 +388,56 @@ fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
         digest[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
     }
     digest
+}
+
+// ---------------------------------------------------------------------------
+// RunStateStore — persist/restore pipeline progress for resume
+// ---------------------------------------------------------------------------
+
+pub fn save_run_state(path: &Path, snapshot: &ResumeSnapshot) -> io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| io::Error::other(format!("serialize run state: {e}")))?;
+    let tmp = path.with_file_name(
+        format!(".{}.tmp", path.file_name().and_then(|s| s.to_str()).unwrap_or("state")),
+    );
+    fs::write(&tmp, &json)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn load_run_state(path: &Path) -> io::Result<Option<ResumeSnapshot>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = fs::read_to_string(path)?;
+    let snapshot: ResumeSnapshot = serde_json::from_str(&json)
+        .map_err(|e| io::Error::other(format!("parse run state: {e}")))?;
+    Ok(Some(snapshot))
+}
+
+// ---------------------------------------------------------------------------
+// CacheStore — simple file-based LLM response cache
+// ---------------------------------------------------------------------------
+
+/// Save a cached response for a given request hash.
+pub fn cache_store(cache_dir: &Path, hash: &str, response: &str) -> io::Result<()> {
+    fs::create_dir_all(cache_dir)?;
+    let path = cache_dir.join(hash);
+    fs::write(&path, response)?;
+    Ok(())
+}
+
+/// Load a cached response for a given request hash, if it exists.
+pub fn cache_load(cache_dir: &Path, hash: &str) -> io::Result<Option<String>> {
+    let path = cache_dir.join(hash);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)?;
+    Ok(Some(content))
 }
 
 #[cfg(test)]
