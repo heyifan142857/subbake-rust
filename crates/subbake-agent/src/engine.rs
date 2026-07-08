@@ -2,7 +2,7 @@
 //!
 //! Design goals:
 //! - Session, Guard, and Engine are separate structs (no 1000-line `_core.py`)
-//! - All I/O goes through the engine so it can be driven programmatically or via TUI
+//! - Optional `EngineObserver` for streaming output (TUI, CLI, or test)
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
 use std::path::PathBuf;
@@ -12,12 +12,92 @@ use crate::guard::FileGuard;
 use crate::session::AgentSessionStore;
 use crate::tools::{ToolKind, ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES};
 
+// ---------------------------------------------------------------------------
+// Observer trait — enables streaming output
+// ---------------------------------------------------------------------------
+
+/// Subscribe to engine lifecycle events for streaming display.
+///
+/// Every method has a default no-op implementation so observers only override
+/// what they care about.
+pub trait EngineObserver: Send {
+    /// The LLM is "thinking" (producing reasoning text).
+    fn on_thinking(&mut self, _text: &str) {}
+
+    /// A tool is about to be called.
+    fn on_tool_call(&mut self, _name: &str, _arguments: &serde_json::Value) {}
+
+    /// A tool produced output (observation for the LLM context).
+    fn on_observation(&mut self, _text: &str) {}
+
+    /// An error occurred during tool execution.
+    fn on_error(&mut self, _error: &str) {}
+
+    /// A final response is ready (respond / ask_user).
+    fn on_response(&mut self, _text: &str) {}
+
+    /// The agent loop reached its step limit.
+    fn on_step_limit(&mut self) {}
+}
+
+/// Observer that prints everything to stdout (mirrors Python `trace._AgentLoopTrace`).
+pub struct StreamingObserver;
+
+impl Default for StreamingObserver {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl StreamingObserver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl EngineObserver for StreamingObserver {
+    fn on_thinking(&mut self, text: &str) {
+        println!("  ⎿  {}…", text.lines().next().unwrap_or(text));
+    }
+
+    fn on_tool_call(&mut self, name: &str, arguments: &serde_json::Value) {
+        let args = serde_json::to_string(arguments).unwrap_or_default();
+        if args.len() > 120 {
+            println!("  ⚡ {name}  ({args:.120}…)");
+        } else {
+            println!("  ⚡ {name}  {args}");
+        }
+    }
+
+    fn on_observation(&mut self, text: &str) {
+        let preview = text.lines().next().unwrap_or(text);
+        if preview.len() > 200 {
+            println!("  ◀  {:.200}…", preview);
+        } else {
+            println!("  ◀  {preview}");
+        }
+    }
+
+    fn on_error(&mut self, error: &str) {
+        eprintln!("  ✖ {error}");
+    }
+
+    fn on_response(&mut self, text: &str) {
+        println!("  ➔ {text}");
+    }
+
+    fn on_step_limit(&mut self) {
+        println!("  ⚠ Agent loop reached step limit.");
+    }
+}
+
 /// The headless agent engine.
 pub struct AgentEngine {
     pub project_root: PathBuf,
     pub session_store: AgentSessionStore,
     pub guard: FileGuard,
     pub session: Option<crate::session::AgentSession>,
+    pub observer: Option<Box<dyn EngineObserver>>,
 }
 
 impl AgentEngine {
@@ -29,7 +109,14 @@ impl AgentEngine {
             session_store,
             guard,
             session: None,
+            observer: None,
         }
+    }
+
+    /// Attach an observer for streaming output.
+    pub fn with_observer(mut self, observer: Box<dyn EngineObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     // ------------------------------------------------------------------

@@ -4,7 +4,10 @@ pub mod guard;
 pub mod session;
 pub mod tools;
 
+pub use engine::{AgentEngine, EngineObserver, StreamingObserver};
+pub use guard::FileGuard;
 pub use session::*;
+pub use tools::{ALL_TOOL_SPECS, DISCOVERY_TOOL_NAMES, APPROVAL_REQUIRED_TOOL_NAMES, ToolKind};
 
 // ---------------------------------------------------------------------------
 // Compatibility API — used by the CLI while the interactive engine is built.
