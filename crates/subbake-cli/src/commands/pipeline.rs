@@ -1,18 +1,16 @@
 use std::io;
 
-use subbake_adapters::is_supported_subtitle_path;
+use subbake_adapters::{PipelineRequest, run_pipeline};
 
 use crate::args::TranslateArgs;
-
-use super::translate;
+use crate::output::print_pipeline_outcome;
 
 pub fn run(args: TranslateArgs) -> io::Result<()> {
-    if is_supported_subtitle_path(&args.input_path) {
-        return translate::translate_file(args).map(|_| ());
-    }
-
-    Err(io::Error::other(format!(
-        "pipeline transcription is pending migration for {}; subtitle inputs are supported",
-        args.input_path.display()
-    )))
+    let outcome = run_pipeline(PipelineRequest {
+        input_path: args.input_path,
+        output_path: args.output,
+        settings: args.settings,
+    })?;
+    print_pipeline_outcome(&outcome, args.json)?;
+    Ok(())
 }

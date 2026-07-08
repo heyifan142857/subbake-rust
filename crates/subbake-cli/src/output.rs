@@ -2,8 +2,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    BatchTranslationOutcome, ProviderCheckOutcome, RuntimeOutcome, TranscriptionOutcome,
-    TranslationOutcome, WhisperOutcome,
+    BatchTranslationOutcome, PipelineOutcome, ProviderCheckOutcome, RuntimeOutcome,
+    TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
 };
 use subbake_agent::AgentOutcome;
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
@@ -23,6 +23,15 @@ pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
 
 pub fn print_agent_outcome(outcome: &AgentOutcome) {
     println!("{}", outcome.message);
+}
+
+pub fn print_pipeline_outcome(
+    outcome: &PipelineOutcome,
+    json: bool,
+) -> io::Result<Option<PathBuf>> {
+    match outcome {
+        PipelineOutcome::Subtitle(outcome) => print_translation_outcome(outcome, json),
+    }
 }
 
 pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
