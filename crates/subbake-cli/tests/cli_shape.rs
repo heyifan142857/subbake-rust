@@ -34,6 +34,18 @@ fn provider_check_uses_mock_backend() {
 }
 
 #[test]
+fn runtime_clean_requires_confirmation() {
+    let error = subbake_cli::run(vec![
+        "runtime".to_owned(),
+        "clean".to_owned(),
+        "clip.srt".to_owned(),
+    ])
+    .expect_err("runtime clean should require confirmation");
+
+    assert!(error.to_string().contains("--yes"));
+}
+
+#[test]
 fn whisper_status_is_available_without_installation() {
     subbake_cli::run(vec!["whisper".to_owned(), "status".to_owned()])
         .expect("whisper status should not require installed backend");

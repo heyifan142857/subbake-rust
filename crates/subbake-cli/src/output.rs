@@ -2,8 +2,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    BatchTranslationOutcome, ProviderCheckOutcome, TranscriptionOutcome, TranslationOutcome,
-    WhisperOutcome,
+    BatchTranslationOutcome, ProviderCheckOutcome, RuntimeOutcome, TranscriptionOutcome,
+    TranslationOutcome, WhisperOutcome,
 };
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
 
@@ -27,6 +27,10 @@ pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
 pub fn print_provider_check_outcome(outcome: &ProviderCheckOutcome) {
     println!("Provider check passed.");
     println!("{}", outcome.message);
+}
+
+pub fn print_runtime_outcome(outcome: &RuntimeOutcome) {
+    print!("{}", runtime_text(outcome));
 }
 
 pub fn print_whisper_outcome(outcome: &WhisperOutcome) {
@@ -112,6 +116,28 @@ fn whisper_text(outcome: &WhisperOutcome) -> String {
             status.models_dir.display(),
             exists_label(status.models_dir_exists)
         ),
+    }
+}
+
+fn runtime_text(outcome: &RuntimeOutcome) -> String {
+    match outcome {
+        RuntimeOutcome::Inspection(inspection) => {
+            let paths = &inspection.paths;
+            format!(
+                "runtime: {}\nrun: {}\ncache: {}\nstate: {}\nglossary: {}\n",
+                paths.root_dir.display(),
+                paths.run_dir.display(),
+                paths.cache_dir.display(),
+                paths.state_path.display(),
+                paths.glossary_path.display()
+            )
+        }
+        RuntimeOutcome::Clean(clean) if clean.removed => {
+            format!("Removed: {}\n", clean.root_dir.display())
+        }
+        RuntimeOutcome::Clean(clean) => {
+            format!("Nothing removed: {}\n", clean.root_dir.display())
+        }
     }
 }
 
@@ -254,5 +280,17 @@ mod tests {
 
         assert!(output.contains("whisper-cli (missing)"));
         assert!(output.contains("models (found)"));
+    }
+
+    #[test]
+    fn runtime_text_reports_clean_result() {
+        let output = runtime_text(&RuntimeOutcome::Clean(
+            subbake_adapters::RuntimeCleanOutcome {
+                root_dir: ".subbake".into(),
+                removed: false,
+            },
+        ));
+
+        assert_eq!(output, "Nothing removed: .subbake\n");
     }
 }

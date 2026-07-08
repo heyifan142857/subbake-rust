@@ -1,0 +1,144 @@
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+use subbake_core::storage::{RuntimePaths, build_runtime_paths};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRequest {
+    pub action: RuntimeAction,
+    pub target_path: PathBuf,
+    pub runtime_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeAction {
+    Inspect,
+    Clean { yes: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeOutcome {
+    Inspection(Box<RuntimeInspection>),
+    Clean(RuntimeCleanOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeInspection {
+    pub paths: RuntimePaths,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCleanOutcome {
+    pub root_dir: PathBuf,
+    pub removed: bool,
+}
+
+pub fn run_runtime(request: RuntimeRequest) -> io::Result<RuntimeOutcome> {
+    let paths = runtime_paths(&request);
+    match request.action {
+        RuntimeAction::Inspect => Ok(RuntimeOutcome::Inspection(Box::new(RuntimeInspection {
+            paths,
+        }))),
+        RuntimeAction::Clean { yes } => clean_runtime(paths, yes),
+    }
+}
+
+fn runtime_paths(request: &RuntimeRequest) -> RuntimePaths {
+    build_runtime_paths(
+        &request.target_path,
+        request.runtime_dir.as_deref(),
+        None,
+        "Auto",
+        "Chinese",
+        false,
+    )
+}
+
+fn clean_runtime(paths: RuntimePaths, yes: bool) -> io::Result<RuntimeOutcome> {
+    if !yes {
+        return Err(io::Error::other(
+            "runtime clean requires --yes in the current non-interactive implementation",
+        ));
+    }
+
+    let removed = if paths.root_dir.exists() {
+        fs::remove_dir_all(&paths.root_dir)?;
+        true
+    } else {
+        false
+    };
+    Ok(RuntimeOutcome::Clean(RuntimeCleanOutcome {
+        root_dir: paths.root_dir,
+        removed,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn inspect_returns_runtime_paths() {
+        let root = temp_root("inspect");
+        let outcome = run_runtime(RuntimeRequest {
+            action: RuntimeAction::Inspect,
+            target_path: root.join("clip.srt"),
+            runtime_dir: Some(root.join(".runtime")),
+        })
+        .expect("inspect runtime");
+
+        let RuntimeOutcome::Inspection(inspection) = outcome else {
+            panic!("expected inspection");
+        };
+        assert_eq!(inspection.paths.root_dir, root.join(".runtime"));
+        assert!(inspection.paths.state_path.ends_with("run_state.json"));
+    }
+
+    #[test]
+    fn clean_requires_yes() {
+        let error = run_runtime(RuntimeRequest {
+            action: RuntimeAction::Clean { yes: false },
+            target_path: PathBuf::from("clip.srt"),
+            runtime_dir: None,
+        })
+        .expect_err("clean should require confirmation");
+
+        assert!(error.to_string().contains("--yes"));
+    }
+
+    #[test]
+    fn clean_removes_runtime_root() {
+        let root = temp_root("clean");
+        let runtime_dir = root.join(".runtime");
+        fs::create_dir_all(runtime_dir.join("cache")).expect("create runtime");
+
+        let outcome = run_runtime(RuntimeRequest {
+            action: RuntimeAction::Clean { yes: true },
+            target_path: root.join("clip.srt"),
+            runtime_dir: Some(runtime_dir.clone()),
+        })
+        .expect("clean runtime");
+        let exists = runtime_dir.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            outcome,
+            RuntimeOutcome::Clean(RuntimeCleanOutcome {
+                root_dir: runtime_dir,
+                removed: true
+            })
+        );
+        assert!(!exists);
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("subbake-runtime-service-{label}-{nanos}"))
+    }
+}

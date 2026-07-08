@@ -2,8 +2,8 @@ use std::io;
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    BackendConfig, TranscriptionFormat, TranscriptionSettings, TranslationSettings, WhisperAction,
-    load_translation_settings_patch,
+    BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
+    WhisperAction, load_translation_settings_patch,
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,13 @@ pub struct TranscribeArgs {
 #[derive(Debug, Clone)]
 pub struct ProviderArgs {
     pub config: BackendConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeArgs {
+    pub action: RuntimeAction,
+    pub target_path: PathBuf,
+    pub runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +254,44 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
     })
 }
 
+pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
+    let command = args
+        .first()
+        .ok_or_else(|| io::Error::other("runtime requires `inspect` or `clean`"))?;
+    let target_path = args
+        .get(1)
+        .ok_or_else(|| io::Error::other(format!("runtime {command} requires a target")))?;
+    let mut runtime_dir = None;
+    let mut yes = false;
+    let mut index = 2usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--runtime-dir" => {
+                runtime_dir = Some(required_path(args, &mut index, "--runtime-dir")?)
+            }
+            "--yes" if command == "clean" => yes = true,
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown runtime option `{other}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let action = match command.as_str() {
+        "inspect" => RuntimeAction::Inspect,
+        "clean" => RuntimeAction::Clean { yes },
+        _ => return Err(io::Error::other("runtime requires `inspect` or `clean`")),
+    };
+
+    Ok(RuntimeArgs {
+        action,
+        target_path: PathBuf::from(target_path),
+        runtime_dir,
+    })
+}
+
 pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     let (action, mut index) = match command {
@@ -302,10 +347,6 @@ fn apply_config_if_present(
     settings.apply_patch(patch);
     *config_path = Some(path);
     Ok(())
-}
-
-pub(crate) fn option_path_value(args: &[String], flag: &str) -> io::Result<Option<PathBuf>> {
-    option_path_value_from(args, 0, flag)
 }
 
 fn option_path_value_from(
@@ -452,6 +493,23 @@ mod tests {
         let parsed = parse_provider_args(&args).expect("provider check should parse");
 
         assert_eq!(parsed.config, BackendConfig::new("mock", "mock-zh"));
+    }
+
+    #[test]
+    fn parse_runtime_clean_requires_explicit_action() {
+        let args = vec![
+            "clean".to_owned(),
+            "clip.srt".to_owned(),
+            "--yes".to_owned(),
+            "--runtime-dir".to_owned(),
+            ".subbake".to_owned(),
+        ];
+
+        let parsed = parse_runtime_args(&args).expect("runtime args should parse");
+
+        assert_eq!(parsed.action, RuntimeAction::Clean { yes: true });
+        assert_eq!(parsed.target_path, PathBuf::from("clip.srt"));
+        assert_eq!(parsed.runtime_dir, Some(PathBuf::from(".subbake")));
     }
 
     #[test]

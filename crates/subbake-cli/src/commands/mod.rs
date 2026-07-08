@@ -1,8 +1,8 @@
 use std::io;
 
 use crate::args::{
-    parse_batch_args, parse_pipeline_args, parse_provider_args, parse_transcribe_args,
-    parse_translate_args, parse_whisper_args,
+    parse_batch_args, parse_pipeline_args, parse_provider_args, parse_runtime_args,
+    parse_transcribe_args, parse_translate_args, parse_whisper_args,
 };
 
 mod pipeline;
@@ -25,7 +25,7 @@ pub fn dispatch(args: Vec<String>) -> io::Result<()> {
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),
         "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
         "provider" => provider::run(parse_provider_args(&args[1..])?),
-        "runtime" => runtime::run(&args[1..]),
+        "runtime" => runtime::run(parse_runtime_args(&args[1..])?),
         "whisper" => whisper::run(parse_whisper_args(&args[1..])?),
         "--help" | "-h" => {
             print_help();

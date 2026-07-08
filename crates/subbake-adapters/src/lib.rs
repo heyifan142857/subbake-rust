@@ -2,6 +2,7 @@ pub mod config;
 pub mod fs;
 pub mod mock;
 pub mod providers;
+pub mod runtime;
 pub mod runtime_store;
 pub mod settings;
 pub mod transcription;
@@ -15,6 +16,10 @@ pub use fs::{
 pub use mock::MockBackend;
 pub use providers::{
     BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend, check_provider,
+};
+pub use runtime::{
+    RuntimeAction, RuntimeCleanOutcome, RuntimeInspection, RuntimeOutcome, RuntimeRequest,
+    run_runtime,
 };
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{TranslationSettings, TranslationSettingsPatch};
