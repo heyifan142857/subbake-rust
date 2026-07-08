@@ -1,4 +1,91 @@
+use std::io;
+use std::path::{Path, PathBuf};
+
+use subbake_adapters::{BatchTranslationOutcome, TranslationOutcome};
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
+
+pub fn print_translation_outcome(
+    outcome: &TranslationOutcome,
+    json: bool,
+) -> io::Result<Option<PathBuf>> {
+    let (output, output_path) = render_translation_outcome(outcome, json)?;
+    print!("{output}");
+    Ok(output_path)
+}
+
+pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
+    print!("{}", batch_text(outcome));
+}
+
+fn render_translation_outcome(
+    outcome: &TranslationOutcome,
+    json: bool,
+) -> io::Result<(String, Option<PathBuf>)> {
+    if outcome.result.dry_run {
+        return Ok((dry_run_text(&outcome.result, json), None));
+    }
+
+    let output_path = outcome
+        .output_path
+        .clone()
+        .ok_or_else(|| io::Error::other("translation completed without an output path"))?;
+    let output = if json {
+        format!("{}\n", result_json(&outcome.result))
+    } else {
+        translation_text(&outcome.result, &output_path)
+    };
+
+    Ok((output, Some(output_path)))
+}
+
+fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
+    format!(
+        "Output: {}\nUsage: {} in / {} out / {} total\nBatches: {} translated\n",
+        output_path.display(),
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total_tokens,
+        result.batches_translated
+    )
+}
+
+fn dry_run_text(result: &PipelineResult, json: bool) -> String {
+    if json {
+        return format!("{}\n", result_json(result));
+    }
+
+    let mut output = format!(
+        "Dry run: no model calls were made.\nPlanned batches: {}\n",
+        result.planned_batches.len()
+    );
+    for batch in &result.planned_batches {
+        output.push_str(&format!(
+            "  batch {}: {} line(s), {} -> {}\n",
+            batch.index, batch.size, batch.first_id, batch.last_id
+        ));
+    }
+    output
+}
+
+fn batch_text(outcome: &BatchTranslationOutcome) -> String {
+    if outcome.processed == 0 && outcome.skipped.is_empty() {
+        return "No subtitle files found.\n".to_owned();
+    }
+
+    let mut output = String::new();
+    for path in &outcome.skipped {
+        output.push_str(&format!(
+            "Skipped existing output for: {}\n",
+            path.display()
+        ));
+    }
+    output.push_str(&format!(
+        "Batch result: {} processed, {} skipped, 0 failed\n",
+        outcome.processed,
+        outcome.skipped.len()
+    ));
+    output
+}
 
 pub fn result_json(result: &PipelineResult) -> String {
     let output_path = result
@@ -82,5 +169,45 @@ mod tests {
         };
 
         assert!(result_json(&result).contains("quote\\\"path.txt"));
+    }
+
+    #[test]
+    fn dry_run_text_lists_planned_batches() {
+        let result = PipelineResult {
+            output_path: None,
+            batches_translated: 0,
+            review_batches: 0,
+            usage: Usage::default(),
+            dry_run: true,
+            planned_batches: vec![BatchPlanEntry {
+                index: 1,
+                size: 3,
+                first_id: "1".to_owned(),
+                last_id: "3".to_owned(),
+            }],
+            cache_hits: 0,
+            resumed_translation_batches: 0,
+            resumed_review_batches: 0,
+            translation_memory_hits: 0,
+            state_path: None,
+            glossary_path: None,
+            agent_repairs: Vec::new(),
+        };
+
+        let output = dry_run_text(&result, false);
+
+        assert!(output.contains("Planned batches: 1"));
+        assert!(output.contains("batch 1: 3 line(s), 1 -> 3"));
+    }
+
+    #[test]
+    fn batch_text_reports_empty_directory() {
+        let outcome = BatchTranslationOutcome {
+            processed: 0,
+            skipped: Vec::new(),
+            outputs: Vec::new(),
+        };
+
+        assert_eq!(batch_text(&outcome), "No subtitle files found.\n");
     }
 }

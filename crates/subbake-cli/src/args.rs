@@ -5,7 +5,7 @@ use subbake_adapters::{TranslationSettings, load_translation_settings_patch};
 
 #[derive(Debug, Clone)]
 pub struct TranslateArgs {
-    pub subtitle: PathBuf,
+    pub input_path: PathBuf,
     pub output: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub settings: TranslationSettings,
@@ -27,9 +27,9 @@ pub struct BatchArgs {
 }
 
 impl TranslateArgs {
-    pub fn default_for(subtitle: impl Into<PathBuf>) -> Self {
+    pub fn default_for(input_path: impl Into<PathBuf>) -> Self {
         Self {
-            subtitle: subtitle.into(),
+            input_path: input_path.into(),
             output: None,
             config_path: None,
             settings: TranslationSettings::default(),
@@ -39,10 +39,22 @@ impl TranslateArgs {
 }
 
 pub fn parse_translate_args(args: &[String]) -> io::Result<TranslateArgs> {
-    let subtitle = args
+    parse_file_translation_args(args, "translate requires a subtitle path", "translate")
+}
+
+pub fn parse_pipeline_args(args: &[String]) -> io::Result<TranslateArgs> {
+    parse_file_translation_args(args, "pipeline requires an input path", "pipeline")
+}
+
+fn parse_file_translation_args(
+    args: &[String],
+    missing_input_message: &str,
+    command_name: &str,
+) -> io::Result<TranslateArgs> {
+    let input_path = args
         .first()
-        .ok_or_else(|| io::Error::other("translate requires a subtitle path"))?;
-    let mut parsed = TranslateArgs::default_for(subtitle);
+        .ok_or_else(|| io::Error::other(missing_input_message))?;
+    let mut parsed = TranslateArgs::default_for(input_path);
     apply_config_if_present(args, 1, &mut parsed.config_path, &mut parsed.settings)?;
     let mut index = 1usize;
     while index < args.len() {
@@ -78,7 +90,7 @@ pub fn parse_translate_args(args: &[String]) -> io::Result<TranslateArgs> {
             "--json" => parsed.json = true,
             other => {
                 return Err(io::Error::other(format!(
-                    "unknown translate option `{other}`"
+                    "unknown {command_name} option `{other}`"
                 )));
             }
         }
@@ -268,5 +280,23 @@ mod tests {
         assert_eq!(parsed.settings.target_language, "English");
         assert_eq!(parsed.settings.batch_size, 9);
         assert!(parsed.settings.bilingual);
+    }
+
+    #[test]
+    fn parse_pipeline_reuses_file_translation_options() {
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--output".to_owned(),
+            "movie.zh.srt".to_owned(),
+            "--json".to_owned(),
+            "--no-review".to_owned(),
+        ];
+
+        let parsed = parse_pipeline_args(&args).expect("pipeline args should parse");
+
+        assert_eq!(parsed.input_path, PathBuf::from("movie.srt"));
+        assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
+        assert!(parsed.json);
+        assert!(!parsed.settings.final_review);
     }
 }

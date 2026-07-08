@@ -1,7 +1,8 @@
 use std::io;
 
-use crate::args::{parse_batch_args, parse_translate_args};
+use crate::args::{parse_batch_args, parse_pipeline_args, parse_translate_args};
 
+mod pipeline;
 mod provider;
 mod runtime;
 mod stub;
@@ -18,7 +19,7 @@ pub fn dispatch(args: Vec<String>) -> io::Result<()> {
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
         "transcribe" => stub::run_transcribe(&args[1..]),
-        "pipeline" => stub::run_pipeline(&args[1..]),
+        "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
         "provider" => provider::run(&args[1..]),
         "runtime" => runtime::run(&args[1..]),
         "whisper" => stub::run_whisper(&args[1..]),
