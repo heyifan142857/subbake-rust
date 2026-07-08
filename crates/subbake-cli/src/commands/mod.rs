@@ -2,14 +2,15 @@ use std::io;
 
 use crate::args::{
     parse_batch_args, parse_pipeline_args, parse_transcribe_args, parse_translate_args,
+    parse_whisper_args,
 };
 
 mod pipeline;
 mod provider;
 mod runtime;
-mod stub;
 mod transcribe;
 mod translate;
+mod whisper;
 
 pub fn dispatch(args: Vec<String>) -> io::Result<()> {
     if args.is_empty() {
@@ -25,7 +26,7 @@ pub fn dispatch(args: Vec<String>) -> io::Result<()> {
         "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
         "provider" => provider::run(&args[1..]),
         "runtime" => runtime::run(&args[1..]),
-        "whisper" => stub::run_whisper(&args[1..]),
+        "whisper" => whisper::run(parse_whisper_args(&args[1..])?),
         "--help" | "-h" => {
             print_help();
             Ok(())

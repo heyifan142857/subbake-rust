@@ -2,7 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    TranscriptionFormat, TranscriptionSettings, TranslationSettings,
+    TranscriptionFormat, TranscriptionSettings, TranslationSettings, WhisperAction,
     load_translation_settings_patch,
 };
 
@@ -34,6 +34,13 @@ pub struct TranscribeArgs {
     pub media_path: PathBuf,
     pub output: Option<PathBuf>,
     pub settings: TranscriptionSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct WhisperArgs {
+    pub action: WhisperAction,
+    pub binary_path: Option<PathBuf>,
+    pub models_dir: Option<PathBuf>,
 }
 
 impl TranslateArgs {
@@ -209,6 +216,48 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
     Ok(parsed)
 }
 
+pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
+    let command = args.first().map(String::as_str).unwrap_or("status");
+    let (action, mut index) = match command {
+        "status" => (WhisperAction::Status, 1usize),
+        "install" => (WhisperAction::Install, 1usize),
+        "model" | "download-model" => {
+            let name = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| io::Error::other("whisper model requires a model name"))?;
+            (WhisperAction::DownloadModel { name }, 2usize)
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "unknown whisper command `{other}`"
+            )));
+        }
+    };
+    let mut parsed = WhisperArgs {
+        action,
+        binary_path: None,
+        models_dir: None,
+    };
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bin" => parsed.binary_path = Some(required_path(args, &mut index, "--bin")?),
+            "--models-dir" => {
+                parsed.models_dir = Some(required_path(args, &mut index, "--models-dir")?)
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown whisper option `{other}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(parsed)
+}
+
 fn apply_config_if_present(
     args: &[String],
     start_index: usize,
@@ -363,5 +412,28 @@ mod tests {
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
         assert_eq!(parsed.settings.model.as_deref(), Some("base"));
         assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
+    }
+
+    #[test]
+    fn parse_whisper_model_accepts_paths() {
+        let args = vec![
+            "model".to_owned(),
+            "base".to_owned(),
+            "--bin".to_owned(),
+            "tools/whisper-cli".to_owned(),
+            "--models-dir".to_owned(),
+            "models".to_owned(),
+        ];
+
+        let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+
+        assert_eq!(
+            parsed.action,
+            WhisperAction::DownloadModel {
+                name: "base".to_owned()
+            }
+        );
+        assert_eq!(parsed.binary_path, Some(PathBuf::from("tools/whisper-cli")));
+        assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
     }
 }

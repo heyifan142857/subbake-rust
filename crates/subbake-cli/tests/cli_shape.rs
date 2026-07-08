@@ -8,6 +8,7 @@ fn cli_exposes_redesigned_commands() {
     assert!(names.contains(&"pipeline"));
     assert!(names.contains(&"provider"));
     assert!(names.contains(&"runtime"));
+    assert!(names.contains(&"whisper"));
 }
 
 #[test]
@@ -22,6 +23,24 @@ fn pipeline_reports_pending_transcription_for_media_inputs() {
 fn transcribe_reports_pending_backend() {
     let error = subbake_cli::run(vec!["transcribe".to_owned(), "movie.mp4".to_owned()])
         .expect_err("transcription backend should be pending");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+}
+
+#[test]
+fn whisper_status_is_available_without_installation() {
+    subbake_cli::run(vec!["whisper".to_owned(), "status".to_owned()])
+        .expect("whisper status should not require installed backend");
+}
+
+#[test]
+fn whisper_model_reports_pending_backend() {
+    let error = subbake_cli::run(vec![
+        "whisper".to_owned(),
+        "model".to_owned(),
+        "base".to_owned(),
+    ])
+    .expect_err("model download should be pending");
 
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }

@@ -1,7 +1,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use subbake_adapters::{BatchTranslationOutcome, TranscriptionOutcome, TranslationOutcome};
+use subbake_adapters::{
+    BatchTranslationOutcome, TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
+};
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
 
 pub fn print_translation_outcome(
@@ -19,6 +21,10 @@ pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
 
 pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
     println!("Output: {}", outcome.output_path.display());
+}
+
+pub fn print_whisper_outcome(outcome: &WhisperOutcome) {
+    print!("{}", whisper_text(outcome));
 }
 
 fn render_translation_outcome(
@@ -89,6 +95,22 @@ fn batch_text(outcome: &BatchTranslationOutcome) -> String {
         outcome.skipped.len()
     ));
     output
+}
+
+fn whisper_text(outcome: &WhisperOutcome) -> String {
+    match outcome {
+        WhisperOutcome::Status(status) => format!(
+            "Whisper binary: {} ({})\nModel directory: {} ({})\n",
+            status.binary_path.display(),
+            exists_label(status.binary_exists),
+            status.models_dir.display(),
+            exists_label(status.models_dir_exists)
+        ),
+    }
+}
+
+fn exists_label(value: bool) -> &'static str {
+    if value { "found" } else { "missing" }
 }
 
 pub fn result_json(result: &PipelineResult) -> String {
@@ -213,5 +235,18 @@ mod tests {
         };
 
         assert_eq!(batch_text(&outcome), "No subtitle files found.\n");
+    }
+
+    #[test]
+    fn whisper_text_reports_status_paths() {
+        let output = whisper_text(&WhisperOutcome::Status(subbake_adapters::WhisperStatus {
+            binary_path: "whisper-cli".into(),
+            binary_exists: false,
+            models_dir: "models".into(),
+            models_dir_exists: true,
+        }));
+
+        assert!(output.contains("whisper-cli (missing)"));
+        assert!(output.contains("models (found)"));
     }
 }

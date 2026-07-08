@@ -6,6 +6,7 @@ pub mod runtime_store;
 pub mod settings;
 pub mod transcription;
 pub mod translation;
+pub mod whisper;
 
 pub use config::{load_translation_settings_patch, parse_translation_settings_patch};
 pub use fs::{
@@ -24,3 +25,4 @@ pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
     translate_subtitle, translate_subtitle_batch,
 };
+pub use whisper::{WhisperAction, WhisperOutcome, WhisperRequest, WhisperStatus, run_whisper};
