@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use subbake_adapters::{BatchTranslationOutcome, TranslationOutcome};
+use subbake_adapters::{BatchTranslationOutcome, TranscriptionOutcome, TranslationOutcome};
 use subbake_core::entities::{BatchPlanEntry, PipelineResult};
 
 pub fn print_translation_outcome(
@@ -15,6 +15,10 @@ pub fn print_translation_outcome(
 
 pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
     print!("{}", batch_text(outcome));
+}
+
+pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
+    println!("Output: {}", outcome.output_path.display());
 }
 
 fn render_translation_outcome(

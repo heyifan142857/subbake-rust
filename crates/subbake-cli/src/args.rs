@@ -1,7 +1,10 @@
 use std::io;
 use std::path::PathBuf;
 
-use subbake_adapters::{TranslationSettings, load_translation_settings_patch};
+use subbake_adapters::{
+    TranscriptionFormat, TranscriptionSettings, TranslationSettings,
+    load_translation_settings_patch,
+};
 
 #[derive(Debug, Clone)]
 pub struct TranslateArgs {
@@ -24,6 +27,13 @@ pub struct BatchArgs {
     pub overwrite: bool,
     pub config_path: Option<PathBuf>,
     pub translate: BatchTranslateOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscribeArgs {
+    pub media_path: PathBuf,
+    pub output: Option<PathBuf>,
+    pub settings: TranscriptionSettings,
 }
 
 impl TranslateArgs {
@@ -157,6 +167,41 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
                     Some(required_path(args, &mut index, "--glossary")?)
             }
             other => return Err(io::Error::other(format!("unknown batch option `{other}`"))),
+        }
+        index += 1;
+    }
+
+    Ok(parsed)
+}
+
+pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
+    let media_path = args
+        .first()
+        .ok_or_else(|| io::Error::other("transcribe requires a media path"))?;
+    let mut parsed = TranscribeArgs {
+        media_path: PathBuf::from(media_path),
+        output: None,
+        settings: TranscriptionSettings::default(),
+    };
+
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
+            "--language" => {
+                parsed.settings.language = Some(required_value(args, &mut index, "--language")?)
+            }
+            "--model" => parsed.settings.model = Some(required_value(args, &mut index, "--model")?),
+            "--format" => {
+                let value = required_value(args, &mut index, "--format")?;
+                parsed.settings.output_format = TranscriptionFormat::parse(&value)
+                    .ok_or_else(|| io::Error::other("--format must be one of: srt, vtt, txt"))?;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown transcribe option `{other}`"
+                )));
+            }
         }
         index += 1;
     }
@@ -298,5 +343,25 @@ mod tests {
         assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
         assert!(parsed.json);
         assert!(!parsed.settings.final_review);
+    }
+
+    #[test]
+    fn parse_transcribe_accepts_backend_options() {
+        let args = vec![
+            "movie.mp4".to_owned(),
+            "--language".to_owned(),
+            "en".to_owned(),
+            "--model".to_owned(),
+            "base".to_owned(),
+            "--format".to_owned(),
+            "vtt".to_owned(),
+        ];
+
+        let parsed = parse_transcribe_args(&args).expect("transcribe args should parse");
+
+        assert_eq!(parsed.media_path, PathBuf::from("movie.mp4"));
+        assert_eq!(parsed.settings.language.as_deref(), Some("en"));
+        assert_eq!(parsed.settings.model.as_deref(), Some("base"));
+        assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
     }
 }

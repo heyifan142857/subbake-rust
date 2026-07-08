@@ -17,3 +17,11 @@ fn pipeline_reports_pending_transcription_for_media_inputs() {
 
     assert!(error.to_string().contains("transcription is pending"));
 }
+
+#[test]
+fn transcribe_reports_pending_backend() {
+    let error = subbake_cli::run(vec!["transcribe".to_owned(), "movie.mp4".to_owned()])
+        .expect_err("transcription backend should be pending");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+}
