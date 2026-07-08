@@ -181,6 +181,15 @@ impl LlmBackend for OpenAiCompatibleBackend {
     }
 
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        let (parsed, usage) = self.generate_raw_json(messages)?;
+        let result = parse_translation_payload(&parsed)?;
+        Ok(BackendJsonResult {
+            payload: BackendPayload::Translation(result),
+            usage,
+        })
+    }
+
+    fn generate_raw_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(JsonValue, Usage)> {
         let messages_value: Vec<JsonValue> = messages.iter().map(message_json).collect();
         let payload_with_format = json!({
             "model": self.model,
@@ -203,11 +212,7 @@ impl LlmBackend for OpenAiCompatibleBackend {
                 }
             }
         };
-        let result = parse_translation_payload(&parsed)?;
-        Ok(BackendJsonResult {
-            payload: BackendPayload::Translation(result),
-            usage,
-        })
+        Ok((parsed, usage))
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -347,12 +352,17 @@ impl LlmBackend for AnthropicBackend {
     }
 
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-        let (parsed, usage) = runtime().block_on(async { self.generate_once(messages).await })?;
+        let (parsed, usage) = self.generate_raw_json(messages)?;
         let result = parse_translation_payload(&parsed)?;
         Ok(BackendJsonResult {
             payload: BackendPayload::Translation(result),
             usage,
         })
+    }
+
+    fn generate_raw_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(JsonValue, Usage)> {
+        let (parsed, usage) = runtime().block_on(async { self.generate_once(messages).await })?;
+        Ok((parsed, usage))
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {

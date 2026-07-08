@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -70,7 +70,9 @@ pub fn run_whisper(request: WhisperRequest) -> io::Result<WhisperOutcome> {
 
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| Runtime::new().unwrap_or_else(|_| panic!("unable to start whisper runtime")))
+    RUNTIME.get_or_init(|| {
+        Runtime::new().unwrap_or_else(|_| panic!("unable to start whisper runtime"))
+    })
 }
 
 const GITHUB_REPO_OWNER: &str = "ggerganov";
@@ -79,7 +81,8 @@ const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/ggerganov/whispe
 const HF_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
 struct PlatformAssets {
-    archive_name: String,
+    os_terms: &'static [&'static str],
+    arch_terms: &'static [&'static str],
     binary_name: &'static str,
 }
 
@@ -88,31 +91,23 @@ fn detect_platform() -> Option<PlatformAssets> {
     let os = std::env::consts::OS;
     match (os, arch) {
         ("linux", "x86_64") => Some(PlatformAssets {
-            archive_name: format!(
-                "whisper-cli-{tag}-linux-x64.tar.gz",
-                tag = "{tag}"
-            ),
+            os_terms: &["linux"],
+            arch_terms: &["x64", "x86_64", "amd64"],
             binary_name: "whisper-cli",
         }),
         ("macos", "aarch64") => Some(PlatformAssets {
-            archive_name: format!(
-                "whisper-cli-{tag}-macos-arm64.tar.gz",
-                tag = "{tag}"
-            ),
+            os_terms: &["macos", "darwin", "osx"],
+            arch_terms: &["arm64", "aarch64"],
             binary_name: "whisper-cli",
         }),
         ("macos", "x86_64") => Some(PlatformAssets {
-            archive_name: format!(
-                "whisper-cli-{tag}-macos-x64.tar.gz",
-                tag = "{tag}"
-            ),
+            os_terms: &["macos", "darwin", "osx"],
+            arch_terms: &["x64", "x86_64", "amd64"],
             binary_name: "whisper-cli",
         }),
         ("windows", "x86_64") => Some(PlatformAssets {
-            archive_name: format!(
-                "whisper-cli-{tag}-win-x64.zip",
-                tag = "{tag}"
-            ),
+            os_terms: &["windows", "win"],
+            arch_terms: &["x64", "x86_64", "amd64"],
             binary_name: "whisper-cli.exe",
         }),
         _ => None,
@@ -123,42 +118,129 @@ fn install_binary(request: &WhisperRequest) -> io::Result<()> {
     let bin_dir = request
         .binary_path
         .clone()
-        .map(|p| p.parent().unwrap_or_else(|| Path::new(".subbake/whisper/bin")).to_path_buf())
+        .map(|p| {
+            p.parent()
+                .unwrap_or_else(|| Path::new(".subbake/whisper/bin"))
+                .to_path_buf()
+        })
         .unwrap_or_else(|| PathBuf::from(".subbake/whisper/bin"));
     let version_tag = "latest";
     let target_dir = bin_dir.clone();
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| io::Error::other(format!("create binary dir: {e}")))?;
 
     if let Some(platform) = detect_platform() {
-        let archive_name = platform
-            .archive_name
-            .replace("{tag}", version_tag);
-        let url = format!("{GITHUB_RELEASES_API}/{version_tag}/assets/{archive_name}");
+        let asset = runtime().block_on(async { find_latest_release_asset(&platform).await })?;
         let download_dir = std::env::temp_dir().join("subbake-whisper-install");
+        let extract_dir = download_dir.join("extract");
         std::fs::create_dir_all(&download_dir)
             .map_err(|e| io::Error::other(format!("create download dir: {e}")))?;
-        let archive_path = download_dir.join(&archive_name);
+        std::fs::create_dir_all(&extract_dir)
+            .map_err(|e| io::Error::other(format!("create extract dir: {e}")))?;
+        let archive_path = download_dir.join(&asset.name);
 
         // Download the archive using reqwest.
-        runtime().block_on(async {
-            download_file(&url, &archive_path).await
-        })?;
+        runtime().block_on(async { download_file(&asset.url, &archive_path).await })?;
 
         // Extract archive.
-        if archive_name.ends_with(".tar.gz") {
-            extract_tar_gz(&archive_path, &target_dir)?;
-        } else if archive_name.ends_with(".zip") {
-            extract_zip_system(&archive_path, &target_dir)?;
+        if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz") {
+            extract_tar_gz(&archive_path, &extract_dir)?;
+        } else if asset.name.ends_with(".zip") {
+            extract_zip_system(&archive_path, &extract_dir)?;
+        } else {
+            let direct_path = extract_dir.join(platform.binary_name);
+            std::fs::copy(&archive_path, &direct_path)
+                .map_err(|e| io::Error::other(format!("copy direct binary: {e}")))?;
         }
 
         // Promote binary to final location.
-        promote_binary(&download_dir, &target_dir, platform.binary_name)?;
-        write_version_file(&target_dir, version_tag)?;
+        promote_binary(&extract_dir, &target_dir, platform.binary_name)?;
+        write_version_file(&target_dir, &asset.tag)?;
         let _ = std::fs::remove_dir_all(&download_dir);
         return Ok(());
     }
 
     // Fallback: cmake from source
     build_from_source(&target_dir, version_tag)
+}
+
+struct ReleaseAsset {
+    name: String,
+    url: String,
+    tag: String,
+}
+
+async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<ReleaseAsset> {
+    let client = reqwest::Client::builder()
+        .user_agent("subbake/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| io::Error::other(format!("http client: {e}")))?;
+
+    let response = client
+        .get(format!("{GITHUB_RELEASES_API}/latest"))
+        .send()
+        .await
+        .map_err(|e| io::Error::other(format!("release lookup request: {e}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| io::Error::other(format!("release lookup response: {e}")))?;
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "release lookup failed ({status}): {body}"
+        )));
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| io::Error::other(format!("release metadata parse: {e}")))?;
+    let tag = payload["tag_name"].as_str().unwrap_or("latest").to_owned();
+    let assets = payload["assets"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("release metadata does not contain an assets array"))?;
+
+    assets
+        .iter()
+        .filter_map(|asset| {
+            let name = asset["name"].as_str()?;
+            let url = asset["browser_download_url"].as_str()?;
+            let score = asset_match_score(name, platform)?;
+            Some((score, name.to_owned(), url.to_owned()))
+        })
+        .max_by_key(|(score, _, _)| *score)
+        .map(|(_, name, url)| ReleaseAsset { name, url, tag })
+        .ok_or_else(|| io::Error::other("no matching whisper.cpp release asset for this platform"))
+}
+
+fn asset_match_score(name: &str, platform: &PlatformAssets) -> Option<usize> {
+    let lower = name.to_lowercase();
+    let supported_archive =
+        lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip");
+    let direct_binary = lower.ends_with(platform.binary_name);
+    if !supported_archive && !direct_binary {
+        return None;
+    }
+    if !platform.os_terms.iter().any(|term| lower.contains(term)) {
+        return None;
+    }
+    if !platform.arch_terms.iter().any(|term| lower.contains(term)) {
+        return None;
+    }
+    let mut score = 1usize;
+    if lower.contains("whisper") {
+        score += 4;
+    }
+    if lower.contains("cli") {
+        score += 4;
+    }
+    if lower.contains(platform.binary_name) {
+        score += 2;
+    }
+    if lower.ends_with(".tar.gz") || lower.ends_with(".zip") {
+        score += 1;
+    }
+    Some(score)
 }
 
 async fn download_file(url: &str, dest: &Path) -> io::Result<()> {
@@ -168,28 +250,50 @@ async fn download_file(url: &str, dest: &Path) -> io::Result<()> {
         .build()
         .map_err(|e| io::Error::other(format!("http client: {e}")))?;
 
-    let response = client.get(url).send().await
+    let mut response = client
+        .get(url)
+        .send()
+        .await
         .map_err(|e| io::Error::other(format!("download request: {e}")))?;
     let status = response.status();
-    let bytes = response.bytes().await
-        .map_err(|e| io::Error::other(format!("download response: {e}")))?;
 
     if !status.is_success() {
-        return Err(io::Error::other(format!("download failed ({status}) from {url}")));
+        return Err(io::Error::other(format!(
+            "download failed ({status}) from {url}"
+        )));
     }
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| io::Error::other(format!("create dest dir: {e}")))?;
     }
-    std::fs::write(dest, &bytes)
-        .map_err(|e| io::Error::other(format!("write download: {e}")))?;
+    let tmp = dest.with_extension("download.tmp");
+    let mut file = std::fs::File::create(&tmp)
+        .map_err(|e| io::Error::other(format!("create download file: {e}")))?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| io::Error::other(format!("download response: {e}")))?
+    {
+        file.write_all(&chunk)
+            .map_err(|e| io::Error::other(format!("write download: {e}")))?;
+    }
+    file.flush()
+        .map_err(|e| io::Error::other(format!("flush download: {e}")))?;
+    std::fs::rename(&tmp, dest).map_err(|e| io::Error::other(format!("finalize download: {e}")))?;
     Ok(())
 }
 
 fn extract_tar_gz(archive: &Path, target: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(target)
+        .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
     let status = Command::new("tar")
-        .args(["-xzf", &archive.to_string_lossy(), "-C", &target.to_string_lossy()])
+        .args([
+            "-xzf",
+            &archive.to_string_lossy(),
+            "-C",
+            &target.to_string_lossy(),
+        ])
         .status()
         .map_err(|e| io::Error::other(format!("tar not found: {e}")))?;
     if !status.success() {
@@ -199,8 +303,15 @@ fn extract_tar_gz(archive: &Path, target: &Path) -> io::Result<()> {
 }
 
 fn extract_zip_system(archive: &Path, target: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(target)
+        .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
     let status = Command::new("unzip")
-        .args(["-o", &archive.to_string_lossy(), "-d", &target.to_string_lossy()])
+        .args([
+            "-o",
+            &archive.to_string_lossy(),
+            "-d",
+            &target.to_string_lossy(),
+        ])
         .status()
         .map_err(|e| io::Error::other(format!("unzip not found: {e}")))?;
     if !status.success() {
@@ -254,8 +365,7 @@ fn write_version_file(target_dir: &Path, version: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)
             .map_err(|e| io::Error::other(format!("create dir: {e}")))?;
     }
-    std::fs::write(&path, version)
-        .map_err(|e| io::Error::other(format!("write version: {e}")))?;
+    std::fs::write(&path, version).map_err(|e| io::Error::other(format!("write version: {e}")))?;
     Ok(())
 }
 
@@ -269,19 +379,21 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("create src dir: {e}")))?;
 
     // Download source tarball from GitHub.
-    let tarball_url = format!(
-        "https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/tarball/HEAD"
-    );
+    let tarball_url =
+        format!("https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/tarball/HEAD");
     let tarball_path = build_dir.join("source.tar.gz");
-    runtime().block_on(async {
-        download_file(&tarball_url, &tarball_path).await
-    })?;
+    runtime().block_on(async { download_file(&tarball_url, &tarball_path).await })?;
 
     // Extract with tar.
-    std::fs::create_dir_all(&src_dir)
-        .map_err(|e| io::Error::other(format!("create src: {e}")))?;
+    std::fs::create_dir_all(&src_dir).map_err(|e| io::Error::other(format!("create src: {e}")))?;
     let status = Command::new("tar")
-        .args(["-xzf", &tarball_path.to_string_lossy(), "-C", &src_dir.to_string_lossy(), "--strip-components=1"])
+        .args([
+            "-xzf",
+            &tarball_path.to_string_lossy(),
+            "-C",
+            &src_dir.to_string_lossy(),
+            "--strip-components=1",
+        ])
         .status()
         .map_err(|e| io::Error::other(format!("tar source: {e}")))?;
     if !status.success() {
@@ -294,8 +406,10 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
 
     let cmake = Command::new("cmake")
         .args([
-            "-S", &src_dir.to_string_lossy(),
-            "-B", &build_out_dir.to_string_lossy(),
+            "-S",
+            &src_dir.to_string_lossy(),
+            "-B",
+            &build_out_dir.to_string_lossy(),
             "-DWHISPER_BUILD_TESTS=OFF",
             "-DWHISPER_BUILD_EXAMPLES=ON",
         ])
@@ -307,7 +421,15 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
     }
 
     let make = Command::new("cmake")
-        .args(["--build", &build_out_dir.to_string_lossy(), "--config", "Release", "--target", "whisper-cli", "-j"])
+        .args([
+            "--build",
+            &build_out_dir.to_string_lossy(),
+            "--config",
+            "Release",
+            "--target",
+            "whisper-cli",
+            "-j",
+        ])
         .arg(num_cpus().to_string())
         .output()
         .map_err(|e| io::Error::other(format!("cmake build: {e}")))?;
@@ -315,13 +437,23 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
         let stderr = String::from_utf8_lossy(&make.stderr);
         // Retry with target "main" (older whisper.cpp releases).
         let make2 = Command::new("cmake")
-            .args(["--build", &build_out_dir.to_string_lossy(), "--config", "Release", "--target", "main", "-j"])
+            .args([
+                "--build",
+                &build_out_dir.to_string_lossy(),
+                "--config",
+                "Release",
+                "--target",
+                "main",
+                "-j",
+            ])
             .arg(num_cpus().to_string())
             .output()
             .map_err(|e| io::Error::other(format!("cmake build main: {e}")))?;
         if !make2.status.success() {
             let stderr2 = String::from_utf8_lossy(&make2.stderr);
-            return Err(io::Error::other(format!("cmake build failed: {stderr} / {stderr2}")));
+            return Err(io::Error::other(format!(
+                "cmake build failed: {stderr} / {stderr2}"
+            )));
         }
     }
 
@@ -345,6 +477,7 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
                     .map_err(|e| io::Error::other(format!("chmod binary: {e}")))?;
             }
             let _ = std::fs::remove_dir_all(&build_dir);
+            write_version_file(target_dir, _version)?;
             return Ok(());
         }
     }
@@ -354,7 +487,9 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +519,7 @@ fn download_model(request: &WhisperRequest, name: &str) -> io::Result<()> {
     }
 
     let url = format!("{HF_MODEL_BASE}/ggml-{name}.bin");
-    runtime().block_on(async {
-        download_file(&url, &dest).await
-    })?;
+    runtime().block_on(async { download_file(&url, &dest).await })?;
 
     Ok(())
 }
@@ -493,7 +626,10 @@ mod tests {
 
         let msg = error.to_string();
         // The old stub said "pending adapter migration".
-        assert!(!msg.contains("pending"), "should no longer be a stub: {msg}");
+        assert!(
+            !msg.contains("pending"),
+            "should no longer be a stub: {msg}"
+        );
     }
 
     #[test]
@@ -540,7 +676,10 @@ mod tests {
 
         let msg = error.to_string();
         // The old stub said "pending adapter migration".
-        assert!(!msg.contains("pending"), "should no longer be a stub: {msg}");
+        assert!(
+            !msg.contains("pending"),
+            "should no longer be a stub: {msg}"
+        );
         assert!(msg.contains("unknown model"));
     }
 

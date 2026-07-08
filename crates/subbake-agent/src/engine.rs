@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
 use crate::session::AgentSessionStore;
-use crate::tools::{ToolKind, ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES};
+use crate::tools::{ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES, ToolKind};
 
 // ---------------------------------------------------------------------------
 // Observer trait — enables streaming output
@@ -175,7 +175,11 @@ impl AgentEngine {
     // Plan mode
     // ------------------------------------------------------------------
 
-    pub fn store_plan(&mut self, message: &str, tool_calls: Vec<ToolCallDraft>) -> std::io::Result<()> {
+    pub fn store_plan(
+        &mut self,
+        message: &str,
+        tool_calls: Vec<ToolCallDraft>,
+    ) -> std::io::Result<()> {
         let session = self
             .session
             .as_mut()
@@ -190,7 +194,19 @@ impl AgentEngine {
         Ok(())
     }
 
-    pub fn approve_plan(&mut self) -> std::io::Result<()> {
+    pub fn approve_plan(&mut self) -> std::io::Result<String> {
+        let pending = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_plan.clone())
+            .ok_or_else(|| std::io::Error::other("no pending plan to approve"))?;
+
+        let mut outputs = Vec::new();
+        for call in &pending.tool_calls {
+            let result = self.run_tool(&call.tool_name, &call.arguments)?;
+            outputs.push(format!("{}: {}", call.tool_name, result));
+        }
+
         let session = self
             .session
             .as_mut()
@@ -198,10 +214,18 @@ impl AgentEngine {
         session.mode = "chat".to_owned();
         session.pending_plan = None;
         self.record(EventKind::Approve)?;
-        Ok(())
+
+        if outputs.is_empty() {
+            Ok("Approved an empty plan.".to_owned())
+        } else {
+            Ok(format!(
+                "Approved and executed plan.\n{}",
+                outputs.join("\n")
+            ))
+        }
     }
 
-    pub fn reject_plan(&mut self) -> std::io::Result<()> {
+    pub fn reject_plan(&mut self) -> std::io::Result<String> {
         let session = self
             .session
             .as_mut()
@@ -209,7 +233,54 @@ impl AgentEngine {
         session.mode = "chat".to_owned();
         session.pending_plan = None;
         self.record(EventKind::Reject)?;
-        Ok(())
+        Ok("Rejected pending plan.".to_owned())
+    }
+
+    pub fn toggle_plan_mode(&mut self) -> std::io::Result<String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        if session.mode == "plan" {
+            session.mode = "chat".to_owned();
+            session.pending_plan = None;
+            self.session_store.save(session)?;
+            Ok("Plan mode off.".to_owned())
+        } else {
+            session.mode = "plan".to_owned();
+            self.session_store.save(session)?;
+            Ok("Plan mode on. Mutating tools will wait for `/approve`.".to_owned())
+        }
+    }
+
+    pub fn session_summary(&self) -> std::io::Result<String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        let pending = if session.pending_plan.is_some() {
+            "pending plan"
+        } else {
+            "no pending plan"
+        };
+        Ok(format!(
+            "Session: {}\nMode: {}\nEvents: {}\n{}",
+            session.id,
+            session.mode,
+            session.events.len(),
+            pending
+        ))
+    }
+
+    pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
+        match input.trim() {
+            "/plan" => self.toggle_plan_mode(),
+            "/approve" => self.approve_plan(),
+            "/reject" => self.reject_plan(),
+            "/undo" => self.undo_last(),
+            "/session" => self.session_summary(),
+            other => Ok(format!("Unknown command `{other}`. Try /help.")),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -230,11 +301,22 @@ impl AgentEngine {
         let target = events
             .iter()
             .rev()
-            .find(|event| event.kind == "file_operation" && !event.data.get("undone").and_then(|v| v.as_bool()).unwrap_or(false))
+            .find(|event| {
+                event.kind == "file_operation"
+                    && !event
+                        .data
+                        .get("undone")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+            })
             .cloned()
             .ok_or_else(|| std::io::Error::other("nothing to undo"))?;
 
-        let group_id = target.data.get("group_id").and_then(|v| v.as_str()).map(String::from);
+        let group_id = target
+            .data
+            .get("group_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // Collect all events in this undo group.
         let targets: Vec<_> = if let Some(ref gid) = group_id {
@@ -243,7 +325,11 @@ impl AgentEngine {
                 .filter(|e| {
                     e.kind == "file_operation"
                         && e.data.get("group_id").and_then(|v| v.as_str()) == Some(gid.as_str())
-                        && !e.data.get("undone").and_then(|v| v.as_bool()).unwrap_or(false)
+                        && !e
+                            .data
+                            .get("undone")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
                 })
                 .cloned()
                 .collect()
@@ -253,8 +339,16 @@ impl AgentEngine {
 
         let mut count = 0usize;
         for event in &targets {
-            let action = event.data.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            let path = event.data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let action = event
+                .data
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let path = event
+                .data
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let backup = event.data.get("backup_path").and_then(|v| v.as_str());
 
             let target_path = self.project_root.join(path);
@@ -265,7 +359,17 @@ impl AgentEngine {
                     let _ = std::fs::remove_file(&target_path);
                     let _ = std::fs::remove_dir_all(&target_path);
                 }
-                "deleted" | "renamed" | "modified" | "appended" => {
+                "renamed" => {
+                    if let Some(new_path) = event.data.get("new_path").and_then(|v| v.as_str()) {
+                        let moved_path = self.project_root.join(new_path);
+                        let _ = std::fs::remove_file(&moved_path);
+                        let _ = std::fs::remove_dir_all(&moved_path);
+                    }
+                    if let Some(bp) = backup {
+                        FileGuard::restore_backup(PathBuf::from(bp).as_path(), &target_path)?;
+                    }
+                }
+                "deleted" | "modified" | "appended" => {
                     if let Some(bp) = backup {
                         FileGuard::restore_backup(PathBuf::from(bp).as_path(), &target_path)?;
                     }
@@ -326,12 +430,18 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
         EventKind::User { text } => ("user".into(), text.clone(), serde_json::json!({})),
         EventKind::Assistant { text } => ("assistant".into(), text.clone(), serde_json::json!({})),
         EventKind::AskUser { text } => ("ask_user".into(), text.clone(), serde_json::json!({})),
-        EventKind::ToolCall { tool_name, arguments } => (
+        EventKind::ToolCall {
+            tool_name,
+            arguments,
+        } => (
             "tool_call".into(),
             tool_name.clone(),
             serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
         ),
-        EventKind::FinalToolCall { tool_name, arguments } => (
+        EventKind::FinalToolCall {
+            tool_name,
+            arguments,
+        } => (
             "final_tool_call".into(),
             tool_name.clone(),
             serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
@@ -341,7 +451,10 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
             format!("{} {}", data.action, data.path),
             serde_json::to_value(data).unwrap_or_default(),
         ),
-        EventKind::Plan { message, tool_calls } => (
+        EventKind::Plan {
+            message,
+            tool_calls,
+        } => (
             "plan".into(),
             message.clone(),
             serde_json::json!({"message": message, "tool_calls": tool_calls}),

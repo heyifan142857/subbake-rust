@@ -72,7 +72,10 @@ impl FileGuard {
     pub fn create_file(&self, path: &Path, content: &str) -> std::io::Result<FileOpResult> {
         let safe = self.resolve(path)?;
         if safe.exists() {
-            return Err(std::io::Error::other(format!("file already exists: {}", safe.display())));
+            return Err(std::io::Error::other(format!(
+                "file already exists: {}",
+                safe.display()
+            )));
         }
         self.write_atomically(&safe, content)?;
         Ok(FileOpResult {
@@ -101,7 +104,12 @@ impl FileGuard {
         })
     }
 
-    pub fn replace_in_file(&self, path: &Path, old: &str, new: &str) -> std::io::Result<FileOpResult> {
+    pub fn replace_in_file(
+        &self,
+        path: &Path,
+        old: &str,
+        new: &str,
+    ) -> std::io::Result<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
         let content = std::fs::read_to_string(&safe)?;
@@ -171,6 +179,10 @@ impl FileGuard {
         Ok(results)
     }
 
+    pub fn resolve_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.resolve(path)
+    }
+
     // ------------------------------------------------------------------
     // Path resolution + sandbox
     // ------------------------------------------------------------------
@@ -179,16 +191,17 @@ impl FileGuard {
     /// rejecting paths that escape the project root or contain protected components.
     fn resolve(&self, user_path: &Path) -> std::io::Result<PathBuf> {
         // Normalise `..` components so `root/../etc/passwd` is caught below.
-        let anchored = normalize_path(
-            if user_path.is_absolute() {
-                user_path.to_path_buf()
-            } else {
-                self.project_root.join(user_path)
-            },
-        );
+        let anchored = normalize_path(if user_path.is_absolute() {
+            user_path.to_path_buf()
+        } else {
+            self.project_root.join(user_path)
+        });
 
         // ── Escape guard: anchor must be under project_root ──
-        let root_canon = self.project_root.canonicalize().unwrap_or_else(|_| self.project_root.clone());
+        let root_canon = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
         if !anchored.starts_with(&root_canon) {
             return Err(std::io::Error::other(format!(
                 "path escapes project root `{}`: {}",
@@ -199,14 +212,14 @@ impl FileGuard {
 
         // Canonicalize existing paths; for new files canonicalize the parent.
         let safe = if anchored.exists() {
-            anchored.canonicalize().map_err(|e| {
-                std::io::Error::other(format!("resolve existing path: {e}"))
-            })?
+            anchored
+                .canonicalize()
+                .map_err(|e| std::io::Error::other(format!("resolve existing path: {e}")))?
         } else if let Some(parent) = anchored.parent() {
             if parent.exists() {
-                let canonical_parent = parent.canonicalize().map_err(|e| {
-                    std::io::Error::other(format!("resolve parent: {e}"))
-                })?;
+                let canonical_parent = parent
+                    .canonicalize()
+                    .map_err(|e| std::io::Error::other(format!("resolve parent: {e}")))?;
                 canonical_parent.join(anchored.file_name().unwrap_or_default())
             } else {
                 // Parent doesn't exist yet — trust the escape check above.
@@ -216,21 +229,35 @@ impl FileGuard {
             anchored
         };
 
+        if !safe.starts_with(&root_canon) {
+            return Err(std::io::Error::other(format!(
+                "path escapes project root `{}` after canonicalization: {}",
+                root_canon.display(),
+                safe.display(),
+            )));
+        }
+
         // Check for protected components (e.g. .git, .subbake).
         for component in safe.components() {
             if let Some(name) = component.as_os_str().to_str()
-                && PROTECTED_PATH_PARTS.contains(&name) {
-                    return Err(std::io::Error::other(format!(
-                        "path contains protected component `{name}`: {}",
-                        safe.display()
-                    )));
-                }
+                && PROTECTED_PATH_PARTS.contains(&name)
+            {
+                return Err(std::io::Error::other(format!(
+                    "path contains protected component `{name}`: {}",
+                    safe.display()
+                )));
+            }
         }
 
         Ok(safe)
     }
 
-    fn search_recursive(&self, dir: &Path, pattern: &str, results: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    fn search_recursive(
+        &self,
+        dir: &Path,
+        pattern: &str,
+        results: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -260,9 +287,7 @@ impl FileGuard {
             )));
         }
 
-        let rel = path
-            .strip_prefix(&self.project_root)
-            .unwrap_or(path);
+        let rel = path.strip_prefix(&self.project_root).unwrap_or(path);
         let ts = nanos_since_epoch();
         let backup_path = self.backup_root.join(format!("{ts}")).join(rel);
 
@@ -356,7 +381,9 @@ mod tests {
     #[test]
     fn rejects_protected_path() {
         let (root, guard) = setup();
-        let err = guard.create_file(Path::new(".git/config"), "data").expect_err("should reject");
+        let err = guard
+            .create_file(Path::new(".git/config"), "data")
+            .expect_err("should reject");
         assert!(err.to_string().contains(".git"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -390,8 +417,12 @@ mod tests {
     #[test]
     fn rename_moves_file() {
         let (root, guard) = setup();
-        guard.create_file(Path::new("a.txt"), "data").expect("create");
-        let result = guard.rename_path(Path::new("a.txt"), Path::new("b.txt")).expect("rename");
+        guard
+            .create_file(Path::new("a.txt"), "data")
+            .expect("create");
+        let result = guard
+            .rename_path(Path::new("a.txt"), Path::new("b.txt"))
+            .expect("rename");
         assert_eq!(result.action, FileOpAction::Renamed);
         assert!(root.join("b.txt").exists());
         assert!(!root.join("a.txt").exists());
@@ -414,8 +445,30 @@ mod tests {
     #[test]
     fn read_nonexistent_fails() {
         let (root, guard) = setup();
-        let err = guard.read_file(Path::new("missing.txt")).expect_err("should fail");
+        let err = guard
+            .read_file(Path::new("missing.txt"))
+            .expect_err("should fail");
         assert!(err.to_string().contains("missing.txt"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (root, guard) = setup();
+        std::fs::create_dir_all(&root).expect("create root");
+        let outside = std::env::temp_dir().join(format!("subbake-outside-{}", nanos_since_epoch()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(&outside, root.join("outside-link")).expect("create symlink");
+
+        let err = guard
+            .create_file(Path::new("outside-link/escape.txt"), "data")
+            .expect_err("symlink escape should be rejected");
+
+        assert!(err.to_string().contains("escapes project root"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

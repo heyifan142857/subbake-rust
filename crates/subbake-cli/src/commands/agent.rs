@@ -1,5 +1,8 @@
 use std::io;
 
+use subbake_adapters::{
+    TranslationSettings, build_backend, discover_config_path, load_and_resolve,
+};
 use subbake_agent::{AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui};
 
 use crate::args::AgentArgs;
@@ -18,7 +21,9 @@ pub fn run(args: AgentArgs) -> io::Result<()> {
         }
         _other => {
             // Legacy stub path (backwards compat).
-            let outcome = subbake_agent::run_agent(AgentRequest { action: args.action });
+            let outcome = subbake_agent::run_agent(AgentRequest {
+                action: args.action,
+            });
             print_agent_outcome(&outcome);
             Ok(())
         }
@@ -42,9 +47,7 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 }
 
 fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
-    // Build a mock LLM backend for the agent decision loop.
-    let mut backend: Box<dyn subbake_core::ports::LlmBackend> =
-        Box::new(EchoDecisionBackend::new("mock-decision"));
+    let mut backend = build_agent_decision_backend();
 
     // Create the TUI with an observer attached to the engine.
     let mut tui = SubBakeTui::new()?;
@@ -53,11 +56,31 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
 
     tui.run(|input, _obs| {
         // Each user input: run through the engine's decision pipeline.
-        let result = engine.run_line(input, &mut *backend)?;
+        let result = if input.trim().starts_with('/') {
+            engine.handle_slash_command(input)?
+        } else {
+            engine.run_line(input, &mut *backend)?
+        };
 
         // Save session after each interaction.
         let _ = engine.save();
 
         Ok(result)
     })
+}
+
+fn build_agent_decision_backend() -> Box<dyn subbake_core::ports::LlmBackend> {
+    let mut settings = TranslationSettings::default();
+    if let Some(path) = discover_config_path()
+        && let Ok(Some(patch)) = load_and_resolve(&path, None)
+    {
+        settings.apply_patch(patch);
+    }
+
+    if settings.provider == "mock" {
+        return Box::new(EchoDecisionBackend::new("mock-decision"));
+    }
+
+    build_backend(&settings.backend_config())
+        .unwrap_or_else(|_| Box::new(EchoDecisionBackend::new("mock-decision")))
 }

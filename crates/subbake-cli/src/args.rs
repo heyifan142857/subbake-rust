@@ -3,8 +3,7 @@ use std::path::PathBuf;
 
 use subbake_adapters::{
     BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, default_api_key_env, discover_config_path, load_and_resolve,
-    load_translation_settings_patch, resolve_env_var,
+    WhisperAction, default_api_key_env, discover_config_path, load_and_resolve, resolve_env_var,
 };
 use subbake_agent::AgentAction;
 
@@ -20,6 +19,7 @@ pub struct TranslateArgs {
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub settings: TranslationSettings,
+    pub transcription_settings: TranscriptionSettings,
     pub json: bool,
 }
 
@@ -34,6 +34,7 @@ pub struct BatchArgs {
     pub recursive: bool,
     pub overwrite: bool,
     pub config_path: Option<PathBuf>,
+    pub profile: Option<String>,
     pub translate: BatchTranslateOptions,
 }
 
@@ -71,6 +72,7 @@ impl TranslateArgs {
             config_path: None,
             profile: None,
             settings: TranslationSettings::default(),
+            transcription_settings: TranscriptionSettings::default(),
             json: false,
         }
     }
@@ -149,6 +151,14 @@ fn parse_file_translation_args(
             }
             "--json" => parsed.json = true,
             value
+                if command_name == "pipeline"
+                    && parse_pipeline_transcription_option(
+                        value,
+                        args,
+                        &mut index,
+                        &mut parsed.transcription_settings,
+                    )? => {}
+            value
                 if parse_translation_setting_option(
                     value,
                     args,
@@ -193,7 +203,10 @@ fn extract_config_and_profile(args: &[String]) -> (Option<PathBuf>, Option<Strin
 /// Skip a flag and its value (used to avoid re-consuming --config/--profile).
 fn skip_two(args: &[String], index: &mut usize) -> io::Result<()> {
     if *index + 1 >= args.len() {
-        return Err(io::Error::other(format!("{} requires a value", args[*index])));
+        return Err(io::Error::other(format!(
+            "{} requires a value",
+            args[*index]
+        )));
     }
     *index += 1;
     Ok(())
@@ -208,21 +221,30 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
         recursive: false,
         overwrite: false,
         config_path: None,
+        profile: None,
         translate: BatchTranslateOptions::default(),
     };
-    apply_config_if_present(
-        args,
-        1,
-        &mut parsed.config_path,
-        &mut parsed.translate.settings,
-    )?;
+
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
+    let cfg_file = explicit_config.clone().unwrap_or_else(|| {
+        discover_config_path().unwrap_or_else(|| PathBuf::from(".subbake.toml"))
+    });
+    if let Ok(Some(patch)) = load_and_resolve(&cfg_file, explicit_profile.as_deref()) {
+        parsed.translate.settings.apply_patch(patch);
+    }
+    if cfg_file.exists() {
+        parsed.config_path = Some(cfg_file);
+    }
+    parsed.profile = explicit_profile;
 
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "--recursive" => parsed.recursive = true,
             "--overwrite" => parsed.overwrite = true,
-            "--config" => parsed.config_path = Some(required_path(args, &mut index, "--config")?),
+            "--config" | "--profile" => {
+                skip_two(args, &mut index)?;
+            }
             value
                 if parse_translation_setting_option(
                     value,
@@ -255,7 +277,17 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
             "--language" => {
                 parsed.settings.language = Some(required_value(args, &mut index, "--language")?)
             }
+            "--provider" | "--transcriber" => {
+                let flag = args[index].clone();
+                parsed.settings.provider = required_value(args, &mut index, &flag)?
+            }
             "--model" => parsed.settings.model = Some(required_value(args, &mut index, "--model")?),
+            "--api-key" => {
+                parsed.settings.api_key = Some(required_value(args, &mut index, "--api-key")?)
+            }
+            "--base-url" => {
+                parsed.settings.base_url = Some(required_value(args, &mut index, "--base-url")?)
+            }
             "--sidecar" => {
                 parsed.settings.sidecar_path = Some(required_path(args, &mut index, "--sidecar")?)
             }
@@ -274,6 +306,37 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
     }
 
     Ok(parsed)
+}
+
+fn parse_pipeline_transcription_option(
+    option: &str,
+    args: &[String],
+    index: &mut usize,
+    settings: &mut TranscriptionSettings,
+) -> io::Result<bool> {
+    match option {
+        "--transcriber" | "--transcriber-provider" => {
+            settings.provider = required_value(args, index, option)?
+        }
+        "--transcribe-language" | "--language" => {
+            settings.language = Some(required_value(args, index, option)?)
+        }
+        "--transcribe-model" | "--transcriber-model" => {
+            settings.model = Some(required_value(args, index, option)?)
+        }
+        "--transcribe-api-key" => settings.api_key = Some(required_value(args, index, option)?),
+        "--transcribe-base-url" => settings.base_url = Some(required_value(args, index, option)?),
+        "--sidecar" => settings.sidecar_path = Some(required_path(args, index, option)?),
+        "--transcribe-format" => {
+            let value = required_value(args, index, option)?;
+            settings.output_format = TranscriptionFormat::parse(&value).ok_or_else(|| {
+                io::Error::other("--transcribe-format must be one of: srt, vtt, txt")
+            })?;
+        }
+        _ => return Ok(false),
+    }
+
+    Ok(true)
 }
 
 pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
@@ -302,8 +365,7 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
     }
 
     // Resolve API key: explicit value > provider-default env var
-    let resolved_api_key = api_key
-        .or_else(|| resolve_env_var(default_api_key_env(&provider)));
+    let resolved_api_key = api_key.or_else(|| resolve_env_var(default_api_key_env(&provider)));
 
     Ok(ProviderArgs {
         config: BackendConfig {
@@ -413,21 +475,6 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
     Ok(parsed)
 }
 
-fn apply_config_if_present(
-    args: &[String],
-    start_index: usize,
-    config_path: &mut Option<PathBuf>,
-    settings: &mut TranslationSettings,
-) -> io::Result<()> {
-    let Some(path) = option_path_value_from(args, start_index, "--config")? else {
-        return Ok(());
-    };
-    let patch = load_translation_settings_patch(&path)?;
-    settings.apply_patch(patch);
-    *config_path = Some(path);
-    Ok(())
-}
-
 fn parse_translation_setting_option(
     option: &str,
     args: &[String],
@@ -449,25 +496,14 @@ fn parse_translation_setting_option(
         "--fast" => settings.fast_mode = true,
         "--no-review" => settings.final_review = false,
         "--dry-run" => settings.dry_run = true,
+        "--resume" => settings.resume = true,
+        "--no-resume" => settings.resume = false,
+        "--cache" => settings.use_cache = true,
+        "--no-cache" => settings.use_cache = false,
         _ => return Ok(false),
     }
 
     Ok(true)
-}
-
-fn option_path_value_from(
-    args: &[String],
-    start_index: usize,
-    flag: &str,
-) -> io::Result<Option<PathBuf>> {
-    let mut index = start_index;
-    while index < args.len() {
-        if args[index] == flag {
-            return required_path(args, &mut index, flag).map(Some);
-        }
-        index += 1;
-    }
-    Ok(None)
 }
 
 pub(crate) fn required_value(args: &[String], index: &mut usize, flag: &str) -> io::Result<String> {
@@ -508,6 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_translate_accepts_resume_and_cache_switches() {
+        let args = vec![
+            "clip.srt".to_owned(),
+            "--no-resume".to_owned(),
+            "--no-cache".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("translate args should parse");
+
+        assert!(!parsed.settings.resume);
+        assert!(!parsed.settings.use_cache);
+    }
+
+    #[test]
     fn parse_agent_resume_accepts_optional_session() {
         let args = vec!["resume".to_owned(), "abc".to_owned()];
 
@@ -533,6 +582,42 @@ mod tests {
 
         assert!(parsed.recursive);
         assert!(parsed.translate.settings.bilingual);
+    }
+
+    #[test]
+    fn parse_batch_resolves_profile_config() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "subbake-test-{}-{}.toml",
+            std::process::id(),
+            "batch-profile"
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            [defaults]
+            target_language = "Japanese"
+
+            [profiles.zh]
+            target_language = "Chinese"
+            batch_size = 7
+            "#,
+        )
+        .expect("write config");
+
+        let args = vec![
+            "season".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().to_string(),
+            "--profile".to_owned(),
+            "zh".to_owned(),
+        ];
+        let parsed = parse_batch_args(&args).expect("batch args should parse");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(parsed.profile.as_deref(), Some("zh"));
+        assert_eq!(parsed.translate.settings.target_language, "Chinese");
+        assert_eq!(parsed.translate.settings.batch_size, 7);
     }
 
     #[test]
@@ -577,6 +662,12 @@ mod tests {
             "movie.zh.srt".to_owned(),
             "--json".to_owned(),
             "--no-review".to_owned(),
+            "--transcriber".to_owned(),
+            "whisper_cpp".to_owned(),
+            "--transcribe-model".to_owned(),
+            "base".to_owned(),
+            "--language".to_owned(),
+            "en".to_owned(),
         ];
 
         let parsed = parse_pipeline_args(&args).expect("pipeline args should parse");
@@ -585,6 +676,12 @@ mod tests {
         assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
         assert!(parsed.json);
         assert!(!parsed.settings.final_review);
+        assert_eq!(parsed.transcription_settings.provider, "whisper_cpp");
+        assert_eq!(parsed.transcription_settings.model.as_deref(), Some("base"));
+        assert_eq!(
+            parsed.transcription_settings.language.as_deref(),
+            Some("en")
+        );
     }
 
     #[test]
@@ -593,8 +690,14 @@ mod tests {
             "movie.mp4".to_owned(),
             "--language".to_owned(),
             "en".to_owned(),
+            "--provider".to_owned(),
+            "whisper_cpp".to_owned(),
             "--model".to_owned(),
             "base".to_owned(),
+            "--api-key".to_owned(),
+            "sk-test".to_owned(),
+            "--base-url".to_owned(),
+            "https://example.test/v1".to_owned(),
             "--format".to_owned(),
             "vtt".to_owned(),
             "--sidecar".to_owned(),
@@ -605,7 +708,13 @@ mod tests {
 
         assert_eq!(parsed.media_path, PathBuf::from("movie.mp4"));
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
+        assert_eq!(parsed.settings.provider, "whisper_cpp");
         assert_eq!(parsed.settings.model.as_deref(), Some("base"));
+        assert_eq!(parsed.settings.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            parsed.settings.base_url.as_deref(),
+            Some("https://example.test/v1")
+        );
         assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
         assert_eq!(
             parsed.settings.sidecar_path,

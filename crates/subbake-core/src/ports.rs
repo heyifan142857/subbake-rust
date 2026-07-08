@@ -1,6 +1,6 @@
 use crate::entities::{BatchTranslationResult, SubtitleSegment, Usage};
 use crate::error::CoreResult;
-use crate::storage::RuntimePaths;
+use crate::storage::{RunState, RuntimePaths};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -39,6 +39,15 @@ pub trait LlmBackend {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;
+    fn generate_raw_json(
+        &mut self,
+        _messages: &[ChatMessage],
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        Err(crate::error::CoreError::Backend(format!(
+            "{} backend does not support raw JSON generation",
+            self.provider_name()
+        )))
+    }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
         Ok((
@@ -62,6 +71,13 @@ where
 
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
         (**self).generate_json(messages)
+    }
+
+    fn generate_raw_json(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        (**self).generate_raw_json(messages)
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -109,4 +125,19 @@ pub trait RuntimeStore {
         batch_index: usize,
         segments: &[SubtitleSegment],
     ) -> CoreResult<()>;
+    fn load_batch_segments(
+        &self,
+        _kind: BatchShardKind,
+        _completed_batches: usize,
+    ) -> CoreResult<Vec<SubtitleSegment>> {
+        Ok(Vec::new())
+    }
+
+    fn save_run_state(&self, _state: &RunState) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn load_run_state(&self) -> CoreResult<Option<RunState>> {
+        Ok(None)
+    }
 }

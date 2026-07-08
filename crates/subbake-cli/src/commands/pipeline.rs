@@ -10,6 +10,7 @@ pub fn run(args: TranslateArgs) -> io::Result<()> {
         input_path: args.input_path,
         output_path: args.output,
         settings: args.settings,
+        transcription_settings: args.transcription_settings,
     })?;
     print_pipeline_outcome(&outcome, args.json)?;
     Ok(())

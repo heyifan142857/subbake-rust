@@ -14,14 +14,16 @@
 
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Terminal;
 
 use crate::engine::EngineObserver;
 use crate::session::iso_now;
@@ -173,8 +175,7 @@ impl SubBakeTui {
 
     fn handle_slash(&self, input: &str) -> String {
         match input {
-            "/help" | "/h" => {
-                r#"Commands:
+            "/help" | "/h" => r#"Commands:
   /help /h  —  this menu
   /plan     —  toggle plan mode
   /approve  —  approve pending plan
@@ -184,10 +185,11 @@ impl SubBakeTui {
   /quit     —  exit
 
 Or just type what you want, e.g. "translate @clip.srt""#
-                    .to_owned()
-            }
+                .to_owned(),
             "/plan" | "/approve" | "/reject" | "/undo" | "/session" => {
-                format!("`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session.")
+                format!(
+                    "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
+                )
             }
             _ => {
                 format!("Unknown command `{input}`. Try /help.")
@@ -201,7 +203,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        let messages = self.msg_view.lock().map(|v| v.all().to_vec()).unwrap_or_default();
+        let messages = self
+            .msg_view
+            .lock()
+            .map(|v| v.all().to_vec())
+            .unwrap_or_default();
         let scroll = self.scroll_offset;
 
         self.terminal.draw(|frame| {
@@ -213,20 +219,28 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // -- Output pane --
             let output_area = chunks[0];
-            let items: Vec<Line<'_>> = messages.iter().map(|msg| {
-                let style = match msg.style {
-                    MsgStyle::User => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    MsgStyle::Thinking => Style::default().fg(Color::Yellow),
-                    MsgStyle::ToolCall => Style::default().fg(Color::Green),
-                    MsgStyle::Observation => Style::default().fg(Color::DarkGray),
-                    MsgStyle::Response => Style::default().fg(Color::White),
-                    MsgStyle::Error => Style::default().fg(Color::Red),
-                    MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-                };
-                Line::from(Span::styled(&msg.text, style))
-            }).collect();
+            let items: Vec<Line<'_>> = messages
+                .iter()
+                .map(|msg| {
+                    let style = match msg.style {
+                        MsgStyle::User => Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        MsgStyle::Thinking => Style::default().fg(Color::Yellow),
+                        MsgStyle::ToolCall => Style::default().fg(Color::Green),
+                        MsgStyle::Observation => Style::default().fg(Color::DarkGray),
+                        MsgStyle::Response => Style::default().fg(Color::White),
+                        MsgStyle::Error => Style::default().fg(Color::Red),
+                        MsgStyle::System => {
+                            Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
+                        }
+                    };
+                    Line::from(Span::styled(&msg.text, style))
+                })
+                .collect();
 
-            let max_scroll = (items.len() as u16).saturating_sub(output_area.height.saturating_sub(2));
+            let max_scroll =
+                (items.len() as u16).saturating_sub(output_area.height.saturating_sub(2));
             let offset = scroll.min(max_scroll);
 
             let paragraph = Paragraph::new(items)
@@ -296,8 +310,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         v.push(MsgStyle::User, format!("[{:?}] {}", iso_now(), trimmed));
                     }
 
-                    // Handle slash commands locally.
-                    if trimmed.starts_with('/') {
+                    // Handle help locally; engine-backed slash commands need
+                    // session state, so route them through `process_fn`.
+                    if trimmed.starts_with('/') && matches!(trimmed.as_str(), "/help" | "/h") {
                         let response = self.handle_slash(&trimmed);
                         if let Ok(mut v) = self.msg_view.lock() {
                             v.push(MsgStyle::Response, response);
@@ -340,13 +355,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 KeyCode::Tab => {
                     // Simple completion: "tra" → "translate "
                     let completions = [
-                        "translate ", "transcribe ", "list files", "read file",
-                        "search files", "whisper ",
+                        "translate ",
+                        "transcribe ",
+                        "list files",
+                        "read file",
+                        "search files",
+                        "whisper ",
                     ];
                     if !self.input.is_empty()
-                        && let Some(c) = completions.iter().find(|c| c.starts_with(&self.input)) {
-                            self.input = c.to_string();
-                        }
+                        && let Some(c) = completions.iter().find(|c| c.starts_with(&self.input))
+                    {
+                        self.input = c.to_string();
+                    }
                 }
                 _ => {}
             },

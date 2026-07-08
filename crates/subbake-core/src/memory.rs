@@ -31,7 +31,10 @@ pub struct ContextMemory {
 }
 
 fn default_style_rules() -> Vec<String> {
-    DEFAULT_STYLE_RULES.iter().map(|rule| (*rule).to_owned()).collect()
+    DEFAULT_STYLE_RULES
+        .iter()
+        .map(|rule| (*rule).to_owned())
+        .collect()
 }
 
 fn default_max_summaries() -> usize {
@@ -93,7 +96,8 @@ impl ContextMemory {
         let haystack = texts.join("\n").to_lowercase();
         let mut matched = Vec::new();
         for (source, target) in &self.glossary {
-            if haystack.contains(&source.to_lowercase()) || haystack.contains(&target.to_lowercase())
+            if haystack.contains(&source.to_lowercase())
+                || haystack.contains(&target.to_lowercase())
             {
                 matched.push((source.clone(), target.clone()));
                 if matched.len() >= GLOSSARY_RELEVANCE_LIMIT {
@@ -107,7 +111,10 @@ impl ContextMemory {
     /// Recent summaries, newest last, capped at `max_summaries` — the slice
     /// injected into prompts as `recent`.
     pub fn recent_summaries_for_prompt(&self) -> &[String] {
-        let start = self.recent_summaries.len().saturating_sub(self.max_summaries);
+        let start = self
+            .recent_summaries
+            .len()
+            .saturating_sub(self.max_summaries);
         &self.recent_summaries[start..]
     }
 }
@@ -142,13 +149,18 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(memory.glossary.get("alice").map(String::as_str), Some("爱丽"));
+        assert_eq!(
+            memory.glossary.get("alice").map(String::as_str),
+            Some("爱丽")
+        );
     }
 
     #[test]
     fn select_relevant_glossary_filters_by_hit() {
         let mut memory = ContextMemory::new();
-        memory.glossary.insert("alice".to_owned(), "爱丽丝".to_owned());
+        memory
+            .glossary
+            .insert("alice".to_owned(), "爱丽丝".to_owned());
         memory.glossary.insert("bob".to_owned(), "鲍勃".to_owned());
 
         let matched = memory.select_relevant_glossary(&["alice runs away"]);
@@ -174,10 +186,13 @@ mod tests {
     #[test]
     fn serializes_and_restores_via_serde() {
         let mut memory = ContextMemory::new();
-        memory.update("summary", &[GlossaryEntry {
-            source: "x".to_owned(),
-            target: "y".to_owned(),
-        }]);
+        memory.update(
+            "summary",
+            &[GlossaryEntry {
+                source: "x".to_owned(),
+                target: "y".to_owned(),
+            }],
+        );
         let json = serde_json::to_string(&memory).expect("serialize");
         let restored: ContextMemory = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, memory);

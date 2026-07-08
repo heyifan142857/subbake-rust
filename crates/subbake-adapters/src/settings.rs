@@ -18,6 +18,8 @@ pub struct TranslationSettings {
     pub fast_mode: bool,
     pub final_review: bool,
     pub dry_run: bool,
+    pub resume: bool,
+    pub use_cache: bool,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -61,6 +63,12 @@ impl TranslationSettingsPatch {
         if let Some(value) = other.dry_run {
             self.dry_run = Some(value);
         }
+        if let Some(value) = other.resume {
+            self.resume = Some(value);
+        }
+        if let Some(value) = other.use_cache {
+            self.use_cache = Some(value);
+        }
         if let Some(value) = other.runtime_dir {
             self.runtime_dir = Some(value);
         }
@@ -84,6 +92,8 @@ pub struct TranslationSettingsPatch {
     pub fast_mode: Option<bool>,
     pub final_review: Option<bool>,
     pub dry_run: Option<bool>,
+    pub resume: Option<bool>,
+    pub use_cache: Option<bool>,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -103,6 +113,8 @@ impl Default for TranslationSettings {
             fast_mode: false,
             final_review: true,
             dry_run: false,
+            resume: true,
+            use_cache: true,
             runtime_dir: None,
             glossary_path: None,
         }
@@ -152,6 +164,12 @@ impl TranslationSettings {
         if let Some(value) = patch.dry_run {
             self.dry_run = value;
         }
+        if let Some(value) = patch.resume {
+            self.resume = value;
+        }
+        if let Some(value) = patch.use_cache {
+            self.use_cache = value;
+        }
         if let Some(value) = patch.runtime_dir {
             self.runtime_dir = Some(value);
         }
@@ -196,6 +214,8 @@ impl TranslationSettings {
         options.fast_mode = self.fast_mode;
         options.final_review = self.final_review;
         options.dry_run = self.dry_run;
+        options.resume = self.resume;
+        options.use_cache = self.use_cache;
         options.runtime_dir = self.runtime_dir.clone();
         options.glossary_path = self.glossary_path.clone();
         options
@@ -228,6 +248,8 @@ mod tests {
         assert_eq!(settings.target_language, "Chinese");
         assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
         assert!(settings.final_review);
+        assert!(settings.resume);
+        assert!(settings.use_cache);
     }
 
     #[test]
@@ -244,6 +266,8 @@ mod tests {
         assert_eq!(options.target_language, "English");
         assert!(options.bilingual);
         assert_eq!(options.output_format.as_deref(), Some("txt"));
+        assert!(options.resume);
+        assert!(options.use_cache);
     }
 
     #[test]
@@ -275,5 +299,4 @@ mod tests {
         assert_eq!(config.api_key.as_deref(), Some("direct-key"));
         assert_eq!(config.base_url.as_deref(), Some("https://example.test/v1"));
     }
-
 }

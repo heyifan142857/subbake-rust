@@ -179,9 +179,14 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
 
 /// Non-mutating discovery tools that can run without approval even in plan mode.
 pub const DISCOVERY_TOOL_NAMES: &[&str] = &[
-    "list_files", "search_files", "recent_translations",
-    "candidate_subtitles", "read_file_preview", "read_file",
-    "diagnose_path", "diagnose_text",
+    "list_files",
+    "search_files",
+    "recent_translations",
+    "candidate_subtitles",
+    "read_file_preview",
+    "read_file",
+    "diagnose_path",
+    "diagnose_text",
 ];
 
 /// Tools that always require confirmation (equivalent to APPROVAL_REQUIRED mode).

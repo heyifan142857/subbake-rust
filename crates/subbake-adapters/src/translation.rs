@@ -1,13 +1,14 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use subbake_core::PipelineResult;
 use subbake_core::formats::RenderOptions;
 use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
-use subbake_core::storage::build_runtime_paths;
+use subbake_core::storage::{build_runtime_paths, input_signature_from_bytes};
 
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
@@ -51,6 +52,14 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
         ));
     }
 
+    let input_bytes = fs::read(&request.input_path)?;
+    let metadata = fs::metadata(&request.input_path)?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    let input_signature = input_signature_from_bytes(&input_bytes, mtime_ns);
     let document = read_document(&request.input_path)?;
     let output_path = match request.output_path.clone() {
         Some(path) => path,
@@ -78,7 +87,8 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
     let store = FileRuntimeStore::new(paths);
     store.ensure_layout().map_err(io::Error::other)?;
 
-    let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options);
+    let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options)
+        .with_input_signature(input_signature);
     pipeline = pipeline.with_store(Box::new(store));
     let run = pipeline.run_document(&document).map_err(io::Error::other)?;
 

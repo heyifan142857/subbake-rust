@@ -18,7 +18,10 @@ fn pipeline_media_input_attempts_transcription() {
 
     let msg = error.to_string();
     // The old stub said "pending migration"; now it tries real transcription.
-    assert!(!msg.contains("pending migration"), "should no longer be a stub: {msg}");
+    assert!(
+        !msg.contains("pending migration"),
+        "should no longer be a stub: {msg}"
+    );
 }
 
 #[test]
@@ -27,7 +30,10 @@ fn transcribe_media_attempts_transcription() {
         .expect_err("transcribe should try real backend");
 
     let msg = error.to_string();
-    assert!(!msg.contains("pending migration"), "should no longer be a stub: {msg}");
+    assert!(
+        !msg.contains("pending migration"),
+        "should no longer be a stub: {msg}"
+    );
 }
 
 #[test]
@@ -84,5 +90,8 @@ fn whisper_model_attempts_download() {
     .expect_err("model download should attempt real download");
 
     let msg = error.to_string();
-    assert!(!msg.contains("pending"), "should no longer be a stub: {msg}");
+    assert!(
+        !msg.contains("pending"),
+        "should no longer be a stub: {msg}"
+    );
 }

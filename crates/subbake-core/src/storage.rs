@@ -1,11 +1,10 @@
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
 use crate::languages::language_pair_slug;
+use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
 pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 5;
@@ -26,21 +25,115 @@ pub struct RuntimePaths {
     pub agent_logs_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputSignature {
     pub sha1: String,
     pub size: u64,
     pub mtime_ns: Option<u128>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translated_segments: Vec<SubtitleSegment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewed_segments: Vec<SubtitleSegment>,
+    #[serde(default)]
     pub usage: Usage,
+    #[serde(default)]
+    pub memory: ContextMemory,
+    #[serde(default)]
     pub translation_batches_completed: usize,
+    #[serde(default)]
     pub review_batches_completed: usize,
+    #[serde(default)]
     pub validation_completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunState {
+    pub version: u64,
+    #[serde(default, alias = "pipeline_fingerprint")]
+    pub translation_fingerprint: String,
+    #[serde(default)]
+    pub render_fingerprint: String,
+    #[serde(default)]
+    pub input_path: String,
+    #[serde(default)]
+    pub output_path: Option<String>,
+    #[serde(default)]
+    pub input_signature: Option<InputSignature>,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub batch_size: usize,
+    #[serde(default)]
+    pub translation_batches_completed: usize,
+    #[serde(default)]
+    pub review_batches_completed: usize,
+    #[serde(default)]
+    pub validation_completed: bool,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default)]
+    pub memory: ContextMemory,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub translated_segments: Vec<SubtitleSegment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewed_segments: Vec<SubtitleSegment>,
+}
+
+impl RunState {
+    pub fn new(
+        options: &PipelineOptions,
+        input_signature: InputSignature,
+        usage: Usage,
+        memory: ContextMemory,
+        translation_batches_completed: usize,
+        review_batches_completed: usize,
+        validation_completed: bool,
+    ) -> Self {
+        Self {
+            version: RUN_STATE_VERSION,
+            translation_fingerprint: build_translation_fingerprint(options, &input_signature),
+            render_fingerprint: build_render_fingerprint(options),
+            input_path: options.input_path.to_string_lossy().into_owned(),
+            output_path: options
+                .output_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            input_signature: Some(input_signature),
+            provider: options.provider.clone(),
+            model: options.model.clone(),
+            batch_size: options.batch_size,
+            translation_batches_completed,
+            review_batches_completed,
+            validation_completed,
+            usage,
+            memory,
+            translated_segments: Vec::new(),
+            reviewed_segments: Vec::new(),
+        }
+    }
+
+    pub fn resume_snapshot(self, expected_translation_fingerprint: &str) -> Option<ResumeSnapshot> {
+        if !matches!(self.version, 1 | 2 | RUN_STATE_VERSION)
+            || self.translation_fingerprint != expected_translation_fingerprint
+        {
+            return None;
+        }
+        Some(ResumeSnapshot {
+            translated_segments: self.translated_segments,
+            reviewed_segments: self.reviewed_segments,
+            usage: self.usage,
+            memory: self.memory,
+            translation_batches_completed: self.translation_batches_completed,
+            review_batches_completed: self.review_batches_completed,
+            validation_completed: self.validation_completed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,9 +196,10 @@ pub fn build_runtime_paths(
             .and_then(|value| value.to_str())
             .unwrap_or("input"),
     );
+    let stable_input_path = stable_path_for_hash(input_path);
     let input_key = &stable_hash(&JsonValue::Object(vec![(
         "path".to_owned(),
-        JsonValue::String(input_path.to_string_lossy().to_string()),
+        JsonValue::String(stable_input_path.to_string_lossy().to_string()),
     )]))[..12];
     let run_dir = root_dir
         .join("runs")
@@ -129,6 +223,18 @@ pub fn build_runtime_paths(
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
     }
+}
+
+fn stable_path_for_hash(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
 }
 
 pub fn input_signature_from_bytes(bytes: &[u8], mtime_ns: Option<u128>) -> InputSignature {
@@ -390,56 +496,6 @@ fn sha1_digest(bytes: &[u8]) -> [u8; 20] {
     digest
 }
 
-// ---------------------------------------------------------------------------
-// RunStateStore — persist/restore pipeline progress for resume
-// ---------------------------------------------------------------------------
-
-pub fn save_run_state(path: &Path, snapshot: &ResumeSnapshot) -> io::Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(snapshot)
-        .map_err(|e| io::Error::other(format!("serialize run state: {e}")))?;
-    let tmp = path.with_file_name(
-        format!(".{}.tmp", path.file_name().and_then(|s| s.to_str()).unwrap_or("state")),
-    );
-    fs::write(&tmp, &json)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-pub fn load_run_state(path: &Path) -> io::Result<Option<ResumeSnapshot>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let json = fs::read_to_string(path)?;
-    let snapshot: ResumeSnapshot = serde_json::from_str(&json)
-        .map_err(|e| io::Error::other(format!("parse run state: {e}")))?;
-    Ok(Some(snapshot))
-}
-
-// ---------------------------------------------------------------------------
-// CacheStore — simple file-based LLM response cache
-// ---------------------------------------------------------------------------
-
-/// Save a cached response for a given request hash.
-pub fn cache_store(cache_dir: &Path, hash: &str, response: &str) -> io::Result<()> {
-    fs::create_dir_all(cache_dir)?;
-    let path = cache_dir.join(hash);
-    fs::write(&path, response)?;
-    Ok(())
-}
-
-/// Load a cached response for a given request hash, if it exists.
-pub fn cache_load(cache_dir: &Path, hash: &str) -> io::Result<Option<String>> {
-    let path = cache_dir.join(hash);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&path)?;
-    Ok(Some(content))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +529,22 @@ mod tests {
     }
 
     #[test]
+    fn translation_fingerprint_matches_python_canonical_json() {
+        let mut options = PipelineOptions::new("clip.txt".into());
+        options.batch_size = 2;
+        let signature = InputSignature {
+            sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
+            size: 3,
+            mtime_ns: Some(123),
+        };
+
+        assert_eq!(
+            build_translation_fingerprint(&options, &signature),
+            "102a9fddbf1093211e0fc41f79bf0f4044393a67"
+        );
+    }
+
+    #[test]
     fn sha1_matches_known_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }
@@ -494,5 +566,44 @@ mod tests {
                 .to_string_lossy()
                 .contains("translation_memory.v2.auto-chinese.standard.json")
         );
+    }
+
+    #[test]
+    fn run_state_accepts_python_v1_pipeline_fingerprint() {
+        let state: RunState = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "pipeline_fingerprint": "expected",
+                "translation_batches_completed": 2,
+                "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+                "memory": {"recent_summaries": ["summary"]}
+            }"#,
+        )
+        .expect("parse legacy state");
+
+        let snapshot = state
+            .resume_snapshot("expected")
+            .expect("matching legacy state");
+        assert_eq!(snapshot.translation_batches_completed, 2);
+        assert_eq!(snapshot.usage.total_tokens, 7);
+        assert_eq!(snapshot.memory.recent_summaries, vec!["summary"]);
+    }
+
+    #[test]
+    fn run_state_rejects_mismatched_fingerprint() {
+        let mut options = PipelineOptions::new("clip.txt".into());
+        options.batch_size = 2;
+        let signature = input_signature_from_bytes(b"one\ntwo\n", Some(1));
+        let state = RunState::new(
+            &options,
+            signature,
+            Usage::default(),
+            ContextMemory::new(),
+            1,
+            0,
+            false,
+        );
+
+        assert!(state.resume_snapshot("different").is_none());
     }
 }

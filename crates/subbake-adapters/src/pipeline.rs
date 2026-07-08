@@ -3,9 +3,7 @@ use std::path::PathBuf;
 
 use crate::fs::is_supported_subtitle_path;
 use crate::settings::TranslationSettings;
-use crate::transcription::{
-    TranscriptionRequest, TranscriptionSettings, transcribe_media,
-};
+use crate::transcription::{TranscriptionRequest, TranscriptionSettings, transcribe_media};
 use crate::translation::{TranslationOutcome, TranslationRequest, translate_subtitle};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +11,7 @@ pub struct PipelineRequest {
     pub input_path: PathBuf,
     pub output_path: Option<PathBuf>,
     pub settings: TranslationSettings,
+    pub transcription_settings: TranscriptionSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +33,7 @@ pub fn run_pipeline(request: PipelineRequest) -> io::Result<PipelineOutcome> {
     let transcription_out = transcribe_media(TranscriptionRequest {
         media_path: request.input_path.clone(),
         output_path: None,
-        settings: TranscriptionSettings::default(),
+        settings: request.transcription_settings,
     })?;
     let transcribed_path = transcription_out.output_path;
 
@@ -71,6 +70,7 @@ mod tests {
             input_path,
             output_path: None,
             settings,
+            transcription_settings: TranscriptionSettings::default(),
         })
         .expect("run pipeline");
         let output_path = match outcome {
@@ -90,12 +90,15 @@ mod tests {
             input_path: PathBuf::from("audio.wav"),
             output_path: None,
             settings: TranslationSettings::default(),
+            transcription_settings: TranscriptionSettings::default(),
         })
         .expect_err("media pipeline should try transcription");
 
         let msg = error.to_string();
-        assert!(!msg.contains("pending migration"),
-            "media path should no longer return pending migration: {msg}");
+        assert!(
+            !msg.contains("pending migration"),
+            "media path should no longer return pending migration: {msg}"
+        );
     }
 
     fn temp_root(label: &str) -> PathBuf {

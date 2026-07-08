@@ -242,7 +242,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("subbake-agent-events-{}", hex_id()));
         let store = AgentSessionStore::new(dir.clone());
         let mut session = store.create().expect("create session");
-        session.record_event("user", "translate hello", serde_json::json!({"path": "hello.srt"}));
+        session.record_event(
+            "user",
+            "translate hello",
+            serde_json::json!({"path": "hello.srt"}),
+        );
         store.save(&session).expect("save with events");
 
         let loaded = store.load(&session.id).expect("load session");

@@ -16,9 +16,7 @@ pub fn discover_config_path() -> Option<PathBuf> {
     let candidates = vec![
         std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs_or_default()
-            })
+            .unwrap_or_else(|_| dirs_or_default())
             .join("subbake/config.toml"),
         dirs_or_default().join("subbake/config.toml"),
         PathBuf::from(".subbake.toml"),
@@ -34,7 +32,10 @@ fn dirs_or_default() -> PathBuf {
 
 /// Load a config file (full format) and resolve the named profile
 /// (or `default_profile`). Returns `None` if the file doesn't exist.
-pub fn load_and_resolve(path: &Path, profile: Option<&str>) -> io::Result<Option<TranslationSettingsPatch>> {
+pub fn load_and_resolve(
+    path: &Path,
+    profile: Option<&str>,
+) -> io::Result<Option<TranslationSettingsPatch>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -147,14 +148,20 @@ impl ConfigFile {
                     default_profile = Some(cv.into_string(key)?);
                     continue;
                 }
-                return Err(format!("unsupported top-level key `{key}` on line {}", line_number + 1));
+                return Err(format!(
+                    "unsupported top-level key `{key}` on line {}",
+                    line_number + 1
+                ));
             }
 
             let target = if table == "defaults" {
                 &mut defaults
             } else if let Some(name) = table.strip_prefix("profiles.") {
                 profiles.get_mut(name).ok_or_else(|| {
-                    format!("internal: missing profile `{name}` on line {}", line_number + 1)
+                    format!(
+                        "internal: missing profile `{name}` on line {}",
+                        line_number + 1
+                    )
                 })?
             } else {
                 continue; // unreachable
@@ -205,6 +212,8 @@ fn apply_key_value(
         "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
         "final_review" | "review" => patch.final_review = Some(value.into_bool(key)?),
         "dry_run" => patch.dry_run = Some(value.into_bool(key)?),
+        "resume" => patch.resume = Some(value.into_bool(key)?),
+        "cache" | "use_cache" => patch.use_cache = Some(value.into_bool(key)?),
         "runtime_dir" => patch.runtime_dir = Some(PathBuf::from(value.into_string(key)?)),
         "glossary" | "glossary_path" => {
             patch.glossary_path = Some(PathBuf::from(value.into_string(key)?));
@@ -327,6 +336,8 @@ mod tests {
             batch_size = 8
             bilingual = true
             final_review = false
+            resume = false
+            cache = false
             "#,
         )
         .expect("config should parse");
@@ -338,6 +349,8 @@ mod tests {
         assert_eq!(patch.batch_size, Some(8));
         assert_eq!(patch.bilingual, Some(true));
         assert_eq!(patch.final_review, Some(false));
+        assert_eq!(patch.resume, Some(false));
+        assert_eq!(patch.use_cache, Some(false));
     }
 
     #[test]
@@ -368,11 +381,17 @@ mod tests {
 
         assert_eq!(config.default_profile.as_deref(), Some("deepseek"));
         assert_eq!(
-            config.profiles.get("deepseek").and_then(|p| p.provider.as_deref()),
+            config
+                .profiles
+                .get("deepseek")
+                .and_then(|p| p.provider.as_deref()),
             Some("openai")
         );
         assert_eq!(
-            config.profiles.get("deepseek").and_then(|p| p.model.as_deref()),
+            config
+                .profiles
+                .get("deepseek")
+                .and_then(|p| p.model.as_deref()),
             Some("deepseek-v4-flash")
         );
     }

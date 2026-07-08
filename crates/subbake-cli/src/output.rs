@@ -6,7 +6,7 @@ use subbake_adapters::{
     TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
 };
 use subbake_agent::AgentOutcome;
-use subbake_core::entities::{BatchPlanEntry, PipelineResult};
+use subbake_core::entities::PipelineResult;
 
 pub fn print_translation_outcome(
     outcome: &TranslationOutcome,
@@ -73,14 +73,40 @@ fn render_translation_outcome(
 }
 
 fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
-    format!(
+    let mut output = format!(
         "Output: {}\nUsage: {} in / {} out / {} total\nBatches: {} translated\n",
         output_path.display(),
         result.usage.input_tokens,
         result.usage.output_tokens,
         result.usage.total_tokens,
         result.batches_translated
-    )
+    );
+    let mut reuse = Vec::new();
+    if result.resumed_translation_batches > 0 {
+        reuse.push(format!(
+            "{} translated batch(es) resumed",
+            result.resumed_translation_batches
+        ));
+    }
+    if result.resumed_review_batches > 0 {
+        reuse.push(format!(
+            "{} review batch(es) resumed",
+            result.resumed_review_batches
+        ));
+    }
+    if result.cache_hits > 0 {
+        reuse.push(format!("{} cached request(s)", result.cache_hits));
+    }
+    if result.translation_memory_hits > 0 {
+        reuse.push(format!(
+            "{} translation-memory hit(s)",
+            result.translation_memory_hits
+        ));
+    }
+    if !reuse.is_empty() {
+        output.push_str(&format!("Reused: {}\n", reuse.join(", ")));
+    }
+    output
 }
 
 fn dry_run_text(result: &PipelineResult, json: bool) -> String {
@@ -175,62 +201,52 @@ pub fn result_json(result: &PipelineResult) -> String {
     let output_path = result
         .output_path
         .as_ref()
-        .map(|path| quote_json(&path.to_string_lossy()))
-        .unwrap_or_else(|| "null".to_owned());
+        .map(|path| path.to_string_lossy().to_string());
     let glossary_path = result
         .glossary_path
         .as_ref()
-        .map(|path| quote_json(&path.to_string_lossy()))
-        .unwrap_or_else(|| "null".to_owned());
-    let planned_batches = result
+        .map(|path| path.to_string_lossy().to_string());
+    let state_path = result
+        .state_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let planned_batches: Vec<serde_json::Value> = result
         .planned_batches
         .iter()
-        .map(batch_json)
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|batch| {
+            serde_json::json!({
+                "index": batch.index,
+                "size": batch.size,
+                "first_id": batch.first_id,
+                "last_id": batch.last_id,
+            })
+        })
+        .collect();
 
-    format!(
-        "{{\"output_path\":{output_path},\"batches_translated\":{},\"review_batches\":{},\"usage\":{{\"input_tokens\":{},\"output_tokens\":{},\"total_tokens\":{}}},\"dry_run\":{},\"planned_batches\":[{}],\"glossary_path\":{glossary_path}}}",
-        result.batches_translated,
-        result.review_batches,
-        result.usage.input_tokens,
-        result.usage.output_tokens,
-        result.usage.total_tokens,
-        result.dry_run,
-        planned_batches
-    )
-}
-
-fn batch_json(batch: &BatchPlanEntry) -> String {
-    format!(
-        "{{\"index\":{},\"size\":{},\"first_id\":{},\"last_id\":{}}}",
-        batch.index,
-        batch.size,
-        quote_json(&batch.first_id),
-        quote_json(&batch.last_id)
-    )
-}
-
-fn quote_json(value: &str) -> String {
-    let mut output = String::new();
-    output.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            ch => output.push(ch),
-        }
-    }
-    output.push('"');
-    output
+    serde_json::to_string(&serde_json::json!({
+        "output_path": output_path,
+        "batches_translated": result.batches_translated,
+        "review_batches": result.review_batches,
+        "usage": {
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "total_tokens": result.usage.total_tokens,
+        },
+        "dry_run": result.dry_run,
+        "planned_batches": planned_batches,
+        "cache_hits": result.cache_hits,
+        "resumed_translation_batches": result.resumed_translation_batches,
+        "resumed_review_batches": result.resumed_review_batches,
+        "translation_memory_hits": result.translation_memory_hits,
+        "state_path": state_path,
+        "glossary_path": glossary_path,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use subbake_core::entities::Usage;
+    use subbake_core::entities::{BatchPlanEntry, Usage};
 
     use super::*;
 

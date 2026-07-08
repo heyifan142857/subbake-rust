@@ -15,6 +15,7 @@ name = "subbake_cli"
 path = "src/lib.rs"
 
 [dependencies]
+serde_json = "1"
 subbake-adapters = { path = "../subbake-adapters" }
 subbake-agent = { path = "../subbake-agent" }
 subbake-core = { path = "../subbake-core" }

@@ -60,6 +60,32 @@ impl LlmBackend for MockBackend {
         })
     }
 
+    fn generate_raw_json(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        let result = self.generate_json(messages)?;
+        let BackendPayload::Translation(batch) = result.payload;
+        let lines: Vec<serde_json::Value> = batch
+            .lines
+            .into_iter()
+            .map(|line| serde_json::json!({"id": line.id, "translation": line.translation}))
+            .collect();
+        let glossary_updates: Vec<serde_json::Value> = batch
+            .glossary_updates
+            .into_iter()
+            .map(|entry| serde_json::json!({"source": entry.source, "target": entry.target}))
+            .collect();
+        Ok((
+            serde_json::json!({
+                "lines": lines,
+                "summary": batch.summary,
+                "glossary_updates": glossary_updates,
+            }),
+            result.usage,
+        ))
+    }
+
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
         Ok((
             true,

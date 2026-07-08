@@ -1141,6 +1141,7 @@ dependencies = [
 name = "subbake-cli"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "subbake-adapters",
  "subbake-agent",
  "subbake-core",

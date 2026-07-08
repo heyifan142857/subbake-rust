@@ -11,17 +11,18 @@
 use std::io;
 use std::path::PathBuf;
 
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{
     TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
-    WhisperAction, WhisperRequest,
-    transcribe_media, translate_subtitle,
+    WhisperAction, WhisperRequest, transcribe_media, translate_subtitle,
 };
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
 use subbake_core::error::CoreResult;
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
 
 use crate::engine::AgentEngine;
+use crate::event::{EventKind, FileOpEventData};
+use crate::guard::{FileOpAction, FileOpResult};
 use crate::tools::ALL_TOOL_SPECS;
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,26 @@ impl LlmBackend for EchoDecisionBackend {
     }
 
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        let (decision, usage) = self.generate_raw_json(messages)?;
+        let text = serde_json::to_string(&decision).unwrap_or_default();
+
+        Ok(BackendJsonResult {
+            payload: BackendPayload::Translation(BatchTranslationResult {
+                lines: vec![TranslationLine {
+                    id: "1".to_owned(),
+                    translation: text,
+                }],
+                summary: "echo decision".to_owned(),
+                glossary_updates: Vec::new(),
+            }),
+            usage,
+        })
+    }
+
+    fn generate_raw_json(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> CoreResult<(serde_json::Value, Usage)> {
         // Extract the user message (last user message).
         let user_text = messages
             .iter()
@@ -66,24 +87,15 @@ impl LlmBackend for EchoDecisionBackend {
             "text": user_text,
             "confidence": 1.0
         });
-        let text = serde_json::to_string(&decision).unwrap_or_default();
         let input_tokens = user_text.chars().count().div_ceil(4).max(1);
-
-        Ok(BackendJsonResult {
-            payload: BackendPayload::Translation(BatchTranslationResult {
-                lines: vec![TranslationLine {
-                    id: "1".to_owned(),
-                    translation: text,
-                }],
-                summary: "echo decision".to_owned(),
-                glossary_updates: Vec::new(),
-            }),
-            usage: Usage {
+        Ok((
+            decision,
+            Usage {
                 input_tokens,
                 output_tokens: 1,
                 total_tokens: input_tokens + 1,
             },
-        })
+        ))
     }
 }
 
@@ -116,7 +128,7 @@ struct LoopState {
 
 /// The LLM's structured decision.
 struct Decision {
-    action: String,      // "respond" | "tool_call" | "ask_user"
+    action: String, // "respond" | "tool_call" | "ask_user"
     text: String,
     tool_name: Option<String>,
     arguments: Option<JsonValue>,
@@ -132,12 +144,17 @@ impl AgentEngine {
     ///
     /// Returns the response text to show to the user.
     pub fn run_line(&mut self, input: &str, backend: &mut dyn LlmBackend) -> io::Result<String> {
+        self.record_if_active(EventKind::User {
+            text: input.to_owned(),
+        })?;
+
         // 1. Quick-path: keyword matching without LLM.
         if let Some(result) = self.try_quick_path(input)? {
             if let Some(ref text) = result.response_text
-                && let Some(ref mut obs) = self.observer {
-                    obs.on_response(text);
-                }
+                && let Some(ref mut obs) = self.observer
+            {
+                obs.on_response(text);
+            }
             return Ok(result.output);
         }
 
@@ -204,27 +221,7 @@ impl AgentEngine {
 
                     // Mutating tool (execute, then exit loop).
                     // Check plan mode / approval.
-                    if self.tool_requires_approval(tool_name)
-                        || self.is_in_plan_mode()
-                    {
-                        // Store as plan for later approval.
-                        let draft = crate::event::ToolCallDraft {
-                            tool_name: tool_name.to_owned(),
-                            arguments: args.clone(),
-                        };
-                        self.store_plan("", vec![draft])?;
-                        let msg = "I've prepared a plan for your approval. Use `/approve` to execute.".to_owned();
-                        if let Some(ref mut obs) = self.observer {
-                            obs.on_tool_call(tool_name, &args);
-                            obs.on_response(&msg);
-                        }
-                        return Ok(msg);
-                    }
-
-                    if let Some(ref mut obs) = self.observer {
-                        obs.on_tool_call(tool_name, &args);
-                    }
-                    let result_text = self.run_tool(tool_name, &args)?;
+                    let result_text = self.execute_or_plan_tool(tool_name, &args)?;
                     if let Some(ref mut obs) = self.observer {
                         obs.on_response(&result_text);
                     }
@@ -246,32 +243,42 @@ impl AgentEngine {
     // Quick-path deterministic matching
     // ------------------------------------------------------------------
 
-    fn try_quick_path(&self, input: &str) -> io::Result<Option<QuickResult>> {
+    fn try_quick_path(&mut self, input: &str) -> io::Result<Option<QuickResult>> {
         let trimmed = input.trim();
 
         // Pattern: "translate @<path>" or "translate <path>"
         if let Some(path) = trimmed.strip_prefix("translate ") {
-            let p = self.resolve_tool_path(path);
+            let args = json!({"path": self.tool_path_arg(path)});
+            let output = self.execute_or_plan_tool("translate_file", &args)?;
             return Ok(Some(QuickResult {
-                output: format!("Translate {}", p.display()),
-                response_text: Some(format!("Translate {}", p.display())),
+                response_text: Some(output.clone()),
+                output,
             }));
         }
 
         // Pattern: "transcribe @<path>"
         if let Some(path) = trimmed.strip_prefix("transcribe ") {
-            let p = self.resolve_tool_path(path);
+            let args = json!({"path": self.tool_path_arg(path)});
+            let output = self.execute_or_plan_tool("transcribe_audio", &args)?;
             return Ok(Some(QuickResult {
-                output: format!("Transcribe {}", p.display()),
-                response_text: Some(format!("Transcribing {}", p.display())),
+                response_text: Some(output.clone()),
+                output,
             }));
         }
 
         // Pattern: "list files" or "ls"
         if matches!(trimmed, "list files" | "ls" | "list") {
             return Ok(Some(QuickResult {
-                output: self.guard.list_files(std::path::Path::new("."))
-                    .map(|files| files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+                output: self
+                    .guard
+                    .list_files(std::path::Path::new("."))
+                    .map(|files| {
+                        files
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
                     .unwrap_or_default(),
                 response_text: None,
             }));
@@ -280,10 +287,9 @@ impl AgentEngine {
         Ok(None)
     }
 
-    fn resolve_tool_path(&self, input: &str) -> std::path::PathBuf {
+    fn tool_path_arg(&self, input: &str) -> String {
         // Strip @ prefix if present.
-        let cleaned = input.trim().trim_start_matches('@');
-        self.project_root.join(cleaned)
+        input.trim().trim_start_matches('@').to_owned()
     }
 
     // ------------------------------------------------------------------
@@ -300,13 +306,9 @@ impl AgentEngine {
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
-        let result = backend.generate_json(&messages);
+        let result = backend.generate_raw_json(&messages);
         match result {
-            Ok(backend_result) => {
-                let subbake_core::ports::BackendPayload::Translation(translation) = backend_result.payload;
-                let text = translation.lines.first().map(|l| l.translation.clone()).unwrap_or_default();
-                self.parse_decision(&text)
-            }
+            Ok((decision, _usage)) => self.parse_decision_value(&decision),
             Err(e) => {
                 if let Some(ref mut obs) = self.observer {
                     obs.on_error(&e.to_string());
@@ -339,7 +341,9 @@ impl AgentEngine {
         system.push_str("\n- `respond`: reply to the user directly.\n");
         system.push_str("- `tool_call`: invoke a tool. Discovery tools feed observations back; mutating tools execute immediately.\n");
         system.push_str("- `ask_user`: ask the user for clarification.\n");
-        system.push_str("Keep confidence high (≥0.85) for direct tool calls, lower for clarification.\n");
+        system.push_str(
+            "Keep confidence high (≥0.85) for direct tool calls, lower for clarification.\n",
+        );
         system.push_str("Preserve subtitle id order, never merge or drop entries.\n");
 
         let mut user = String::new();
@@ -354,21 +358,10 @@ impl AgentEngine {
             }
         }
 
-        vec![
-            ChatMessage::system(&system),
-            ChatMessage::user(&user),
-        ]
+        vec![ChatMessage::system(&system), ChatMessage::user(&user)]
     }
 
-    /// Parse the LLM's JSON response into a structured Decision.
-    fn parse_decision(&self, text: &str) -> io::Result<Decision> {
-        let trimmed = text.trim();
-        let json_start = trimmed.find('{').unwrap_or(0);
-        let json_str = &trimmed[json_start..];
-
-        let parsed: JsonValue = serde_json::from_str(json_str)
-            .unwrap_or_else(|_| json!({"action": "respond", "text": text}));
-
+    fn parse_decision_value(&self, parsed: &JsonValue) -> io::Result<Decision> {
         Ok(Decision {
             action: parsed["action"].as_str().unwrap_or("respond").to_owned(),
             text: parsed["text"].as_str().unwrap_or("").to_owned(),
@@ -399,7 +392,11 @@ impl AgentEngine {
         if state.observations.len() < MIN_OBSERVATIONS {
             return Decision {
                 action: "ask_user".into(),
-                text: format!("Shall I {} with {:?}?", decision.tool_name.as_deref().unwrap_or("?"), decision.arguments),
+                text: format!(
+                    "Shall I {} with {:?}?",
+                    decision.tool_name.as_deref().unwrap_or("?"),
+                    decision.arguments
+                ),
                 tool_name: decision.tool_name,
                 arguments: decision.arguments,
                 confidence: decision.confidence,
@@ -413,23 +410,56 @@ impl AgentEngine {
     // ------------------------------------------------------------------
 
     fn is_in_plan_mode(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|s| s.mode == "plan")
+        self.session.as_ref().is_some_and(|s| s.mode == "plan")
     }
 
     // ------------------------------------------------------------------
     // Tool runner (stub — dispatches to real adapters)
     // ------------------------------------------------------------------
 
+    fn execute_or_plan_tool(&mut self, tool_name: &str, args: &JsonValue) -> io::Result<String> {
+        if let Some(ref mut obs) = self.observer {
+            obs.on_tool_call(tool_name, args);
+        }
+
+        if self.tool_requires_approval(tool_name) || self.is_in_plan_mode() {
+            let draft = crate::event::ToolCallDraft {
+                tool_name: tool_name.to_owned(),
+                arguments: args.clone(),
+            };
+            self.store_plan("", vec![draft])?;
+            return Ok(
+                "I've prepared a plan for your approval. Use `/approve` to execute.".to_owned(),
+            );
+        }
+
+        self.run_tool(tool_name, args)
+    }
+
+    pub(crate) fn record_if_active(&mut self, kind: EventKind) -> io::Result<()> {
+        if self.session.is_some() {
+            self.record(kind)?;
+        }
+        Ok(())
+    }
+
     /// Execute a tool by name with arguments. Returns a text summary.
-    fn run_tool(&self, name: &str, args: &JsonValue) -> io::Result<String> {
+    pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> io::Result<String> {
+        self.record_if_active(EventKind::ToolCall {
+            tool_name: name.to_owned(),
+            arguments: args.clone(),
+        })?;
+
         match name {
             // -- Browse (FileGuard) --
             "list_files" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let files = self.guard.list_files(PathBuf::from(dir).as_path())?;
-                Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+                Ok(files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"))
             }
             "search_files" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -453,15 +483,21 @@ impl AgentEngine {
             }
             "candidate_subtitles" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let files = self.guard.search_files(PathBuf::from(dir).as_path(), ".srt")?;
+                let files = self
+                    .guard
+                    .search_files(PathBuf::from(dir).as_path(), ".srt")?;
                 Ok(format_file_list(&files))
             }
             "recent_translations" => {
                 let session = self.session.as_ref();
-                let events = session.map(|s| &s.events).map(|v| v.as_slice()).unwrap_or(&[]);
+                let events = session
+                    .map(|s| &s.events)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let mut out = Vec::new();
                 for event in events.iter().rev().take(20) {
-                    if event.kind == "translate_file" || event.kind == "final_tool_call" {
+                    let tool_name = event.data.get("tool_name").and_then(|value| value.as_str());
+                    if matches!(tool_name, Some("translate_file" | "translate_series")) {
                         out.push(event.text.clone());
                     }
                 }
@@ -473,60 +509,102 @@ impl AgentEngine {
                 let path = req_arg(args, "path")?;
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let r = self.guard.create_file(&path, content)?;
+                self.record_file_operation(&r)?;
                 Ok(format!("Created {}", r.path.display()))
             }
             "append_file" => {
                 let path = req_arg(args, "path")?;
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let r = self.guard.append_file(&path, content)?;
-                Ok(format!("Appended {} (backup: {})", r.path.display(),
-                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+                self.record_file_operation(&r)?;
+                Ok(format!(
+                    "Appended {} (backup: {})",
+                    r.path.display(),
+                    r.backup_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ))
             }
             "replace_in_file" => {
                 let path = req_arg(args, "path")?;
                 let old = args.get("old").and_then(|v| v.as_str()).unwrap_or("");
                 let new = args.get("new").and_then(|v| v.as_str()).unwrap_or("");
                 let r = self.guard.replace_in_file(&path, old, new)?;
-                Ok(format!("Replaced in {} (backup: {})", r.path.display(),
-                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+                self.record_file_operation(&r)?;
+                Ok(format!(
+                    "Replaced in {} (backup: {})",
+                    r.path.display(),
+                    r.backup_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ))
             }
             "rename_path" => {
                 let from = req_arg(args, "from")?;
                 let to = req_arg(args, "to")?;
                 let r = self.guard.rename_path(&from, &to)?;
-                Ok(format!("Renamed {} → {}", r.path.display(),
-                    r.new_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+                self.record_file_operation(&r)?;
+                Ok(format!(
+                    "Renamed {} → {}",
+                    r.path.display(),
+                    r.new_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ))
             }
             "delete_file" => {
                 let path = req_arg(args, "path")?;
                 let r = self.guard.delete_file(&path)?;
-                Ok(format!("Deleted {} (backup: {})", r.path.display(),
-                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+                self.record_file_operation(&r)?;
+                Ok(format!(
+                    "Deleted {} (backup: {})",
+                    r.path.display(),
+                    r.backup_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ))
             }
 
             // -- Translate --
             "translate_file" => {
                 let path = req_arg(args, "path")?;
-                let input = self.project_root.join(&path);
+                let input = self.guard.resolve_path(&path)?;
                 let request = TranslationRequest {
                     input_path: input,
                     output_path: None,
                     settings: TranslationSettings::default(),
                 };
                 let outcome = translate_subtitle(request)?;
-                Ok(outcome.output_path.map(|p| format!("Translated: {}", p.display())).unwrap_or_default())
+                Ok(outcome
+                    .output_path
+                    .map(|p| format!("Translated: {}", p.display()))
+                    .unwrap_or_default())
             }
             "translate_series" => {
                 let dir = req_arg(args, "path")?;
-                let input = self.project_root.join(&dir);
+                let input = self.guard.resolve_path(&dir)?;
                 let request = subbake_adapters::BatchTranslationRequest {
                     root: input,
-                    recursive: args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false),
-                    overwrite: args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false),
+                    recursive: args
+                        .get("recursive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    overwrite: args
+                        .get("overwrite")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     settings: TranslationSettings::default(),
                 };
                 let outcome = subbake_adapters::translate_subtitle_batch(request)?;
-                Ok(format!("Translated {} files, skipped {}.", outcome.processed, outcome.skipped.len()))
+                Ok(format!(
+                    "Translated {} files, skipped {}.",
+                    outcome.processed,
+                    outcome.skipped.len()
+                ))
             }
 
             // -- Edit: read file, show content, suggest re-translate --
@@ -539,7 +617,8 @@ impl AgentEngine {
                     let preview: String = content.chars().take(500).collect();
                     Ok(format!(
                         "Current content of {}:\n{}\n\nTo edit, set `path` and `instructions` in arguments.",
-                        path.display(), preview
+                        path.display(),
+                        preview
                     ))
                 } else {
                     Ok(format!("File {} not found.", path.display()))
@@ -549,7 +628,7 @@ impl AgentEngine {
             // -- Transcribe --
             "transcribe_audio" => {
                 let path = req_arg(args, "path")?;
-                let input = self.project_root.join(&path);
+                let input = self.guard.resolve_path(&path)?;
                 let request = TranscriptionRequest {
                     media_path: input,
                     output_path: None,
@@ -563,14 +642,22 @@ impl AgentEngine {
 
             // -- Whisper management --
             "manage_whisper" => {
-                let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+                let action_str = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("status");
                 let action = match action_str {
                     "install" => WhisperAction::Install,
                     "status" => WhisperAction::Status,
                     "list-models" | "models" => WhisperAction::ListModels,
                     "download" => {
-                        let name = args.get("model").and_then(|v| v.as_str()).unwrap_or("small");
-                        WhisperAction::DownloadModel { name: name.to_owned() }
+                        let name = args
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("small");
+                        WhisperAction::DownloadModel {
+                            name: name.to_owned(),
+                        }
                     }
                     other => return Ok(format!("unknown whisper action `{other}`")),
                 };
@@ -598,8 +685,11 @@ impl AgentEngine {
                             for f in std::fs::read_dir(&failures_dir).map_err(io::Error::other)? {
                                 let f = f.map_err(io::Error::other)?;
                                 if let Ok(content) = std::fs::read_to_string(f.path()) {
-                                    results.push(format!("{}: {}",
-                                        f.path().display(), &content[..content.len().min(200)]));
+                                    results.push(format!(
+                                        "{}: {}",
+                                        f.path().display(),
+                                        &content[..content.len().min(200)]
+                                    ));
                                 }
                             }
                         }
@@ -613,7 +703,10 @@ impl AgentEngine {
             }
             "diagnose_text" => {
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                Ok(format!("Diagnose text: received {} chars. For detailed diagnosis, set `path` to a run directory.", text.len()))
+                Ok(format!(
+                    "Diagnose text: received {} chars. For detailed diagnosis, set `path` to a run directory.",
+                    text.len()
+                ))
             }
 
             // -- Profile: read profiles from subbake.toml --
@@ -626,7 +719,10 @@ impl AgentEngine {
                     .map_err(|e| io::Error::other(format!("read config: {e}")))?;
                 let profiles = find_profile_names(&content);
                 if profiles.is_empty() {
-                    Ok("No profiles defined in subbake.toml. Create [profiles.<name>] sections.".to_owned())
+                    Ok(
+                        "No profiles defined in subbake.toml. Create [profiles.<name>] sections."
+                            .to_owned(),
+                    )
                 } else {
                     Ok(format!("Profiles: {}", profiles.join(", ")))
                 }
@@ -635,21 +731,64 @@ impl AgentEngine {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let config_path = self.project_root.join("subbake.toml");
                 if !config_path.exists() {
-                    return Ok("No subbake.toml. Create one with [profiles.<name>] sections.".to_owned());
+                    return Ok(
+                        "No subbake.toml. Create one with [profiles.<name>] sections.".to_owned(),
+                    );
                 }
                 let content = std::fs::read_to_string(&config_path)
                     .map_err(|e| io::Error::other(format!("read config: {e}")))?;
                 let profiles = find_profile_names(&content);
                 if profiles.contains(&name.to_owned()) {
                     // Switching is done by the user editing their config default_profile.
-                    Ok(format!("Profile `{name}` exists. Set `default_profile = \"{name}\"` in subbake.toml to activate it."))
+                    Ok(format!(
+                        "Profile `{name}` exists. Set `default_profile = \"{name}\"` in subbake.toml to activate it."
+                    ))
                 } else {
-                    Ok(format!("Profile `{name}` not found. Available: {}", profiles.join(", ")))
+                    Ok(format!(
+                        "Profile `{name}` not found. Available: {}",
+                        profiles.join(", ")
+                    ))
                 }
             }
 
             _ => Ok(format!("[{name}: not yet wired]")),
         }
+    }
+
+    fn record_file_operation(&mut self, result: &FileOpResult) -> io::Result<()> {
+        self.record_if_active(EventKind::FileOperation(FileOpEventData {
+            action: file_action_label(result.action).to_owned(),
+            path: self.event_path(&result.path),
+            new_path: result.new_path.as_ref().map(|path| self.event_path(path)),
+            backup_path: result
+                .backup_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            group_id: None,
+            undone: false,
+        }))
+    }
+
+    fn event_path(&self, path: &std::path::Path) -> String {
+        let root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
+        path.strip_prefix(&root)
+            .or_else(|_| path.strip_prefix(&self.project_root))
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+fn file_action_label(action: FileOpAction) -> &'static str {
+    match action {
+        FileOpAction::Create => "created",
+        FileOpAction::Append => "appended",
+        FileOpAction::Modified => "modified",
+        FileOpAction::Renamed => "renamed",
+        FileOpAction::Deleted => "deleted",
     }
 }
 
@@ -665,7 +804,11 @@ fn format_file_list(files: &[PathBuf]) -> String {
     if files.is_empty() {
         return "(no files found)".to_owned();
     }
-    files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")
+    files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse lines like `[profiles.myprofile]` from TOML content.
@@ -674,12 +817,13 @@ fn find_profile_names(toml: &str) -> Vec<String> {
     for line in toml.lines() {
         let trimmed = line.trim();
         if let Some(inner) = trimmed.strip_prefix("[profiles.")
-            && let Some(name) = inner.strip_suffix(']') {
-                let clean = name.trim();
-                if !clean.is_empty() {
-                    names.push(clean.to_owned());
-                }
+            && let Some(name) = inner.strip_suffix(']')
+        {
+            let clean = name.trim();
+            if !clean.is_empty() {
+                names.push(clean.to_owned());
             }
+        }
     }
     names.sort();
     names
@@ -693,4 +837,73 @@ fn find_profile_names(toml: &str) -> Vec<String> {
 struct QuickResult {
     output: String,
     response_text: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn quick_path_translate_executes_tool() {
+        let root = temp_root("quick-translate");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("clip.txt"), "hello\n").expect("write subtitle");
+
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = EchoDecisionBackend::new("test");
+
+        let output = engine
+            .run_line("translate @clip.txt", &mut backend)
+            .expect("run line");
+
+        assert!(output.contains("Translated:"), "{output}");
+        assert!(root.join("clip.translated.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_tool_records_event_and_undo_removes_created_file() {
+        let root = temp_root("file-undo");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let result = engine
+            .run_tool(
+                "create_file",
+                &json!({"path": "notes.txt", "content": "hello"}),
+            )
+            .expect("create file");
+
+        assert!(result.contains("Created"));
+        assert!(root.join("notes.txt").exists());
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .events
+                .iter()
+                .any(|event| event.kind == "file_operation")
+        );
+
+        let undone = engine.undo_last().expect("undo");
+        assert!(undone.contains("Undone"));
+        assert!(!root.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("subbake-agent-decision-{label}-{nanos}"))
+    }
 }

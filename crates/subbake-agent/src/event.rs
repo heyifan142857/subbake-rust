@@ -4,7 +4,6 @@
 //! (`agent/session.py` events list). Every recorded event has a
 //! well-known variant; unknown or ad-hoc kinds are rejected at compile time.
 
-
 use serde::{Deserialize, Serialize};
 
 /// A file-operation payload attached to a session event.
@@ -23,18 +22,37 @@ pub struct FileOpEventData {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
-    User { text: String },
-    Assistant { text: String },
-    AskUser { text: String },
-    ToolCall { tool_name: String, arguments: serde_json::Value },
-    FinalToolCall { tool_name: String, arguments: serde_json::Value },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    AskUser {
+        text: String,
+    },
+    ToolCall {
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
+    FinalToolCall {
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
     FileOperation(FileOpEventData),
-    Plan { message: String, tool_calls: Vec<ToolCallDraft> },
+    Plan {
+        message: String,
+        tool_calls: Vec<ToolCallDraft>,
+    },
     Approve,
     Reject,
     Undo,
-    Profile { name: String },
-    Error { text: String },
+    Profile {
+        name: String,
+    },
+    Error {
+        text: String,
+    },
 }
 
 /// Stub for a tool call within a pending plan.

@@ -96,8 +96,9 @@ impl Default for TranscriptionSettings {
 
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| Runtime::new().unwrap_or_else(|_| panic!("unable to start subbake transcription runtime")))
+    RUNTIME.get_or_init(|| {
+        Runtime::new().unwrap_or_else(|_| panic!("unable to start subbake transcription runtime"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -125,12 +126,22 @@ pub struct WhisperApiTranscriber {
 }
 
 impl WhisperApiTranscriber {
-    pub fn new(api_key: String, base_url: String, model: String, timeout_seconds: f64) -> io::Result<Self> {
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        model: String,
+        timeout_seconds: f64,
+    ) -> io::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
             .build()
             .map_err(|e| io::Error::other(format!("http client build: {e}")))?;
-        Ok(Self { api_key, base_url, model, client })
+        Ok(Self {
+            api_key,
+            base_url,
+            model,
+            client,
+        })
     }
 }
 
@@ -142,7 +153,10 @@ impl TranscriberBackend for WhisperApiTranscriber {
         output_format: TranscriptionFormat,
     ) -> io::Result<SubtitleDocument> {
         runtime().block_on(async {
-            let url = format!("{}/audio/transcriptions", self.base_url.trim_end_matches('/'));
+            let url = format!(
+                "{}/audio/transcriptions",
+                self.base_url.trim_end_matches('/')
+            );
             let audio_bytes = std::fs::read(audio_path)
                 .map_err(|e| io::Error::other(format!("read audio file: {e}")))?;
             let file_name = audio_path
@@ -152,9 +166,15 @@ impl TranscriberBackend for WhisperApiTranscriber {
                 .to_owned();
 
             let mut form = multipart::Form::new()
-                .part("file", multipart::Part::bytes(audio_bytes).file_name(file_name))
+                .part(
+                    "file",
+                    multipart::Part::bytes(audio_bytes).file_name(file_name),
+                )
                 .text("model", self.model.clone())
-                .text("response_format", output_format.response_format_arg().to_owned());
+                .text(
+                    "response_format",
+                    output_format.response_format_arg().to_owned(),
+                );
             if let Some(lang) = language {
                 form = form.text("language", lang.to_owned());
             }
@@ -169,10 +189,14 @@ impl TranscriberBackend for WhisperApiTranscriber {
                 .map_err(|e| io::Error::other(format!("whisper api request: {e}")))?;
 
             let status = resp.status();
-            let body = resp.text().await
+            let body = resp
+                .text()
+                .await
                 .map_err(|e| io::Error::other(format!("whisper api response: {e}")))?;
             if !status.is_success() {
-                return Err(io::Error::other(format!("whisper api rejected ({status}): {body}")));
+                return Err(io::Error::other(format!(
+                    "whisper api rejected ({status}): {body}"
+                )));
             }
             parse_whisper_response(&body, output_format)
         })
@@ -191,7 +215,11 @@ pub struct WhisperCppTranscriber {
 
 impl WhisperCppTranscriber {
     pub fn new(binary: PathBuf, model_path: PathBuf, extra_args: Vec<String>) -> Self {
-        Self { binary, model_path, extra_args }
+        Self {
+            binary,
+            model_path,
+            extra_args,
+        }
     }
 }
 
@@ -203,23 +231,39 @@ impl TranscriberBackend for WhisperCppTranscriber {
         output_format: TranscriptionFormat,
     ) -> io::Result<SubtitleDocument> {
         let output_dir = audio_path.parent().unwrap_or_else(|| Path::new("."));
-        let base_name = audio_path.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+        let base_name = audio_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio");
         let output_base = output_dir.join(base_name);
 
         let mut cmd = Command::new(&self.binary);
         cmd.args([
-            "-m", &self.model_path.to_string_lossy(),
-            "-f", &audio_path.to_string_lossy(),
-            "-os", "--output-file", &output_base.to_string_lossy(),
+            "-m",
+            &self.model_path.to_string_lossy(),
+            "-f",
+            &audio_path.to_string_lossy(),
+            "-os",
+            "--output-file",
+            &output_base.to_string_lossy(),
         ]);
         match output_format {
-            TranscriptionFormat::Srt | TranscriptionFormat::Txt => { cmd.arg("--output-srt"); }
-            TranscriptionFormat::Vtt => { cmd.arg("--output-vtt"); }
+            TranscriptionFormat::Srt | TranscriptionFormat::Txt => {
+                cmd.arg("--output-srt");
+            }
+            TranscriptionFormat::Vtt => {
+                cmd.arg("--output-vtt");
+            }
         }
-        if let Some(lang) = language { cmd.args(["-l", lang]); }
-        for arg in &self.extra_args { cmd.arg(arg); }
+        if let Some(lang) = language {
+            cmd.args(["-l", lang]);
+        }
+        for arg in &self.extra_args {
+            cmd.arg(arg);
+        }
 
-        let out = cmd.output()
+        let out = cmd
+            .output()
             .map_err(|e| io::Error::other(format!("whisper.cpp execution: {e}")))?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
@@ -229,15 +273,26 @@ impl TranscriberBackend for WhisperCppTranscriber {
             )));
         }
 
-        let suffix = match output_format { TranscriptionFormat::Vtt => "vtt", _ => "srt" };
+        let suffix = match output_format {
+            TranscriptionFormat::Vtt => "vtt",
+            _ => "srt",
+        };
         let generated = output_base.with_extension(suffix);
         let mut doc = read_document(&generated)?;
         let _ = std::fs::remove_file(&generated);
 
         if matches!(output_format, TranscriptionFormat::Txt) {
-            doc.segments = doc.segments.iter().map(|s| SubtitleSegment {
-                start: None, end: None, identifier: None, settings: None, ..s.clone()
-            }).collect();
+            doc.segments = doc
+                .segments
+                .iter()
+                .map(|s| SubtitleSegment {
+                    start: None,
+                    end: None,
+                    identifier: None,
+                    settings: None,
+                    ..s.clone()
+                })
+                .collect();
             doc.format = "txt".to_owned();
         }
         Ok(doc)
@@ -263,26 +318,46 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
 
     let doc = match request.settings.provider.as_str() {
         "whisper_api" => {
-            let api_key = request.settings.api_key.clone()
+            let api_key = request
+                .settings
+                .api_key
+                .clone()
                 .or_else(default_whisper_api_key)
-                .ok_or_else(|| io::Error::other(
-                    "Missing API key for Whisper API. Set OPENAI_API_KEY or use --api-key.",
-                ))?;
-            let base_url = request.settings.base_url.clone()
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "Missing API key for Whisper API. Set OPENAI_API_KEY or use --api-key.",
+                    )
+                })?;
+            let base_url = request
+                .settings
+                .base_url
+                .clone()
                 .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
-            let model = request.settings.model.clone().unwrap_or_else(|| "whisper-1".to_owned());
+            let model = request
+                .settings
+                .model
+                .clone()
+                .unwrap_or_else(|| "whisper-1".to_owned());
             let t = WhisperApiTranscriber::new(api_key, base_url, model, 120.0)?;
             t.transcribe(&audio_path, request.settings.language.as_deref(), fmt)?
         }
         "whisper_cpp" => {
-            let model = request.settings.model.clone().unwrap_or_else(|| "small".to_owned());
+            let model = request
+                .settings
+                .model
+                .clone()
+                .unwrap_or_else(|| "small".to_owned());
             let binary = locate_whisper_binary()?;
             let model_path = locate_whisper_model(&model)?;
             let t = WhisperCppTranscriber::new(binary, model_path, Vec::new());
             t.transcribe(&audio_path, request.settings.language.as_deref(), fmt)?
         }
-        other => return Err(io::Error::other(format!("unsupported transcriber `{other}"))),
+        other => {
+            return Err(io::Error::other(format!(
+                "unsupported transcriber `{other}"
+            )));
+        }
     };
 
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
@@ -295,19 +370,34 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
 // ---------------------------------------------------------------------------
 
 fn ensure_audio(media_path: &Path) -> io::Result<PathBuf> {
-    if is_audio_ext(media_path) { return Ok(media_path.to_path_buf()); }
+    if is_audio_ext(media_path) {
+        return Ok(media_path.to_path_buf());
+    }
 
     let parent = media_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = media_path.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+    let stem = media_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio");
     let tmp_dir = parent.join(".subbake").join("tmp");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| io::Error::other(format!("create tmp dir: {e}")))?;
     let output = tmp_dir.join(format!("{stem}_audio.wav"));
 
     let status = Command::new("ffmpeg")
-        .args(["-y", "-i", &media_path.to_string_lossy(), "-vn",
-               "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-               &output.to_string_lossy()])
+        .args([
+            "-y",
+            "-i",
+            &media_path.to_string_lossy(),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            &output.to_string_lossy(),
+        ])
         .status()
         .map_err(|e| io::Error::other(format!("ffmpeg not found: {e}")))?;
     if !status.success() {
@@ -323,19 +413,27 @@ fn is_audio_ext(path: &Path) -> bool {
 }
 
 fn default_whisper_api_key() -> Option<String> {
-    std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.trim().is_empty())
+    std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
 }
 
 fn locate_whisper_binary() -> io::Result<PathBuf> {
     let p = PathBuf::from(".subbake/whisper/bin/whisper-cli");
-    if p.exists() { Ok(p) } else {
-        Err(io::Error::other("whisper.cpp binary not found. Run `sbake whisper install` first."))
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(io::Error::other(
+            "whisper.cpp binary not found. Run `sbake whisper install` first.",
+        ))
     }
 }
 
 fn locate_whisper_model(name: &str) -> io::Result<PathBuf> {
     let p = PathBuf::from(".subbake/whisper/models").join(format!("ggml-{name}.bin"));
-    if p.exists() { Ok(p) } else {
+    if p.exists() {
+        Ok(p)
+    } else {
         Err(io::Error::other(format!(
             "model `{name}` not found at {}. Run `sbake whisper models --download {name}`.",
             p.display()
@@ -350,7 +448,10 @@ fn default_output_path(media_path: &Path, fmt: TranscriptionFormat) -> PathBuf {
 fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> io::Result<()> {
     let doc = read_document(path)?;
     if fmt != TranscriptionFormat::Txt
-        && doc.segments.iter().any(|s| s.start.is_none() || s.end.is_none())
+        && doc
+            .segments
+            .iter()
+            .any(|s| s.start.is_none() || s.end.is_none())
     {
         return Err(io::Error::other(
             "sidecar lacks timing data; use --format txt or a timed subtitle file",
@@ -369,8 +470,7 @@ fn parse_whisper_response(body: &str, fmt: TranscriptionFormat) -> io::Result<Su
             std::fs::create_dir_all(&dir)
                 .map_err(|e| io::Error::other(format!("create tmp dir: {e}")))?;
             let tmp = dir.join(format!("response.{ext}"));
-            std::fs::write(&tmp, body)
-                .map_err(|e| io::Error::other(format!("write tmp: {e}")))?;
+            std::fs::write(&tmp, body).map_err(|e| io::Error::other(format!("write tmp: {e}")))?;
             let doc = read_document(&tmp)?;
             let _ = std::fs::remove_file(&tmp);
             Ok(doc)
@@ -380,18 +480,27 @@ fn parse_whisper_response(body: &str, fmt: TranscriptionFormat) -> io::Result<Su
                 .map_err(|e| io::Error::other(format!("whisper json parse: {e}")))?;
             let text = parsed["segments"]
                 .as_array()
-                .map(|segs| segs.iter()
-                    .filter_map(|s| s["text"].as_str())
-                    .collect::<Vec<_>>().join("\n"))
+                .map(|segs| {
+                    segs.iter()
+                        .filter_map(|s| s["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
                 .or_else(|| parsed["text"].as_str().map(String::from))
                 .unwrap_or_default();
             Ok(SubtitleDocument {
-                path: PathBuf::new(), format: "txt".to_owned(),
+                path: PathBuf::new(),
+                format: "txt".to_owned(),
                 segments: vec![SubtitleSegment {
-                    id: "1".to_owned(), text,
-                    start: None, end: None, identifier: None, settings: None,
+                    id: "1".to_owned(),
+                    text,
+                    start: None,
+                    end: None,
+                    identifier: None,
+                    settings: None,
                 }],
-                header: None, passthrough_blocks: Vec::new(),
+                header: None,
+                passthrough_blocks: Vec::new(),
             })
         }
     }
@@ -423,11 +532,17 @@ mod tests {
             media_path: root.join("x.mp4"),
             output_path: Some(out.clone()),
             settings: TranscriptionSettings {
-                sidecar_path: Some(src), ..Default::default()
+                sidecar_path: Some(src),
+                ..Default::default()
             },
-        }).expect("transcribe");
+        })
+        .expect("transcribe");
         assert_eq!(r.output_path, out);
-        assert!(fs::read_to_string(&out).expect("read out").contains("hello"));
+        assert!(
+            fs::read_to_string(&out)
+                .expect("read out")
+                .contains("hello")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -441,9 +556,11 @@ mod tests {
             media_path: root.join("x.mp4"),
             output_path: None,
             settings: TranscriptionSettings {
-                sidecar_path: Some(src), ..Default::default()
+                sidecar_path: Some(src),
+                ..Default::default()
             },
-        }).expect_err("untimed should error");
+        })
+        .expect_err("untimed should error");
         let _ = fs::remove_dir_all(&root);
         assert!(e.to_string().contains("lacks timing"));
     }
@@ -454,9 +571,12 @@ mod tests {
             media_path: PathBuf::from("m.wav"),
             output_path: None,
             settings: TranscriptionSettings {
-                provider: "whisper_api".to_owned(), api_key: None, ..Default::default()
+                provider: "whisper_api".to_owned(),
+                api_key: None,
+                ..Default::default()
             },
-        }).expect_err("no key should error");
+        })
+        .expect_err("no key should error");
         assert!(e.to_string().contains("API key"));
     }
 
@@ -466,9 +586,11 @@ mod tests {
             media_path: PathBuf::from("m.wav"),
             output_path: None,
             settings: TranscriptionSettings {
-                provider: "nope".to_owned(), ..Default::default()
+                provider: "nope".to_owned(),
+                ..Default::default()
             },
-        }).expect_err("unknown provider should error");
+        })
+        .expect_err("unknown provider should error");
         assert!(e.to_string().contains("unsupported transcriber"));
     }
 
