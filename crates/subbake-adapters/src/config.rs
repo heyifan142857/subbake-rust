@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,111 @@ pub fn parse_translation_settings_patch(content: &str) -> Result<TranslationSett
     }
 
     Ok(patch)
+}
+
+// ---------------------------------------------------------------------------
+// Full config file parser (multi-profile)
+// ---------------------------------------------------------------------------
+
+/// Parsed representation of a `subbake.toml` / `config.toml`.
+#[derive(Debug, Clone)]
+pub struct ConfigFile {
+    pub default_profile: Option<String>,
+    pub defaults: TranslationSettingsPatch,
+    pub profiles: HashMap<String, TranslationSettingsPatch>,
+}
+
+impl ConfigFile {
+    /// Load and parse a config file from disk.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        Self::parse(&content).map_err(io::Error::other)
+    }
+
+    /// Parse TOML-like config content supporting `default_profile`,
+    /// `[defaults]`, and `[profiles.<name>]` sections.
+    pub fn parse(content: &str) -> Result<Self, String> {
+        let mut default_profile = None;
+        let mut defaults = TranslationSettingsPatch::default();
+        let mut profiles = HashMap::new();
+        let mut current_table: Option<String> = None;
+
+        for (line_number, raw_line) in content.lines().enumerate() {
+            let line = strip_comment(raw_line).trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Section header
+            if line.starts_with('[') && line.ends_with(']') {
+                let table = line[1..line.len() - 1].trim().to_owned();
+                current_table = Some(table.clone());
+
+                if table == "defaults" {
+                    // valid
+                } else if let Some(profile_name) = table.strip_prefix("profiles.") {
+                    profiles.entry(profile_name.to_owned()).or_default();
+                } else {
+                    return Err(format!(
+                        "unsupported config table `[{table}]` on line {}",
+                        line_number + 1
+                    ));
+                }
+                continue;
+            }
+
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("expected `key = value` on line {}", line_number + 1))?;
+            let key = key.trim();
+            let cv = parse_value(value.trim())
+                .map_err(|e| format!("{e} on line {}", line_number + 1))?;
+
+            // Top-level keys (outside any table)
+            let table = current_table.as_deref().unwrap_or("");
+            if table.is_empty() {
+                if key == "default_profile" {
+                    default_profile = Some(cv.into_string(key)?);
+                    continue;
+                }
+                return Err(format!("unsupported top-level key `{key}` on line {}", line_number + 1));
+            }
+
+            let target = if table == "defaults" {
+                &mut defaults
+            } else if let Some(name) = table.strip_prefix("profiles.") {
+                profiles.get_mut(name).ok_or_else(|| {
+                    format!("internal: missing profile `{name}` on line {}", line_number + 1)
+                })?
+            } else {
+                continue; // unreachable
+            };
+
+            apply_key_value(target, key, cv)
+                .map_err(|e| format!("{e} on line {}", line_number + 1))?;
+        }
+
+        Ok(Self {
+            default_profile,
+            defaults,
+            profiles,
+        })
+    }
+
+    /// Resolve settings for `profile_name` (falls back to default_profile,
+    /// then to `defaults`, then to built-in defaults).
+    pub fn resolve(&self, profile_name: Option<&str>) -> TranslationSettingsPatch {
+        let name = profile_name
+            .or(self.default_profile.as_deref())
+            .unwrap_or("");
+        let mut patch = self.defaults.clone();
+        if !name.is_empty()
+            && let Some(profile) = self.profiles.get(name)
+        {
+            patch.merge(profile.clone());
+        }
+        patch
+    }
 }
 
 fn apply_key_value(
@@ -202,6 +308,58 @@ mod tests {
         let error =
             parse_translation_settings_patch("unknown = true").expect_err("unknown key fails");
         assert!(error.contains("unsupported config key"));
+    }
+
+    #[test]
+    fn parses_user_config_file() {
+        let config = ConfigFile::parse(
+            r#"
+            default_profile = "deepseek"
+
+            [defaults]
+            target_language = "zh"
+            batch_size = 30
+
+            [profiles.deepseek]
+            provider = "openai"
+            model = "deepseek-v4-flash"
+            base_url = "https://api.deepseek.com"
+            api_key = "sk-test123"
+            "#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.default_profile.as_deref(), Some("deepseek"));
+        assert_eq!(
+            config.profiles.get("deepseek").and_then(|p| p.provider.as_deref()),
+            Some("openai")
+        );
+        assert_eq!(
+            config.profiles.get("deepseek").and_then(|p| p.model.as_deref()),
+            Some("deepseek-v4-flash")
+        );
+    }
+
+    #[test]
+    fn resolve_merges_defaults_and_profile() {
+        let config = ConfigFile::parse(
+            r#"
+            [defaults]
+            target_language = "Chinese"
+            batch_size = 20
+
+            [profiles.custom]
+            provider = "anthropic"
+            model = "claude-sonnet-4"
+            "#,
+        )
+        .expect("config should parse");
+
+        let resolved = config.resolve(Some("custom"));
+        assert_eq!(resolved.target_language.as_deref(), Some("Chinese"));
+        assert_eq!(resolved.batch_size, Some(20));
+        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-4"));
     }
 
     #[test]

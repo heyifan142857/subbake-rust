@@ -22,6 +22,54 @@ pub struct TranslationSettings {
     pub glossary_path: Option<PathBuf>,
 }
 
+impl TranslationSettingsPatch {
+    /// Overlay `other` onto `self` — `Some` fields in `other` replace `self`.
+    pub fn merge(&mut self, other: TranslationSettingsPatch) {
+        if let Some(value) = other.output_format {
+            self.output_format = Some(value);
+        }
+        if let Some(value) = other.provider {
+            self.provider = Some(value);
+        }
+        if let Some(value) = other.model {
+            self.model = Some(value);
+        }
+        if let Some(value) = other.api_key {
+            self.api_key = Some(value);
+        }
+        if let Some(value) = other.base_url {
+            self.base_url = Some(value);
+        }
+        if let Some(value) = other.source_language {
+            self.source_language = Some(value);
+        }
+        if let Some(value) = other.target_language {
+            self.target_language = Some(value);
+        }
+        if let Some(value) = other.batch_size {
+            self.batch_size = Some(value);
+        }
+        if let Some(value) = other.bilingual {
+            self.bilingual = Some(value);
+        }
+        if let Some(value) = other.fast_mode {
+            self.fast_mode = Some(value);
+        }
+        if let Some(value) = other.final_review {
+            self.final_review = Some(value);
+        }
+        if let Some(value) = other.dry_run {
+            self.dry_run = Some(value);
+        }
+        if let Some(value) = other.runtime_dir {
+            self.runtime_dir = Some(value);
+        }
+        if let Some(value) = other.glossary_path {
+            self.glossary_path = Some(value);
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct TranslationSettingsPatch {
     pub output_format: Option<String>,

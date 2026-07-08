@@ -11,7 +11,7 @@ pub mod transcription;
 pub mod translation;
 pub mod whisper;
 
-pub use config::{load_translation_settings_patch, parse_translation_settings_patch};
+pub use config::{load_translation_settings_patch, parse_translation_settings_patch, ConfigFile};
 pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };
