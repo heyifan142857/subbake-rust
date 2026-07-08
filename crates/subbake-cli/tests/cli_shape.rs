@@ -73,13 +73,16 @@ fn whisper_model_list_is_available_without_download() {
 }
 
 #[test]
-fn whisper_model_reports_pending_backend() {
+fn whisper_model_attempts_download() {
+    // "model unknown-name" is rejected immediately by the CLI parser
+    // as an unknown model name.
     let error = subbake_cli::run(vec![
         "whisper".to_owned(),
         "model".to_owned(),
-        "base".to_owned(),
+        "nonexistentmodel12345".to_owned(),
     ])
-    .expect_err("model download should be pending");
+    .expect_err("model download should attempt real download");
 
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let msg = error.to_string();
+    assert!(!msg.contains("pending"), "should no longer be a stub: {msg}");
 }
