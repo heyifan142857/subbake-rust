@@ -1,3 +1,4 @@
+pub mod decision;
 pub mod engine;
 pub mod event;
 pub mod guard;
