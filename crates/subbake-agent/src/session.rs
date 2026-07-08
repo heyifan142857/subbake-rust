@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::event::PendingPlan;
+
 pub const SESSION_VERSION: u64 = 1;
 
 /// A single event recorded in a session. The `kind` field discriminates the
@@ -17,21 +19,6 @@ pub struct AgentEvent {
     pub text: String,
     pub data: serde_json::Value,
     pub created_at: String,
-}
-
-/// A pending plan stored in the session (set by plan mode, consumed by approve).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingPlan {
-    pub message: String,
-    pub tool_calls: Vec<ToolCallDraft>,
-    pub created_at: String,
-}
-
-/// Stub for a tool call within a pending plan.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallDraft {
-    pub tool_name: String,
-    pub arguments: serde_json::Value,
 }
 
 /// An interactive agent session.
@@ -189,7 +176,7 @@ impl AgentSessionStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     // Rough ISO-8601 UTC timestamp without pulling in chrono.
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

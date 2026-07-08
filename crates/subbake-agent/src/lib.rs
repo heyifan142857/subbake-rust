@@ -1,7 +1,6 @@
-// SubBake agent — headless engine types.
-// The full interactive agent (session loop, intent gating, plan/approval, undo)
-// is built on top of these core abstractions.
-
+pub mod engine;
+pub mod event;
+pub mod guard;
 pub mod session;
 pub mod tools;
 
