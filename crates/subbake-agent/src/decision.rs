@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value as JsonValue};
 use subbake_adapters::{
     TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
+    WhisperAction, WhisperRequest,
     transcribe_media, translate_subtitle,
 };
 use subbake_core::ports::{ChatMessage, LlmBackend};
@@ -359,7 +360,7 @@ impl AgentEngine {
     /// Execute a tool by name with arguments. Returns a text summary.
     fn run_tool(&self, name: &str, args: &JsonValue) -> io::Result<String> {
         match name {
-            // -- Browse tools --
+            // -- Browse (FileGuard) --
             "list_files" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let files = self.guard.list_files(PathBuf::from(dir).as_path())?;
@@ -369,7 +370,7 @@ impl AgentEngine {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
                 let files = self.guard.search_files(PathBuf::from(dir).as_path(), pat)?;
-                Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+                Ok(format_file_list(&files))
             }
             "read_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -388,10 +389,9 @@ impl AgentEngine {
             "candidate_subtitles" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let files = self.guard.search_files(PathBuf::from(dir).as_path(), ".srt")?;
-                Ok(files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"))
+                Ok(format_file_list(&files))
             }
             "recent_translations" => {
-                // Scan session events for translate_file/final_tool_call records.
                 let session = self.session.as_ref();
                 let events = session.map(|s| &s.events).map(|v| v.as_slice()).unwrap_or(&[]);
                 let mut out = Vec::new();
@@ -403,21 +403,57 @@ impl AgentEngine {
                 Ok(out.join("\n"))
             }
 
+            // -- File operations (FileGuard) --
+            "create_file" => {
+                let path = req_arg(args, "path")?;
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let r = self.guard.create_file(&path, content)?;
+                Ok(format!("Created {}", r.path.display()))
+            }
+            "append_file" => {
+                let path = req_arg(args, "path")?;
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let r = self.guard.append_file(&path, content)?;
+                Ok(format!("Appended {} (backup: {})", r.path.display(),
+                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+            }
+            "replace_in_file" => {
+                let path = req_arg(args, "path")?;
+                let old = args.get("old").and_then(|v| v.as_str()).unwrap_or("");
+                let new = args.get("new").and_then(|v| v.as_str()).unwrap_or("");
+                let r = self.guard.replace_in_file(&path, old, new)?;
+                Ok(format!("Replaced in {} (backup: {})", r.path.display(),
+                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+            }
+            "rename_path" => {
+                let from = req_arg(args, "from")?;
+                let to = req_arg(args, "to")?;
+                let r = self.guard.rename_path(&from, &to)?;
+                Ok(format!("Renamed {} → {}", r.path.display(),
+                    r.new_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+            }
+            "delete_file" => {
+                let path = req_arg(args, "path")?;
+                let r = self.guard.delete_file(&path)?;
+                Ok(format!("Deleted {} (backup: {})", r.path.display(),
+                    r.backup_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()))
+            }
+
             // -- Translate --
             "translate_file" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let input = self.project_root.join(path);
+                let path = req_arg(args, "path")?;
+                let input = self.project_root.join(&path);
                 let request = TranslationRequest {
                     input_path: input,
                     output_path: None,
                     settings: TranslationSettings::default(),
                 };
                 let outcome = translate_subtitle(request)?;
-                Ok(format!("Translated: {}", outcome.output_path.map(|p| p.display().to_string()).unwrap_or_default()))
+                Ok(outcome.output_path.map(|p| format!("Translated: {}", p.display())).unwrap_or_default())
             }
             "translate_series" => {
-                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let input = self.project_root.join(dir);
+                let dir = req_arg(args, "path")?;
+                let input = self.project_root.join(&dir);
                 let request = subbake_adapters::BatchTranslationRequest {
                     root: input,
                     recursive: args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -428,10 +464,15 @@ impl AgentEngine {
                 Ok(format!("Translated {} files, skipped {}.", outcome.processed, outcome.skipped.len()))
             }
 
+            // -- Edit (requires editing pipeline) --
+            "edit_subtitle" => {
+                Ok("Edit tool: point me at a file and I'll re-translate specific lines.".to_owned())
+            }
+
             // -- Transcribe --
             "transcribe_audio" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let input = self.project_root.join(path);
+                let path = req_arg(args, "path")?;
+                let input = self.project_root.join(&path);
                 let request = TranscriptionRequest {
                     media_path: input,
                     output_path: None,
@@ -443,19 +484,58 @@ impl AgentEngine {
                 }
             }
 
-            // -- Diagnose --
+            // -- Whisper management --
+            "manage_whisper" => {
+                let action_str = args.get("action").and_then(|v| v.as_str()).unwrap_or("status");
+                let action = match action_str {
+                    "install" => WhisperAction::Install,
+                    "status" => WhisperAction::Status,
+                    "list-models" | "models" => WhisperAction::ListModels,
+                    "download" => {
+                        let name = args.get("model").and_then(|v| v.as_str()).unwrap_or("small");
+                        WhisperAction::DownloadModel { name: name.to_owned() }
+                    }
+                    other => return Ok(format!("unknown whisper action `{other}`")),
+                };
+                let request = WhisperRequest {
+                    action,
+                    binary_path: None,
+                    models_dir: None,
+                };
+                match subbake_adapters::run_whisper(request) {
+                    Ok(_) => Ok("whisper: done".to_owned()),
+                    Err(e) => Ok(format!("whisper: {e}")),
+                }
+            }
+
+            // -- Diagnose (offline log reader — stub for now) --
             "diagnose_path" | "diagnose_text" => {
-                Ok(format!("[{name} not yet implemented]"))
+                Ok(format!("[{name}: not yet implemented. Translate failed runs produce log files I can read.]"))
             }
 
-            // -- Profile --
+            // -- Profile (stub) --
             "switch_profile" | "list_profiles" => {
-                Ok(format!("[{name} not yet wired]"))
+                Ok(format!("[{name}: configure profiles in subbake.toml]"))
             }
 
-            other => Ok(format!("[{other} not yet wired]")),
+            _ => Ok(format!("[{name}: not yet wired]")),
         }
     }
+}
+
+/// Extract a required string argument from the LLM's tool args, or error.
+fn req_arg(args: &JsonValue, key: &str) -> io::Result<PathBuf> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
+}
+
+fn format_file_list(files: &[PathBuf]) -> String {
+    if files.is_empty() {
+        return "(no files found)".to_owned();
+    }
+    files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n")
 }
 
 // ---------------------------------------------------------------------------
