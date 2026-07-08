@@ -171,6 +171,30 @@ impl SubBakeTui {
         Ok(())
     }
 
+    fn handle_slash(&self, input: &str) -> String {
+        match input {
+            "/help" | "/h" => {
+                r#"Commands:
+  /help /h  —  this menu
+  /plan     —  toggle plan mode
+  /approve  —  approve pending plan
+  /reject   —  reject pending plan
+  /undo     —  undo last file operation
+  /session  —  show session info
+  /quit     —  exit
+
+Or just type what you want, e.g. "translate @clip.srt""#
+                    .to_owned()
+            }
+            "/plan" | "/approve" | "/reject" | "/undo" | "/session" => {
+                format!("`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session.")
+            }
+            _ => {
+                format!("Unknown command `{input}`. Try /help.")
+            }
+        }
+    }
+
     fn welcome(&mut self, obs: &mut TuiObserver) -> io::Result<()> {
         obs.on_response("SubBake agent ready. Type a message or /help for commands.");
         Ok(())
@@ -270,6 +294,15 @@ impl SubBakeTui {
                     // Show user message.
                     if let Ok(mut v) = self.msg_view.lock() {
                         v.push(MsgStyle::User, format!("[{:?}] {}", iso_now(), trimmed));
+                    }
+
+                    // Handle slash commands locally.
+                    if trimmed.starts_with('/') {
+                        let response = self.handle_slash(&trimmed);
+                        if let Ok(mut v) = self.msg_view.lock() {
+                            v.push(MsgStyle::Response, response);
+                        }
+                        return Ok(());
                     }
 
                     // Process.

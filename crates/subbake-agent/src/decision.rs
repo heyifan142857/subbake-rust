@@ -17,10 +17,75 @@ use subbake_adapters::{
     WhisperAction, WhisperRequest,
     transcribe_media, translate_subtitle,
 };
-use subbake_core::ports::{ChatMessage, LlmBackend};
+use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
+use subbake_core::error::CoreResult;
+use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
 
 use crate::engine::AgentEngine;
 use crate::tools::ALL_TOOL_SPECS;
+
+// ---------------------------------------------------------------------------
+// Echo backend for agent decision loop (no TASK_START markers needed)
+// ---------------------------------------------------------------------------
+
+/// A lightweight `LlmBackend` that echoes the user message as a JSON
+/// decision.  Used when no real LLM provider is configured — the pipeline
+/// always chooses "respond" so the TUI/CLI flow can be exercised end-to-end.
+pub struct EchoDecisionBackend {
+    model: String,
+}
+
+impl EchoDecisionBackend {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+}
+
+impl LlmBackend for EchoDecisionBackend {
+    fn provider_name(&self) -> &str {
+        "echo-decision"
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        // Extract the user message (last user message).
+        let user_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "user")
+            .map(|msg| msg.content.as_str())
+            .unwrap_or("");
+
+        let decision = json!({
+            "action": "respond",
+            "text": user_text,
+            "confidence": 1.0
+        });
+        let text = serde_json::to_string(&decision).unwrap_or_default();
+        let input_tokens = user_text.chars().count().div_ceil(4).max(1);
+
+        Ok(BackendJsonResult {
+            payload: BackendPayload::Translation(BatchTranslationResult {
+                lines: vec![TranslationLine {
+                    id: "1".to_owned(),
+                    translation: text,
+                }],
+                summary: "echo decision".to_owned(),
+                glossary_updates: Vec::new(),
+            }),
+            usage: Usage {
+                input_tokens,
+                output_tokens: 1,
+                total_tokens: input_tokens + 1,
+            },
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -6,6 +6,7 @@ pub mod session;
 pub mod tools;
 pub mod tui;
 
+pub use decision::EchoDecisionBackend;
 pub use engine::{AgentEngine, EngineObserver, StreamingObserver};
 pub use guard::FileGuard;
 pub use session::*;

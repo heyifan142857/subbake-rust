@@ -1,7 +1,6 @@
 use std::io;
 
-use subbake_adapters::BackendConfig;
-use subbake_agent::{AgentEngine, AgentRequest, SubBakeTui};
+use subbake_agent::{AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui};
 
 use crate::args::AgentArgs;
 use crate::output::print_agent_outcome;
@@ -44,8 +43,8 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 
 fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
     // Build a mock LLM backend for the agent decision loop.
-    let mut backend = subbake_adapters::build_backend(&BackendConfig::new("mock", "mock-zh"))
-        .map_err(|e| io::Error::other(format!("build backend: {e}")))?;
+    let mut backend: Box<dyn subbake_core::ports::LlmBackend> =
+        Box::new(EchoDecisionBackend::new("mock-decision"));
 
     // Create the TUI with an observer attached to the engine.
     let mut tui = SubBakeTui::new()?;
