@@ -34,4 +34,7 @@ pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
     translate_subtitle, translate_subtitle_batch,
 };
-pub use whisper::{WhisperAction, WhisperOutcome, WhisperRequest, WhisperStatus, run_whisper};
+pub use whisper::{
+    WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,
+    run_whisper,
+};

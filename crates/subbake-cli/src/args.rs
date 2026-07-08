@@ -281,6 +281,10 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
     let (action, mut index) = match command {
         "status" => (WhisperAction::Status, 1usize),
         "install" => (WhisperAction::Install, 1usize),
+        "models" | "list-models" => (WhisperAction::ListModels, 1usize),
+        "model" if args.get(1).is_some_and(|value| value == "list") => {
+            (WhisperAction::ListModels, 2usize)
+        }
         "model" | "download-model" => {
             let name = args
                 .get(1)
@@ -555,6 +559,21 @@ mod tests {
             }
         );
         assert_eq!(parsed.binary_path, Some(PathBuf::from("tools/whisper-cli")));
+        assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
+    }
+
+    #[test]
+    fn parse_whisper_model_list_accepts_models_dir() {
+        let args = vec![
+            "model".to_owned(),
+            "list".to_owned(),
+            "--models-dir".to_owned(),
+            "models".to_owned(),
+        ];
+
+        let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+
+        assert_eq!(parsed.action, WhisperAction::ListModels);
         assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
     }
 }

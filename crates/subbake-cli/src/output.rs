@@ -130,6 +130,18 @@ fn whisper_text(outcome: &WhisperOutcome) -> String {
             status.models_dir.display(),
             exists_label(status.models_dir_exists)
         ),
+        WhisperOutcome::ModelList(list) => {
+            let mut output = format!(
+                "Model directory: {} ({})\nModels: {}\n",
+                list.models_dir.display(),
+                exists_label(list.models_dir_exists),
+                list.models.len()
+            );
+            for model in &list.models {
+                output.push_str(&format!("  {}: {}\n", model.name, model.path.display()));
+            }
+            output
+        }
     }
 }
 
@@ -294,6 +306,23 @@ mod tests {
 
         assert!(output.contains("whisper-cli (missing)"));
         assert!(output.contains("models (found)"));
+    }
+
+    #[test]
+    fn whisper_text_lists_models() {
+        let output = whisper_text(&WhisperOutcome::ModelList(
+            subbake_adapters::WhisperModelList {
+                models_dir: "models".into(),
+                models_dir_exists: true,
+                models: vec![subbake_adapters::WhisperModel {
+                    name: "ggml-base".to_owned(),
+                    path: "models/ggml-base.bin".into(),
+                }],
+            },
+        ));
+
+        assert!(output.contains("Models: 1"));
+        assert!(output.contains("ggml-base"));
     }
 
     #[test]

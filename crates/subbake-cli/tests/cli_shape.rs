@@ -60,6 +60,16 @@ fn whisper_status_is_available_without_installation() {
 }
 
 #[test]
+fn whisper_model_list_is_available_without_download() {
+    subbake_cli::run(vec![
+        "whisper".to_owned(),
+        "model".to_owned(),
+        "list".to_owned(),
+    ])
+    .expect("whisper model list should not require download backend");
+}
+
+#[test]
 fn whisper_model_reports_pending_backend() {
     let error = subbake_cli::run(vec![
         "whisper".to_owned(),
