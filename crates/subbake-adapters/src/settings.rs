@@ -2,13 +2,15 @@ use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{DEFAULT_BATCH_SIZE, PipelineOptions};
 
-use crate::providers::BackendConfig;
+use crate::providers::{BackendConfig, default_api_key_env, resolve_env_var};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationSettings {
     pub output_format: Option<String>,
     pub provider: String,
     pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
     pub source_language: String,
     pub target_language: String,
     pub batch_size: usize,
@@ -25,6 +27,9 @@ pub struct TranslationSettingsPatch {
     pub output_format: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     pub batch_size: Option<usize>,
@@ -42,6 +47,8 @@ impl Default for TranslationSettings {
             output_format: None,
             provider: "mock".to_owned(),
             model: "mock-zh".to_owned(),
+            api_key: None,
+            base_url: None,
             source_language: "Auto".to_owned(),
             target_language: "Chinese".to_owned(),
             batch_size: DEFAULT_BATCH_SIZE,
@@ -70,6 +77,18 @@ impl TranslationSettings {
         }
         if let Some(value) = patch.model {
             self.model = value;
+        }
+        if let Some(value) = patch.api_key {
+            self.api_key = Some(value);
+        }
+        if let Some(value) = patch.api_key_env {
+            // Resolve api_key_env to api_key eagerly, but only if no direct api_key was set.
+            if self.api_key.is_none() {
+                self.api_key = resolve_env_var(Some(&value));
+            }
+        }
+        if let Some(value) = patch.base_url {
+            self.base_url = Some(value);
         }
         if let Some(value) = patch.source_language {
             self.source_language = value;
@@ -101,7 +120,20 @@ impl TranslationSettings {
     }
 
     pub fn backend_config(&self) -> BackendConfig {
-        BackendConfig::new(self.provider.clone(), self.model.clone())
+        BackendConfig {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            api_key: self.resolve_api_key(),
+            base_url: self.base_url.clone(),
+        }
+    }
+
+    /// Resolve the API key: use the already-resolved direct/env value, or fall back
+    /// to the provider-default environment variable (e.g. OPENAI_API_KEY for "openai").
+    fn resolve_api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| resolve_env_var(default_api_key_env(&self.provider)))
     }
 
     pub fn to_pipeline_options(
@@ -114,6 +146,8 @@ impl TranslationSettings {
         options.output_format = self.output_format.clone();
         options.provider = self.provider.clone();
         options.model = self.model.clone();
+        options.api_key = self.backend_config().api_key;
+        options.base_url = self.base_url.clone();
         options.source_language = self.source_language.clone();
         options.target_language = self.target_language.clone();
         options.batch_size = self.batch_size;
@@ -183,5 +217,46 @@ mod tests {
         assert_eq!(settings.provider, "openai");
         assert_eq!(settings.batch_size, 12);
         assert!(!settings.final_review);
+    }
+
+    #[test]
+    fn builds_backend_config_with_api_key_sources() {
+        let settings = TranslationSettings {
+            provider: "openai".to_owned(),
+            model: "gpt".to_owned(),
+            api_key: Some("direct-key".to_owned()),
+            base_url: Some("https://example.test/v1".to_owned()),
+            ..TranslationSettings::default()
+        };
+
+        let config = settings.backend_config();
+
+        assert_eq!(config.api_key.as_deref(), Some("direct-key"));
+        assert_eq!(config.base_url.as_deref(), Some("https://example.test/v1"));
+    }
+
+    #[test]
+    fn apply_patch_resolves_api_key_env() {
+        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
+            api_key_env: Some("OPENAI_API_KEY".to_owned()),
+            provider: Some("openai".to_owned()),
+            ..TranslationSettingsPatch::default()
+        });
+
+        // api_key_env should be resolved eagerly in apply_patch.
+        // If OPENAI_API_KEY is not set in test env, api_key remains None.
+        assert_eq!(settings.api_key, std::env::var("OPENAI_API_KEY").ok());
+    }
+
+    #[test]
+    fn apply_patch_direct_api_key_overrides_api_key_env() {
+        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
+            api_key: Some("explicit-key".to_owned()),
+            api_key_env: Some("OPENAI_API_KEY".to_owned()),
+            ..TranslationSettingsPatch::default()
+        });
+
+        // direct api_key wins over api_key_env
+        assert_eq!(settings.api_key.as_deref(), Some("explicit-key"));
     }
 }

@@ -2,6 +2,7 @@ pub mod entities;
 pub mod error;
 pub mod formats;
 pub mod languages;
+pub mod memory;
 pub mod pipeline;
 pub mod ports;
 pub mod storage;
@@ -13,3 +14,4 @@ pub use entities::{
     TranslationLine, Usage,
 };
 pub use error::{CoreError, CoreResult};
+pub use memory::ContextMemory;

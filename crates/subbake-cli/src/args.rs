@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use subbake_adapters::{
     BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, load_translation_settings_patch,
+    WhisperAction, default_api_key_env, load_translation_settings_patch, resolve_env_var,
 };
 use subbake_agent::AgentAction;
 
@@ -222,11 +222,19 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
 
     let mut provider = "mock".to_owned();
     let mut model = "mock-zh".to_owned();
+    let mut api_key = None;
+    let mut api_key_env = None;
+    let mut base_url = None;
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "--provider" => provider = required_value(args, &mut index, "--provider")?,
             "--model" => model = required_value(args, &mut index, "--model")?,
+            "--api-key" => api_key = Some(required_value(args, &mut index, "--api-key")?),
+            "--api-key-env" => {
+                api_key_env = Some(required_value(args, &mut index, "--api-key-env")?)
+            }
+            "--base-url" => base_url = Some(required_value(args, &mut index, "--base-url")?),
             other => {
                 return Err(io::Error::other(format!(
                     "unknown provider option `{other}`"
@@ -236,8 +244,18 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
         index += 1;
     }
 
+    // Resolve API key: direct value > configured env var > provider-default env var
+    let resolved_api_key = api_key
+        .or_else(|| resolve_env_var(api_key_env.as_deref()))
+        .or_else(|| resolve_env_var(default_api_key_env(&provider)));
+
     Ok(ProviderArgs {
-        config: BackendConfig::new(provider, model),
+        config: BackendConfig {
+            provider,
+            model,
+            api_key: resolved_api_key,
+            base_url,
+        },
     })
 }
 
@@ -350,6 +368,15 @@ fn parse_translation_setting_option(
         "--output-format" => settings.output_format = Some(required_value(args, index, option)?),
         "--provider" => settings.provider = required_value(args, index, option)?,
         "--model" => settings.model = required_value(args, index, option)?,
+        "--api-key" => settings.api_key = Some(required_value(args, index, option)?),
+        "--api-key-env" => {
+            // Resolve --api-key-env to direct value eagerly
+            let name = required_value(args, index, option)?;
+            if settings.api_key.is_none() {
+                settings.api_key = resolve_env_var(Some(&name));
+            }
+        }
+        "--base-url" => settings.base_url = Some(required_value(args, index, option)?),
         "--source-lang" => settings.source_language = required_value(args, index, option)?,
         "--target-lang" => settings.target_language = required_value(args, index, option)?,
         "--batch-size" => settings.batch_size = parse_batch_size(args, index)?,
@@ -529,6 +556,33 @@ mod tests {
         let parsed = parse_provider_args(&args).expect("provider check should parse");
 
         assert_eq!(parsed.config, BackendConfig::new("mock", "mock-zh"));
+    }
+
+    #[test]
+    fn parse_provider_check_accepts_api_key_sources() {
+        let args = vec![
+            "check".to_owned(),
+            "--provider".to_owned(),
+            "openai".to_owned(),
+            "--model".to_owned(),
+            "gpt".to_owned(),
+            "--api-key-env".to_owned(),
+            "OPENAI_API_KEY".to_owned(),
+            "--base-url".to_owned(),
+            "https://example.test/v1".to_owned(),
+        ];
+
+        let parsed = parse_provider_args(&args).expect("provider check should parse");
+
+        assert_eq!(parsed.config.provider, "openai");
+        assert_eq!(
+            parsed.config.api_key.as_deref(),
+            None // env var is not resolved because it's not set in test env
+        );
+        assert_eq!(
+            parsed.config.base_url.as_deref(),
+            Some("https://example.test/v1")
+        );
     }
 
     #[test]

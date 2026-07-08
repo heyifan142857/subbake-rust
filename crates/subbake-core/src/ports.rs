@@ -90,8 +90,19 @@ pub enum BatchShardKind {
 pub trait RuntimeStore {
     fn paths(&self) -> &RuntimePaths;
     fn ensure_layout(&self) -> CoreResult<()>;
+
     fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()>;
+    fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
+        let _ = self;
+        Ok(Vec::new())
+    }
+
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
+    fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
+        let _ = self;
+        Ok(Vec::new())
+    }
+
     fn save_batch_segments(
         &self,
         kind: BatchShardKind,

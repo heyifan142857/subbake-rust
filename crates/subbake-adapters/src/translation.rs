@@ -6,11 +6,14 @@ use subbake_core::PipelineResult;
 use subbake_core::formats::RenderOptions;
 use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
+use subbake_core::ports::RuntimeStore;
+use subbake_core::storage::build_runtime_paths;
 
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };
 use crate::providers::build_backend;
+use crate::runtime_store::FileRuntimeStore;
 use crate::settings::TranslationSettings;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +65,21 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
         .settings
         .to_pipeline_options(request.input_path.clone(), Some(output_path.clone()));
     let backend = build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
+
+    // Wire runtime store for glossary/TM persistence.
+    let paths = build_runtime_paths(
+        &request.input_path,
+        request.settings.runtime_dir(),
+        request.settings.glossary_path(),
+        &request.settings.source_language,
+        &request.settings.target_language,
+        request.settings.fast_mode,
+    );
+    let store = FileRuntimeStore::new(paths);
+    store.ensure_layout().map_err(io::Error::other)?;
+
     let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options);
+    pipeline = pipeline.with_store(Box::new(store));
     let run = pipeline.run_document(&document).map_err(io::Error::other)?;
 
     if request.settings.dry_run {

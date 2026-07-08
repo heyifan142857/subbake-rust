@@ -73,6 +73,50 @@ impl RuntimeStore for FileRuntimeStore {
         ]);
         write_json_verified(&path, &payload)
     }
+
+    fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
+        if !self.paths.glossary_path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&self.paths.glossary_path)
+            .map_err(storage_error)?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&text)
+                .map_err(|error| CoreError::Data(format!(
+                    "glossary parse failed: {error}",
+                )))?;
+        let entries: Vec<(String, String)> = map
+            .into_iter()
+            .filter_map(|(source, value)| {
+                value
+                    .as_str()
+                    .map(|target| (source, target.to_owned()))
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
+        if !self.paths.translation_memory_path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&self.paths.translation_memory_path)
+            .map_err(storage_error)?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&text)
+                .map_err(|error| CoreError::Data(format!(
+                    "translation memory parse failed: {error}",
+                )))?;
+        let entries: Vec<(String, String)> = map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|translation| (key, translation.to_owned()))
+            })
+            .collect();
+        Ok(entries)
+    }
 }
 
 fn string_map_json(entries: &[(String, String)]) -> JsonValue {
@@ -163,6 +207,47 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(content, r#"{"Alice":"爱丽丝"}"#);
+    }
+
+    #[test]
+    fn round_trips_glossary_via_save_and_load() {
+        let root = temp_root("glossary-rt");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let entries = vec![
+            ("Alice".to_owned(), "爱丽丝".to_owned()),
+            ("Bob".to_owned(), "鲍勃".to_owned()),
+        ];
+        store.save_glossary(&entries).expect("save");
+        let loaded = store.load_glossary().expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains(&("Alice".to_owned(), "爱丽丝".to_owned())));
+        assert!(loaded.contains(&("Bob".to_owned(), "鲍勃".to_owned())));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_glossary_returns_empty_when_file_missing() {
+        let root = temp_root("glossary-empty");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let loaded = store.load_glossary().expect("load");
+        assert!(loaded.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

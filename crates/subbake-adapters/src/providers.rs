@@ -7,6 +7,8 @@ use crate::mock::MockBackend;
 pub struct BackendConfig {
     pub provider: String,
     pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,16 +28,55 @@ impl BackendConfig {
         Self {
             provider: provider.into(),
             model: model.into(),
+            api_key: None,
+            base_url: None,
         }
     }
 }
 
+pub fn default_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider.to_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "gemini" => Some("GEMINI_API_KEY"),
+        _ => None,
+    }
+}
+
+pub fn resolve_env_var(env_var: Option<&str>) -> Option<String> {
+    env_var
+        .and_then(non_empty_string)
+        .and_then(|name| std::env::var(name).ok())
+        .and_then(|value| non_empty_string(&value).map(ToOwned::to_owned))
+}
+
 pub fn build_backend(config: &BackendConfig) -> CoreResult<Box<dyn LlmBackend>> {
+    build_backend_with_timeout(config, crate::llm_backends::default_timeout_seconds())
+}
+
+/// Build a backend with an explicit request timeout (seconds). The translation
+/// paths carry a configured timeout; credential checks use the default.
+pub fn build_backend_with_timeout(
+    config: &BackendConfig,
+    timeout_seconds: f64,
+) -> CoreResult<Box<dyn LlmBackend>> {
     match config.provider.to_lowercase().as_str() {
         "mock" => Ok(Box::new(MockBackend::new(config.model.clone()))),
+        "openai" => crate::llm_backends::openai_backend(config, timeout_seconds),
+        "gemini" => crate::llm_backends::gemini_backend(config, timeout_seconds),
+        "anthropic" => crate::llm_backends::anthropic_backend(config, timeout_seconds),
         provider => Err(CoreError::Backend(format!(
-            "provider `{provider}` adapter is pending migration"
+            "unsupported provider `{provider}`"
         ))),
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -67,11 +108,28 @@ mod tests {
 
     #[test]
     fn rejects_unknown_backend() {
-        let error = match build_backend(&BackendConfig::new("openai", "gpt")) {
-            Ok(_) => panic!("openai should be pending"),
+        let error = match build_backend(&BackendConfig::new("zzz-unknown", "model")) {
+            Ok(_) => panic!("unknown provider should not build"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("pending migration"));
+        assert!(error.to_string().contains("unsupported provider"));
+    }
+
+    #[test]
+    fn openai_backend_requires_api_key() {
+        let error = match build_backend(&BackendConfig::new("openai", "gpt")) {
+            Ok(_) => panic!("missing api key should fail build"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("API key"));
+    }
+
+    #[test]
+    fn default_api_key_env_depends_on_provider() {
+        assert_eq!(default_api_key_env("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(default_api_key_env("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(default_api_key_env("gemini"), Some("GEMINI_API_KEY"));
+        assert_eq!(default_api_key_env("mock"), None);
     }
 
     #[test]

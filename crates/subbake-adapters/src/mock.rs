@@ -1,8 +1,9 @@
-use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
+use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine, Usage};
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::languages::{language_short_code, normalize_language_name};
-use subbake_core::pipeline::unescape_field;
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
+
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone)]
 pub struct MockBackend {
@@ -68,47 +69,48 @@ impl LlmBackend for MockBackend {
 }
 
 fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
-    let target_language = extract_context_value(prompt, "target_language")?
-        .map(|value| normalize_language_name(&value, false))
+    let context_json = extract_between(prompt, "CONTEXT_JSON_START", "CONTEXT_JSON_END")?;
+    let context: JsonValue = serde_json::from_str(context_json)
+        .map_err(|err| CoreError::Backend(format!("invalid context json: {err}")))?;
+    let target_language = context["tgt"]
+        .as_str()
+        .map(|value| normalize_language_name(value, false))
         .unwrap_or_else(|| "Chinese".to_owned());
     let tag = language_short_code(&target_language);
-    let body = extract_between(prompt, "BATCH_LINES_START", "BATCH_LINES_END")?;
+
+    let batch_json = extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END")?;
+    let batch: JsonValue = serde_json::from_str(batch_json)
+        .map_err(|err| CoreError::Backend(format!("invalid batch json: {err}")))?;
+    let entries = batch["lines"]
+        .as_array()
+        .ok_or_else(|| CoreError::Backend("mock batch is missing lines array".to_owned()))?;
 
     let mut lines = Vec::new();
-    for raw_line in body.lines().filter(|line| !line.trim().is_empty()) {
-        let (id, text) = raw_line.split_once('\t').ok_or_else(|| {
-            CoreError::Backend("mock batch line is missing tab separator".to_owned())
-        })?;
-        let text = unescape_field(text)?;
+    let mut glossary_updates = Vec::new();
+    for entry in entries {
+        let id = entry["id"].as_str().unwrap_or_default().to_owned();
+        let text = entry["text"].as_str().unwrap_or_default().to_owned();
         let translation = if text.trim().is_empty() {
             String::new()
         } else {
             format!("[MOCK-{tag}] {text}")
         };
-        lines.push(TranslationLine {
-            id: unescape_field(id)?,
-            translation,
-        });
+        lines.push(TranslationLine { id, translation });
+
+        if glossary_updates.is_empty() && !text.trim().is_empty() {
+            let source_word = text.split_whitespace().next().unwrap_or(&text).to_owned();
+            glossary_updates.push(GlossaryEntry {
+                source: source_word,
+                target: format!("[MOCK-{tag}]"),
+            });
+        }
     }
 
     Ok(BatchTranslationResult {
         lines,
         summary: "Mock summary of the latest subtitle batch.".to_owned(),
-        glossary_updates: Vec::new(),
+        glossary_updates,
     })
-}
-
-fn extract_context_value(prompt: &str, key: &str) -> CoreResult<Option<String>> {
-    let context = extract_between(prompt, "CONTEXT_START", "CONTEXT_END")?;
-    for raw_line in context.lines() {
-        let Some((left, right)) = raw_line.split_once('=') else {
-            continue;
-        };
-        if left == key {
-            return Ok(Some(unescape_field(right)?));
-        }
-    }
-    Ok(None)
 }
 
 fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> CoreResult<&'a str> {
@@ -125,4 +127,56 @@ fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> C
 
 fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translate_prompt(text: &str, target_language: &str) -> String {
+        let context = serde_json::json!({
+            "src": "English",
+            "tgt": target_language,
+            "batch_index": 1,
+            "fast": false,
+        });
+        let batch = serde_json::json!({"lines":[{"id":"1","text":text}]});
+        let context_json = serde_json::to_string(&context).unwrap_or_default();
+        let batch_json = serde_json::to_string(&batch).unwrap_or_default();
+        format!(
+            "TASK_START\ntranslate_subtitles\nTASK_END\n\
+             CONTEXT_JSON_START{context_json}CONTEXT_JSON_END\n\
+             BATCH_JSON_START{batch_json}BATCH_JSON_END"
+        )
+    }
+
+    #[test]
+    fn mock_translates_batch_and_produces_glossary_update() {
+        let mut backend = MockBackend::new("mock-zh");
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user(translate_prompt("hello world", "Chinese")),
+        ];
+        let result = backend.generate_json(&messages).expect("mock generate");
+        let BackendPayload::Translation(batch) = result.payload;
+
+        assert_eq!(batch.lines.len(), 1);
+        assert!(batch.lines[0].translation.contains("[MOCK-"));
+        assert!(!batch.glossary_updates.is_empty());
+        assert_eq!(batch.glossary_updates[0].source, "hello");
+    }
+
+    #[test]
+    fn mock_leaves_empty_text_empty() {
+        let mut backend = MockBackend::default();
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user(translate_prompt("  ", "Chinese")),
+        ];
+        let result = backend.generate_json(&messages).expect("mock generate");
+        let BackendPayload::Translation(batch) = result.payload;
+
+        assert_eq!(batch.lines[0].translation, "");
+        assert!(batch.glossary_updates.is_empty());
+    }
 }
