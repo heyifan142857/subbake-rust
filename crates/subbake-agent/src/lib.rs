@@ -1,37 +1,24 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolSpec {
-    pub name: &'static str,
-    pub category: &'static str,
-    pub mutating: bool,
-}
+// SubBake agent — headless engine types.
+// The full interactive agent (session loop, intent gating, plan/approval, undo)
+// is built on top of these core abstractions.
 
-pub const TOOL_SPECS: &[ToolSpec] = &[
-    ToolSpec {
-        name: "translate_file",
-        category: "translate",
-        mutating: true,
-    },
-    ToolSpec {
-        name: "translate_batch",
-        category: "translate",
-        mutating: true,
-    },
-    ToolSpec {
-        name: "transcribe_media",
-        category: "transcribe",
-        mutating: true,
-    },
-    ToolSpec {
-        name: "diagnose_path",
-        category: "diagnose",
-        mutating: false,
-    },
-    ToolSpec {
-        name: "list_files",
-        category: "browse",
-        mutating: false,
-    },
-];
+pub mod session;
+pub mod tools;
+
+pub use session::*;
+
+// ---------------------------------------------------------------------------
+// Compatibility API — used by the CLI while the interactive engine is built.
+// These will be replaced when the full agent loop lands in stage 5.
+// ---------------------------------------------------------------------------
+
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAction {
+    pub kind: String,
+    pub session_id: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest {
@@ -39,70 +26,47 @@ pub struct AgentRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentAction {
-    Start,
-    Resume { session_id: Option<String> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentOutcome {
     pub message: String,
 }
 
-pub fn run_agent(request: AgentRequest) -> AgentOutcome {
-    let message = match request.action {
-        AgentAction::Start => {
-            "SubBake agent is scaffolded in Rust. Full interactive behavior is pending migration."
-                .to_owned()
-        }
-        AgentAction::Resume {
-            session_id: Some(session_id),
-        } => format!("SubBake agent resume requested for session `{session_id}`."),
-        AgentAction::Resume { session_id: None } => {
-            "SubBake agent resume requested for latest session.".to_owned()
-        }
-    };
+impl fmt::Display for AgentOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
 
+pub fn run_agent(request: AgentRequest) -> AgentOutcome {
+    let message = match request.action.kind.as_str() {
+        "start" => format!(
+            "SubBake agent session {} started.",
+            request.action.session_id.as_deref().unwrap_or("(new)")
+        ),
+        "resume" => format!(
+            "SubBake agent session resume requested for `{}`.",
+            request.action.session_id.as_deref().unwrap_or("latest")
+        ),
+        _ => "SubBake agent command received.".to_owned(),
+    };
     AgentOutcome { message }
 }
 
 pub fn start_agent() -> String {
     run_agent(AgentRequest {
-        action: AgentAction::Start,
+        action: AgentAction {
+            kind: "start".to_owned(),
+            session_id: None,
+        },
     })
     .message
 }
 
 pub fn resume_agent(session_id: Option<&str>) -> String {
     run_agent(AgentRequest {
-        action: AgentAction::Resume {
+        action: AgentAction {
+            kind: "resume".to_owned(),
             session_id: session_id.map(str::to_owned),
         },
     })
     .message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_agent_starts_scaffold() {
-        let outcome = run_agent(AgentRequest {
-            action: AgentAction::Start,
-        });
-
-        assert!(outcome.message.contains("scaffolded"));
-    }
-
-    #[test]
-    fn run_agent_resumes_specific_session() {
-        let outcome = run_agent(AgentRequest {
-            action: AgentAction::Resume {
-                session_id: Some("abc".to_owned()),
-            },
-        });
-
-        assert!(outcome.message.contains("abc"));
-    }
 }

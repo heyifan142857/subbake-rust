@@ -75,14 +75,18 @@ impl TranslateArgs {
 
 pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
     let action = match args.first().map(String::as_str) {
-        None => AgentAction::Start,
+        None => AgentAction {
+            kind: "start".to_owned(),
+            session_id: None,
+        },
         Some("resume") => {
             if args.len() > 2 {
                 return Err(io::Error::other(
                     "agent resume accepts at most one session id",
                 ));
             }
-            AgentAction::Resume {
+            AgentAction {
+                kind: "resume".to_owned(),
                 session_id: args.get(1).cloned(),
             }
         }
@@ -452,8 +456,9 @@ mod tests {
 
         assert_eq!(
             parsed.action,
-            AgentAction::Resume {
-                session_id: Some("abc".to_owned())
+            AgentAction {
+                kind: "resume".to_owned(),
+                session_id: Some("abc".to_owned()),
             }
         );
     }

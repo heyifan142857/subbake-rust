@@ -784,6 +784,11 @@ dependencies = [
 [[package]]
 name = "subbake-agent"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subbake-core",
+]
 
 [[package]]
 name = "subbake-cli"
