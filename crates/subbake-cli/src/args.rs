@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use subbake_adapters::{
     BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, default_api_key_env, load_translation_settings_patch, resolve_env_var,
+    WhisperAction, default_api_key_env, discover_config_path, load_and_resolve,
+    load_translation_settings_patch, resolve_env_var,
 };
 use subbake_agent::AgentAction;
 
@@ -17,6 +18,7 @@ pub struct TranslateArgs {
     pub input_path: PathBuf,
     pub output: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
+    pub profile: Option<String>,
     pub settings: TranslationSettings,
     pub json: bool,
 }
@@ -67,6 +69,7 @@ impl TranslateArgs {
             input_path: input_path.into(),
             output: None,
             config_path: None,
+            profile: None,
             settings: TranslationSettings::default(),
             json: false,
         }
@@ -117,12 +120,33 @@ fn parse_file_translation_args(
         .first()
         .ok_or_else(|| io::Error::other(missing_input_message))?;
     let mut parsed = TranslateArgs::default_for(input_path);
-    apply_config_if_present(args, 1, &mut parsed.config_path, &mut parsed.settings)?;
+
+    // First pass: extract --config and --profile (store their values).
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
+
+    // Discover config file if none given via --config.
+    let cfg_file = explicit_config.clone().unwrap_or_else(|| {
+        discover_config_path().unwrap_or_else(|| PathBuf::from(".subbake.toml"))
+    });
+
+    // Load config + resolve profile as the baseline.
+    if let Ok(Some(patch)) = load_and_resolve(&cfg_file, explicit_profile.as_deref()) {
+        parsed.settings.apply_patch(patch);
+    }
+    if cfg_file.exists() {
+        parsed.config_path = Some(cfg_file);
+    }
+    parsed.profile = explicit_profile;
+
+    // Second pass: all remaining CLI flags override.
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
-            "--config" => parsed.config_path = Some(required_path(args, &mut index, "--config")?),
+            "--config" | "--profile" => {
+                // Skip flag + value (already consumed in first pass).
+                skip_two(args, &mut index)?;
+            }
             "--json" => parsed.json = true,
             value
                 if parse_translation_setting_option(
@@ -140,6 +164,39 @@ fn parse_file_translation_args(
         index += 1;
     }
     Ok(parsed)
+}
+
+/// Scan only for `--config` and `--profile`, returning their values.
+fn extract_config_and_profile(args: &[String]) -> (Option<PathBuf>, Option<String>) {
+    let mut config_path = None;
+    let mut profile = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" if i + 1 < args.len() => {
+                config_path = Some(PathBuf::from(args[i + 1].clone()));
+                i += 2;
+                continue;
+            }
+            "--profile" if i + 1 < args.len() => {
+                profile = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (config_path, profile)
+}
+
+/// Skip a flag and its value (used to avoid re-consuming --config/--profile).
+fn skip_two(args: &[String], index: &mut usize) -> io::Result<()> {
+    if *index + 1 >= args.len() {
+        return Err(io::Error::other(format!("{} requires a value", args[*index])));
+    }
+    *index += 1;
+    Ok(())
 }
 
 pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {

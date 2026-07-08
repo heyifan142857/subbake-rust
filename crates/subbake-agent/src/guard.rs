@@ -10,7 +10,15 @@
 use std::path::{Path, PathBuf};
 
 /// Path components that are never allowed in file operations.
-pub const PROTECTED_PATH_PARTS: &[&str] = &[".git", ".hg", ".svn", ".venv", "venv", ".subbake", "__pycache__"];
+pub const PROTECTED_PATH_PARTS: [&str; 7] = [
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    ".subbake",
+    "__pycache__",
+];
 
 /// The result of a successful file operation.
 #[derive(Debug, Clone, PartialEq, Eq)]

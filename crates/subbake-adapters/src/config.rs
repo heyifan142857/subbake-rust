@@ -10,6 +10,43 @@ pub fn load_translation_settings_patch(path: &Path) -> io::Result<TranslationSet
     parse_translation_settings_patch(&content).map_err(io::Error::other)
 }
 
+/// Discover config file from XDG paths or project root.
+pub fn discover_config_path() -> Option<PathBuf> {
+    // 1. XDG_CONFIG_HOME / default ~/.config
+    let candidates = vec![
+        std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs_or_default()
+            })
+            .join("subbake/config.toml"),
+        dirs_or_default().join("subbake/config.toml"),
+        PathBuf::from(".subbake.toml"),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn dirs_or_default() -> PathBuf {
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".config"))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Load a config file (full format) and resolve the named profile
+/// (or `default_profile`). Returns `None` if the file doesn't exist.
+pub fn load_and_resolve(path: &Path, profile: Option<&str>) -> io::Result<Option<TranslationSettingsPatch>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let config = ConfigFile::load(path)?;
+    let resolved = config.resolve(profile);
+    if resolved == TranslationSettingsPatch::default() {
+        // All fields are None → nothing to apply.
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
 pub fn parse_translation_settings_patch(content: &str) -> Result<TranslationSettingsPatch, String> {
     let mut patch = TranslationSettingsPatch::default();
 
