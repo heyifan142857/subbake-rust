@@ -1,8 +1,8 @@
 use std::io;
 
 use crate::args::{
-    parse_batch_args, parse_pipeline_args, parse_provider_args, parse_runtime_args,
-    parse_transcribe_args, parse_translate_args, parse_whisper_args,
+    parse_agent_args, parse_batch_args, parse_pipeline_args, parse_provider_args,
+    parse_runtime_args, parse_transcribe_args, parse_translate_args, parse_whisper_args,
 };
 
 mod agent;
@@ -15,12 +15,11 @@ mod whisper;
 
 pub fn dispatch(args: Vec<String>) -> io::Result<()> {
     if args.is_empty() {
-        println!("{}", subbake_agent::start_agent());
-        return Ok(());
+        return agent::run(parse_agent_args(&[])?);
     }
 
     match args[0].as_str() {
-        "agent" => agent::run(&args[1..]),
+        "agent" => agent::run(parse_agent_args(&args[1..])?),
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),

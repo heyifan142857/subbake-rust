@@ -1,17 +1,14 @@
 use std::io;
 
-pub fn run(args: &[String]) -> io::Result<()> {
-    if args.first().is_some_and(|value| value == "resume") {
-        println!(
-            "{}",
-            subbake_agent::resume_agent(args.get(1).map(String::as_str))
-        );
-    } else if args.is_empty() {
-        println!("{}", subbake_agent::start_agent());
-    } else {
-        return Err(io::Error::other(
-            "unsupported agent command; use `agent resume [SESSION_ID]`",
-        ));
-    }
+use subbake_agent::AgentRequest;
+
+use crate::args::AgentArgs;
+use crate::output::print_agent_outcome;
+
+pub fn run(args: AgentArgs) -> io::Result<()> {
+    let outcome = subbake_agent::run_agent(AgentRequest {
+        action: args.action,
+    });
+    print_agent_outcome(&outcome);
     Ok(())
 }

@@ -5,6 +5,12 @@ use subbake_adapters::{
     BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
     WhisperAction, load_translation_settings_patch,
 };
+use subbake_agent::AgentAction;
+
+#[derive(Debug, Clone)]
+pub struct AgentArgs {
+    pub action: AgentAction,
+}
 
 #[derive(Debug, Clone)]
 pub struct TranslateArgs {
@@ -65,6 +71,29 @@ impl TranslateArgs {
             json: false,
         }
     }
+}
+
+pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
+    let action = match args.first().map(String::as_str) {
+        None => AgentAction::Start,
+        Some("resume") => {
+            if args.len() > 2 {
+                return Err(io::Error::other(
+                    "agent resume accepts at most one session id",
+                ));
+            }
+            AgentAction::Resume {
+                session_id: args.get(1).cloned(),
+            }
+        }
+        Some(_) => {
+            return Err(io::Error::other(
+                "unsupported agent command; use `agent resume [SESSION_ID]`",
+            ));
+        }
+    };
+
+    Ok(AgentArgs { action })
 }
 
 pub fn parse_translate_args(args: &[String]) -> io::Result<TranslateArgs> {
@@ -399,6 +428,20 @@ mod tests {
         ];
         let error = parse_translate_args(&args).expect_err("zero batch size should fail");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_agent_resume_accepts_optional_session() {
+        let args = vec!["resume".to_owned(), "abc".to_owned()];
+
+        let parsed = parse_agent_args(&args).expect("agent resume should parse");
+
+        assert_eq!(
+            parsed.action,
+            AgentAction::Resume {
+                session_id: Some("abc".to_owned())
+            }
+        );
     }
 
     #[test]
