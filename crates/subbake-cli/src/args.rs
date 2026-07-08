@@ -119,33 +119,14 @@ fn parse_file_translation_args(
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
             "--config" => parsed.config_path = Some(required_path(args, &mut index, "--config")?),
-            "--output-format" => {
-                parsed.settings.output_format =
-                    Some(required_value(args, &mut index, "--output-format")?)
-            }
-            "--provider" => {
-                parsed.settings.provider = required_value(args, &mut index, "--provider")?
-            }
-            "--model" => parsed.settings.model = required_value(args, &mut index, "--model")?,
-            "--source-lang" => {
-                parsed.settings.source_language = required_value(args, &mut index, "--source-lang")?
-            }
-            "--target-lang" => {
-                parsed.settings.target_language = required_value(args, &mut index, "--target-lang")?
-            }
-            "--batch-size" => parsed.settings.batch_size = parse_batch_size(args, &mut index)?,
-            "--bilingual" => parsed.settings.bilingual = true,
-            "--fast" => parsed.settings.fast_mode = true,
-            "--no-review" => parsed.settings.final_review = false,
-            "--dry-run" => parsed.settings.dry_run = true,
-            "--runtime-dir" => {
-                parsed.settings.runtime_dir =
-                    Some(required_path(args, &mut index, "--runtime-dir")?)
-            }
-            "--glossary" => {
-                parsed.settings.glossary_path = Some(required_path(args, &mut index, "--glossary")?)
-            }
             "--json" => parsed.json = true,
+            value
+                if parse_translation_setting_option(
+                    value,
+                    args,
+                    &mut index,
+                    &mut parsed.settings,
+                )? => {}
             other => {
                 return Err(io::Error::other(format!(
                     "unknown {command_name} option `{other}`"
@@ -181,39 +162,13 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
             "--recursive" => parsed.recursive = true,
             "--overwrite" => parsed.overwrite = true,
             "--config" => parsed.config_path = Some(required_path(args, &mut index, "--config")?),
-            "--output-format" => {
-                parsed.translate.settings.output_format =
-                    Some(required_value(args, &mut index, "--output-format")?)
-            }
-            "--provider" => {
-                parsed.translate.settings.provider = required_value(args, &mut index, "--provider")?
-            }
-            "--model" => {
-                parsed.translate.settings.model = required_value(args, &mut index, "--model")?
-            }
-            "--source-lang" => {
-                parsed.translate.settings.source_language =
-                    required_value(args, &mut index, "--source-lang")?
-            }
-            "--target-lang" => {
-                parsed.translate.settings.target_language =
-                    required_value(args, &mut index, "--target-lang")?
-            }
-            "--batch-size" => {
-                parsed.translate.settings.batch_size = parse_batch_size(args, &mut index)?
-            }
-            "--bilingual" => parsed.translate.settings.bilingual = true,
-            "--fast" => parsed.translate.settings.fast_mode = true,
-            "--no-review" => parsed.translate.settings.final_review = false,
-            "--dry-run" => parsed.translate.settings.dry_run = true,
-            "--runtime-dir" => {
-                parsed.translate.settings.runtime_dir =
-                    Some(required_path(args, &mut index, "--runtime-dir")?)
-            }
-            "--glossary" => {
-                parsed.translate.settings.glossary_path =
-                    Some(required_path(args, &mut index, "--glossary")?)
-            }
+            value
+                if parse_translation_setting_option(
+                    value,
+                    args,
+                    &mut index,
+                    &mut parsed.translate.settings,
+                )? => {}
             other => return Err(io::Error::other(format!("unknown batch option `{other}`"))),
         }
         index += 1;
@@ -376,6 +331,31 @@ fn apply_config_if_present(
     settings.apply_patch(patch);
     *config_path = Some(path);
     Ok(())
+}
+
+fn parse_translation_setting_option(
+    option: &str,
+    args: &[String],
+    index: &mut usize,
+    settings: &mut TranslationSettings,
+) -> io::Result<bool> {
+    match option {
+        "--output-format" => settings.output_format = Some(required_value(args, index, option)?),
+        "--provider" => settings.provider = required_value(args, index, option)?,
+        "--model" => settings.model = required_value(args, index, option)?,
+        "--source-lang" => settings.source_language = required_value(args, index, option)?,
+        "--target-lang" => settings.target_language = required_value(args, index, option)?,
+        "--batch-size" => settings.batch_size = parse_batch_size(args, index)?,
+        "--runtime-dir" => settings.runtime_dir = Some(required_path(args, index, option)?),
+        "--glossary" => settings.glossary_path = Some(required_path(args, index, option)?),
+        "--bilingual" => settings.bilingual = true,
+        "--fast" => settings.fast_mode = true,
+        "--no-review" => settings.final_review = false,
+        "--dry-run" => settings.dry_run = true,
+        _ => return Ok(false),
+    }
+
+    Ok(true)
 }
 
 fn option_path_value_from(
