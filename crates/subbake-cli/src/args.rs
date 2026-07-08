@@ -195,6 +195,9 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
                 parsed.settings.language = Some(required_value(args, &mut index, "--language")?)
             }
             "--model" => parsed.settings.model = Some(required_value(args, &mut index, "--model")?),
+            "--sidecar" => {
+                parsed.settings.sidecar_path = Some(required_path(args, &mut index, "--sidecar")?)
+            }
             "--format" => {
                 let value = required_value(args, &mut index, "--format")?;
                 parsed.settings.output_format = TranscriptionFormat::parse(&value)
@@ -503,6 +506,8 @@ mod tests {
             "base".to_owned(),
             "--format".to_owned(),
             "vtt".to_owned(),
+            "--sidecar".to_owned(),
+            "movie.srt".to_owned(),
         ];
 
         let parsed = parse_transcribe_args(&args).expect("transcribe args should parse");
@@ -511,6 +516,10 @@ mod tests {
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
         assert_eq!(parsed.settings.model.as_deref(), Some("base"));
         assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
+        assert_eq!(
+            parsed.settings.sidecar_path,
+            Some(PathBuf::from("movie.srt"))
+        );
     }
 
     #[test]
