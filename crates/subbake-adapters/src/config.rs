@@ -214,6 +214,11 @@ fn apply_key_value(
         "dry_run" => patch.dry_run = Some(value.into_bool(key)?),
         "resume" => patch.resume = Some(value.into_bool(key)?),
         "cache" | "use_cache" => patch.use_cache = Some(value.into_bool(key)?),
+        "retries" => patch.retries = Some(value.into_nonnegative_usize(key)?),
+        "agent" => patch.agent = Some(value.into_bool(key)?),
+        "agent_repair_attempts" => {
+            patch.agent_repair_attempts = Some(value.into_nonnegative_usize(key)?);
+        }
         "runtime_dir" => patch.runtime_dir = Some(PathBuf::from(value.into_string(key)?)),
         "glossary" | "glossary_path" => {
             patch.glossary_path = Some(PathBuf::from(value.into_string(key)?));
@@ -253,6 +258,15 @@ impl ConfigValue {
         match self {
             ConfigValue::Integer(value) if value > 0 => Ok(value),
             ConfigValue::Integer(_) => Err(format!("config key `{key}` must be greater than zero")),
+            ConfigValue::String(_) | ConfigValue::Bool(_) => {
+                Err(format!("config key `{key}` expects an integer"))
+            }
+        }
+    }
+
+    fn into_nonnegative_usize(self, key: &str) -> Result<usize, String> {
+        match self {
+            ConfigValue::Integer(value) => Ok(value),
             ConfigValue::String(_) | ConfigValue::Bool(_) => {
                 Err(format!("config key `{key}` expects an integer"))
             }
@@ -338,6 +352,9 @@ mod tests {
             final_review = false
             resume = false
             cache = false
+            retries = 0
+            agent = false
+            agent_repair_attempts = 3
             "#,
         )
         .expect("config should parse");
@@ -351,6 +368,9 @@ mod tests {
         assert_eq!(patch.final_review, Some(false));
         assert_eq!(patch.resume, Some(false));
         assert_eq!(patch.use_cache, Some(false));
+        assert_eq!(patch.retries, Some(0));
+        assert_eq!(patch.agent, Some(false));
+        assert_eq!(patch.agent_repair_attempts, Some(3));
     }
 
     #[test]

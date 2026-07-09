@@ -469,7 +469,7 @@ pub(crate) fn extract_json_object(text: &str) -> CoreResult<JsonValue> {
 pub(crate) fn parse_translation_payload(value: &JsonValue) -> CoreResult<BatchTranslationResult> {
     let lines = value["lines"]
         .as_array()
-        .ok_or_else(|| CoreError::Backend("response missing lines array".to_owned()))?
+        .ok_or_else(|| CoreError::InvalidTranslation("response missing lines array".to_owned()))?
         .iter()
         .map(|entry| TranslationLine {
             id: entry["id"].as_str().unwrap_or_default().to_owned(),

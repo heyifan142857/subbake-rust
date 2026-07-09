@@ -1,4 +1,6 @@
-use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine, Usage};
+use subbake_core::entities::{
+    BatchTranslationResult, GlossaryEntry, ReviewResult, TranslationLine, Usage,
+};
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::languages::{language_short_code, normalize_language_name};
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
@@ -40,8 +42,9 @@ impl LlmBackend for MockBackend {
             .collect::<Vec<_>>()
             .join("\n");
         let task = extract_between(&prompt, "TASK_START", "TASK_END")?.trim();
-        let result = match task {
-            "translate_subtitles" => translate_subtitles(&prompt)?,
+        let payload = match task {
+            "translate_subtitles" => BackendPayload::Translation(translate_subtitles(&prompt)?),
+            "review_translations" => BackendPayload::Review(review_translations(&prompt)?),
             other => {
                 return Err(CoreError::Backend(format!(
                     "unsupported mock task `{other}`"
@@ -49,9 +52,9 @@ impl LlmBackend for MockBackend {
             }
         };
         let input_tokens = estimate_tokens(&prompt);
-        let output_tokens = estimate_tokens(&format!("{result:?}"));
+        let output_tokens = estimate_tokens(&format!("{payload:?}"));
         Ok(BackendJsonResult {
-            payload: BackendPayload::Translation(result),
+            payload,
             usage: Usage {
                 input_tokens,
                 output_tokens,
@@ -65,25 +68,12 @@ impl LlmBackend for MockBackend {
         messages: &[ChatMessage],
     ) -> CoreResult<(serde_json::Value, Usage)> {
         let result = self.generate_json(messages)?;
-        let BackendPayload::Translation(batch) = result.payload;
-        let lines: Vec<serde_json::Value> = batch
-            .lines
-            .into_iter()
-            .map(|line| serde_json::json!({"id": line.id, "translation": line.translation}))
-            .collect();
-        let glossary_updates: Vec<serde_json::Value> = batch
-            .glossary_updates
-            .into_iter()
-            .map(|entry| serde_json::json!({"source": entry.source, "target": entry.target}))
-            .collect();
-        Ok((
-            serde_json::json!({
-                "lines": lines,
-                "summary": batch.summary,
-                "glossary_updates": glossary_updates,
-            }),
-            result.usage,
-        ))
+        let payload = match result.payload {
+            BackendPayload::Translation(batch) => serde_json::to_value(batch),
+            BackendPayload::Review(review) => serde_json::to_value(review),
+        }
+        .map_err(|error| CoreError::Backend(format!("mock response encode failed: {error}")))?;
+        Ok((payload, result.usage))
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -139,6 +129,26 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
     })
 }
 
+fn review_translations(prompt: &str) -> CoreResult<ReviewResult> {
+    let review_json = extract_between(prompt, "REVIEW_JSON_START", "REVIEW_JSON_END")?;
+    let review: JsonValue = serde_json::from_str(review_json)
+        .map_err(|err| CoreError::Backend(format!("invalid review json: {err}")))?;
+    let entries = review["lines"]
+        .as_array()
+        .ok_or_else(|| CoreError::Backend("mock review is missing lines array".to_owned()))?;
+    let lines = entries
+        .iter()
+        .map(|entry| TranslationLine {
+            id: entry["id"].as_str().unwrap_or_default().to_owned(),
+            translation: entry["translation"].as_str().unwrap_or_default().to_owned(),
+        })
+        .collect();
+    Ok(ReviewResult {
+        lines,
+        review_notes: "Mock targeted review completed.".to_owned(),
+    })
+}
+
 fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> CoreResult<&'a str> {
     let start = text
         .find(start_marker)
@@ -176,6 +186,21 @@ mod tests {
         )
     }
 
+    fn review_prompt(translation: &str) -> String {
+        let review = serde_json::json!({
+            "lines": [{
+                "id": "1",
+                "source": "Meet Alice.",
+                "translation": translation,
+            }],
+        });
+        let review_json = serde_json::to_string(&review).unwrap_or_default();
+        format!(
+            "TASK_START\nreview_translations\nTASK_END\n\
+             REVIEW_JSON_START{review_json}REVIEW_JSON_END"
+        )
+    }
+
     #[test]
     fn mock_translates_batch_and_produces_glossary_update() {
         let mut backend = MockBackend::new("mock-zh");
@@ -184,7 +209,9 @@ mod tests {
             ChatMessage::user(translate_prompt("hello world", "Chinese")),
         ];
         let result = backend.generate_json(&messages).expect("mock generate");
-        let BackendPayload::Translation(batch) = result.payload;
+        let BackendPayload::Translation(batch) = result.payload else {
+            panic!("expected translation payload");
+        };
 
         assert_eq!(batch.lines.len(), 1);
         assert!(batch.lines[0].translation.contains("[MOCK-"));
@@ -200,9 +227,27 @@ mod tests {
             ChatMessage::user(translate_prompt("  ", "Chinese")),
         ];
         let result = backend.generate_json(&messages).expect("mock generate");
-        let BackendPayload::Translation(batch) = result.payload;
+        let BackendPayload::Translation(batch) = result.payload else {
+            panic!("expected translation payload");
+        };
 
         assert_eq!(batch.lines[0].translation, "");
         assert!(batch.glossary_updates.is_empty());
+    }
+
+    #[test]
+    fn mock_reviews_without_changing_valid_lines() {
+        let mut backend = MockBackend::default();
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user(review_prompt("[MOCK-ZH] Meet Alice.")),
+        ];
+        let result = backend.generate_json(&messages).expect("mock review");
+        let BackendPayload::Review(review) = result.payload else {
+            panic!("expected review payload");
+        };
+
+        assert_eq!(review.lines[0].translation, "[MOCK-ZH] Meet Alice.");
+        assert!(!review.review_notes.is_empty());
     }
 }

@@ -180,6 +180,7 @@ impl AgentEngine {
         message: &str,
         tool_calls: Vec<ToolCallDraft>,
     ) -> std::io::Result<()> {
+        let event_calls = tool_calls.clone();
         let session = self
             .session
             .as_mut()
@@ -191,6 +192,10 @@ impl AgentEngine {
             created_at: crate::session::iso_now(),
         });
         self.session_store.save(session)?;
+        self.record(EventKind::Plan {
+            message: message.to_owned(),
+            tool_calls: event_calls,
+        })?;
         Ok(())
     }
 
@@ -272,15 +277,50 @@ impl AgentEngine {
         ))
     }
 
+    pub fn conversation_context_summary(&self, limit: usize) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let mut lines = session
+            .events
+            .iter()
+            .rev()
+            .skip_while(|event| event.kind == "user")
+            .filter_map(|event| {
+                let label = match event.kind.as_str() {
+                    "user" => "User",
+                    "assistant" => "Assistant",
+                    "ask_user" => "Assistant question",
+                    "tool_call" => "Tool",
+                    "file_operation" => "File operation",
+                    "plan" => "Plan",
+                    "error" => "Error",
+                    _ => return None,
+                };
+                let text = if event.text.trim().is_empty() {
+                    event.data.to_string()
+                } else {
+                    event.text.clone()
+                };
+                Some(format!("{label}: {}", truncate_summary(&text, 240)))
+            })
+            .take(limit)
+            .collect::<Vec<_>>();
+        lines.reverse();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
     pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
-        match input.trim() {
+        let result = match input.trim() {
             "/plan" => self.toggle_plan_mode(),
             "/approve" => self.approve_plan(),
             "/reject" => self.reject_plan(),
             "/undo" => self.undo_last(),
             "/session" => self.session_summary(),
             other => Ok(format!("Unknown command `{other}`. Try /help.")),
-        }
+        }?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
     }
 
     // ------------------------------------------------------------------
@@ -464,5 +504,14 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
         EventKind::Undo => ("undo".into(), String::new(), serde_json::json!({})),
         EventKind::Profile { name } => ("profile".into(), name.clone(), serde_json::json!({})),
         EventKind::Error { text } => ("error".into(), text.clone(), serde_json::json!({})),
+    }
+}
+
+fn truncate_summary(text: &str, limit: usize) -> String {
+    let value = text.chars().take(limit).collect::<String>();
+    if text.chars().count() > limit {
+        format!("{value}...")
+    } else {
+        value
     }
 }

@@ -66,9 +66,10 @@ pub struct BatchTranslationResult {
     pub glossary_updates: Vec<GlossaryEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
     pub lines: Vec<TranslationLine>,
+    #[serde(default)]
     pub review_notes: String,
 }
 
@@ -88,6 +89,52 @@ pub struct AgentRepairRecord {
     pub success: bool,
     pub log_path: PathBuf,
     pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptLog {
+    pub attempt: usize,
+    pub cached: bool,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub messages: Vec<crate::ports::ChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_retry: Option<SplitRetryLog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitRetryLog {
+    pub triggered: bool,
+    pub sizes: Vec<usize>,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureLog {
+    pub stage: String,
+    pub batch_index: usize,
+    pub request_hash: String,
+    pub batch_segments: Vec<SubtitleSegment>,
+    pub messages: Vec<crate::ports::ChatMessage>,
+    #[serde(default)]
+    pub translated_segments: Vec<SubtitleSegment>,
+    pub attempts: Vec<AttemptLog>,
+    #[serde(default)]
+    pub agent_attempts: Vec<AttemptLog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLog {
+    pub stage: String,
+    pub batch_index: usize,
+    pub success: bool,
+    pub attempts: Vec<AttemptLog>,
+    pub final_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

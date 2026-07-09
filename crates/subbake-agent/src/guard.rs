@@ -159,6 +159,27 @@ impl FileGuard {
         })
     }
 
+    /// Snapshot a path before an adapter writes it, so the resulting external
+    /// write can participate in the same undo log as direct file operations.
+    pub fn snapshot_write(&self, path: &Path) -> std::io::Result<FileOpResult> {
+        let safe = self.resolve(path)?;
+        if safe.exists() {
+            Ok(FileOpResult {
+                action: FileOpAction::Modified,
+                path: safe.clone(),
+                backup_path: Some(self.backup(&safe)?),
+                new_path: None,
+            })
+        } else {
+            Ok(FileOpResult {
+                action: FileOpAction::Create,
+                path: safe,
+                backup_path: None,
+                new_path: None,
+            })
+        }
+    }
+
     pub fn list_files(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         let safe = self.resolve(dir)?;
         let mut files = Vec::new();

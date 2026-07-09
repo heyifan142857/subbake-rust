@@ -500,6 +500,12 @@ fn parse_translation_setting_option(
         "--no-resume" => settings.resume = false,
         "--cache" => settings.use_cache = true,
         "--no-cache" => settings.use_cache = false,
+        "--retries" => settings.retries = parse_nonnegative_usize(args, index, option)?,
+        "--agent" => settings.agent = true,
+        "--no-agent" => settings.agent = false,
+        "--agent-repair-attempts" => {
+            settings.agent_repair_attempts = parse_nonnegative_usize(args, index, option)?
+        }
         _ => return Ok(false),
     }
 
@@ -528,6 +534,12 @@ fn parse_batch_size(args: &[String], index: &mut usize) -> io::Result<usize> {
     Ok(value)
 }
 
+fn parse_nonnegative_usize(args: &[String], index: &mut usize, flag: &str) -> io::Result<usize> {
+    required_value(args, index, flag)?
+        .parse::<usize>()
+        .map_err(|_| io::Error::other(format!("{flag} must be a non-negative integer")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,11 +561,19 @@ mod tests {
             "clip.srt".to_owned(),
             "--no-resume".to_owned(),
             "--no-cache".to_owned(),
+            "--retries".to_owned(),
+            "0".to_owned(),
+            "--no-agent".to_owned(),
+            "--agent-repair-attempts".to_owned(),
+            "3".to_owned(),
         ];
         let parsed = parse_translate_args(&args).expect("translate args should parse");
 
         assert!(!parsed.settings.resume);
         assert!(!parsed.settings.use_cache);
+        assert_eq!(parsed.settings.retries, 0);
+        assert!(!parsed.settings.agent);
+        assert_eq!(parsed.settings.agent_repair_attempts, 3);
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct TranslationSettings {
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
+    pub retries: usize,
+    pub agent: bool,
+    pub agent_repair_attempts: usize,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -69,6 +72,15 @@ impl TranslationSettingsPatch {
         if let Some(value) = other.use_cache {
             self.use_cache = Some(value);
         }
+        if let Some(value) = other.retries {
+            self.retries = Some(value);
+        }
+        if let Some(value) = other.agent {
+            self.agent = Some(value);
+        }
+        if let Some(value) = other.agent_repair_attempts {
+            self.agent_repair_attempts = Some(value);
+        }
         if let Some(value) = other.runtime_dir {
             self.runtime_dir = Some(value);
         }
@@ -94,6 +106,9 @@ pub struct TranslationSettingsPatch {
     pub dry_run: Option<bool>,
     pub resume: Option<bool>,
     pub use_cache: Option<bool>,
+    pub retries: Option<usize>,
+    pub agent: Option<bool>,
+    pub agent_repair_attempts: Option<usize>,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -115,6 +130,9 @@ impl Default for TranslationSettings {
             dry_run: false,
             resume: true,
             use_cache: true,
+            retries: 2,
+            agent: true,
+            agent_repair_attempts: 2,
             runtime_dir: None,
             glossary_path: None,
         }
@@ -170,6 +188,15 @@ impl TranslationSettings {
         if let Some(value) = patch.use_cache {
             self.use_cache = value;
         }
+        if let Some(value) = patch.retries {
+            self.retries = value;
+        }
+        if let Some(value) = patch.agent {
+            self.agent = value;
+        }
+        if let Some(value) = patch.agent_repair_attempts {
+            self.agent_repair_attempts = value;
+        }
         if let Some(value) = patch.runtime_dir {
             self.runtime_dir = Some(value);
         }
@@ -216,6 +243,9 @@ impl TranslationSettings {
         options.dry_run = self.dry_run;
         options.resume = self.resume;
         options.use_cache = self.use_cache;
+        options.retries = self.retries;
+        options.agent = self.agent;
+        options.agent_repair_attempts = self.agent_repair_attempts;
         options.runtime_dir = self.runtime_dir.clone();
         options.glossary_path = self.glossary_path.clone();
         options
@@ -250,6 +280,9 @@ mod tests {
         assert!(settings.final_review);
         assert!(settings.resume);
         assert!(settings.use_cache);
+        assert_eq!(settings.retries, 2);
+        assert!(settings.agent);
+        assert_eq!(settings.agent_repair_attempts, 2);
     }
 
     #[test]
@@ -268,6 +301,9 @@ mod tests {
         assert_eq!(options.output_format.as_deref(), Some("txt"));
         assert!(options.resume);
         assert!(options.use_cache);
+        assert_eq!(options.retries, 2);
+        assert!(options.agent);
+        assert_eq!(options.agent_repair_attempts, 2);
     }
 
     #[test]

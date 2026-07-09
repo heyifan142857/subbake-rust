@@ -14,16 +14,18 @@ use std::path::PathBuf;
 use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{
     TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
-    WhisperAction, WhisperRequest, transcribe_media, translate_subtitle,
+    WhisperAction, WhisperRequest, default_output_path, is_supported_subtitle_path,
+    transcribe_media, translate_subtitle,
 };
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
 use subbake_core::error::CoreResult;
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
 
+use crate::discovery::{rank_subtitle_candidates, summarize_observation};
 use crate::engine::AgentEngine;
-use crate::event::{EventKind, FileOpEventData};
+use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
 use crate::guard::{FileOpAction, FileOpResult};
-use crate::tools::ALL_TOOL_SPECS;
+use crate::tools::{ranked_tool_specs, validate_tool_call};
 
 // ---------------------------------------------------------------------------
 // Echo backend for agent decision loop (no TASK_START markers needed)
@@ -114,9 +116,9 @@ pub const MIN_OBSERVATIONS: usize = 2;
 
 #[derive(Debug, Clone)]
 struct Observation {
-    #[allow(dead_code)]
     tool_name: String,
     text: String,
+    summary: String,
 }
 
 #[derive(Debug, Clone)]
@@ -128,10 +130,11 @@ struct LoopState {
 
 /// The LLM's structured decision.
 struct Decision {
-    action: String, // "respond" | "tool_call" | "ask_user"
+    action: String, // "respond" | "tool_call" | "plan" | "ask_user"
     text: String,
     tool_name: Option<String>,
     arguments: Option<JsonValue>,
+    tool_calls: Vec<ToolCallDraft>,
     confidence: f64,
 }
 
@@ -150,12 +153,7 @@ impl AgentEngine {
 
         // 1. Quick-path: keyword matching without LLM.
         if let Some(result) = self.try_quick_path(input)? {
-            if let Some(ref text) = result.response_text
-                && let Some(ref mut obs) = self.observer
-            {
-                obs.on_response(text);
-            }
-            return Ok(result.output);
+            return self.finish_response(result.output, false, result.response_text.is_some());
         }
 
         // 2. Bounded LLM loop.
@@ -172,10 +170,9 @@ impl AgentEngine {
                     state.max_steps,
                 );
                 if let Some(ref mut obs) = self.observer {
-                    obs.on_response(&msg);
                     obs.on_step_limit();
                 }
-                return Ok(msg);
+                return self.finish_response(msg, true, true);
             }
             state.step += 1;
 
@@ -187,18 +184,11 @@ impl AgentEngine {
 
             match decision.action.as_str() {
                 "respond" => {
-                    if let Some(ref mut obs) = self.observer {
-                        obs.on_response(&decision.text);
-                    }
-                    return Ok(decision.text);
+                    return self.finish_response(decision.text, false, true);
                 }
 
                 "ask_user" => {
-                    let msg = decision.text;
-                    if let Some(ref mut obs) = self.observer {
-                        obs.on_response(&msg);
-                    }
-                    return Ok(msg);
+                    return self.finish_response(decision.text, true, true);
                 }
 
                 "tool_call" => {
@@ -208,9 +198,11 @@ impl AgentEngine {
                     if self.is_discovery_tool(tool_name) {
                         // Discovery → run, append observation, continue.
                         let obs_text = self.run_tool(tool_name, &args)?;
+                        let summary = summarize_observation(tool_name, &obs_text);
                         state.observations.push(Observation {
                             tool_name: tool_name.to_owned(),
                             text: obs_text.clone(),
+                            summary,
                         });
                         if let Some(ref mut obs) = self.observer {
                             obs.on_tool_call(tool_name, &args);
@@ -222,21 +214,43 @@ impl AgentEngine {
                     // Mutating tool (execute, then exit loop).
                     // Check plan mode / approval.
                     let result_text = self.execute_or_plan_tool(tool_name, &args)?;
-                    if let Some(ref mut obs) = self.observer {
-                        obs.on_response(&result_text);
-                    }
-                    return Ok(result_text);
+                    return self.finish_response(result_text, false, true);
+                }
+
+                "plan" => {
+                    self.store_plan(&decision.text, decision.tool_calls)?;
+                    return self.finish_response(
+                        "I've prepared a plan for your approval. Use `/approve` to execute."
+                            .to_owned(),
+                        false,
+                        true,
+                    );
                 }
 
                 other => {
                     let msg = format!("I'm not sure how to proceed (action={other}).");
-                    if let Some(ref mut obs) = self.observer {
-                        obs.on_response(&msg);
-                    }
-                    return Ok(msg);
+                    return self.finish_response(msg, true, true);
                 }
             }
         }
+    }
+
+    fn finish_response(
+        &mut self,
+        text: String,
+        ask_user: bool,
+        notify_observer: bool,
+    ) -> io::Result<String> {
+        let event = if ask_user {
+            EventKind::AskUser { text: text.clone() }
+        } else {
+            EventKind::Assistant { text: text.clone() }
+        };
+        self.record_if_active(event)?;
+        if notify_observer && let Some(ref mut observer) = self.observer {
+            observer.on_response(&text);
+        }
+        Ok(text)
     }
 
     // ------------------------------------------------------------------
@@ -308,7 +322,22 @@ impl AgentEngine {
         }
         let result = backend.generate_raw_json(&messages);
         match result {
-            Ok((decision, _usage)) => self.parse_decision_value(&decision),
+            Ok((decision, _usage)) => match self.parse_decision_value(&decision) {
+                Ok(decision) => Ok(decision),
+                Err(error) => {
+                    if let Some(ref mut obs) = self.observer {
+                        obs.on_error(&error.to_string());
+                    }
+                    Ok(Decision {
+                        action: "ask_user".into(),
+                        text: "I couldn't validate the proposed action. Could you clarify the file and operation?".into(),
+                        tool_name: None,
+                        arguments: None,
+                        tool_calls: Vec::new(),
+                        confidence: 1.0,
+                    })
+                }
+            },
             Err(e) => {
                 if let Some(ref mut obs) = self.observer {
                     obs.on_error(&e.to_string());
@@ -318,6 +347,7 @@ impl AgentEngine {
                     text: format!("Error: {e}"),
                     tool_name: None,
                     arguments: None,
+                    tool_calls: Vec::new(),
                     confidence: 1.0,
                 })
             }
@@ -328,8 +358,8 @@ impl AgentEngine {
     fn build_decision_messages(&self, user_input: &str, state: &LoopState) -> Vec<ChatMessage> {
         let mut system = String::new();
         system.push_str("You are SubBake, a subtitle translation assistant.\n\n");
-        system.push_str("Available tools:\n");
-        for spec in ALL_TOOL_SPECS {
+        system.push_str("Relevant available tools:\n");
+        for spec in ranked_tool_specs(user_input) {
             system.push_str(&format!("- {}: {}", spec.name, spec.description));
             if spec.mutating {
                 system.push_str(" (mutating)");
@@ -337,9 +367,12 @@ impl AgentEngine {
             system.push('\n');
         }
         system.push_str("\nDecide the next action. Return JSON with keys:\n");
-        system.push_str(r#"{"action": "respond" | "tool_call" | "ask_user", "text": "...", "tool_name": "...", "arguments": {...}}"#);
+        system.push_str(r#"{"action": "respond" | "tool_call" | "plan" | "ask_user", "text": "...", "tool_name": "...", "arguments": {...}, "tool_calls": [{"tool_name": "...", "arguments": {...}}], "confidence": 0.0}"#);
         system.push_str("\n- `respond`: reply to the user directly.\n");
         system.push_str("- `tool_call`: invoke a tool. Discovery tools feed observations back; mutating tools execute immediately.\n");
+        system.push_str(
+            "- `plan`: propose one or more mutating tool calls that must wait for `/approve`.\n",
+        );
         system.push_str("- `ask_user`: ask the user for clarification.\n");
         system.push_str(
             "Keep confidence high (≥0.85) for direct tool calls, lower for clarification.\n",
@@ -351,10 +384,19 @@ impl AgentEngine {
         user.push_str(user_input);
         user.push('\n');
 
+        if let Some(summary) = self.conversation_context_summary(12) {
+            user.push_str("\nRecent session context:\n");
+            user.push_str(&summary);
+            user.push('\n');
+        }
+
         if !state.observations.is_empty() {
             user.push_str("\nObservations from earlier steps:\n");
             for (i, obs) in state.observations.iter().enumerate() {
-                user.push_str(&format!("  [{i}] {}\n", obs.text));
+                user.push_str(&format!("  [{i}] {}: {}\n", obs.tool_name, obs.summary));
+                for line in obs.text.lines().take(3) {
+                    user.push_str(&format!("      {}\n", truncate_text(line, 240)));
+                }
             }
         }
 
@@ -362,18 +404,87 @@ impl AgentEngine {
     }
 
     fn parse_decision_value(&self, parsed: &JsonValue) -> io::Result<Decision> {
+        let object = parsed
+            .as_object()
+            .ok_or_else(|| io::Error::other("agent decision must be a JSON object"))?;
+        let raw_action = object
+            .get("action")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| io::Error::other("agent decision is missing `action`"))?;
+        let action = match raw_action {
+            "final_tool_call" => "tool_call",
+            "respond" | "tool_call" | "plan" | "ask_user" => raw_action,
+            other => {
+                return Err(io::Error::other(format!(
+                    "unsupported agent action `{other}`"
+                )));
+            }
+        }
+        .to_owned();
+        let text = object
+            .get("text")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let confidence = object
+            .get("confidence")
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let mut tool_name = None;
+        let mut arguments = None;
+        let mut tool_calls = Vec::new();
+        if action == "tool_call" {
+            let name = object
+                .get("tool_name")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| io::Error::other("tool call is missing `tool_name`"))?;
+            let args = object
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            validate_tool_call(name, &args).map_err(io::Error::other)?;
+            tool_name = Some(name.to_owned());
+            arguments = Some(args);
+        } else if action == "plan" {
+            let calls = object
+                .get("tool_calls")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| io::Error::other("plan is missing `tool_calls`"))?;
+            if calls.is_empty() {
+                return Err(io::Error::other("plan must contain at least one tool call"));
+            }
+            for call in calls {
+                let name = call
+                    .get("tool_name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| io::Error::other("planned call is missing `tool_name`"))?;
+                let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                validate_tool_call(name, &args).map_err(io::Error::other)?;
+                if self.is_discovery_tool(name) {
+                    return Err(io::Error::other(
+                        "discovery tools must run before creating a plan",
+                    ));
+                }
+                tool_calls.push(ToolCallDraft {
+                    tool_name: name.to_owned(),
+                    arguments: args,
+                });
+            }
+        }
         Ok(Decision {
-            action: parsed["action"].as_str().unwrap_or("respond").to_owned(),
-            text: parsed["text"].as_str().unwrap_or("").to_owned(),
-            tool_name: parsed["tool_name"].as_str().map(String::from),
-            arguments: parsed.get("arguments").cloned(),
-            confidence: parsed["confidence"].as_f64().unwrap_or(1.0),
+            action,
+            text,
+            tool_name,
+            arguments,
+            tool_calls,
+            confidence,
         })
     }
 
     /// Gate: low-confidence `tool_call` → escalate to `ask_user` or `respond`.
     fn apply_confidence_gate(&self, decision: Decision, state: &LoopState) -> Decision {
-        if decision.action != "tool_call" {
+        if !matches!(decision.action.as_str(), "tool_call" | "plan") {
             return decision;
         }
         if decision.confidence >= CONFIDENCE_MEDIUM {
@@ -385,6 +496,7 @@ impl AgentEngine {
                 text: "Could you clarify what you'd like me to do?".into(),
                 tool_name: None,
                 arguments: None,
+                tool_calls: Vec::new(),
                 confidence: 1.0,
             };
         }
@@ -393,12 +505,19 @@ impl AgentEngine {
             return Decision {
                 action: "ask_user".into(),
                 text: format!(
-                    "Shall I {} with {:?}?",
-                    decision.tool_name.as_deref().unwrap_or("?"),
-                    decision.arguments
+                    "Shall I proceed with {}?",
+                    decision
+                        .tool_name
+                        .as_deref()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!(
+                            "{} planned operation(s)",
+                            decision.tool_calls.len()
+                        ))
                 ),
                 tool_name: decision.tool_name,
                 arguments: decision.arguments,
+                tool_calls: Vec::new(),
                 confidence: decision.confidence,
             };
         }
@@ -483,10 +602,10 @@ impl AgentEngine {
             }
             "candidate_subtitles" => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let files = self
-                    .guard
-                    .search_files(PathBuf::from(dir).as_path(), ".srt")?;
-                Ok(format_file_list(&files))
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let files = self.guard.search_files(PathBuf::from(dir).as_path(), "")?;
+                let ranked = rank_subtitle_candidates(files, query, &self.project_root);
+                Ok(format_file_list(&ranked))
             }
             "recent_translations" => {
                 let session = self.session.as_ref();
@@ -496,9 +615,20 @@ impl AgentEngine {
                     .unwrap_or(&[]);
                 let mut out = Vec::new();
                 for event in events.iter().rev().take(20) {
-                    let tool_name = event.data.get("tool_name").and_then(|value| value.as_str());
-                    if matches!(tool_name, Some("translate_file" | "translate_series")) {
-                        out.push(event.text.clone());
+                    if event.kind != "file_operation"
+                        || event
+                            .data
+                            .get("undone")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let path = event.data.get("path").and_then(JsonValue::as_str);
+                    if path.is_some_and(|path| {
+                        path.contains(".translated.") || path.contains(".bilingual.")
+                    }) {
+                        out.push(path.unwrap_or_default().to_owned());
                     }
                 }
                 Ok(out.join("\n"))
@@ -573,12 +703,19 @@ impl AgentEngine {
             "translate_file" => {
                 let path = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&path)?;
+                let settings = TranslationSettings::default();
+                let output_path =
+                    default_output_path(&input, settings.output_format(), settings.bilingual)?;
+                let undo_snapshot = self.guard.snapshot_write(&output_path)?;
                 let request = TranslationRequest {
                     input_path: input,
                     output_path: None,
-                    settings: TranslationSettings::default(),
+                    settings,
                 };
                 let outcome = translate_subtitle(request)?;
+                if outcome.output_path.is_some() {
+                    self.record_file_operation(&undo_snapshot)?;
+                }
                 Ok(outcome
                     .output_path
                     .map(|p| format!("Translated: {}", p.display()))
@@ -587,19 +724,55 @@ impl AgentEngine {
             "translate_series" => {
                 let dir = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&dir)?;
+                let recursive = args
+                    .get("recursive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let overwrite = args
+                    .get("overwrite")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let settings = TranslationSettings::default();
+                let source_files = if recursive {
+                    self.guard.search_files(&input, "")?
+                } else {
+                    self.guard.list_files(&input)?
+                };
+                let mut undo_snapshots = Vec::new();
+                for source in source_files
+                    .into_iter()
+                    .filter(|path| path.is_file() && is_supported_subtitle_path(path))
+                    .filter(|path| {
+                        !path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .is_some_and(|stem| {
+                                stem.ends_with(".translated") || stem.ends_with(".bilingual")
+                            })
+                    })
+                {
+                    let output =
+                        default_output_path(&source, settings.output_format(), settings.bilingual)?;
+                    if overwrite || !output.exists() {
+                        let snapshot = self.guard.snapshot_write(&output)?;
+                        undo_snapshots.push((output, snapshot));
+                    }
+                }
                 let request = subbake_adapters::BatchTranslationRequest {
                     root: input,
-                    recursive: args
-                        .get("recursive")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    overwrite: args
-                        .get("overwrite")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    settings: TranslationSettings::default(),
+                    recursive,
+                    overwrite,
+                    settings,
                 };
                 let outcome = subbake_adapters::translate_subtitle_batch(request)?;
+                let group_id = format!("translate-series-{}", crate::session::iso_now());
+                for output in &outcome.outputs {
+                    if let Some((_, snapshot)) =
+                        undo_snapshots.iter().find(|(path, _)| path == output)
+                    {
+                        self.record_file_operation_with_group(snapshot, Some(group_id.clone()))?;
+                    }
+                }
                 Ok(format!(
                     "Translated {} files, skipped {}.",
                     outcome.processed,
@@ -756,6 +929,14 @@ impl AgentEngine {
     }
 
     fn record_file_operation(&mut self, result: &FileOpResult) -> io::Result<()> {
+        self.record_file_operation_with_group(result, None)
+    }
+
+    fn record_file_operation_with_group(
+        &mut self,
+        result: &FileOpResult,
+        group_id: Option<String>,
+    ) -> io::Result<()> {
         self.record_if_active(EventKind::FileOperation(FileOpEventData {
             action: file_action_label(result.action).to_owned(),
             path: self.event_path(&result.path),
@@ -764,7 +945,7 @@ impl AgentEngine {
                 .backup_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
-            group_id: None,
+            group_id,
             undone: false,
         }))
     }
@@ -811,6 +992,15 @@ fn format_file_list(files: &[PathBuf]) -> String {
         .join("\n")
 }
 
+fn truncate_text(text: &str, limit: usize) -> String {
+    let value = text.chars().take(limit).collect::<String>();
+    if text.chars().count() > limit {
+        format!("{value}...")
+    } else {
+        value
+    }
+}
+
 /// Parse lines like `[profiles.myprofile]` from TOML content.
 fn find_profile_names(toml: &str) -> Vec<String> {
     let mut names = Vec::new();
@@ -846,6 +1036,31 @@ mod tests {
 
     use super::*;
 
+    struct RawDecisionBackend {
+        decision: JsonValue,
+    }
+
+    impl LlmBackend for RawDecisionBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "decision"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            EchoDecisionBackend::new("test").generate_json(messages)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            _messages: &[ChatMessage],
+        ) -> CoreResult<(JsonValue, Usage)> {
+            Ok((self.decision.clone(), Usage::default()))
+        }
+    }
+
     #[test]
     fn quick_path_translate_executes_tool() {
         let root = temp_root("quick-translate");
@@ -862,7 +1077,157 @@ mod tests {
 
         assert!(output.contains("Translated:"), "{output}");
         assert!(root.join("clip.translated.txt").exists());
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .events
+                .iter()
+                .any(|event| event.kind == "assistant")
+        );
+        let context = engine
+            .conversation_context_summary(12)
+            .expect("conversation summary");
+        assert!(context.contains("User:"));
+        assert!(context.contains("Assistant:"));
 
+        engine.undo_last().expect("undo translation");
+        assert!(!root.join("clip.translated.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn undo_restores_overwritten_translation_output() {
+        let root = temp_root("translate-overwrite-undo");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("clip.txt"), "new\n").expect("write subtitle");
+        std::fs::write(root.join("clip.translated.txt"), "old\n").expect("write old output");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = EchoDecisionBackend::new("test");
+
+        engine
+            .run_line("translate @clip.txt", &mut backend)
+            .expect("translate");
+        assert_ne!(
+            std::fs::read_to_string(root.join("clip.translated.txt")).expect("translated"),
+            "old\n"
+        );
+
+        engine.undo_last().expect("undo translation");
+        assert_eq!(
+            std::fs::read_to_string(root.join("clip.translated.txt")).expect("restored"),
+            "old\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn undo_removes_series_outputs_as_one_group() {
+        let root = temp_root("series-undo");
+        let season = root.join("season");
+        std::fs::create_dir_all(&season).expect("create season");
+        std::fs::write(season.join("one.txt"), "one\n").expect("write one");
+        std::fs::write(season.join("two.txt"), "two\n").expect("write two");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        engine
+            .run_tool(
+                "translate_series",
+                &json!({"path": "season", "recursive": false}),
+            )
+            .expect("translate series");
+        assert!(season.join("one.translated.txt").exists());
+        assert!(season.join("two.translated.txt").exists());
+        let recent = engine
+            .run_tool("recent_translations", &json!({}))
+            .expect("recent");
+        assert!(recent.contains("one.translated.txt"));
+        assert!(recent.contains("two.translated.txt"));
+
+        let result = engine.undo_last().expect("undo series");
+        assert!(result.contains("2 operations"));
+        assert!(!season.join("one.translated.txt").exists());
+        assert!(!season.join("two.translated.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn llm_plan_waits_for_approval_and_then_executes() {
+        let root = temp_root("llm-plan");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = RawDecisionBackend {
+            decision: json!({
+                "action": "plan",
+                "text": "Create notes",
+                "tool_calls": [{
+                    "tool_name": "create_file",
+                    "arguments": {"path": "notes.txt", "content": "hello"}
+                }],
+                "confidence": 0.95
+            }),
+        };
+
+        let response = engine.run_line("create notes", &mut backend).expect("plan");
+        assert!(response.contains("/approve"));
+        assert!(!root.join("notes.txt").exists());
+        assert_eq!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .pending_plan
+                .as_ref()
+                .expect("pending")
+                .tool_calls
+                .len(),
+            1
+        );
+
+        engine.approve_plan().expect("approve");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).expect("created"),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_llm_tool_call_becomes_clarification() {
+        let root = temp_root("invalid-decision");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = RawDecisionBackend {
+            decision: json!({
+                "action": "tool_call",
+                "tool_name": "shell",
+                "arguments": {"command": "rm -rf ."},
+                "confidence": 1.0
+            }),
+        };
+
+        let response = engine
+            .run_line("do something", &mut backend)
+            .expect("clarification");
+
+        assert!(response.contains("clarify"));
+        assert_eq!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .events
+                .last()
+                .expect("event")
+                .kind,
+            "ask_user"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

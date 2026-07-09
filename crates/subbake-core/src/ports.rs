@@ -1,8 +1,14 @@
-use crate::entities::{BatchTranslationResult, SubtitleSegment, Usage};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::entities::{
+    AgentLog, BatchTranslationResult, FailureLog, ReviewResult, SubtitleSegment, Usage,
+};
 use crate::error::CoreResult;
 use crate::storage::{RunState, RuntimePaths};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -33,17 +39,24 @@ pub struct BackendJsonResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendPayload {
     Translation(BatchTranslationResult),
+    Review(ReviewResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStage {
     Translate,
+    Review,
+    AgentTranslateRepair,
+    AgentReviewRepair,
 }
 
 impl CacheStage {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Translate => "translate",
+            Self::Review => "review",
+            Self::AgentTranslateRepair => "agent_translate_repair",
+            Self::AgentReviewRepair => "agent_review_repair",
         }
     }
 }
@@ -169,5 +182,19 @@ pub trait RuntimeStore {
         _request_hash: &str,
     ) -> CoreResult<Option<BackendJsonResult>> {
         Ok(None)
+    }
+
+    fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
+        Ok(self
+            .paths()
+            .failures_dir
+            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
+    }
+
+    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
+        Ok(self
+            .paths()
+            .agent_logs_dir
+            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
     }
 }

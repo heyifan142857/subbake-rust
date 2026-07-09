@@ -1,4 +1,5 @@
 pub mod decision;
+mod discovery;
 pub mod engine;
 pub mod event;
 pub mod guard;

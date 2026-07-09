@@ -3,7 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use subbake_core::entities::{BatchTranslationResult, SubtitleSegment, Usage};
+use subbake_core::entities::{
+    AgentLog, BatchTranslationResult, FailureLog, ReviewResult, SubtitleSegment, Usage,
+};
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeStore,
@@ -39,6 +41,13 @@ impl FileRuntimeStore {
 #[derive(Debug, Serialize, Deserialize)]
 struct TranslationCacheEntry {
     payload: BatchTranslationResult,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReviewCacheEntry {
+    payload: ReviewResult,
     #[serde(default)]
     usage: Usage,
 }
@@ -172,12 +181,29 @@ impl RuntimeStore for FileRuntimeStore {
         request_hash: &str,
         response: &BackendJsonResult,
     ) -> CoreResult<()> {
-        let BackendPayload::Translation(payload) = &response.payload;
-        let entry = TranslationCacheEntry {
-            payload: payload.clone(),
-            usage: response.usage,
+        let value = match (stage, &response.payload) {
+            (
+                CacheStage::Translate | CacheStage::AgentTranslateRepair,
+                BackendPayload::Translation(payload),
+            ) => serde_json::to_value(TranslationCacheEntry {
+                payload: payload.clone(),
+                usage: response.usage,
+            }),
+            (
+                CacheStage::Review | CacheStage::AgentReviewRepair,
+                BackendPayload::Review(payload),
+            ) => serde_json::to_value(ReviewCacheEntry {
+                payload: payload.clone(),
+                usage: response.usage,
+            }),
+            _ => {
+                return Err(CoreError::Data(format!(
+                    "cached response payload does not match stage {}",
+                    stage.as_str()
+                )));
+            }
         };
-        let value = serde_json::to_value(entry)
+        let value = value
             .map_err(|error| CoreError::Data(format!("serialize request cache failed: {error}")))?;
         write_json_verified(&self.cache_path(stage, request_hash), &value)
     }
@@ -192,12 +218,49 @@ impl RuntimeStore for FileRuntimeStore {
             return Ok(None);
         }
         let text = fs::read_to_string(&path).map_err(storage_error)?;
-        let entry: TranslationCacheEntry = serde_json::from_str(&text)
-            .map_err(|error| CoreError::Data(format!("request cache parse failed: {error}")))?;
-        Ok(Some(BackendJsonResult {
-            payload: BackendPayload::Translation(entry.payload),
-            usage: entry.usage,
-        }))
+        match stage {
+            CacheStage::Translate | CacheStage::AgentTranslateRepair => {
+                let entry: TranslationCacheEntry =
+                    serde_json::from_str(&text).map_err(|error| {
+                        CoreError::Data(format!("request cache parse failed: {error}"))
+                    })?;
+                Ok(Some(BackendJsonResult {
+                    payload: BackendPayload::Translation(entry.payload),
+                    usage: entry.usage,
+                }))
+            }
+            CacheStage::Review | CacheStage::AgentReviewRepair => {
+                let entry: ReviewCacheEntry = serde_json::from_str(&text).map_err(|error| {
+                    CoreError::Data(format!("request cache parse failed: {error}"))
+                })?;
+                Ok(Some(BackendJsonResult {
+                    payload: BackendPayload::Review(entry.payload),
+                    usage: entry.usage,
+                }))
+            }
+        }
+    }
+
+    fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
+        let path = self
+            .paths
+            .failures_dir
+            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index));
+        let value = serde_json::to_value(log)
+            .map_err(|error| CoreError::Data(format!("serialize failure log failed: {error}")))?;
+        write_json_verified(&path, &value)?;
+        Ok(path)
+    }
+
+    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
+        let path = self
+            .paths
+            .agent_logs_dir
+            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index));
+        let value = serde_json::to_value(log)
+            .map_err(|error| CoreError::Data(format!("serialize agent log failed: {error}")))?;
+        write_json_verified(&path, &value)?;
+        Ok(path)
     }
 }
 
@@ -292,7 +355,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use subbake_core::entities::{
-        BatchTranslationResult, GlossaryEntry, PipelineOptions, TranslationLine, Usage,
+        AgentLog, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry, PipelineOptions,
+        TranslationLine, Usage,
     };
     use subbake_core::memory::ContextMemory;
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
@@ -531,6 +595,116 @@ mod tests {
         assert_eq!(value["payload"]["glossary_updates"][0]["source"], "hello");
         assert_eq!(value["usage"]["total_tokens"], 5);
         assert!(path.ends_with(format!("translate/{hash}.json")));
+    }
+
+    #[test]
+    fn round_trips_python_compatible_review_cache_shape() {
+        let root = temp_root("review-cache");
+        let paths = build_runtime_paths(
+            &root.join("clip.txt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let response = BackendJsonResult {
+            payload: BackendPayload::Review(ReviewResult {
+                lines: vec![TranslationLine {
+                    id: "1".to_owned(),
+                    translation: "审校后".to_owned(),
+                }],
+                review_notes: "terminology fixed".to_owned(),
+            }),
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            },
+        };
+        let hash = "review-hash";
+
+        store
+            .save_cached_response(CacheStage::Review, hash, &response)
+            .expect("save review cache");
+        let loaded = store
+            .load_cached_response(CacheStage::Review, hash)
+            .expect("load review cache")
+            .expect("cache exists");
+        let path = store.cache_path(CacheStage::Review, hash);
+        let raw = fs::read_to_string(&path).expect("read cache");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(loaded, response);
+        assert_eq!(value["payload"]["lines"][0]["translation"], "审校后");
+        assert_eq!(value["payload"]["review_notes"], "terminology fixed");
+        assert!(path.ends_with("review/review-hash.json"));
+    }
+
+    #[test]
+    fn writes_python_compatible_failure_and_agent_logs() {
+        let root = temp_root("recovery-logs");
+        let paths = build_runtime_paths(
+            &root.join("clip.txt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let segment = SubtitleSegment {
+            id: "1".to_owned(),
+            text: "hello".to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+        };
+        let attempt = AttemptLog {
+            attempt: 1,
+            cached: false,
+            error: Some("invalid output".to_owned()),
+            payload: None,
+            messages: vec![subbake_core::ports::ChatMessage::user("prompt")],
+            split_retry: None,
+        };
+        let failure_path = store
+            .save_failure_log(&FailureLog {
+                stage: "translate".to_owned(),
+                batch_index: 1,
+                request_hash: "hash".to_owned(),
+                batch_segments: vec![segment],
+                messages: attempt.messages.clone(),
+                translated_segments: Vec::new(),
+                attempts: vec![attempt.clone()],
+                agent_attempts: vec![attempt.clone()],
+            })
+            .expect("save failure");
+        let agent_path = store
+            .save_agent_log(&AgentLog {
+                stage: "translate".to_owned(),
+                batch_index: 1,
+                success: false,
+                attempts: vec![attempt],
+                final_error: Some("invalid output".to_owned()),
+            })
+            .expect("save agent log");
+        let failure: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&failure_path).expect("read failure"))
+                .expect("failure json");
+        let agent: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&agent_path).expect("read agent"))
+                .expect("agent json");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(failure["stage"], "translate");
+        assert_eq!(failure["attempts"][0]["messages"][0]["role"], "user");
+        assert_eq!(failure["agent_attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(agent["success"], false);
+        assert_eq!(agent["final_error"], "invalid output");
     }
 
     fn temp_root(label: &str) -> PathBuf {

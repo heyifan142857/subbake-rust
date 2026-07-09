@@ -1,15 +1,25 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::entities::{
-    BatchPlanEntry, GlossaryEntry, PipelineOptions, PipelineResult, SubtitleDocument,
-    SubtitleSegment, TranslationLine, Usage,
+    AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, FailureLog, GlossaryEntry,
+    PipelineOptions, PipelineResult, SplitRetryLog, SubtitleDocument, SubtitleSegment,
+    TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
-    BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink, LlmBackend,
-    RuntimeStore,
+    BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink,
+    LlmBackend, RuntimeStore,
+};
+use crate::recovery::{
+    backend_payload_json, build_agent_repair_messages, combine_glossary, combine_summaries,
+    parse_translation_payload, retry_correction_message, split_index,
+};
+use crate::review::{
+    ReviewBatchPlan, build_review_messages, build_review_plan, parse_review_payload,
+    restore_review_progress,
 };
 use crate::storage::{
     InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash,
@@ -28,6 +38,7 @@ pub struct SubtitlePipeline<B, D> {
     translation_memory: HashMap<String, String>,
     translation_memory_hits: usize,
     cache_hits: usize,
+    agent_repairs: Vec<AgentRepairRecord>,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -48,6 +59,7 @@ where
             translation_memory: HashMap::new(),
             translation_memory_hits: 0,
             cache_hits: 0,
+            agent_repairs: Vec::new(),
         }
     }
 
@@ -101,7 +113,7 @@ where
                     translation_memory_hits: 0,
                     state_path,
                     glossary_path,
-                    agent_repairs: Vec::new(),
+                    agent_repairs: self.agent_repairs.clone(),
                 },
                 translated_segments: Vec::new(),
             });
@@ -211,23 +223,80 @@ where
         self.save_run_state(batches.len(), resume.review_batches_completed, true, usage)?;
         self.dashboard.mark_done("TRANSLATE");
 
+        let review_plan = if self.options.final_review
+            && !self.options.fast_mode
+            && !translated_segments.is_empty()
+        {
+            build_review_plan(&batches, &translated_segments, &self.memory)
+        } else {
+            Vec::new()
+        };
+        self.dashboard
+            .set_total_steps(3 + batches.len() + review_plan.len());
+
+        let resumed_review_batches = if review_plan.is_empty() {
+            0
+        } else {
+            if resume.review_batches_completed > review_plan.len() {
+                return Err(CoreError::Data(format!(
+                    "resume state has {} reviewed batches, but the current review plan has only {}",
+                    resume.review_batches_completed,
+                    review_plan.len()
+                )));
+            }
+            resume.review_batches_completed
+        };
+        let mut output_segments = translated_segments.clone();
+        if !review_plan.is_empty() {
+            restore_review_progress(
+                &review_plan,
+                resumed_review_batches,
+                &resume.reviewed_segments,
+                &mut output_segments,
+            )?;
+            self.dashboard.mark_running("FINAL_REVIEW");
+            for (review_index, review_batch) in
+                review_plan.iter().enumerate().skip(resumed_review_batches)
+            {
+                let review_position = review_index + 1;
+                let reviewed = self.review_batch(review_position, review_batch)?;
+                usage.add(reviewed.usage);
+                self.dashboard.add_usage(reviewed.usage);
+                let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
+                if let Some(ref store) = self.store {
+                    store.save_batch_segments(
+                        BatchShardKind::Reviewed,
+                        review_position,
+                        &reviewed_segments,
+                    )?;
+                }
+                output_segments[review_batch.start_offset
+                    ..review_batch.start_offset + reviewed_segments.len()]
+                    .clone_from_slice(&reviewed_segments);
+                self.save_run_state(batches.len(), review_position, true, usage)?;
+            }
+            validate_full_alignment(&document.segments, &output_segments)?;
+            self.dashboard.mark_done("FINAL_REVIEW");
+        }
+        self.save_run_state(batches.len(), review_plan.len(), true, usage)?;
+
         Ok(PipelineRun {
             result: PipelineResult {
                 output_path: self.options.output_path.clone(),
                 batches_translated: batches.len(),
-                review_batches: 0,
+                review_batches: review_plan.len(),
                 usage,
                 dry_run: false,
                 planned_batches,
                 cache_hits: self.cache_hits,
                 resumed_translation_batches: resume.translation_batches_completed,
-                resumed_review_batches: resume.review_batches_completed,
+                resumed_review_batches,
                 translation_memory_hits: self.translation_memory_hits,
                 state_path,
                 glossary_path,
-                agent_repairs: Vec::new(),
+                agent_repairs: self.agent_repairs.clone(),
             },
-            translated_segments,
+            translated_segments: output_segments,
         })
     }
 
@@ -236,17 +305,107 @@ where
         batch_index: usize,
         batch: &[SubtitleSegment],
     ) -> CoreResult<BatchWithUsage> {
-        let messages = build_translation_messages(&self.options, batch_index, batch, &self.memory);
-        let request_hash = build_request_hash(
-            &self.options.provider,
-            &self.options.model,
-            CacheStage::Translate.as_str(),
-            messages_json(&messages),
-        );
+        self.translate_batch_impl(batch_index, batch, true)
+    }
+
+    fn translate_batch_impl(
+        &mut self,
+        batch_index: usize,
+        batch: &[SubtitleSegment],
+        record_failure: bool,
+    ) -> CoreResult<BatchWithUsage> {
+        let mut last_error = None;
+        let mut attempts = Vec::new();
+        for attempt in 1..=self.options.retries + 1 {
+            let mut messages =
+                build_translation_messages(&self.options, batch_index, batch, &self.memory);
+            if let Some(error) = last_error.as_ref() {
+                messages.push(retry_correction_message(error));
+            }
+            let request_hash = request_hash(&self.options, CacheStage::Translate, &messages);
+            match self.translate_once(batch, &messages, &request_hash) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    let failure_messages = messages.clone();
+                    let mut attempt_log = AttemptLog {
+                        attempt,
+                        cached: false,
+                        error: Some(error.to_string()),
+                        payload: None,
+                        messages,
+                        split_retry: None,
+                    };
+                    if matches!(error, CoreError::InvalidTranslation(_))
+                        && !self.options.fast_mode
+                        && batch.len() > 1
+                    {
+                        let split = split_index(batch);
+                        attempt_log.split_retry = Some(SplitRetryLog {
+                            triggered: true,
+                            sizes: vec![split, batch.len() - split],
+                            resolved: false,
+                            error: None,
+                        });
+                        match self.translate_split(batch_index, batch, split) {
+                            Ok(result) => {
+                                if let Some(split_log) = attempt_log.split_retry.as_mut() {
+                                    split_log.resolved = true;
+                                }
+                                attempts.push(attempt_log);
+                                return Ok(result);
+                            }
+                            Err(split_error) => {
+                                if let Some(split_log) = attempt_log.split_retry.as_mut() {
+                                    split_log.error = Some(split_error.to_string());
+                                }
+                                attempts.push(attempt_log);
+                                if record_failure {
+                                    return self.finish_translation_failure(
+                                        batch_index,
+                                        batch,
+                                        split_error,
+                                        request_hash,
+                                        failure_messages,
+                                        attempts,
+                                    );
+                                }
+                                return Err(split_error);
+                            }
+                        }
+                    }
+                    last_error = Some(error.clone());
+                    attempts.push(attempt_log);
+                    if attempt == self.options.retries + 1 {
+                        if record_failure {
+                            return self.finish_translation_failure(
+                                batch_index,
+                                batch,
+                                error,
+                                request_hash,
+                                failure_messages,
+                                attempts,
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(CoreError::Data(
+            "translation retry loop ended unexpectedly".to_owned(),
+        ))
+    }
+
+    fn translate_once(
+        &mut self,
+        batch: &[SubtitleSegment],
+        messages: &[ChatMessage],
+        request_hash: &str,
+    ) -> CoreResult<BatchWithUsage> {
         let cached_response = if self.options.use_cache {
             self.store
                 .as_ref()
-                .map(|store| store.load_cached_response(CacheStage::Translate, &request_hash))
+                .map(|store| store.load_cached_response(CacheStage::Translate, request_hash))
                 .transpose()?
                 .flatten()
         } else {
@@ -258,17 +417,25 @@ where
                 self.cache_hits += 1;
                 response
             }
-            None => self.backend.generate_json(&messages)?,
+            None => self.backend.generate_json(messages)?,
         };
-        let BackendPayload::Translation(result) = &backend_result.payload;
+        let BackendPayload::Translation(result) = &backend_result.payload else {
+            return Err(CoreError::Data(
+                "translation cache returned a review payload".to_owned(),
+            ));
+        };
         validate_translation_batch(batch, &result.lines)?;
         if self.options.use_cache
             && !cached
             && let Some(store) = self.store.as_ref()
         {
-            store.save_cached_response(CacheStage::Translate, &request_hash, &backend_result)?;
+            store.save_cached_response(CacheStage::Translate, request_hash, &backend_result)?;
         }
-        let BackendPayload::Translation(result) = backend_result.payload;
+        let BackendPayload::Translation(result) = backend_result.payload else {
+            return Err(CoreError::Data(
+                "translation backend returned a review payload".to_owned(),
+            ));
+        };
         Ok(BatchWithUsage {
             lines: result.lines,
             summary: result.summary,
@@ -279,6 +446,385 @@ where
                 backend_result.usage
             },
         })
+    }
+
+    fn translate_split(
+        &mut self,
+        batch_index: usize,
+        batch: &[SubtitleSegment],
+        split: usize,
+    ) -> CoreResult<BatchWithUsage> {
+        let left = self.translate_batch_impl(batch_index, &batch[..split], false)?;
+        let right = self.translate_batch_impl(batch_index, &batch[split..], false)?;
+        let mut usage = left.usage;
+        usage.add(right.usage);
+        Ok(BatchWithUsage {
+            lines: left.lines.into_iter().chain(right.lines).collect(),
+            summary: combine_summaries(&left.summary, &right.summary, self.memory.max_summaries),
+            glossary_updates: combine_glossary(left.glossary_updates, right.glossary_updates),
+            usage,
+        })
+    }
+
+    fn review_batch(
+        &mut self,
+        batch_index: usize,
+        batch: &ReviewBatchPlan,
+    ) -> CoreResult<ReviewWithUsage> {
+        let mut last_error = None;
+        let mut attempts = Vec::new();
+        for attempt in 1..=self.options.retries + 1 {
+            let mut messages = build_review_messages(
+                &self.options,
+                &batch.source,
+                &batch.translated,
+                &batch.reasons,
+                &self.memory,
+            );
+            if let Some(error) = last_error.as_ref() {
+                messages.push(retry_correction_message(error));
+            }
+            let request_hash = request_hash(&self.options, CacheStage::Review, &messages);
+            match self.review_once(batch, &messages, &request_hash) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    let failure_messages = messages.clone();
+                    attempts.push(AttemptLog {
+                        attempt,
+                        cached: false,
+                        error: Some(error.to_string()),
+                        payload: None,
+                        messages,
+                        split_retry: None,
+                    });
+                    last_error = Some(error.clone());
+                    if attempt == self.options.retries + 1 {
+                        return self.finish_review_failure(
+                            batch_index,
+                            batch,
+                            error,
+                            request_hash,
+                            failure_messages,
+                            attempts,
+                        );
+                    }
+                }
+            }
+        }
+        Err(CoreError::Data(
+            "review retry loop ended unexpectedly".to_owned(),
+        ))
+    }
+
+    fn review_once(
+        &mut self,
+        batch: &ReviewBatchPlan,
+        messages: &[ChatMessage],
+        request_hash: &str,
+    ) -> CoreResult<ReviewWithUsage> {
+        let cached_response = if self.options.use_cache {
+            self.store
+                .as_ref()
+                .map(|store| store.load_cached_response(CacheStage::Review, request_hash))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let cached = cached_response.is_some();
+        let backend_result = match cached_response {
+            Some(response) => {
+                self.cache_hits += 1;
+                response
+            }
+            None => {
+                let (payload, usage) = self.backend.generate_raw_json(messages)?;
+                BackendJsonResult {
+                    payload: BackendPayload::Review(parse_review_payload(&payload)?),
+                    usage,
+                }
+            }
+        };
+        let BackendPayload::Review(result) = &backend_result.payload else {
+            return Err(CoreError::Data(
+                "review cache returned a translation payload".to_owned(),
+            ));
+        };
+        validate_translation_batch(&batch.source, &result.lines)?;
+        if self.options.use_cache
+            && !cached
+            && let Some(store) = self.store.as_ref()
+        {
+            store.save_cached_response(CacheStage::Review, request_hash, &backend_result)?;
+        }
+        let BackendPayload::Review(result) = backend_result.payload else {
+            return Err(CoreError::Data(
+                "review backend returned a translation payload".to_owned(),
+            ));
+        };
+        Ok(ReviewWithUsage {
+            lines: result.lines,
+            usage: if cached {
+                Usage::default()
+            } else {
+                backend_result.usage
+            },
+        })
+    }
+
+    fn finish_translation_failure(
+        &mut self,
+        batch_index: usize,
+        batch: &[SubtitleSegment],
+        error: CoreError,
+        request_hash: String,
+        messages: Vec<ChatMessage>,
+        attempts: Vec<AttemptLog>,
+    ) -> CoreResult<BatchWithUsage> {
+        let repair =
+            self.run_agent_repair("translate", batch_index, batch, None, &error, &attempts)?;
+        if let Some(outcome) = repair.as_ref()
+            && let Some(BackendPayload::Translation(result)) = outcome.payload.clone()
+        {
+            return Ok(BatchWithUsage {
+                lines: result.lines,
+                summary: result.summary,
+                glossary_updates: result.glossary_updates,
+                usage: outcome.usage,
+            });
+        }
+        let agent_attempts = repair
+            .as_ref()
+            .map(|outcome| outcome.attempts.clone())
+            .unwrap_or_default();
+        let failure_path = self.save_failure(FailureLog {
+            stage: "translate".to_owned(),
+            batch_index,
+            request_hash,
+            batch_segments: batch.to_vec(),
+            messages,
+            translated_segments: Vec::new(),
+            attempts,
+            agent_attempts,
+        })?;
+        Err(failure_error(
+            "Translation",
+            batch_index,
+            &error,
+            failure_path.as_ref(),
+            repair.as_ref(),
+        ))
+    }
+
+    fn finish_review_failure(
+        &mut self,
+        batch_index: usize,
+        batch: &ReviewBatchPlan,
+        error: CoreError,
+        request_hash: String,
+        messages: Vec<ChatMessage>,
+        attempts: Vec<AttemptLog>,
+    ) -> CoreResult<ReviewWithUsage> {
+        let repair = self.run_agent_repair(
+            "review",
+            batch_index,
+            &batch.source,
+            Some(&batch.translated),
+            &error,
+            &attempts,
+        )?;
+        if let Some(outcome) = repair.as_ref()
+            && let Some(BackendPayload::Review(result)) = outcome.payload.clone()
+        {
+            return Ok(ReviewWithUsage {
+                lines: result.lines,
+                usage: outcome.usage,
+            });
+        }
+        let agent_attempts = repair
+            .as_ref()
+            .map(|outcome| outcome.attempts.clone())
+            .unwrap_or_default();
+        let failure_path = self.save_failure(FailureLog {
+            stage: "review".to_owned(),
+            batch_index,
+            request_hash,
+            batch_segments: batch.source.clone(),
+            messages,
+            translated_segments: batch.translated.clone(),
+            attempts,
+            agent_attempts,
+        })?;
+        Err(failure_error(
+            "Final review",
+            batch_index,
+            &error,
+            failure_path.as_ref(),
+            repair.as_ref(),
+        ))
+    }
+
+    fn run_agent_repair(
+        &mut self,
+        stage: &str,
+        batch_index: usize,
+        source: &[SubtitleSegment],
+        translated: Option<&[SubtitleSegment]>,
+        initial_error: &CoreError,
+        failed_attempts: &[AttemptLog],
+    ) -> CoreResult<Option<RepairOutcome>> {
+        if !self.options.agent
+            || self.options.agent_repair_attempts == 0
+            || !is_agent_repairable(initial_error)
+        {
+            return Ok(None);
+        }
+
+        let cache_stage = if stage == "translate" {
+            CacheStage::AgentTranslateRepair
+        } else {
+            CacheStage::AgentReviewRepair
+        };
+        let mut repair_error = initial_error.clone();
+        let mut attempts = Vec::new();
+        let mut total_usage = Usage::default();
+        let mut log_path = PathBuf::new();
+        for attempt in 1..=self.options.agent_repair_attempts {
+            let messages = build_agent_repair_messages(
+                stage,
+                source,
+                translated,
+                &self.options.target_language,
+                &repair_error,
+                failed_attempts,
+                &attempts,
+            );
+            let request_hash = request_hash(&self.options, cache_stage, &messages);
+            let cached_response = if self.options.use_cache {
+                self.store
+                    .as_ref()
+                    .map(|store| store.load_cached_response(cache_stage, &request_hash))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let cached = cached_response.is_some();
+            let response_result = match cached_response {
+                Some(response) => {
+                    self.cache_hits += 1;
+                    Ok(response)
+                }
+                None => self
+                    .backend
+                    .generate_raw_json(&messages)
+                    .and_then(|(payload, usage)| {
+                        total_usage.add(usage);
+                        let payload = if stage == "translate" {
+                            BackendPayload::Translation(parse_translation_payload(&payload)?)
+                        } else {
+                            BackendPayload::Review(parse_review_payload(&payload)?)
+                        };
+                        Ok(BackendJsonResult { payload, usage })
+                    }),
+            };
+
+            match response_result.and_then(|response| {
+                let lines = match &response.payload {
+                    BackendPayload::Translation(result) => &result.lines,
+                    BackendPayload::Review(result) => &result.lines,
+                };
+                validate_translation_batch(source, lines)?;
+                if self.options.use_cache
+                    && !cached
+                    && let Some(store) = self.store.as_ref()
+                {
+                    store.save_cached_response(cache_stage, &request_hash, &response)?;
+                }
+                Ok(response)
+            }) {
+                Ok(response) => {
+                    attempts.push(AttemptLog {
+                        attempt,
+                        cached,
+                        error: None,
+                        payload: Some(backend_payload_json(&response.payload)?),
+                        messages,
+                        split_retry: None,
+                    });
+                    log_path = self.save_agent_log(AgentLog {
+                        stage: stage.to_owned(),
+                        batch_index,
+                        success: true,
+                        attempts: attempts.clone(),
+                        final_error: None,
+                    })?;
+                    self.agent_repairs.push(AgentRepairRecord {
+                        stage: stage.to_owned(),
+                        batch_index,
+                        attempts: attempt,
+                        success: true,
+                        log_path: log_path.clone(),
+                        error: String::new(),
+                    });
+                    return Ok(Some(RepairOutcome {
+                        payload: Some(response.payload),
+                        usage: total_usage,
+                        attempts,
+                        log_path,
+                        error: None,
+                    }));
+                }
+                Err(error) => {
+                    repair_error = error;
+                    attempts.push(AttemptLog {
+                        attempt,
+                        cached,
+                        error: Some(repair_error.to_string()),
+                        payload: None,
+                        messages,
+                        split_retry: None,
+                    });
+                    log_path = self.save_agent_log(AgentLog {
+                        stage: stage.to_owned(),
+                        batch_index,
+                        success: false,
+                        attempts: attempts.clone(),
+                        final_error: Some(repair_error.to_string()),
+                    })?;
+                }
+            }
+        }
+        self.agent_repairs.push(AgentRepairRecord {
+            stage: stage.to_owned(),
+            batch_index,
+            attempts: attempts.len(),
+            success: false,
+            log_path: log_path.clone(),
+            error: repair_error.to_string(),
+        });
+        Ok(Some(RepairOutcome {
+            payload: None,
+            usage: total_usage,
+            attempts,
+            log_path,
+            error: Some(repair_error.to_string()),
+        }))
+    }
+
+    fn save_failure(&self, log: FailureLog) -> CoreResult<Option<PathBuf>> {
+        self.store
+            .as_ref()
+            .map(|store| store.save_failure_log(&log))
+            .transpose()
+    }
+
+    fn save_agent_log(&self, log: AgentLog) -> CoreResult<PathBuf> {
+        self.store
+            .as_ref()
+            .map(|store| store.save_agent_log(&log))
+            .transpose()
+            .map(|path| path.unwrap_or_default())
     }
 
     fn load_resume_snapshot(
@@ -383,6 +929,21 @@ struct BatchWithUsage {
     usage: Usage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewWithUsage {
+    lines: Vec<TranslationLine>,
+    usage: Usage,
+}
+
+#[derive(Debug, Clone)]
+struct RepairOutcome {
+    payload: Option<BackendPayload>,
+    usage: Usage,
+    attempts: Vec<AttemptLog>,
+    log_path: PathBuf,
+    error: Option<String>,
+}
+
 fn build_translation_messages(
     options: &PipelineOptions,
     batch_index: usize,
@@ -461,6 +1022,58 @@ fn messages_json(messages: &[ChatMessage]) -> JsonValue {
             })
             .collect(),
     )
+}
+
+fn request_hash(options: &PipelineOptions, stage: CacheStage, messages: &[ChatMessage]) -> String {
+    build_request_hash(
+        &options.provider,
+        &options.model,
+        stage.as_str(),
+        messages_json(messages),
+    )
+}
+
+fn failure_error(
+    stage: &str,
+    batch_index: usize,
+    error: &CoreError,
+    failure_path: Option<&PathBuf>,
+    repair: Option<&RepairOutcome>,
+) -> CoreError {
+    let mut message = format!("{stage} batch {batch_index} failed: {error}");
+    if let Some(repair) = repair
+        && repair.payload.is_none()
+    {
+        message.push_str(&format!(
+            "\nAgent repair failed after {} attempt(s).",
+            repair.attempts.len()
+        ));
+        if !repair.log_path.as_os_str().is_empty() {
+            message.push_str(&format!(
+                "\nAgent log saved to:\n{}",
+                repair.log_path.display()
+            ));
+        }
+        if let Some(error) = &repair.error {
+            message.push_str(&format!("\nLast agent error: {error}"));
+        }
+    }
+    if let Some(path) = failure_path {
+        message.push_str(&format!("\nFailure sample saved to:\n{}", path.display()));
+    }
+    CoreError::InvalidTranslation(message)
+}
+
+fn is_agent_repairable(error: &CoreError) -> bool {
+    match error {
+        CoreError::InvalidTranslation(_) => true,
+        CoreError::Backend(message) => {
+            message.contains("invalid JSON in response")
+                || message.contains("response JSON object")
+                || message.contains("response missing lines array")
+        }
+        _ => false,
+    }
 }
 
 fn chunk_segments(segments: &[SubtitleSegment], batch_size: usize) -> Vec<Vec<SubtitleSegment>> {
@@ -670,6 +1283,260 @@ mod tests {
         }
     }
 
+    struct ReviewBackend {
+        translation_calls: Arc<AtomicUsize>,
+        review_calls: Arc<AtomicUsize>,
+        fail_on_review_call: Option<usize>,
+    }
+
+    impl LlmBackend for ReviewBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "echo"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            self.translation_calls.fetch_add(1, Ordering::SeqCst);
+            EchoBackend.generate_json(messages)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            messages: &[ChatMessage],
+        ) -> CoreResult<(serde_json::Value, Usage)> {
+            let call = self.review_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_review_call == Some(call) {
+                return Err(CoreError::Backend("scripted review failure".to_owned()));
+            }
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = prompt
+                .split("REVIEW_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("REVIEW_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing review json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::Data(format!("invalid review json: {error}")))?;
+            let lines = parsed["lines"]
+                .as_array()
+                .ok_or_else(|| CoreError::Data("missing review lines".to_owned()))?
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": format!(
+                            "[REVIEWED] {}",
+                            line["translation"].as_str().unwrap_or_default()
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                serde_json::json!({
+                    "lines": lines,
+                    "review_notes": "reviewed",
+                }),
+                Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                },
+            ))
+        }
+    }
+
+    struct StructuralFailureBackend {
+        call_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LlmBackend for StructuralFailureBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "structural"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            let mut response = EchoBackend.generate_json(messages)?;
+            let BackendPayload::Translation(result) = &mut response.payload else {
+                unreachable!();
+            };
+            self.call_sizes
+                .lock()
+                .expect("call sizes lock")
+                .push(result.lines.len());
+            if result.lines.len() > 1 {
+                result.lines.pop();
+            } else {
+                result.lines[0].translation =
+                    result.lines[0].translation.replacen("[ECHO]", "[SPLIT]", 1);
+            }
+            Ok(response)
+        }
+    }
+
+    struct AgentRepairBackend {
+        regular_calls: Arc<AtomicUsize>,
+        repair_calls: Arc<AtomicUsize>,
+        repair_succeeds: bool,
+    }
+
+    impl LlmBackend for AgentRepairBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "repair"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            self.regular_calls.fetch_add(1, Ordering::SeqCst);
+            let mut response = EchoBackend.generate_json(messages)?;
+            let BackendPayload::Translation(result) = &mut response.payload else {
+                unreachable!();
+            };
+            for line in &mut result.lines {
+                line.translation.clear();
+            }
+            Ok(response)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            messages: &[ChatMessage],
+        ) -> CoreResult<(serde_json::Value, Usage)> {
+            self.repair_calls.fetch_add(1, Ordering::SeqCst);
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = prompt
+                .split("AGENT_REPAIR_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing agent repair json".to_owned()))?;
+            let payload: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::Data(format!("invalid repair json: {error}")))?;
+            let source_lines = payload["source_lines"]
+                .as_array()
+                .ok_or_else(|| CoreError::Data("missing repair source lines".to_owned()))?;
+            let lines = source_lines
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": if self.repair_succeeds {
+                            format!("[AGENT] {}", line["text"].as_str().unwrap_or_default())
+                        } else {
+                            String::new()
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                serde_json::json!({
+                    "lines": lines,
+                    "summary": "agent repaired",
+                    "glossary_updates": [],
+                }),
+                Usage {
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    total_tokens: 7,
+                },
+            ))
+        }
+    }
+
+    struct AgentReviewBackend {
+        review_calls: Arc<AtomicUsize>,
+        repair_calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for AgentReviewBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "review-repair"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            EchoBackend.generate_json(messages)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            messages: &[ChatMessage],
+        ) -> CoreResult<(serde_json::Value, Usage)> {
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if prompt.contains("TASK_START\nreview_translations\nTASK_END") {
+                self.review_calls.fetch_add(1, Ordering::SeqCst);
+                let body = prompt
+                    .split("REVIEW_JSON_START")
+                    .nth(1)
+                    .and_then(|value| value.split("REVIEW_JSON_END").next())
+                    .ok_or_else(|| CoreError::Data("missing review json".to_owned()))?;
+                let payload: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|error| CoreError::Data(format!("invalid review json: {error}")))?;
+                let lines = payload["lines"]
+                    .as_array()
+                    .ok_or_else(|| CoreError::Data("missing review lines".to_owned()))?
+                    .iter()
+                    .map(|line| serde_json::json!({"id": line["id"], "translation": ""}))
+                    .collect::<Vec<_>>();
+                return Ok((
+                    serde_json::json!({"lines": lines, "review_notes": "broken"}),
+                    Usage::default(),
+                ));
+            }
+
+            self.repair_calls.fetch_add(1, Ordering::SeqCst);
+            let body = prompt
+                .split("AGENT_REPAIR_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing review repair json".to_owned()))?;
+            let payload: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::Data(format!("invalid review repair json: {error}")))?;
+            let current = payload["current_translations"]
+                .as_array()
+                .ok_or_else(|| CoreError::Data("missing current translations".to_owned()))?;
+            let lines = current
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": line["translation"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((
+                serde_json::json!({"lines": lines, "review_notes": "agent repaired"}),
+                Usage {
+                    input_tokens: 2,
+                    output_tokens: 2,
+                    total_tokens: 4,
+                },
+            ))
+        }
+    }
+
     #[test]
     fn tm_key_normalizes_and_attaches_punctuation() {
         assert_eq!(translation_memory_key("Hello, world!"), "hello, world!");
@@ -771,6 +1638,7 @@ mod tests {
         };
         let mut options = PipelineOptions::new("resume.txt".into());
         options.batch_size = 1;
+        options.retries = 0;
         let signature = input_signature_from_bytes(b"one\ntwo\nthree\n", Some(1));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -901,12 +1769,435 @@ mod tests {
         assert_eq!(second_run.translated_segments[0].text, "[ECHO] hello");
     }
 
+    #[test]
+    fn pipeline_retries_transient_backend_failure() {
+        let document = document("retry.txt", &["hello"]);
+        let mut options = PipelineOptions::new("retry.txt".into());
+        options.final_review = false;
+        options.retries = 1;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&calls),
+                fail_on_call: Some(1),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("retry succeeds");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
+    }
+
+    #[test]
+    fn structural_failures_recursively_split_translation_batch() {
+        let document = document("split.txt", &["one", "two", "three", "four"]);
+        let mut options = PipelineOptions::new("split.txt".into());
+        options.batch_size = 8;
+        options.final_review = false;
+        options.retries = 0;
+        options.agent = false;
+        let call_sizes = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            StructuralFailureBackend {
+                call_sizes: Arc::clone(&call_sizes),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("split succeeds");
+
+        assert_eq!(
+            *call_sizes.lock().expect("call sizes lock"),
+            vec![4, 2, 1, 1, 2, 1, 1]
+        );
+        assert!(
+            run.translated_segments
+                .iter()
+                .all(|segment| segment.text.starts_with("[SPLIT]"))
+        );
+    }
+
+    #[test]
+    fn agent_repair_continues_pipeline_and_records_log() {
+        let document = document("agent.txt", &["Alpha."]);
+        let mut options = PipelineOptions::new("agent.txt".into());
+        options.final_review = false;
+        options.retries = 0;
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("agent.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let regular_calls = Arc::new(AtomicUsize::new(0));
+        let repair_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            AgentRepairBackend {
+                regular_calls: Arc::clone(&regular_calls),
+                repair_calls: Arc::clone(&repair_calls),
+                repair_succeeds: true,
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+
+        let run = pipeline.run_document(&document).expect("agent repairs");
+
+        assert_eq!(regular_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repair_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run.translated_segments[0].text, "[AGENT] Alpha.");
+        assert_eq!(run.result.agent_repairs.len(), 1);
+        assert!(run.result.agent_repairs[0].success);
+        let data = captured.lock().expect("capture lock");
+        assert!(data.agent_logs.last().expect("agent log").success);
+        assert!(data.failure_logs.is_empty());
+    }
+
+    #[test]
+    fn agent_repair_cache_bypasses_second_repair_call() {
+        let document = document("agent-cache.txt", &["Alpha."]);
+        let mut options = PipelineOptions::new("agent-cache.txt".into());
+        options.final_review = false;
+        options.retries = 0;
+        options.resume = false;
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("agent-cache.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let mut first = SubtitlePipeline::new(
+            AgentRepairBackend {
+                regular_calls: Arc::new(AtomicUsize::new(0)),
+                repair_calls: Arc::new(AtomicUsize::new(0)),
+                repair_succeeds: true,
+            },
+            NoopDashboard,
+            options.clone(),
+        )
+        .with_store(Box::new(store.clone()));
+        first.run_document(&document).expect("prime repair cache");
+
+        let repair_calls = Arc::new(AtomicUsize::new(0));
+        let mut second = SubtitlePipeline::new(
+            AgentRepairBackend {
+                regular_calls: Arc::new(AtomicUsize::new(0)),
+                repair_calls: Arc::clone(&repair_calls),
+                repair_succeeds: false,
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+        let run = second.run_document(&document).expect("cached repair");
+
+        assert_eq!(repair_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(run.result.cache_hits, 1);
+        assert_eq!(run.translated_segments[0].text, "[AGENT] Alpha.");
+    }
+
+    #[test]
+    fn agent_can_repair_review_validation_failure() {
+        let document = document("review-agent.txt", &["Meet Alice now."]);
+        let mut options = PipelineOptions::new("review-agent.txt".into());
+        options.batch_size = 1;
+        options.retries = 0;
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let repair_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            AgentReviewBackend {
+                review_calls: Arc::clone(&review_calls),
+                repair_calls: Arc::clone(&repair_calls),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("review repaired");
+
+        assert_eq!(review_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repair_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run.result.agent_repairs.len(), 1);
+        assert_eq!(run.result.agent_repairs[0].stage, "review");
+        assert_eq!(run.translated_segments[0].text, "[ECHO] Meet Alice now.");
+    }
+
+    #[test]
+    fn failed_agent_repair_persists_failure_and_attempts() {
+        let document = document("agent-fail.txt", &["Alpha."]);
+        let mut options = PipelineOptions::new("agent-fail.txt".into());
+        options.final_review = false;
+        options.retries = 0;
+        options.agent_repair_attempts = 2;
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("agent-fail.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let mut pipeline = SubtitlePipeline::new(
+            AgentRepairBackend {
+                regular_calls: Arc::new(AtomicUsize::new(0)),
+                repair_calls: Arc::new(AtomicUsize::new(0)),
+                repair_succeeds: false,
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+
+        let error = pipeline
+            .run_document(&document)
+            .expect_err("agent repair fails");
+
+        assert!(error.to_string().contains("Agent repair failed after 2"));
+        let data = captured.lock().expect("capture lock");
+        assert_eq!(data.agent_logs.last().expect("agent log").attempts.len(), 2);
+        assert_eq!(
+            data.failure_logs
+                .last()
+                .expect("failure log")
+                .agent_attempts
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn review_plan_selects_only_high_risk_batches() {
+        let batches = vec![
+            vec![segment("1", "Hello there.")],
+            vec![segment("2", "Meet Alice now.")],
+            vec![segment("3", &"long ".repeat(20))],
+        ];
+        let translated = batches
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<SubtitleSegment>>();
+
+        let plan = build_review_plan(&batches, &translated, &ContextMemory::new());
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source[0].id, "2");
+        assert_eq!(plan[0].reasons, vec!["names and terms"]);
+    }
+
+    #[test]
+    fn pipeline_reviews_high_risk_batches_and_replaces_output() {
+        let document = document("review.txt", &["Meet Alice now.", "move now."]);
+        let mut options = PipelineOptions::new("review.txt".into());
+        options.batch_size = 2;
+        options.resume = false;
+        let translation_calls = Arc::new(AtomicUsize::new(0));
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::clone(&translation_calls),
+                review_calls: Arc::clone(&review_calls),
+                fail_on_review_call: None,
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("reviewed run");
+
+        assert_eq!(translation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(review_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run.result.review_batches, 1);
+        assert_eq!(run.result.usage.total_tokens, 5);
+        assert_eq!(
+            run.translated_segments[0].text,
+            "[REVIEWED] [ECHO] Meet Alice now."
+        );
+    }
+
+    #[test]
+    fn pipeline_resumes_review_batches_from_shards() {
+        let document = document("review-resume.txt", &["Meet Alice now.", "Meet Bob now."]);
+        let mut options = PipelineOptions::new("review-resume.txt".into());
+        options.batch_size = 1;
+        options.retries = 0;
+        let signature = input_signature_from_bytes(b"Meet Alice now.\nMeet Bob now.\n", Some(1));
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("review-resume.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let first_review_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::new(AtomicUsize::new(0)),
+                review_calls: Arc::clone(&first_review_calls),
+                fail_on_review_call: Some(2),
+            },
+            NoopDashboard,
+            options.clone(),
+        )
+        .with_store(Box::new(store.clone()))
+        .with_input_signature(signature.clone());
+
+        first
+            .run_document(&document)
+            .expect_err("second review fails");
+        assert_eq!(first_review_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            captured
+                .lock()
+                .expect("capture lock")
+                .saved_state
+                .as_ref()
+                .expect("review checkpoint")
+                .review_batches_completed,
+            1
+        );
+
+        let resumed_translation_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_review_calls = Arc::new(AtomicUsize::new(0));
+        let mut resumed = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::clone(&resumed_translation_calls),
+                review_calls: Arc::clone(&resumed_review_calls),
+                fail_on_review_call: None,
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store))
+        .with_input_signature(signature);
+        let run = resumed.run_document(&document).expect("resume review");
+
+        assert_eq!(resumed_translation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resumed_review_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run.result.resumed_translation_batches, 2);
+        assert_eq!(run.result.resumed_review_batches, 1);
+        assert_eq!(run.result.review_batches, 2);
+        assert!(
+            run.translated_segments
+                .iter()
+                .all(|segment| segment.text.starts_with("[REVIEWED]"))
+        );
+    }
+
+    #[test]
+    fn pipeline_reuses_review_request_cache() {
+        let document = document("review-cache.txt", &["Meet Alice now."]);
+        let mut options = PipelineOptions::new("review-cache.txt".into());
+        options.batch_size = 1;
+        options.resume = false;
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("review-cache.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let mut first = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::new(AtomicUsize::new(0)),
+                review_calls: Arc::new(AtomicUsize::new(0)),
+                fail_on_review_call: None,
+            },
+            NoopDashboard,
+            options.clone(),
+        )
+        .with_store(Box::new(store.clone()));
+        first.run_document(&document).expect("prime cache");
+
+        let translation_calls = Arc::new(AtomicUsize::new(0));
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let mut second = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::clone(&translation_calls),
+                review_calls: Arc::clone(&review_calls),
+                fail_on_review_call: Some(1),
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+        let run = second.run_document(&document).expect("cached review");
+
+        assert_eq!(translation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(review_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(run.result.cache_hits, 2);
+        assert_eq!(run.result.usage, Usage::default());
+        assert_eq!(
+            run.translated_segments[0].text,
+            "[REVIEWED] [ECHO] Meet Alice now."
+        );
+    }
+
+    fn segment(id: &str, text: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+        }
+    }
+
+    fn document(path: &str, texts: &[&str]) -> SubtitleDocument {
+        SubtitleDocument {
+            path: path.into(),
+            format: "txt".to_owned(),
+            segments: texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| segment(&(index + 1).to_string(), text))
+                .collect(),
+            header: None,
+            passthrough_blocks: Vec::new(),
+        }
+    }
+
     #[derive(Debug, Default)]
     struct CapturedStoreData {
         saved_translation_memory: Vec<(String, String)>,
         saved_batches: Vec<(usize, Vec<SubtitleSegment>)>,
+        saved_review_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_state: Option<RunState>,
         cached_responses: Vec<(CacheStage, String, BackendJsonResult)>,
+        failure_logs: Vec<FailureLog>,
+        agent_logs: Vec<AgentLog>,
     }
 
     #[derive(Debug, Clone)]
@@ -941,9 +2232,15 @@ mod tests {
             batch_index: usize,
             segments: &[SubtitleSegment],
         ) -> CoreResult<()> {
-            assert_eq!(kind, BatchShardKind::Translated);
             let mut data = self.data.lock().expect("capture lock");
-            data.saved_batches.push((batch_index, segments.to_vec()));
+            match kind {
+                BatchShardKind::Translated => {
+                    data.saved_batches.push((batch_index, segments.to_vec()))
+                }
+                BatchShardKind::Reviewed => data
+                    .saved_review_batches
+                    .push((batch_index, segments.to_vec())),
+            }
             Ok(())
         }
 
@@ -952,10 +2249,12 @@ mod tests {
             kind: BatchShardKind,
             completed_batches: usize,
         ) -> CoreResult<Vec<SubtitleSegment>> {
-            assert_eq!(kind, BatchShardKind::Translated);
             let data = self.data.lock().expect("capture lock");
-            Ok(data
-                .saved_batches
+            let batches = match kind {
+                BatchShardKind::Translated => &data.saved_batches,
+                BatchShardKind::Reviewed => &data.saved_review_batches,
+            };
+            Ok(batches
                 .iter()
                 .filter(|(index, _)| *index <= completed_batches)
                 .flat_map(|(_, segments)| segments.clone())
@@ -1000,6 +2299,30 @@ mod tests {
                     *cached_stage == stage && cached_hash == request_hash
                 })
                 .map(|(_, _, response)| response.clone()))
+        }
+
+        fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
+            self.data
+                .lock()
+                .expect("capture lock")
+                .failure_logs
+                .push(log.clone());
+            Ok(self
+                .paths
+                .failures_dir
+                .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
+        }
+
+        fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
+            self.data
+                .lock()
+                .expect("capture lock")
+                .agent_logs
+                .push(log.clone());
+            Ok(self
+                .paths
+                .agent_logs_dir
+                .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
         }
     }
 }

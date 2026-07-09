@@ -204,3 +204,130 @@ pub fn tool_specs_for_categories<'a>(
     result.sort_by_key(|spec| spec.name);
     result
 }
+
+/// Rank and filter tools for an agent decision prompt.
+///
+/// Discovery tools stay visible because they are the safe way to resolve
+/// ambiguous paths. Domain tools are selected from keywords in the request.
+pub fn ranked_tool_specs(input: &str) -> Vec<&'static ToolSpec> {
+    let input = input.to_lowercase();
+    let mut categories = Vec::new();
+    for (kind, keywords) in [
+        (
+            ToolKind::Translate,
+            &["translate", "subtitle", "bilingual", "翻译", "字幕"][..],
+        ),
+        (
+            ToolKind::Transcribe,
+            &[
+                "transcribe",
+                "audio",
+                "video",
+                "media",
+                "转录",
+                "音频",
+                "视频",
+            ][..],
+        ),
+        (ToolKind::Edit, &["edit", "rewrite", "修改", "编辑"][..]),
+        (
+            ToolKind::Diagnose,
+            &[
+                "diagnose", "failure", "error", "debug", "诊断", "失败", "错误",
+            ][..],
+        ),
+        (
+            ToolKind::FileOp,
+            &[
+                "create",
+                "append",
+                "replace",
+                "rename",
+                "delete",
+                "创建",
+                "追加",
+                "替换",
+                "重命名",
+                "删除",
+            ][..],
+        ),
+        (ToolKind::Profile, &["profile", "配置", "预设"][..]),
+        (
+            ToolKind::ManageWhisper,
+            &["whisper", "model", "install", "模型", "安装"][..],
+        ),
+    ] {
+        if keywords.iter().any(|keyword| input.contains(keyword)) {
+            categories.push(kind);
+        }
+    }
+
+    if categories.is_empty() {
+        return ALL_TOOL_SPECS.iter().collect();
+    }
+    categories.push(ToolKind::Browse);
+    let mut specs = ALL_TOOL_SPECS
+        .iter()
+        .filter(|spec| categories.contains(&spec.category))
+        .collect::<Vec<_>>();
+    specs.sort_by_key(|spec| {
+        (
+            if spec.category == ToolKind::Browse {
+                1
+            } else {
+                0
+            },
+            spec.name,
+        )
+    });
+    specs
+}
+
+pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(), String> {
+    if !ALL_TOOL_SPECS.iter().any(|spec| spec.name == name) {
+        return Err(format!("unknown tool `{name}`"));
+    }
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| format!("arguments for `{name}` must be a JSON object"))?;
+    let required: &[&str] = match name {
+        "translate_file" | "translate_series" | "edit_subtitle" | "transcribe_audio"
+        | "read_file" | "read_file_preview" | "create_file" | "append_file" | "replace_in_file"
+        | "delete_file" | "diagnose_path" => &["path"],
+        "rename_path" => &["from", "to"],
+        "diagnose_text" => &["text"],
+        "switch_profile" => &["name"],
+        _ => &[],
+    };
+    for key in required {
+        if object.get(*key).and_then(|value| value.as_str()).is_none() {
+            return Err(format!("tool `{name}` requires string argument `{key}`"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranking_keeps_translation_and_discovery_tools() {
+        let names = ranked_tool_specs("翻译 @episode.srt")
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"translate_file"));
+        assert!(names.contains(&"candidate_subtitles"));
+        assert!(!names.contains(&"manage_whisper"));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_and_incomplete_calls() {
+        assert!(validate_tool_call("unknown", &serde_json::json!({})).is_err());
+        assert!(validate_tool_call("translate_file", &serde_json::json!({})).is_err());
+        assert!(
+            validate_tool_call("translate_file", &serde_json::json!({"path": "clip.srt"})).is_ok()
+        );
+    }
+}
