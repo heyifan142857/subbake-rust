@@ -545,6 +545,31 @@ mod tests {
     }
 
     #[test]
+    fn request_hash_matches_python_canonical_json() {
+        let messages = JsonValue::Array(vec![
+            JsonValue::Object(vec![
+                ("role".to_owned(), JsonValue::String("system".to_owned())),
+                (
+                    "content".to_owned(),
+                    JsonValue::String("TASK_START\ntranslate_subtitles\nTASK_END".to_owned()),
+                ),
+            ]),
+            JsonValue::Object(vec![
+                ("role".to_owned(), JsonValue::String("user".to_owned())),
+                (
+                    "content".to_owned(),
+                    JsonValue::String("你好\nworld".to_owned()),
+                ),
+            ]),
+        ]);
+
+        assert_eq!(
+            build_request_hash("OpenAI", "gpt-test", "translate", messages),
+            "8c13d80251241884e45610d3b6003c103e0421e5"
+        );
+    }
+
+    #[test]
     fn sha1_matches_known_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     }

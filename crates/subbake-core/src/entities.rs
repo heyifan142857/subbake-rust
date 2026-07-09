@@ -29,13 +29,14 @@ pub struct SubtitleDocument {
     pub passthrough_blocks: Vec<PassthroughBlock>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlossaryEntry {
     pub source: String,
     pub target: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
@@ -50,16 +51,18 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslationLine {
     pub id: String,
     pub translation: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchTranslationResult {
     pub lines: Vec<TranslationLine>,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub glossary_updates: Vec<GlossaryEntry>,
 }
 

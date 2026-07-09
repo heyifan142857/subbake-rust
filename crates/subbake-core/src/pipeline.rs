@@ -8,9 +8,13 @@ use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
-    BackendPayload, BatchShardKind, ChatMessage, DashboardSink, LlmBackend, RuntimeStore,
+    BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink, LlmBackend,
+    RuntimeStore,
 };
-use crate::storage::{InputSignature, ResumeSnapshot, RunState, build_translation_fingerprint};
+use crate::storage::{
+    InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash,
+    build_translation_fingerprint,
+};
 use crate::validation::{validate_full_alignment, validate_translation_batch};
 
 pub struct SubtitlePipeline<B, D> {
@@ -23,6 +27,7 @@ pub struct SubtitlePipeline<B, D> {
     /// Normalised-key → translation text cache loaded from the runtime store.
     translation_memory: HashMap<String, String>,
     translation_memory_hits: usize,
+    cache_hits: usize,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -42,6 +47,7 @@ where
             input_signature: None,
             translation_memory: HashMap::new(),
             translation_memory_hits: 0,
+            cache_hits: 0,
         }
     }
 
@@ -213,7 +219,7 @@ where
                 usage,
                 dry_run: false,
                 planned_batches,
-                cache_hits: 0,
+                cache_hits: self.cache_hits,
                 resumed_translation_batches: resume.translation_batches_completed,
                 resumed_review_batches: resume.review_batches_completed,
                 translation_memory_hits: self.translation_memory_hits,
@@ -231,13 +237,47 @@ where
         batch: &[SubtitleSegment],
     ) -> CoreResult<BatchWithUsage> {
         let messages = build_translation_messages(&self.options, batch_index, batch, &self.memory);
-        let backend_result = self.backend.generate_json(&messages)?;
+        let request_hash = build_request_hash(
+            &self.options.provider,
+            &self.options.model,
+            CacheStage::Translate.as_str(),
+            messages_json(&messages),
+        );
+        let cached_response = if self.options.use_cache {
+            self.store
+                .as_ref()
+                .map(|store| store.load_cached_response(CacheStage::Translate, &request_hash))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let cached = cached_response.is_some();
+        let backend_result = match cached_response {
+            Some(response) => {
+                self.cache_hits += 1;
+                response
+            }
+            None => self.backend.generate_json(&messages)?,
+        };
+        let BackendPayload::Translation(result) = &backend_result.payload;
+        validate_translation_batch(batch, &result.lines)?;
+        if self.options.use_cache
+            && !cached
+            && let Some(store) = self.store.as_ref()
+        {
+            store.save_cached_response(CacheStage::Translate, &request_hash, &backend_result)?;
+        }
         let BackendPayload::Translation(result) = backend_result.payload;
         Ok(BatchWithUsage {
             lines: result.lines,
             summary: result.summary,
             glossary_updates: result.glossary_updates,
-            usage: backend_result.usage,
+            usage: if cached {
+                Usage::default()
+            } else {
+                backend_result.usage
+            },
         })
     }
 
@@ -404,6 +444,23 @@ fn build_translation_messages(
         ChatMessage::system("TASK_START\ntranslate_subtitles\nTASK_END"),
         ChatMessage::user(user),
     ]
+}
+
+fn messages_json(messages: &[ChatMessage]) -> JsonValue {
+    JsonValue::Array(
+        messages
+            .iter()
+            .map(|message| {
+                JsonValue::Object(vec![
+                    ("role".to_owned(), JsonValue::String(message.role.clone())),
+                    (
+                        "content".to_owned(),
+                        JsonValue::String(message.content.clone()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 fn chunk_segments(segments: &[SubtitleSegment], batch_size: usize) -> Vec<Vec<SubtitleSegment>> {
@@ -779,11 +836,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pipeline_reuses_request_cache_without_backend_call() {
+        let document = SubtitleDocument {
+            path: "cache.txt".into(),
+            format: "txt".to_owned(),
+            segments: vec![SubtitleSegment {
+                id: "1".to_owned(),
+                text: "hello".to_owned(),
+                start: None,
+                end: None,
+                identifier: None,
+                settings: None,
+            }],
+            header: None,
+            passthrough_blocks: Vec::new(),
+        };
+        let mut options = PipelineOptions::new("cache.txt".into());
+        options.batch_size = 1;
+        options.resume = false;
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("cache.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&first_calls),
+                fail_on_call: None,
+            },
+            NoopDashboard,
+            options.clone(),
+        )
+        .with_store(Box::new(store.clone()));
+        let first_run = first.run_document(&document).expect("first run");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first_run.result.usage.total_tokens, 2);
+        assert_eq!(first_run.result.cache_hits, 0);
+
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut second = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&second_calls),
+                fail_on_call: Some(1),
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+        let second_run = second.run_document(&document).expect("cached run");
+
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_run.result.cache_hits, 1);
+        assert_eq!(second_run.result.usage, Usage::default());
+        assert_eq!(second_run.translated_segments[0].text, "[ECHO] hello");
+    }
+
     #[derive(Debug, Default)]
     struct CapturedStoreData {
         saved_translation_memory: Vec<(String, String)>,
         saved_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_state: Option<RunState>,
+        cached_responses: Vec<(CacheStage, String, BackendJsonResult)>,
     }
 
     #[derive(Debug, Clone)]
@@ -846,6 +969,37 @@ mod tests {
 
         fn load_run_state(&self) -> CoreResult<Option<RunState>> {
             Ok(self.data.lock().expect("capture lock").saved_state.clone())
+        }
+
+        fn save_cached_response(
+            &self,
+            stage: CacheStage,
+            request_hash: &str,
+            response: &BackendJsonResult,
+        ) -> CoreResult<()> {
+            self.data
+                .lock()
+                .expect("capture lock")
+                .cached_responses
+                .push((stage, request_hash.to_owned(), response.clone()));
+            Ok(())
+        }
+
+        fn load_cached_response(
+            &self,
+            stage: CacheStage,
+            request_hash: &str,
+        ) -> CoreResult<Option<BackendJsonResult>> {
+            Ok(self
+                .data
+                .lock()
+                .expect("capture lock")
+                .cached_responses
+                .iter()
+                .find(|(cached_stage, cached_hash, _)| {
+                    *cached_stage == stage && cached_hash == request_hash
+                })
+                .map(|(_, _, response)| response.clone()))
         }
     }
 }

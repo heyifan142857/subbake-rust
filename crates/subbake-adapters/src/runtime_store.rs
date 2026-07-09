@@ -2,9 +2,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use subbake_core::entities::SubtitleSegment;
+use serde::{Deserialize, Serialize};
+use subbake_core::entities::{BatchTranslationResult, SubtitleSegment, Usage};
 use subbake_core::error::{CoreError, CoreResult};
-use subbake_core::ports::{BatchShardKind, RuntimeStore};
+use subbake_core::ports::{
+    BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeStore,
+};
 use subbake_core::storage::{RunState, RuntimePaths};
 
 #[derive(Debug, Clone)]
@@ -24,6 +27,20 @@ impl FileRuntimeStore {
         };
         root.join(format!("{batch_index:04}.json"))
     }
+
+    pub fn cache_path(&self, stage: CacheStage, request_hash: &str) -> PathBuf {
+        self.paths
+            .cache_dir
+            .join(stage.as_str())
+            .join(format!("{request_hash}.json"))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TranslationCacheEntry {
+    payload: BatchTranslationResult,
+    #[serde(default)]
+    usage: Usage,
 }
 
 impl RuntimeStore for FileRuntimeStore {
@@ -148,6 +165,40 @@ impl RuntimeStore for FileRuntimeStore {
             .map(Some)
             .map_err(|error| CoreError::Data(format!("run state parse failed: {error}")))
     }
+
+    fn save_cached_response(
+        &self,
+        stage: CacheStage,
+        request_hash: &str,
+        response: &BackendJsonResult,
+    ) -> CoreResult<()> {
+        let BackendPayload::Translation(payload) = &response.payload;
+        let entry = TranslationCacheEntry {
+            payload: payload.clone(),
+            usage: response.usage,
+        };
+        let value = serde_json::to_value(entry)
+            .map_err(|error| CoreError::Data(format!("serialize request cache failed: {error}")))?;
+        write_json_verified(&self.cache_path(stage, request_hash), &value)
+    }
+
+    fn load_cached_response(
+        &self,
+        stage: CacheStage,
+        request_hash: &str,
+    ) -> CoreResult<Option<BackendJsonResult>> {
+        let path = self.cache_path(stage, request_hash);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path).map_err(storage_error)?;
+        let entry: TranslationCacheEntry = serde_json::from_str(&text)
+            .map_err(|error| CoreError::Data(format!("request cache parse failed: {error}")))?;
+        Ok(Some(BackendJsonResult {
+            payload: BackendPayload::Translation(entry.payload),
+            usage: entry.usage,
+        }))
+    }
 }
 
 fn string_map_json(entries: &[(String, String)]) -> serde_json::Value {
@@ -240,7 +291,9 @@ fn storage_error(error: io::Error) -> CoreError {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use subbake_core::entities::{PipelineOptions, Usage};
+    use subbake_core::entities::{
+        BatchTranslationResult, GlossaryEntry, PipelineOptions, TranslationLine, Usage,
+    };
     use subbake_core::memory::ContextMemory;
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
 
@@ -427,6 +480,57 @@ mod tests {
         assert_eq!(value["translation_batches_completed"], 1);
         assert!(value.get("translated_segments").is_none());
         assert!(value.get("pipeline_fingerprint").is_none());
+    }
+
+    #[test]
+    fn round_trips_python_compatible_request_cache_shape() {
+        let root = temp_root("request-cache");
+        let paths = build_runtime_paths(
+            &root.join("clip.txt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let response = BackendJsonResult {
+            payload: BackendPayload::Translation(BatchTranslationResult {
+                lines: vec![TranslationLine {
+                    id: "1".to_owned(),
+                    translation: "你好".to_owned(),
+                }],
+                summary: "greeting".to_owned(),
+                glossary_updates: vec![GlossaryEntry {
+                    source: "hello".to_owned(),
+                    target: "你好".to_owned(),
+                }],
+            }),
+            usage: Usage {
+                input_tokens: 2,
+                output_tokens: 3,
+                total_tokens: 5,
+            },
+        };
+        let hash = "8c13d80251241884e45610d3b6003c103e0421e5";
+
+        store
+            .save_cached_response(CacheStage::Translate, hash, &response)
+            .expect("save cache");
+        let loaded = store
+            .load_cached_response(CacheStage::Translate, hash)
+            .expect("load cache")
+            .expect("cache exists");
+        let path = store.cache_path(CacheStage::Translate, hash);
+        let raw = fs::read_to_string(&path).expect("read cache");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(loaded, response);
+        assert_eq!(value["payload"]["lines"][0]["translation"], "你好");
+        assert_eq!(value["payload"]["glossary_updates"][0]["source"], "hello");
+        assert_eq!(value["usage"]["total_tokens"], 5);
+        assert!(path.ends_with(format!("translate/{hash}.json")));
     }
 
     fn temp_root(label: &str) -> PathBuf {

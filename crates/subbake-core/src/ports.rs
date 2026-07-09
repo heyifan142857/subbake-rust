@@ -35,6 +35,19 @@ pub enum BackendPayload {
     Translation(BatchTranslationResult),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStage {
+    Translate,
+}
+
+impl CacheStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Translate => "translate",
+        }
+    }
+}
+
 pub trait LlmBackend {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
@@ -138,6 +151,23 @@ pub trait RuntimeStore {
     }
 
     fn load_run_state(&self) -> CoreResult<Option<RunState>> {
+        Ok(None)
+    }
+
+    fn save_cached_response(
+        &self,
+        _stage: CacheStage,
+        _request_hash: &str,
+        _response: &BackendJsonResult,
+    ) -> CoreResult<()> {
+        Ok(())
+    }
+
+    fn load_cached_response(
+        &self,
+        _stage: CacheStage,
+        _request_hash: &str,
+    ) -> CoreResult<Option<BackendJsonResult>> {
         Ok(None)
     }
 }
