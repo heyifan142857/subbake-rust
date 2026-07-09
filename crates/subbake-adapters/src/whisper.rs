@@ -17,6 +17,8 @@ pub struct WhisperRequest {
 pub enum WhisperAction {
     Status,
     Install,
+    Update,
+    Uninstall { keep_models: bool },
     ListModels,
     DownloadModel { name: String },
 }
@@ -54,6 +56,14 @@ pub fn run_whisper(request: WhisperRequest) -> io::Result<WhisperOutcome> {
         WhisperAction::ListModels => Ok(WhisperOutcome::ModelList(list_models(&request)?)),
         WhisperAction::Install => {
             install_binary(&request)?;
+            Ok(WhisperOutcome::Status(inspect_status(&request)))
+        }
+        WhisperAction::Update => {
+            install_binary(&request)?;
+            Ok(WhisperOutcome::Status(inspect_status(&request)))
+        }
+        WhisperAction::Uninstall { keep_models } => {
+            uninstall_whisper(&request, keep_models)?;
             Ok(WhisperOutcome::Status(inspect_status(&request)))
         }
         WhisperAction::DownloadModel { ref name } => {
@@ -577,6 +587,36 @@ fn inspect_status(request: &WhisperRequest) -> WhisperStatus {
     }
 }
 
+fn uninstall_whisper(request: &WhisperRequest, keep_models: bool) -> io::Result<()> {
+    let binary_path = request
+        .binary_path
+        .clone()
+        .unwrap_or_else(default_whisper_binary_path);
+    if binary_path.exists() {
+        fs::remove_file(&binary_path)
+            .map_err(|error| io::Error::other(format!("remove whisper binary: {error}")))?;
+    }
+    if let Some(parent) = binary_path.parent()
+        && parent.is_dir()
+        && fs::read_dir(parent)?.next().is_none()
+    {
+        let _ = fs::remove_dir(parent);
+    }
+
+    if !keep_models {
+        let models_dir = request
+            .models_dir
+            .clone()
+            .unwrap_or_else(default_whisper_models_dir);
+        if models_dir.exists() {
+            fs::remove_dir_all(&models_dir)
+                .map_err(|error| io::Error::other(format!("remove models dir: {error}")))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn is_whisper_model_file(path: &std::path::Path) -> bool {
     matches!(
         path.extension().and_then(|value| value.to_str()),
@@ -701,6 +741,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(matches!(outcome, WhisperOutcome::ModelList(_)));
+    }
+
+    #[test]
+    fn uninstall_removes_binary_and_models() {
+        let root = temp_root("uninstall");
+        let bin_dir = root.join("bin");
+        let models_dir = root.join("models");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        fs::write(bin_dir.join("whisper-cli"), b"fake").expect("write binary");
+        fs::write(models_dir.join("ggml-base.bin"), b"fake").expect("write model");
+
+        let outcome = run_whisper(WhisperRequest {
+            action: WhisperAction::Uninstall { keep_models: false },
+            binary_path: Some(bin_dir.join("whisper-cli")),
+            models_dir: Some(models_dir),
+        })
+        .expect("uninstall whisper");
+        let _ = fs::remove_dir_all(&root);
+
+        let WhisperOutcome::Status(status) = outcome else {
+            panic!("expected status");
+        };
+        assert!(!status.binary_exists);
+        assert!(!status.models_dir_exists);
+    }
+
+    #[test]
+    fn uninstall_can_keep_models() {
+        let root = temp_root("uninstall-keep");
+        let bin_dir = root.join("bin");
+        let models_dir = root.join("models");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        fs::write(bin_dir.join("whisper-cli"), b"fake").expect("write binary");
+        fs::write(models_dir.join("ggml-base.bin"), b"fake").expect("write model");
+
+        let outcome = run_whisper(WhisperRequest {
+            action: WhisperAction::Uninstall { keep_models: true },
+            binary_path: Some(bin_dir.join("whisper-cli")),
+            models_dir: Some(models_dir.clone()),
+        })
+        .expect("uninstall whisper");
+        let kept = models_dir.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let WhisperOutcome::Status(status) = outcome else {
+            panic!("expected status");
+        };
+        assert!(!status.binary_exists);
+        assert!(status.models_dir_exists);
+        assert!(kept);
     }
 
     fn temp_root(label: &str) -> PathBuf {

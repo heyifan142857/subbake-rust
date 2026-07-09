@@ -1,3 +1,4 @@
+use subbake_core::editing::SubtitleEditPayload;
 use subbake_core::entities::{
     BatchTranslationResult, GlossaryEntry, ReviewResult, TranslationLine, Usage,
 };
@@ -67,6 +68,24 @@ impl LlmBackend for MockBackend {
         &mut self,
         messages: &[ChatMessage],
     ) -> CoreResult<(serde_json::Value, Usage)> {
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let task = extract_between(&prompt, "TASK_START", "TASK_END")?.trim();
+        if task == "agent_edit_subtitle" {
+            let payload = serde_json::to_value(edit_subtitles(&prompt)?).map_err(|error| {
+                CoreError::Backend(format!("mock response encode failed: {error}"))
+            })?;
+            let usage = Usage {
+                input_tokens: estimate_tokens(&prompt),
+                output_tokens: estimate_tokens(&payload.to_string()),
+                total_tokens: estimate_tokens(&prompt) + estimate_tokens(&payload.to_string()),
+            };
+            return Ok((payload, usage));
+        }
+
         let result = self.generate_json(messages)?;
         let payload = match result.payload {
             BackendPayload::Translation(batch) => serde_json::to_value(batch),
@@ -82,6 +101,40 @@ impl LlmBackend for MockBackend {
             "Mock provider does not require credentials.".to_owned(),
         ))
     }
+}
+
+fn edit_subtitles(prompt: &str) -> CoreResult<SubtitleEditPayload> {
+    let edit_json = extract_between(prompt, "EDIT_JSON_START", "EDIT_JSON_END")?;
+    let payload: JsonValue = serde_json::from_str(edit_json)
+        .map_err(|err| CoreError::Backend(format!("invalid edit json: {err}")))?;
+    let instruction = payload["instruction"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    let entries = payload["lines"]
+        .as_array()
+        .ok_or_else(|| CoreError::Backend("mock edit is missing lines array".to_owned()))?;
+
+    let lines = entries
+        .iter()
+        .map(|entry| {
+            let id = entry["id"].as_str().unwrap_or_default().to_owned();
+            let current = entry["translation"].as_str().unwrap_or_default();
+            let translation = if current.trim().is_empty() {
+                String::new()
+            } else if instruction.contains("uppercase") || instruction.contains("大写") {
+                current.to_uppercase()
+            } else {
+                format!("{current} [edited]")
+            };
+            TranslationLine { id, translation }
+        })
+        .collect();
+
+    Ok(SubtitleEditPayload {
+        lines,
+        edit_notes: "Mock subtitle edit completed.".to_owned(),
+    })
 }
 
 fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {

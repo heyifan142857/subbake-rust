@@ -1,4 +1,6 @@
 pub mod config;
+pub mod diagnostics;
+pub mod editing;
 pub mod fs;
 pub mod llm_backends;
 pub mod mock;
@@ -15,6 +17,8 @@ pub use config::{
     ConfigFile, discover_config_path, load_and_resolve, load_translation_settings_patch,
     parse_translation_settings_patch,
 };
+pub use diagnostics::{diagnose_failure_path, load_diagnostic_reports};
+pub use editing::{SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle};
 pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };

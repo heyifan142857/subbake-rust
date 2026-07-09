@@ -13,10 +13,12 @@ use std::path::PathBuf;
 
 use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{
-    TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
-    WhisperAction, WhisperRequest, default_output_path, is_supported_subtitle_path,
+    ConfigFile, SubtitleEditRequest, TranscriptionRequest, TranscriptionSettings,
+    TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest, default_output_path,
+    diagnose_failure_path, edit_subtitle, is_supported_subtitle_path, load_diagnostic_reports,
     transcribe_media, translate_subtitle,
 };
+use subbake_core::diagnostics::{diagnose_text as diagnose_failure_text, format_diagnostic_report};
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
 use subbake_core::error::CoreResult;
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
@@ -703,7 +705,7 @@ impl AgentEngine {
             "translate_file" => {
                 let path = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&path)?;
-                let settings = TranslationSettings::default();
+                let settings = self.active_translation_settings()?;
                 let output_path =
                     default_output_path(&input, settings.output_format(), settings.bilingual)?;
                 let undo_snapshot = self.guard.snapshot_write(&output_path)?;
@@ -732,7 +734,7 @@ impl AgentEngine {
                     .get("overwrite")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let settings = TranslationSettings::default();
+                let settings = self.active_translation_settings()?;
                 let source_files = if recursive {
                     self.guard.search_files(&input, "")?
                 } else {
@@ -780,22 +782,27 @@ impl AgentEngine {
                 ))
             }
 
-            // -- Edit: read file, show content, suggest re-translate --
+            // -- Edit: targeted rewrite of a generated subtitle file --
             "edit_subtitle" => {
                 let path = req_arg(args, "path")?;
-                let full = self.project_root.join(&path);
-                if full.exists() {
-                    let content = std::fs::read_to_string(&full)
-                        .unwrap_or_else(|_| "(unreadable)".to_owned());
-                    let preview: String = content.chars().take(500).collect();
-                    Ok(format!(
-                        "Current content of {}:\n{}\n\nTo edit, set `path` and `instructions` in arguments.",
-                        path.display(),
-                        preview
-                    ))
-                } else {
-                    Ok(format!("File {} not found.", path.display()))
+                let instruction = req_string_arg(args, "instruction")?;
+                let target_path = self.guard.resolve_path(&path)?;
+                let snapshot = self.guard.snapshot_write(&target_path)?;
+                let outcome = edit_subtitle(SubtitleEditRequest {
+                    target_path: target_path.clone(),
+                    instruction,
+                    settings: self.active_translation_settings()?,
+                    allow_non_generated: args
+                        .get("allow_non_generated")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                })?;
+                self.record_file_operation(&snapshot)?;
+                let mut lines = vec![format!("Edited: {}", target_path.display())];
+                if !outcome.edit_notes.trim().is_empty() {
+                    lines.push(outcome.edit_notes);
                 }
+                Ok(lines.join("\n"))
             }
 
             // -- Transcribe --
@@ -821,9 +828,16 @@ impl AgentEngine {
                     .unwrap_or("status");
                 let action = match action_str {
                     "install" => WhisperAction::Install,
+                    "update" => WhisperAction::Update,
+                    "uninstall" => WhisperAction::Uninstall {
+                        keep_models: args
+                            .get("keep_models")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                    },
                     "status" => WhisperAction::Status,
                     "list-models" | "models" => WhisperAction::ListModels,
-                    "download" => {
+                    "download" | "download_model" => {
                         let name = args
                             .get("model")
                             .and_then(|v| v.as_str())
@@ -845,83 +859,82 @@ impl AgentEngine {
                 }
             }
 
-            // -- Diagnose: read failure logs from a run directory --
+            // -- Diagnose: structured failure summary from file/run dir/text --
             "diagnose_path" => {
                 let path = req_arg(args, "path")?;
-                let run_dir = self.project_root.join(&path).join(".subbake/runs");
-                let mut results = Vec::new();
-                if run_dir.exists() {
-                    for entry in std::fs::read_dir(&run_dir).map_err(io::Error::other)? {
-                        let entry = entry.map_err(io::Error::other)?;
-                        let failures_dir = entry.path().join("failures");
-                        if failures_dir.exists() {
-                            for f in std::fs::read_dir(&failures_dir).map_err(io::Error::other)? {
-                                let f = f.map_err(io::Error::other)?;
-                                if let Ok(content) = std::fs::read_to_string(f.path()) {
-                                    results.push(format!(
-                                        "{}: {}",
-                                        f.path().display(),
-                                        &content[..content.len().min(200)]
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                if results.is_empty() {
+                let full = self.guard.resolve_path(&path)?;
+                let reports = if full.is_file() {
+                    vec![diagnose_failure_path(&full)?]
+                } else {
+                    load_diagnostic_reports(&full)?
+                };
+                if reports.is_empty() {
                     Ok("No failure logs found.".to_owned())
                 } else {
-                    Ok(results.join("\n---\n"))
+                    Ok(reports
+                        .iter()
+                        .map(format_diagnostic_report)
+                        .collect::<Vec<_>>()
+                        .join("\n\n---\n\n"))
                 }
             }
             "diagnose_text" => {
-                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                Ok(format!(
-                    "Diagnose text: received {} chars. For detailed diagnosis, set `path` to a run directory.",
-                    text.len()
-                ))
+                let text = req_string_arg(args, "text")?;
+                Ok(format_diagnostic_report(&diagnose_failure_text(
+                    &text,
+                    "pasted diagnostic text",
+                )))
             }
 
-            // -- Profile: read profiles from subbake.toml --
+            // -- Profile: read and switch active session profile --
             "list_profiles" => {
-                let config_path = self.project_root.join("subbake.toml");
-                if !config_path.exists() {
-                    return Ok("No subbake.toml found in project root.".to_owned());
-                }
-                let content = std::fs::read_to_string(&config_path)
-                    .map_err(|e| io::Error::other(format!("read config: {e}")))?;
-                let profiles = find_profile_names(&content);
+                let Some((_, config)) = self.load_project_config()? else {
+                    return Ok("No subbake config found in project root.".to_owned());
+                };
+                let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
+                profiles.sort();
                 if profiles.is_empty() {
                     Ok(
                         "No profiles defined in subbake.toml. Create [profiles.<name>] sections."
                             .to_owned(),
                     )
                 } else {
-                    Ok(format!("Profiles: {}", profiles.join(", ")))
+                    let active = self
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.profile.clone());
+                    Ok(format_profile_list(&profiles, active.as_deref()))
                 }
             }
             "switch_profile" => {
-                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let config_path = self.project_root.join("subbake.toml");
-                if !config_path.exists() {
+                let name = req_string_arg(args, "name")?;
+                let Some((config_path, config)) = self.load_project_config()? else {
                     return Ok(
-                        "No subbake.toml. Create one with [profiles.<name>] sections.".to_owned(),
+                        "No subbake config found. Create one with [profiles.<name>] sections."
+                            .to_owned(),
                     );
-                }
-                let content = std::fs::read_to_string(&config_path)
-                    .map_err(|e| io::Error::other(format!("read config: {e}")))?;
-                let profiles = find_profile_names(&content);
-                if profiles.contains(&name.to_owned()) {
-                    // Switching is done by the user editing their config default_profile.
-                    Ok(format!(
-                        "Profile `{name}` exists. Set `default_profile = \"{name}\"` in subbake.toml to activate it."
-                    ))
-                } else {
-                    Ok(format!(
+                };
+                if !config.profiles.contains_key(&name) {
+                    let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
+                    profiles.sort();
+                    return Ok(format!(
                         "Profile `{name}` not found. Available: {}",
                         profiles.join(", ")
-                    ))
+                    ));
                 }
+                let settings = self.settings_for_profile(&config, Some(&name));
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("no active session"))?;
+                session.profile = Some(name.clone());
+                session.config_path = Some(config_path.to_string_lossy().to_string());
+                self.save()?;
+                self.record_if_active(EventKind::Profile { name: name.clone() })?;
+                Ok(format!(
+                    "Profile switched: {name} ({}/{})",
+                    settings.provider, settings.model
+                ))
             }
 
             _ => Ok(format!("[{name}: not yet wired]")),
@@ -948,6 +961,41 @@ impl AgentEngine {
             group_id,
             undone: false,
         }))
+    }
+
+    fn load_project_config(&self) -> io::Result<Option<(PathBuf, ConfigFile)>> {
+        let candidates = [
+            self.session
+                .as_ref()
+                .and_then(|session| session.config_path.as_deref().map(PathBuf::from)),
+            Some(self.project_root.join("subbake.toml")),
+            Some(self.project_root.join(".subbake.toml")),
+        ];
+        for path in candidates.into_iter().flatten() {
+            if path.exists() {
+                return ConfigFile::load(&path).map(|config| Some((path, config)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn active_translation_settings(&self) -> io::Result<TranslationSettings> {
+        let profile = self
+            .session
+            .as_ref()
+            .and_then(|session| session.profile.as_deref());
+        let Some((_, config)) = self.load_project_config()? else {
+            return Ok(TranslationSettings::default());
+        };
+        Ok(self.settings_for_profile(&config, profile))
+    }
+
+    fn settings_for_profile(
+        &self,
+        config: &ConfigFile,
+        profile: Option<&str>,
+    ) -> TranslationSettings {
+        TranslationSettings::default().with_patch(config.resolve(profile))
     }
 
     fn event_path(&self, path: &std::path::Path) -> String {
@@ -981,6 +1029,13 @@ fn req_arg(args: &JsonValue, key: &str) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
 }
 
+fn req_string_arg(args: &JsonValue, key: &str) -> io::Result<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
+}
+
 fn format_file_list(files: &[PathBuf]) -> String {
     if files.is_empty() {
         return "(no files found)".to_owned();
@@ -1001,22 +1056,19 @@ fn truncate_text(text: &str, limit: usize) -> String {
     }
 }
 
-/// Parse lines like `[profiles.myprofile]` from TOML content.
-fn find_profile_names(toml: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in toml.lines() {
-        let trimmed = line.trim();
-        if let Some(inner) = trimmed.strip_prefix("[profiles.")
-            && let Some(name) = inner.strip_suffix(']')
-        {
-            let clean = name.trim();
-            if !clean.is_empty() {
-                names.push(clean.to_owned());
+fn format_profile_list(profiles: &[String], active: Option<&str>) -> String {
+    let rendered = profiles
+        .iter()
+        .map(|name| {
+            if Some(name.as_str()) == active {
+                format!("{name} (active)")
+            } else {
+                name.clone()
             }
-        }
-    }
-    names.sort();
-    names
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Profiles: {rendered}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,6 +1313,82 @@ mod tests {
         assert!(undone.contains("Undone"));
         assert!(!root.join("notes.txt").exists());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edit_subtitle_updates_file_and_undo_restores_previous_content() {
+        let root = temp_root("edit-undo");
+        std::fs::create_dir_all(&root).expect("create root");
+        let target = root.join("clip.translated.txt");
+        std::fs::write(&target, "hello\n").expect("write target");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let output = engine
+            .run_tool(
+                "edit_subtitle",
+                &json!({"path": "clip.translated.txt", "instruction": "make it uppercase"}),
+            )
+            .expect("edit subtitle");
+        assert!(output.contains("Edited:"));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read edited"),
+            "HELLO\n"
+        );
+
+        engine.undo_last().expect("undo edit");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read restored"),
+            "hello\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn diagnose_text_reports_structured_cause() {
+        let root = temp_root("diagnose-text");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let output = engine
+            .run_tool(
+                "diagnose_text",
+                &json!({"text": "missing api key for provider"}),
+            )
+            .expect("diagnose text");
+
+        assert!(output.contains("credentials"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switch_profile_updates_active_session_profile() {
+        let root = temp_root("switch-profile");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("subbake.toml"),
+            "default_profile = \"fast\"\n\
+             [defaults]\nprovider = \"mock\"\n\
+             [profiles.fast]\nmodel = \"mock-fast\"\n\
+             [profiles.strict]\nmodel = \"mock-strict\"\n",
+        )
+        .expect("write config");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let output = engine
+            .run_tool("switch_profile", &json!({"name": "strict"}))
+            .expect("switch profile");
+
+        assert!(output.contains("strict"));
+        let session = engine.session.as_ref().expect("session");
+        assert_eq!(session.profile.as_deref(), Some("strict"));
+        assert_eq!(
+            session.config_path.as_deref(),
+            Some(root.join("subbake.toml").to_string_lossy().as_ref())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

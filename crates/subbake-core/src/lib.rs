@@ -1,3 +1,5 @@
+pub mod diagnostics;
+pub mod editing;
 pub mod entities;
 pub mod error;
 pub mod formats;
@@ -10,6 +12,8 @@ mod review;
 pub mod storage;
 pub mod validation;
 
+pub use diagnostics::DiagnosticReport;
+pub use editing::SubtitleEditPayload;
 pub use entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, BatchTranslationResult, FailureLog,
     GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, ReviewResult, SplitRetryLog,

@@ -291,9 +291,10 @@ pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(
         .as_object()
         .ok_or_else(|| format!("arguments for `{name}` must be a JSON object"))?;
     let required: &[&str] = match name {
-        "translate_file" | "translate_series" | "edit_subtitle" | "transcribe_audio"
-        | "read_file" | "read_file_preview" | "create_file" | "append_file" | "replace_in_file"
+        "translate_file" | "translate_series" | "transcribe_audio" | "read_file"
+        | "read_file_preview" | "create_file" | "append_file" | "replace_in_file"
         | "delete_file" | "diagnose_path" => &["path"],
+        "edit_subtitle" => &["path", "instruction"],
         "rename_path" => &["from", "to"],
         "diagnose_text" => &["text"],
         "switch_profile" => &["name"],

@@ -434,6 +434,8 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
     let (action, mut index) = match command {
         "status" => (WhisperAction::Status, 1usize),
         "install" => (WhisperAction::Install, 1usize),
+        "update" => (WhisperAction::Update, 1usize),
+        "uninstall" => (WhisperAction::Uninstall { keep_models: false }, 1usize),
         "models" | "list-models" => (WhisperAction::ListModels, 1usize),
         "model" if args.get(1).is_some_and(|value| value == "list") => {
             (WhisperAction::ListModels, 2usize)
@@ -462,6 +464,9 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
             "--bin" => parsed.binary_path = Some(required_path(args, &mut index, "--bin")?),
             "--models-dir" => {
                 parsed.models_dir = Some(required_path(args, &mut index, "--models-dir")?)
+            }
+            "--keep-models" => {
+                parsed.action = WhisperAction::Uninstall { keep_models: true };
             }
             other => {
                 return Err(io::Error::other(format!(
@@ -837,5 +842,26 @@ mod tests {
 
         assert_eq!(parsed.action, WhisperAction::ListModels);
         assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
+    }
+
+    #[test]
+    fn parse_whisper_uninstall_accepts_keep_models() {
+        let args = vec!["uninstall".to_owned(), "--keep-models".to_owned()];
+
+        let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+
+        assert_eq!(
+            parsed.action,
+            WhisperAction::Uninstall { keep_models: true }
+        );
+    }
+
+    #[test]
+    fn parse_whisper_update_is_supported() {
+        let args = vec!["update".to_owned()];
+
+        let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+
+        assert_eq!(parsed.action, WhisperAction::Update);
     }
 }
