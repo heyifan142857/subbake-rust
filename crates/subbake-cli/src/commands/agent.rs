@@ -63,8 +63,10 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
 
     // Create the TUI with an observer attached to the engine.
     let input_history = engine.input_history();
+    let session_events = engine.session_events();
     let mut tui = SubBakeTui::new()?;
     tui.set_input_history(input_history);
+    tui.set_session_replay(session_events);
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));
 
@@ -163,8 +165,8 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
 
         if requested_session.is_some() || changed_session {
             Ok(TuiInteraction::SessionChanged {
-                message: result,
                 input_history: engine.input_history(),
+                events: engine.session_events(),
             })
         } else if let Some(options) = session_options {
             Ok(TuiInteraction::SessionPicker {

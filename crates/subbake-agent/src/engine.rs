@@ -510,6 +510,13 @@ impl AgentEngine {
             .unwrap_or_default()
     }
 
+    pub fn session_events(&self) -> Vec<crate::session::AgentEvent> {
+        self.session
+            .as_ref()
+            .map(|session| session.events.clone())
+            .unwrap_or_default()
+    }
+
     pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
         let trimmed = input.trim();
         let result = match trimmed {

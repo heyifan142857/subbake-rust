@@ -95,8 +95,8 @@ pub enum TuiInteraction {
         options: Vec<String>,
     },
     SessionChanged {
-        message: String,
         input_history: Vec<String>,
+        events: Vec<crate::session::AgentEvent>,
     },
     SessionPicker {
         message: String,
@@ -305,6 +305,36 @@ impl SubBakeTui {
         self.input_mode = InputMode::Editing;
     }
 
+    pub fn set_session_replay(&mut self, events: Vec<crate::session::AgentEvent>) {
+        self.finish_stream();
+        if let Ok(mut view) = self.msg_view.lock() {
+            view.messages.clear();
+            for event in events {
+                let (style, text) = match event.kind.as_str() {
+                    "user" => (
+                        MsgStyle::User,
+                        format!("[{}] {}", event.created_at, event.text),
+                    ),
+                    "assistant" | "ask_user" => (MsgStyle::Response, format!("➔ {}", event.text)),
+                    "tool_call" => (MsgStyle::ToolCall, format!("⚡ {}", event.text)),
+                    "file_operation" => (MsgStyle::Observation, format!("◀ {}", event.text)),
+                    "plan" => (MsgStyle::System, format!("Plan: {}", event.text)),
+                    "error" => (MsgStyle::Error, format!("✖ {}", event.text)),
+                    _ => continue,
+                };
+                if view.messages.len() >= view.max {
+                    view.messages.remove(0);
+                }
+                view.messages.push(Msg {
+                    style,
+                    text,
+                    stamp: event.created_at,
+                });
+            }
+        }
+        self.scroll_offset = 0;
+    }
+
     /// Run the event loop. `process_fn` is called with the user's input each
     /// time they press Enter; it should run the agent engine and return the
     /// response text.
@@ -350,13 +380,13 @@ impl SubBakeTui {
                             self.render_response(message, RenderPolicy::Immediate);
                         }
                         Ok(TuiInteraction::SessionChanged {
-                            message,
                             input_history,
+                            events,
                         }) => {
                             self.input_history = input_history;
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
-                            self.render_response(message, RenderPolicy::Immediate);
+                            self.set_session_replay(events);
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
                             self.input_mode = InputMode::ChoosingSession(TuiPicker { options });
