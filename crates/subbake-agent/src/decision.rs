@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{
     ConfigFile, SubtitleEditRequest, TranscriptionRequest, TranscriptionSettings,
-    TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest, default_output_path,
-    diagnose_failure_path, edit_subtitle_cancellable, is_supported_subtitle_path,
-    load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
+    TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest,
+    append_profile_snapshot, default_output_path, diagnose_failure_path, edit_subtitle_cancellable,
+    is_supported_subtitle_path, load_diagnostic_reports, transcribe_media_cancellable,
+    translate_subtitle_cancellable,
 };
 use subbake_core::diagnostics::{diagnose_text as diagnose_failure_text, format_diagnostic_report};
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
@@ -145,6 +146,26 @@ struct Decision {
 // ---------------------------------------------------------------------------
 
 impl AgentEngine {
+    /// Create a profile by appending an effective-settings snapshot. It stays
+    /// inactive so the current conversation never loses working credentials.
+    pub fn create_profile(&mut self, name: &str) -> io::Result<String> {
+        let Some((path, config)) = self.load_project_config()? else {
+            return Ok("No subbake config found. Create one before adding a profile.".to_owned());
+        };
+        let active = self
+            .session
+            .as_ref()
+            .and_then(|session| session.profile.as_deref());
+        append_profile_snapshot(&path, name, config.resolve(active))?;
+        let result = format!(
+            "Created profile `{name}` from the active settings. Inline credentials were not copied; review it, then select it with `/profile {name}`."
+        );
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
+    }
+
     /// Process a single user input line.
     ///
     /// Returns the response text to show to the user.
@@ -1331,6 +1352,54 @@ mod tests {
         assert_eq!(
             engine.set_plan_mode(false).expect("off again"),
             "Plan mode off."
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn revision_in_plan_mode_replaces_the_pending_plan_without_execution() {
+        let root = temp_root("revise-plan");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine
+            .store_plan(
+                "Create the original note",
+                vec![ToolCallDraft {
+                    tool_name: "create_file".to_owned(),
+                    arguments: json!({"path": "original.txt", "content": "old"}),
+                }],
+            )
+            .expect("store original plan");
+        let mut backend = RawDecisionBackend {
+            decision: json!({
+                "action": "plan",
+                "text": "Create the revised note",
+                "tool_calls": [{
+                    "tool_name": "create_file",
+                    "arguments": {"path": "revised.txt", "content": "new"}
+                }],
+                "confidence": 0.95
+            }),
+        };
+
+        let response = engine
+            .run_line("Instead create revised.txt", &mut backend)
+            .expect("revised plan");
+        assert!(response.contains("Choose an action below"));
+        assert!(!root.join("original.txt").exists());
+        assert!(!root.join("revised.txt").exists());
+        let pending = engine
+            .session
+            .as_ref()
+            .expect("session")
+            .pending_plan
+            .as_ref()
+            .expect("pending plan");
+        assert_eq!(pending.tool_calls.len(), 1);
+        assert_eq!(
+            pending.tool_calls[0].arguments["path"].as_str(),
+            Some("revised.txt")
         );
         let _ = std::fs::remove_dir_all(&root);
     }

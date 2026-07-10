@@ -82,6 +82,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         };
         let requested_profile = match &action {
             TuiAction::SelectProfile(name) => Some(name.as_str()),
+            TuiAction::CreateProfile(_) => None,
             TuiAction::SubmitText(input) => input
                 .trim()
                 .strip_prefix("/profile ")
@@ -132,6 +133,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                 TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
                 TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
                 TuiAction::SelectProfile(name) => engine.select_profile(name)?,
+                TuiAction::CreateProfile(name) => engine.create_profile(name)?,
                 TuiAction::SelectSession(id) => engine.select_session(id)?,
                 TuiAction::TogglePlan => engine.handle_toggle_plan()?,
             })

@@ -14,8 +14,8 @@ pub mod translation;
 pub mod whisper;
 
 pub use config::{
-    ConfigFile, discover_config_path, load_and_resolve, load_translation_settings_patch,
-    parse_translation_settings_patch,
+    ConfigFile, append_profile_snapshot, discover_config_path, load_and_resolve,
+    load_translation_settings_patch, parse_translation_settings_patch,
 };
 pub use diagnostics::{diagnose_failure_path, load_diagnostic_reports};
 pub use editing::{

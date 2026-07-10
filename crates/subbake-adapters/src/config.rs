@@ -11,6 +11,125 @@ pub fn load_translation_settings_patch(path: &Path) -> io::Result<TranslationSet
     parse_translation_settings_patch(&content).map_err(io::Error::other)
 }
 
+/// Append a profile snapshot without rewriting existing configuration, comments,
+/// or inline credentials. The caller can keep using its current profile until
+/// the newly created profile has been reviewed.
+pub fn append_profile_snapshot(
+    path: &Path,
+    name: &str,
+    mut settings: TranslationSettingsPatch,
+) -> io::Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "profile name may contain only letters, numbers, '-' and '_'",
+        ));
+    }
+
+    let config = ConfigFile::load(path)?;
+    if config.profiles.contains_key(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("profile `{name}` already exists"),
+        ));
+    }
+
+    // Do not proliferate inline credentials when creating a profile. An
+    // environment-variable reference remains safe to reuse.
+    settings.api_key = None;
+    settings.auth_header = None;
+
+    let mut content = fs::read_to_string(path)?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(&format!("[profiles.{name}]\n"));
+    write_profile_settings(&mut content, &settings);
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let permissions = fs::metadata(path)?.permissions();
+    fs::write(&temporary, content)?;
+    fs::set_permissions(&temporary, permissions)?;
+    let rename_result = fs::rename(&temporary, path);
+    if rename_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    rename_result
+}
+
+fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPatch) {
+    macro_rules! string_setting {
+        ($key:literal, $value:expr) => {
+            if let Some(value) = &$value {
+                content.push_str(&format!("{} = {}\n", $key, quote_string(value)));
+            }
+        };
+    }
+    macro_rules! bool_setting {
+        ($key:literal, $value:expr) => {
+            if let Some(value) = $value {
+                content.push_str(&format!("{} = {}\n", $key, value));
+            }
+        };
+    }
+    macro_rules! usize_setting {
+        ($key:literal, $value:expr) => {
+            if let Some(value) = $value {
+                content.push_str(&format!("{} = {}\n", $key, value));
+            }
+        };
+    }
+    string_setting!("output_format", settings.output_format);
+    string_setting!("provider", settings.provider);
+    string_setting!("model", settings.model);
+    string_setting!("base_url", settings.base_url);
+    if let Some(value) = settings.api_format {
+        string_setting!("api_format", Some(value.as_str().to_owned()));
+    }
+    string_setting!("endpoint_url", settings.endpoint_url);
+    string_setting!("api_key_env", settings.api_key_env);
+    string_setting!("auth_prefix", settings.auth_prefix);
+    string_setting!("source_language", settings.source_language);
+    string_setting!("target_language", settings.target_language);
+    usize_setting!("batch_size", settings.batch_size);
+    bool_setting!("bilingual", settings.bilingual);
+    bool_setting!("fast_mode", settings.fast_mode);
+    bool_setting!("final_review", settings.final_review);
+    bool_setting!("dry_run", settings.dry_run);
+    bool_setting!("resume", settings.resume);
+    bool_setting!("use_cache", settings.use_cache);
+    usize_setting!("retries", settings.retries);
+    bool_setting!("agent", settings.agent);
+    usize_setting!("agent_repair_attempts", settings.agent_repair_attempts);
+    if let Some(value) = &settings.runtime_dir {
+        string_setting!("runtime_dir", Some(value.to_string_lossy().into_owned()));
+    }
+    if let Some(value) = &settings.glossary_path {
+        string_setting!("glossary_path", Some(value.to_string_lossy().into_owned()));
+    }
+}
+
+fn quote_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
 /// Discover config file from XDG paths or project root.
 pub fn discover_config_path() -> Option<PathBuf> {
     // 1. XDG_CONFIG_HOME / default ~/.config
@@ -347,6 +466,14 @@ fn strip_comment(line: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn temporary_config(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("subbake-{name}-{unique}.toml"))
+    }
+
     #[test]
     fn parses_defaults_table() {
         let patch = parse_translation_settings_patch(
@@ -452,5 +579,56 @@ mod tests {
         let patch = parse_translation_settings_patch(r#"model = "mock#tag" # comment"#)
             .expect("config should parse");
         assert_eq!(patch.model.as_deref(), Some("mock#tag"));
+    }
+
+    #[test]
+    fn appends_profile_snapshot_without_rewriting_comments_or_credentials() {
+        let path = temporary_config("new-profile");
+        let original = "# keep this comment\n[defaults]\nprovider = \"mock\"\n";
+        fs::write(&path, original).expect("write config");
+        let patch = TranslationSettingsPatch {
+            provider: Some("custom".to_owned()),
+            model: Some("model\\\"name".to_owned()),
+            api_key: Some("secret".to_owned()),
+            api_key_env: Some("CUSTOM_API_KEY".to_owned()),
+            auth_header: Some("also-secret".to_owned()),
+            batch_size: Some(12),
+            bilingual: Some(true),
+            ..TranslationSettingsPatch::default()
+        };
+
+        append_profile_snapshot(&path, "review_copy", patch).expect("append profile");
+        let content = fs::read_to_string(&path).expect("read config");
+        assert!(content.starts_with(original));
+        assert!(content.contains("[profiles.review_copy]"));
+        assert!(content.contains("model = \"model\\\\\\\"name\""));
+        assert!(content.contains("api_key_env = \"CUSTOM_API_KEY\""));
+        assert!(!content.contains("secret"));
+
+        let parsed = ConfigFile::load(&path).expect("parse appended config");
+        let profile = parsed.profiles.get("review_copy").expect("new profile");
+        assert_eq!(profile.batch_size, Some(12));
+        assert_eq!(profile.bilingual, Some(true));
+        fs::remove_file(path).expect("remove config");
+    }
+
+    #[test]
+    fn profile_snapshot_rejects_unsafe_and_duplicate_names() {
+        let path = temporary_config("profile-validation");
+        fs::write(&path, "[profiles.existing]\nmodel = \"mock\"\n").expect("write config");
+        let patch = TranslationSettingsPatch::default();
+        assert_eq!(
+            append_profile_snapshot(&path, "bad.name", patch.clone())
+                .expect_err("unsafe name")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            append_profile_snapshot(&path, "existing", patch)
+                .expect_err("duplicate name")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs::remove_file(path).expect("remove config");
     }
 }

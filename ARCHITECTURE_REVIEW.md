@@ -6,7 +6,7 @@ This document tracks issues found while reviewing the interactive-agent changes.
 
 ### 1. Profile picker submission conflicts with generic suggestions — fixed
 
-Picker submission and slash completion are now mutually exclusive. A regression test verifies that selecting a profile retains the complete `/profile <name>` action. This remains string-based until the typed action-contract work in item 5.
+Picker submission and slash completion are now mutually exclusive. A regression test verifies the typed profile-selection action, so picker behavior no longer depends on synthesizing `/profile <name>` text.
 
 ### 2. Configuration discovery has two sources of truth — fixed
 
@@ -63,7 +63,7 @@ Short conversational answers benefit from animated streaming, but already-comple
 
 ### 10. Worker thread lifecycle is detached — fixed
 
-The TUI now owns a named worker `JoinHandle`, disconnects its channels during shutdown, restores the visible terminal, and joins the worker. Without backend cancellation support, shutdown during an active request waits for that request to finish and persist rather than detaching it. Esc cancellation remains intentionally unsupported until a cancellation token crosses the backend boundary.
+The TUI now owns a named worker `JoinHandle`, disconnects its channels during shutdown, restores the visible terminal, and joins the worker. Esc uses a generation-based cancellation guard that reaches the agent loop, providers, translation pipeline, transcription, and cancellable child processes.
 
 ### 11. Terminal restoration is not RAII-protected — fixed
 
@@ -77,14 +77,14 @@ After each successful tool call, the engine removes that call from the pending p
 
 Add state-transition tests for:
 
-- profile picker selection and submission;
+- full key-event integration for profile selection/creation (typed selection, creation, and picker-option behavior are covered);
 - full key-event integration for pending-plan choices (typed approve/reject/revise outcomes are covered);
-- revision instructions while a plan remains pending;
+- full key-event integration for revision instructions (plan-mode replacement behavior is covered);
 - full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
 - full profile-switch integration around failed backend construction (invalid backend failure and pre-commit ordering are covered);
 
 ## Deliberately deferred wiki items
 
-- **Provider-call interruption:** Esc now sets a shared cooperative cancellation token. The agent checks it between reasoning steps and immediately before tool execution, preventing new side effects after cancellation. A currently blocking provider HTTP call cannot yet be interrupted and must return before the agent reaches the next cancellation check; the TUI reports this honestly.
-- **Profile picker `new`:** profile creation is not currently available because the config adapter has a reader but no comment-preserving, atomic writer or credential-safe creation workflow. The picker should expose `new` only after that boundary exists.
+- **Provider-call interruption:** completed. Esc uses a generation-based guard; provider HTTP futures, translation/editing calls, transcription, ffmpeg, and whisper.cpp receive it. The remaining limitation is external processes or remote servers that do not respond to termination promptly.
+- **Profile picker `new`:** completed. The picker exposes a typed `new profile…` choice. Creation appends a validated effective-settings snapshot using an adjacent temporary file and rename, preserves the existing file and comments, omits inline API-key/auth-header credentials, and deliberately leaves the current profile active until the user reviews and selects the new profile.
 - **Top-level `sbake resume`:** the Rust CLI intentionally uses `sbake agent resume [SESSION_ID]` per the repository CLI direction; the Python/wiki alias is not reintroduced.

@@ -77,6 +77,7 @@ const APPROVAL_OPTIONS: &[(&str, &str)] = &[
         "revise the plan with your instructions",
     ),
 ];
+const NEW_PROFILE_OPTION: &str = "new profile…";
 
 struct TuiPicker {
     pub options: Vec<String>,
@@ -118,6 +119,7 @@ enum InputMode {
     Editing,
     BrowsingHistory { index: usize, draft: String },
     ChoosingProfile(TuiPicker),
+    CreatingProfile,
     ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
 }
@@ -128,6 +130,7 @@ pub enum TuiAction {
     ApprovePlan,
     RejectPlan,
     SelectProfile(String),
+    CreateProfile(String),
     SelectSession(String),
     TogglePlan,
 }
@@ -145,6 +148,7 @@ impl TuiAction {
             Self::ApprovePlan => "approve".to_owned(),
             Self::RejectPlan => "reject".to_owned(),
             Self::SelectProfile(name) => format!("/profile {name}"),
+            Self::CreateProfile(name) => format!("create profile {name}"),
             Self::SelectSession(id) => format!("/sessions {id}"),
             Self::TogglePlan => "toggle plan mode".to_owned(),
         }
@@ -404,6 +408,8 @@ impl SubBakeTui {
                             self.render_response(message, RenderPolicy::Immediate);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
+                            let mut options = options;
+                            options.push(NEW_PROFILE_OPTION.to_owned());
                             self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
                             self.suggestion_index = 0;
                             self.render_response(message, RenderPolicy::Immediate);
@@ -832,7 +838,20 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             && !picker.options.is_empty()
                         {
                             let index = self.suggestion_index.min(picker.options.len() - 1);
-                            Some(TuiAction::SelectProfile(picker.options[index].clone()))
+                            let option = &picker.options[index];
+                            if option == NEW_PROFILE_OPTION {
+                                self.input_mode = InputMode::CreatingProfile;
+                                self.suggestion_index = 0;
+                                if let Ok(mut view) = self.msg_view.lock() {
+                                    view.push(
+                                        MsgStyle::System,
+                                        "Enter a new profile name (letters, numbers, - and _)."
+                                            .to_owned(),
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            Some(TuiAction::SelectProfile(option.clone()))
                         } else if self.input.is_empty()
                             && let InputMode::ChoosingSession(picker) = &self.input_mode
                             && !picker.options.is_empty()
@@ -860,6 +879,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             return Ok(());
                         }
 
+                        let creating_profile =
+                            matches!(self.input_mode, InputMode::CreatingProfile);
                         self.input_mode = InputMode::Editing;
                         if self
                             .input_history
@@ -881,7 +902,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             }
                             return Ok(());
                         }
-                        TuiAction::SubmitText(trimmed)
+                        if creating_profile {
+                            TuiAction::CreateProfile(trimmed)
+                        } else {
+                            TuiAction::SubmitText(trimmed)
+                        }
                     };
                     self.scroll_offset = 0;
                     let opens_session_picker =
@@ -1039,8 +1064,16 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
         InputMode::ChoosingProfile(picker) if input.is_empty() => picker
             .options
             .iter()
-            .map(|option| (option.clone(), "configured profile".to_owned()))
+            .map(|option| {
+                let description = if option == NEW_PROFILE_OPTION {
+                    "copy active settings without credentials".to_owned()
+                } else {
+                    "configured profile".to_owned()
+                };
+                (option.clone(), description)
+            })
             .collect(),
+        InputMode::CreatingProfile => Vec::new(),
         InputMode::ChoosingSession(_) => Vec::new(),
         _ => slash_suggestions(input)
             .into_iter()
@@ -1156,6 +1189,18 @@ mod tests {
     fn typed_profile_action_has_a_stable_visible_form() {
         let action = TuiAction::SelectProfile("strict".to_owned());
         assert_eq!(action.visible_text(), "/profile strict");
+    }
+
+    #[test]
+    fn profile_creation_is_a_typed_action_and_picker_choice() {
+        let action = TuiAction::CreateProfile("review_copy".to_owned());
+        assert_eq!(action.visible_text(), "create profile review_copy");
+        let mode = InputMode::ChoosingProfile(TuiPicker {
+            options: vec![super::NEW_PROFILE_OPTION.to_owned()],
+        });
+        let choices = suggestions_for("", &mode);
+        assert_eq!(choices[0].0, super::NEW_PROFILE_OPTION);
+        assert!(choices[0].1.contains("without credentials"));
     }
 
     #[test]
