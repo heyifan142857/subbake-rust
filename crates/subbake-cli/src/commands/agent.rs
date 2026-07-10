@@ -65,6 +65,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
     let input_history = engine.input_history();
     let session_events = engine.session_events();
     let mut tui = SubBakeTui::new()?;
+    tui.set_has_config_file(config_path.is_some());
     tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
     tui.set_session_replay(session_events);

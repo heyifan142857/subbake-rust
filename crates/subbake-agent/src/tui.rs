@@ -302,6 +302,7 @@ pub struct SubBakeTui {
     animation_started_at: std::time::Instant,
     cancellation: Option<CancellationToken>,
     cancellation_requested: bool,
+    input_hint: &'static str,
 }
 
 impl SubBakeTui {
@@ -324,7 +325,14 @@ impl SubBakeTui {
             animation_started_at: std::time::Instant::now(),
             cancellation: None,
             cancellation_requested: false,
+            input_hint: session_input_hint(),
         })
+    }
+
+    pub fn set_has_config_file(&mut self, has_config_file: bool) {
+        if !has_config_file {
+            self.input_hint = "Use /profile to create a model profile";
+        }
     }
 
     pub fn observer(&self) -> TuiObserver {
@@ -515,11 +523,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
             v.push(
                 MsgStyle::WelcomeTagline,
                 "Fast AI subtitle translation".to_owned(),
-            );
-            v.push(MsgStyle::System, String::new());
-            v.push(
-                MsgStyle::System,
-                "Type a message or /help for commands.".to_owned(),
             );
         }
         Ok(())
@@ -933,12 +936,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // -- Input bar --
             let input_area = chunks[2];
-            let input_style = Style::default().fg(Color::Cyan);
-            let input_widget = Paragraph::new(Line::from(Span::styled(
-                format!("> {}", self.input),
-                input_style,
-            )))
-            .block(
+            let input_line = input_line(&self.input, &self.input_mode, processing, self.input_hint);
+            let input_widget = Paragraph::new(input_line).block(
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(Color::DarkGray)),
@@ -1246,6 +1245,37 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 }
 
+const INPUT_HINTS: &[&str] = &[
+    "Type a message or /help for commands",
+    "Ask SubBake to translate, transcribe, or inspect a file",
+    "Mention a subtitle file to get started",
+    "Use /plan to review the next steps before changes",
+    "Use /history to revisit earlier requests",
+];
+
+fn session_input_hint() -> &'static str {
+    let index = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.subsec_nanos() as usize % INPUT_HINTS.len()
+        });
+    INPUT_HINTS[index]
+}
+
+fn input_line<'a>(input: &'a str, mode: &InputMode, processing: bool, hint: &'a str) -> Line<'a> {
+    if input.is_empty() && matches!(mode, InputMode::Editing) && !processing {
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!("> {input}"),
+            Style::default().fg(Color::Cyan),
+        ))
+    }
+}
+
 fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
     match mode {
         InputMode::BrowsingHistory { .. } => Vec::new(),
@@ -1398,9 +1428,9 @@ mod tests {
 
     use super::{
         ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
-        approval_choice, empty_mode_choice, history_down, history_up, is_profile_name_character,
-        picker_viewport, previous_suggestion, profile_picker_choice, push_immediate_response,
-        slash_suggestions, suggestions_for,
+        approval_choice, empty_mode_choice, history_down, history_up, input_line,
+        is_profile_name_character, picker_viewport, previous_suggestion, profile_picker_choice,
+        push_immediate_response, slash_suggestions, suggestions_for,
     };
 
     #[test]
@@ -1411,6 +1441,21 @@ mod tests {
             vec![("/model", "show the active model")]
         );
         assert!(slash_suggestions("hello /").is_empty());
+    }
+
+    #[test]
+    fn input_hint_only_appears_for_idle_empty_editing() {
+        let line = input_line("", &InputMode::Editing, false, "A helpful hint");
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[1].content, "A helpful hint");
+
+        let typed = input_line("hello", &InputMode::Editing, false, "hidden");
+        assert_eq!(typed.spans.len(), 1);
+        assert_eq!(typed.spans[0].content, "> hello");
+
+        let processing = input_line("", &InputMode::Editing, true, "hidden");
+        assert_eq!(processing.spans.len(), 1);
+        assert_eq!(processing.spans[0].content, "> ");
     }
 
     #[test]
