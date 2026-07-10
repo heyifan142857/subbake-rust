@@ -82,6 +82,15 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
                 .filter(|name| !name.is_empty()),
             _ => None,
         };
+        let requested_session = match &action {
+            TuiAction::SelectSession(id) => Some(id.as_str()),
+            TuiAction::SubmitText(input) => input
+                .trim()
+                .strip_prefix("/session ")
+                .map(str::trim)
+                .filter(|id| !id.is_empty()),
+            _ => None,
+        };
         let candidate_backend = if let Some(profile) = requested_profile {
             if engine.profile_choices()?.iter().any(|name| name == profile) {
                 Some(build_agent_decision_backend(
@@ -91,6 +100,15 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             } else {
                 None
             }
+        } else {
+            None
+        };
+        let candidate_session_backend = if let Some(id) = requested_session {
+            let profile = engine.session_profile(id)?;
+            Some(build_agent_decision_backend(
+                config_path.as_deref(),
+                profile.as_deref(),
+            )?)
         } else {
             None
         };
@@ -106,9 +124,15 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
             TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
             TuiAction::SelectProfile(name) => engine.select_profile(name)?,
+            TuiAction::SelectSession(id) => engine.select_session(id)?,
+            TuiAction::TogglePlan => engine.handle_toggle_plan()?,
         };
 
         if let Some(candidate) = candidate_backend {
+            backend = candidate;
+        }
+        if let Some(candidate) = candidate_session_backend {
+            engine.set_config_path(config_path.as_deref())?;
             backend = candidate;
         }
 
@@ -131,11 +155,21 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             .then(|| engine.profile_choices())
             .transpose()?
             .filter(|options| !options.is_empty());
+        let session_options = submitted_text
+            .is_some_and(|input| input.trim() == "/session")
+            .then(|| engine.session_choices(20))
+            .transpose()?
+            .filter(|options| !options.is_empty());
 
-        if changed_session {
+        if requested_session.is_some() || changed_session {
             Ok(TuiInteraction::SessionChanged {
                 message: result,
                 input_history: engine.input_history(),
+            })
+        } else if let Some(options) = session_options {
+            Ok(TuiInteraction::SessionPicker {
+                message: result,
+                options,
             })
         } else if engine.has_pending_plan() {
             Ok(TuiInteraction::PlanApproval { message: result })

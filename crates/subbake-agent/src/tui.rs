@@ -98,6 +98,10 @@ pub enum TuiInteraction {
         message: String,
         input_history: Vec<String>,
     },
+    SessionPicker {
+        message: String,
+        options: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,7 @@ enum InputMode {
     Editing,
     BrowsingHistory { index: usize, draft: String },
     ChoosingProfile(TuiPicker),
+    ChoosingSession(TuiPicker),
     AwaitingPlanDecision,
 }
 
@@ -119,6 +124,8 @@ pub enum TuiAction {
     ApprovePlan,
     RejectPlan,
     SelectProfile(String),
+    SelectSession(String),
+    TogglePlan,
 }
 
 impl TuiAction {
@@ -128,6 +135,8 @@ impl TuiAction {
             Self::ApprovePlan => "approve".to_owned(),
             Self::RejectPlan => "reject".to_owned(),
             Self::SelectProfile(name) => format!("/profile {name}"),
+            Self::SelectSession(id) => format!("/session {id}"),
+            Self::TogglePlan => "toggle plan mode".to_owned(),
         }
     }
 }
@@ -349,6 +358,11 @@ impl SubBakeTui {
                             self.suggestion_index = 0;
                             self.render_response(message, RenderPolicy::Immediate);
                         }
+                        Ok(TuiInteraction::SessionPicker { message, options }) => {
+                            self.input_mode = InputMode::ChoosingSession(TuiPicker { options });
+                            self.suggestion_index = 0;
+                            self.render_response(message, RenderPolicy::Immediate);
+                        }
                         Err(error) => {
                             if let Ok(mut view) = self.msg_view.lock() {
                                 view.push(MsgStyle::Error, format!("Error: {error}"));
@@ -486,6 +500,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .options
                 .iter()
                 .map(|option| (option.clone(), "configured profile".to_owned()))
+                .collect(),
+            InputMode::ChoosingSession(picker) if self.input.is_empty() => picker
+                .options
+                .iter()
+                .map(|option| (option.clone(), "saved session".to_owned()))
                 .collect(),
             _ => slash_suggestions(&self.input)
                 .into_iter()
@@ -682,6 +701,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         {
                             let index = self.suggestion_index.min(picker.options.len() - 1);
                             Some(TuiAction::SelectProfile(picker.options[index].clone()))
+                        } else if self.input.is_empty()
+                            && let InputMode::ChoosingSession(picker) = &self.input_mode
+                            && !picker.options.is_empty()
+                        {
+                            let index = self.suggestion_index.min(picker.options.len() - 1);
+                            Some(TuiAction::SelectSession(picker.options[index].clone()))
                         } else if !suggestions.is_empty()
                             && !suggestions.iter().any(|item| item.0 == self.input)
                         {
@@ -779,6 +804,24 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 }
                 KeyCode::PageDown => {
                     self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                }
+                KeyCode::BackTab => {
+                    if self.processing {
+                        return Ok(());
+                    }
+                    let action = TuiAction::TogglePlan;
+                    if let Ok(mut view) = self.msg_view.lock() {
+                        view.push(
+                            MsgStyle::User,
+                            format!("[{:?}] {}", iso_now(), action.visible_text()),
+                        );
+                        view.push(MsgStyle::Thinking, "Updating mode…".to_owned());
+                    }
+                    self.processing = true;
+                    self.animation_started_at = std::time::Instant::now();
+                    request_tx.send(action).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped")
+                    })?;
                 }
                 KeyCode::Tab => {
                     if self.input.starts_with('/') {

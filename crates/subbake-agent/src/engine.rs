@@ -315,6 +315,14 @@ impl AgentEngine {
         }
     }
 
+    pub fn handle_toggle_plan(&mut self) -> std::io::Result<String> {
+        let result = self.toggle_plan_mode()?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
+    }
+
     pub fn session_summary(&self) -> std::io::Result<String> {
         let session = self
             .session
@@ -357,6 +365,25 @@ impl AgentEngine {
             })
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    pub fn session_choices(&self, limit: usize) -> std::io::Result<Vec<String>> {
+        self.session_store
+            .list(limit)
+            .map(|sessions| sessions.into_iter().map(|session| session.id).collect())
+    }
+
+    pub fn session_profile(&self, id: &str) -> std::io::Result<Option<String>> {
+        self.session_store.load(id).map(|session| session.profile)
+    }
+
+    pub fn select_session(&mut self, id: &str) -> std::io::Result<String> {
+        self.resume_session(Some(id))?;
+        let result = self.session_summary()?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
     }
 
     pub fn history_summary(&self, limit: usize) -> std::io::Result<String> {
@@ -486,7 +513,7 @@ impl AgentEngine {
     pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
         let trimmed = input.trim();
         let result = match trimmed {
-            "/plan" => self.toggle_plan_mode(),
+            "/plan" => return self.handle_toggle_plan(),
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
@@ -503,6 +530,10 @@ impl AgentEngine {
                 } else {
                     return self.select_profile(name);
                 }
+            }
+            command if command.starts_with("/session ") => {
+                let id = command.trim_start_matches("/session ").trim();
+                return self.select_session(id);
             }
             command if command == "/history" || command.starts_with("/history ") => {
                 let limit = command
