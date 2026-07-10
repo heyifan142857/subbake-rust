@@ -112,6 +112,17 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             backend = candidate;
         }
 
+        let changed_session =
+            submitted_text.is_some_and(|input| matches!(input.trim(), "/clear" | "/resume"));
+        if changed_session {
+            engine.set_config_path(config_path.as_deref())?;
+            let profile = engine
+                .session
+                .as_ref()
+                .and_then(|session| session.profile.as_deref());
+            backend = build_agent_decision_backend(config_path.as_deref(), profile)?;
+        }
+
         // Save session after each interaction.
         let _ = engine.save();
 
@@ -121,7 +132,12 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             .transpose()?
             .filter(|options| !options.is_empty());
 
-        if engine.has_pending_plan() {
+        if changed_session {
+            Ok(TuiInteraction::SessionChanged {
+                message: result,
+                input_history: engine.input_history(),
+            })
+        } else if engine.has_pending_plan() {
             Ok(TuiInteraction::PlanApproval { message: result })
         } else if let Some(options) = profile_options {
             Ok(TuiInteraction::ProfilePicker {

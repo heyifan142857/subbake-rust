@@ -62,6 +62,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/profile", "list or switch profiles"),
     ("/undo", "undo the last file operation"),
     ("/session", "show session info"),
+    ("/sessions", "list recent sessions"),
+    ("/history", "show conversation history"),
+    ("/clear", "start a new session"),
+    ("/resume", "resume the latest session"),
     ("/quit", "exit SubBake"),
 ];
 
@@ -89,6 +93,10 @@ pub enum TuiInteraction {
     ProfilePicker {
         message: String,
         options: Vec<String>,
+    },
+    SessionChanged {
+        message: String,
+        input_history: Vec<String>,
     },
 }
 
@@ -332,6 +340,15 @@ impl SubBakeTui {
                             self.suggestion_index = 0;
                             self.render_response(message, RenderPolicy::Immediate);
                         }
+                        Ok(TuiInteraction::SessionChanged {
+                            message,
+                            input_history,
+                        }) => {
+                            self.input_history = input_history;
+                            self.input_mode = InputMode::Editing;
+                            self.suggestion_index = 0;
+                            self.render_response(message, RenderPolicy::Immediate);
+                        }
                         Err(error) => {
                             if let Ok(mut view) = self.msg_view.lock() {
                                 view.push(MsgStyle::Error, format!("Error: {error}"));
@@ -367,11 +384,16 @@ impl SubBakeTui {
   /profile [NAME] — list or switch profiles
   /undo     —  undo last file operation
   /session  —  show session info
+  /sessions —  list recent sessions
+  /history [LIMIT] — show recent history
+  /clear    —  start a new session
+  /resume   —  resume latest session
   /quit     —  exit
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
-            "/plan" | "/model" | "/profile" | "/undo" | "/session" => {
+            "/plan" | "/model" | "/profile" | "/undo" | "/session" | "/sessions" | "/history"
+            | "/clear" | "/resume" => {
                 format!(
                     "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
                 )
@@ -847,7 +869,7 @@ mod tests {
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
-        assert_eq!(slash_suggestions("/").len(), 7);
+        assert_eq!(slash_suggestions("/").len(), 11);
         assert_eq!(
             slash_suggestions("/mod"),
             vec![("/model", "show the active model")]

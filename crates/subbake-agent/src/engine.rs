@@ -334,6 +334,82 @@ impl AgentEngine {
         ))
     }
 
+    pub fn sessions_summary(&self, limit: usize) -> std::io::Result<String> {
+        let sessions = self.session_store.list(limit)?;
+        if sessions.is_empty() {
+            return Ok("No saved sessions.".to_owned());
+        }
+        let active_id = self.session.as_ref().map(|session| session.id.as_str());
+        Ok(sessions
+            .iter()
+            .map(|session| {
+                let marker = if Some(session.id.as_str()) == active_id {
+                    "*"
+                } else {
+                    " "
+                };
+                format!(
+                    "{marker} {}  {}  {} events",
+                    session.id,
+                    session.mode,
+                    session.events.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    pub fn history_summary(&self, limit: usize) -> std::io::Result<String> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        let start = session.events.len().saturating_sub(limit);
+        let lines = session.events[start..]
+            .iter()
+            .filter_map(|event| {
+                let label = match event.kind.as_str() {
+                    "user" => "You",
+                    "assistant" | "ask_user" => "Agent",
+                    "tool_call" => "Tool",
+                    "error" => "Error",
+                    _ => return None,
+                };
+                Some(format!("{label}: {}", event.text))
+            })
+            .collect::<Vec<_>>();
+        Ok(if lines.is_empty() {
+            "No conversation history.".to_owned()
+        } else {
+            lines.join("\n")
+        })
+    }
+
+    pub fn clear_session(&mut self) -> std::io::Result<String> {
+        let config_path = self
+            .session
+            .as_ref()
+            .and_then(|session| session.config_path.clone());
+        self.start_session()?;
+        if let Some(session) = self.session.as_mut() {
+            session.config_path = config_path;
+        }
+        self.save()?;
+        Ok("Started a new session.".to_owned())
+    }
+
+    pub fn resume_previous_session(&mut self) -> std::io::Result<String> {
+        let active_id = self.session.as_ref().map(|session| session.id.clone());
+        let target = self
+            .session_store
+            .list(20)?
+            .into_iter()
+            .find(|session| Some(&session.id) != active_id.as_ref())
+            .ok_or_else(|| std::io::Error::other("no previous session to resume"))?;
+        self.session = Some(target);
+        self.session_summary()
+    }
+
     pub fn has_pending_plan(&self) -> bool {
         self.session
             .as_ref()
@@ -415,6 +491,9 @@ impl AgentEngine {
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
             "/session" => self.session_summary(),
+            "/sessions" => self.sessions_summary(20),
+            "/clear" => self.clear_session(),
+            "/resume" => self.resume_previous_session(),
             "/model" => self.active_model_summary(),
             "/profile" => self.run_tool("list_profiles", &serde_json::json!({})),
             command if command.starts_with("/profile ") => {
@@ -424,6 +503,15 @@ impl AgentEngine {
                 } else {
                     return self.select_profile(name);
                 }
+            }
+            command if command == "/history" || command.starts_with("/history ") => {
+                let limit = command
+                    .strip_prefix("/history")
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(20);
+                self.history_summary(limit)
             }
             other => Ok(format!("Unknown command `{other}`. Try /help.")),
         }?;
