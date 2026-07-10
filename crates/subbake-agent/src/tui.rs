@@ -621,7 +621,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let area = frame.area();
             if let Some(options) = &session_picker {
                 frame.render_widget(Clear, area);
-                let mut lines = vec![
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                let header = vec![
                     Line::from(Span::styled(
                         "Resume a previous session",
                         Style::default()
@@ -634,7 +645,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     )),
                     Line::from(""),
                 ];
-                for (index, session) in options.iter().enumerate() {
+                frame.render_widget(Paragraph::new(header), chunks[0]);
+                let (start, end) =
+                    picker_viewport(selected_suggestion, options.len(), chunks[1].height);
+                let mut lines = Vec::new();
+                for (index, session) in options.iter().enumerate().take(end).skip(start) {
                     let selected = index == selected_suggestion;
                     let style = if selected {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -655,21 +670,35 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     )));
                     lines.push(Line::from(""));
                 }
-                lines.push(Line::from(Span::styled(
-                    "↑↓←→ navigate · Enter resume · Esc cancel",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                frame.render_widget(Paragraph::new(lines), chunks[1]);
+                let footer = format!(
+                    "↑↓←→ navigate · Enter resume · Esc cancel  {}/{}",
+                    selected_suggestion.saturating_add(1),
+                    options.len()
+                );
                 frame.render_widget(
-                    Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL))
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    Paragraph::new(Line::from(Span::styled(
+                        footer,
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    chunks[2],
                 );
                 return;
             }
             if let Some(options) = &profile_picker {
                 frame.render_widget(Clear, area);
-                let mut lines = vec![
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                let header = vec![
                     Line::from(Span::styled(
                         "Choose a model profile",
                         Style::default()
@@ -682,7 +711,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     )),
                     Line::from(""),
                 ];
-                for (index, profile) in options.iter().enumerate() {
+                frame.render_widget(Paragraph::new(header), chunks[0]);
+                let (start, end) =
+                    picker_viewport(selected_suggestion, options.len(), chunks[1].height);
+                let mut lines = Vec::new();
+                for (index, profile) in options.iter().enumerate().take(end).skip(start) {
                     let selected = index == selected_suggestion;
                     let style = if selected {
                         Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -702,15 +735,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     lines.push(Line::from(Span::styled(details, style)));
                     lines.push(Line::from(""));
                 }
-                lines.push(Line::from(Span::styled(
-                    "↑↓←→ navigate · Enter select · Esc cancel",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                frame.render_widget(Paragraph::new(lines), chunks[1]);
+                let footer = format!(
+                    "↑↓←→ navigate · Enter select · Esc cancel  {}/{}",
+                    selected_suggestion.saturating_add(1),
+                    options.len()
+                );
                 frame.render_widget(
-                    Paragraph::new(lines)
-                        .block(Block::default().borders(Borders::ALL))
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    Paragraph::new(Line::from(Span::styled(
+                        footer,
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    chunks[2],
                 );
                 return;
             }
@@ -1302,6 +1338,21 @@ fn history_down(history: &[String], mode: &InputMode) -> Option<(InputMode, Stri
     }
 }
 
+const PICKER_ROW_HEIGHT: usize = 3;
+
+fn picker_viewport(selected: usize, option_count: usize, height: u16) -> (usize, usize) {
+    if option_count == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(option_count - 1);
+    let visible = (usize::from(height) / PICKER_ROW_HEIGHT).max(1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(option_count.saturating_sub(visible));
+    (start, start.saturating_add(visible).min(option_count))
+}
+
 fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
     if !input.starts_with('/') || input.contains(char::is_whitespace) {
         return Vec::new();
@@ -1333,8 +1384,8 @@ mod tests {
     use super::{
         ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
         approval_choice, empty_mode_choice, history_down, history_up, is_profile_name_character,
-        previous_suggestion, profile_picker_choice, push_immediate_response, slash_suggestions,
-        suggestions_for,
+        picker_viewport, previous_suggestion, profile_picker_choice, push_immediate_response,
+        slash_suggestions, suggestions_for,
     };
 
     #[test]
@@ -1352,6 +1403,21 @@ mod tests {
         assert_eq!(previous_suggestion(0, 7), 6);
         assert_eq!(previous_suggestion(4, 7), 3);
         assert_eq!((6 + 1) % 7, 0);
+    }
+
+    #[test]
+    fn picker_viewport_keeps_the_selection_visible() {
+        assert_eq!(picker_viewport(0, 20, 9), (0, 3));
+        assert_eq!(picker_viewport(2, 20, 9), (0, 3));
+        assert_eq!(picker_viewport(3, 20, 9), (1, 4));
+        assert_eq!(picker_viewport(19, 20, 9), (17, 20));
+    }
+
+    #[test]
+    fn picker_viewport_handles_empty_and_tiny_areas() {
+        assert_eq!(picker_viewport(0, 0, 9), (0, 0));
+        assert_eq!(picker_viewport(4, 5, 0), (4, 5));
+        assert_eq!(picker_viewport(99, 5, 3), (4, 5));
     }
 
     #[test]
