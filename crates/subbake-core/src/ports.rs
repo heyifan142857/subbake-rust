@@ -61,7 +61,7 @@ impl CacheStage {
     }
 }
 
-pub trait LlmBackend {
+pub trait LlmBackend: Send {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;

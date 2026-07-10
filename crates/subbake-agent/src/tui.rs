@@ -13,6 +13,8 @@
 //! └─────────────────────────────────┘
 
 use std::io;
+use std::sync::mpsc;
+use std::thread;
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -51,6 +53,7 @@ pub enum MsgStyle {
 }
 
 const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -110,8 +113,13 @@ impl TuiObserver {
 
 impl EngineObserver for TuiObserver {
     fn on_thinking(&mut self, text: &str) {
-        if let Ok(mut v) = self.view.lock() {
-            v.push(MsgStyle::Thinking, format!("⎿ {text}"));
+        if let Ok(mut v) = self.view.lock()
+            && !v
+                .messages
+                .last()
+                .is_some_and(|message| message.style == MsgStyle::Thinking && message.text == text)
+        {
+            v.push(MsgStyle::Thinking, text.to_owned());
         }
     }
 
@@ -152,6 +160,9 @@ pub struct SubBakeTui {
     scroll_offset: u16,
     running: bool,
     streaming: Option<StreamingResponse>,
+    suggestion_index: usize,
+    processing: bool,
+    animation_started_at: std::time::Instant,
 }
 
 impl SubBakeTui {
@@ -167,6 +178,9 @@ impl SubBakeTui {
             scroll_offset: 0,
             running: true,
             streaming: None,
+            suggestion_index: 0,
+            processing: false,
+            animation_started_at: std::time::Instant::now(),
         })
     }
 
@@ -179,15 +193,38 @@ impl SubBakeTui {
     /// response text.
     pub fn run<F>(&mut self, mut process_fn: F) -> io::Result<()>
     where
-        F: FnMut(&str, &mut TuiObserver) -> io::Result<String>,
+        F: FnMut(&str, &mut TuiObserver) -> io::Result<String> + Send + 'static,
     {
         let mut observer = self.observer();
         self.welcome(&mut observer)?;
+        let worker_observer = self.observer();
+        let (request_tx, request_rx) = mpsc::channel::<String>();
+        let (response_tx, response_rx) = mpsc::channel::<io::Result<String>>();
+        thread::spawn(move || {
+            let mut observer = worker_observer;
+            while let Ok(input) = request_rx.recv() {
+                let result = process_fn(&input, &mut observer);
+                if response_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
 
         while self.running {
+            if let Ok(result) = response_rx.try_recv() {
+                self.processing = false;
+                match result {
+                    Ok(response) => self.start_stream(response),
+                    Err(error) => {
+                        if let Ok(mut view) = self.msg_view.lock() {
+                            view.push(MsgStyle::Error, format!("Error: {error}"));
+                        }
+                    }
+                }
+            }
             self.advance_stream();
             self.draw()?;
-            self.handle_event(&mut observer, &mut process_fn)?;
+            self.handle_event(&request_tx)?;
         }
 
         disable_raw_mode()?;
@@ -288,6 +325,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
             .unwrap_or_default();
         let scroll = self.scroll_offset;
         let suggestions = self.slash_suggestions();
+        let selected_suggestion = self
+            .suggestion_index
+            .min(suggestions.len().saturating_sub(1));
+        let processing = self.processing;
+        let animation_tick = self.animation_started_at.elapsed().as_millis() / 80;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -304,12 +346,24 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let output_area = chunks[0];
             let items: Vec<Line<'_>> = messages
                 .iter()
-                .flat_map(|msg| {
+                .enumerate()
+                .flat_map(|(index, msg)| {
+                    let is_active_thinking = processing
+                        && msg.style == MsgStyle::Thinking
+                        && !messages[index + 1..]
+                            .iter()
+                            .any(|later| later.style == MsgStyle::Thinking);
                     let style = match msg.style {
                         MsgStyle::User => Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
-                        MsgStyle::Thinking => Style::default().fg(Color::Yellow),
+                        MsgStyle::Thinking if is_active_thinking => {
+                            let colors = [Color::Yellow, Color::LightYellow, Color::White];
+                            Style::default()
+                                .fg(colors[(animation_tick as usize / 2) % colors.len()])
+                                .add_modifier(Modifier::BOLD)
+                        }
+                        MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
                         MsgStyle::ToolCall => Style::default().fg(Color::Green),
                         MsgStyle::Observation => Style::default().fg(Color::DarkGray),
                         MsgStyle::Response => Style::default().fg(Color::White),
@@ -318,7 +372,20 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
                         }
                     };
-                    let lines = msg.text.split('\n').collect::<Vec<_>>();
+                    let display_text = if msg.style == MsgStyle::Thinking {
+                        let marker = if is_active_thinking {
+                            THINKING_FRAMES[animation_tick as usize % THINKING_FRAMES.len()]
+                        } else {
+                            "⎿"
+                        };
+                        format!("{marker} {}", msg.text)
+                    } else {
+                        msg.text.clone()
+                    };
+                    let lines = display_text
+                        .split('\n')
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
                     lines
                         .into_iter()
                         .map(move |line| Line::from(Span::styled(line, style)))
@@ -345,12 +412,30 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // -- Slash command suggestions --
             let suggestion_area = chunks[1];
-            let suggestion_lines = suggestions.iter().map(|(command, description)| {
-                Line::from(vec![
-                    Span::styled(format!("  {command:<10}"), Style::default().fg(Color::Cyan)),
-                    Span::styled(*description, Style::default().fg(Color::DarkGray)),
-                ])
-            });
+            let suggestion_lines =
+                suggestions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (command, description))| {
+                        let selected = index == selected_suggestion;
+                        let command_style = if selected {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Cyan)
+                        };
+                        let description_style = if selected {
+                            Style::default().fg(Color::White).bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        Line::from(vec![
+                            Span::styled(format!("› {command:<10}"), command_style),
+                            Span::styled(*description, description_style),
+                        ])
+                    });
             frame.render_widget(
                 Paragraph::new(suggestion_lines.collect::<Vec<_>>()),
                 suggestion_area,
@@ -380,10 +465,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         Ok(())
     }
 
-    fn handle_event<F>(&mut self, observer: &mut TuiObserver, process_fn: &mut F) -> io::Result<()>
-    where
-        F: FnMut(&str, &mut TuiObserver) -> io::Result<String>,
-    {
+    fn handle_event(&mut self, request_tx: &mpsc::Sender<String>) -> io::Result<()> {
         if !event::poll(STREAM_INTERVAL)? {
             return Ok(());
         }
@@ -400,6 +482,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.running = false;
                 }
                 KeyCode::Enter => {
+                    if self.processing {
+                        return Ok(());
+                    }
+                    let suggestions = self.slash_suggestions();
+                    if !suggestions.is_empty()
+                        && !suggestions.iter().any(|item| item.0 == self.input)
+                    {
+                        let index = self.suggestion_index.min(suggestions.len() - 1);
+                        self.input = suggestions[index].0.to_owned();
+                        self.suggestion_index = 0;
+                        return Ok(());
+                    }
                     let input = std::mem::take(&mut self.input);
                     let trimmed = input.trim().to_owned();
                     self.scroll_offset = 0;
@@ -428,29 +522,41 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         return Ok(());
                     }
 
-                    // Process.
-                    match process_fn(&trimmed, observer) {
-                        Ok(response) => {
-                            self.start_stream(response);
-                        }
-                        Err(e) => {
-                            if let Ok(mut v) = self.msg_view.lock() {
-                                v.push(MsgStyle::Error, format!("Error: {e}"));
-                            }
-                        }
+                    // Paint the submitted message and initial thinking state
+                    // before the potentially slow engine call begins.
+                    if let Ok(mut view) = self.msg_view.lock() {
+                        view.push(MsgStyle::Thinking, "Deciding next action…".to_owned());
                     }
+                    self.processing = true;
+                    self.animation_started_at = std::time::Instant::now();
+                    request_tx.send(trimmed).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped")
+                    })?;
                 }
                 KeyCode::Char(ch) => {
                     self.input.push(ch);
+                    self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    let suggestions = self.slash_suggestions();
+                    if suggestions.is_empty() {
+                        self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    } else {
+                        self.suggestion_index =
+                            previous_suggestion(self.suggestion_index, suggestions.len());
+                    }
                 }
                 KeyCode::Down => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    let suggestions = self.slash_suggestions();
+                    if suggestions.is_empty() {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    } else {
+                        self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
+                    }
                 }
                 KeyCode::PageUp => {
                     self.scroll_offset = self.scroll_offset.saturating_add(10);
@@ -505,9 +611,17 @@ fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+fn previous_suggestion(current: usize, count: usize) -> usize {
+    if current == 0 {
+        count.saturating_sub(1)
+    } else {
+        current - 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::slash_suggestions;
+    use super::{previous_suggestion, slash_suggestions};
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
@@ -517,5 +631,12 @@ mod tests {
             vec![("/approve", "execute the pending plan")]
         );
         assert!(slash_suggestions("hello /").is_empty());
+    }
+
+    #[test]
+    fn slash_selection_wraps_in_both_directions() {
+        assert_eq!(previous_suggestion(0, 7), 6);
+        assert_eq!(previous_suggestion(4, 7), 3);
+        assert_eq!((6 + 1) % 7, 0);
     }
 }

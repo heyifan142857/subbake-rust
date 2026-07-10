@@ -54,7 +54,7 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));
 
-    tui.run(|input, _obs| {
+    tui.run(move |input, _obs| {
         // Each user input: run through the engine's decision pipeline.
         let result = if input.trim().starts_with('/') {
             engine.handle_slash_command(input)?
