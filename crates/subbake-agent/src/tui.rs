@@ -139,6 +139,12 @@ enum ApprovalChoice {
     Revise,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfilePickerChoice {
+    Select(String),
+    Create,
+}
+
 impl TuiAction {
     fn visible_text(&self) -> String {
         match self {
@@ -948,21 +954,24 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             && let InputMode::ChoosingProfile(picker) = &self.input_mode
                             && !picker.options.is_empty()
                         {
-                            let index = self.suggestion_index.min(picker.options.len() - 1);
-                            let option = &picker.options[index];
-                            if option.create {
-                                self.input_mode = InputMode::CreatingProfile;
-                                self.suggestion_index = 0;
-                                if let Ok(mut view) = self.msg_view.lock() {
-                                    view.push(
-                                        MsgStyle::System,
-                                        "Enter a new profile name (letters, numbers, - and _)."
-                                            .to_owned(),
-                                    );
+                            match profile_picker_choice(picker, self.suggestion_index) {
+                                Some(ProfilePickerChoice::Create) => {
+                                    self.input_mode = InputMode::CreatingProfile;
+                                    self.suggestion_index = 0;
+                                    if let Ok(mut view) = self.msg_view.lock() {
+                                        view.push(
+                                            MsgStyle::System,
+                                            "Enter a new profile name (letters, numbers, - and _)."
+                                                .to_owned(),
+                                        );
+                                    }
+                                    return Ok(());
                                 }
-                                return Ok(());
+                                Some(ProfilePickerChoice::Select(name)) => {
+                                    Some(TuiAction::SelectProfile(name))
+                                }
+                                None => None,
                             }
-                            Some(TuiAction::SelectProfile(option.name.clone()))
                         } else if self.input.is_empty()
                             && let InputMode::ChoosingSession(picker) = &self.input_mode
                             && !picker.options.is_empty()
@@ -1216,6 +1225,17 @@ fn approval_choice(index: usize) -> ApprovalChoice {
     }
 }
 
+fn profile_picker_choice(picker: &TuiPicker, index: usize) -> Option<ProfilePickerChoice> {
+    let option = picker
+        .options
+        .get(index.min(picker.options.len().saturating_sub(1)))?;
+    if option.create {
+        Some(ProfilePickerChoice::Create)
+    } else {
+        Some(ProfilePickerChoice::Select(option.name.clone()))
+    }
+}
+
 fn begin_stream(view: &mut MsgView, text: String) -> Option<StreamingResponse> {
     if text.is_empty() {
         return None;
@@ -1296,9 +1316,9 @@ mod tests {
     use crate::engine::ProfileChoice;
 
     use super::{
-        ApprovalChoice, InputMode, TuiAction, TuiPicker, approval_choice, history_down, history_up,
-        is_profile_name_character, previous_suggestion, push_immediate_response, slash_suggestions,
-        suggestions_for,
+        ApprovalChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker, approval_choice,
+        history_down, history_up, is_profile_name_character, previous_suggestion,
+        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
     };
 
     #[test]
@@ -1328,7 +1348,7 @@ mod tests {
     fn profile_creation_is_a_typed_action_and_picker_choice() {
         let action = TuiAction::CreateProfile("review_copy".to_owned());
         assert_eq!(action.visible_text(), "create profile review_copy");
-        let mode = InputMode::ChoosingProfile(TuiPicker {
+        let picker = TuiPicker {
             options: vec![ProfileChoice {
                 name: "new profile…".to_owned(),
                 provider: String::new(),
@@ -1336,12 +1356,34 @@ mod tests {
                 active: false,
                 create: true,
             }],
-        });
+        };
+        assert_eq!(
+            profile_picker_choice(&picker, 0),
+            Some(ProfilePickerChoice::Create)
+        );
+        let mode = InputMode::ChoosingProfile(picker);
         assert!(suggestions_for("", &mode).is_empty());
         assert!(is_profile_name_character('_'));
         assert!(is_profile_name_character('9'));
         assert!(!is_profile_name_character('.'));
         assert!(!is_profile_name_character('中'));
+    }
+
+    #[test]
+    fn existing_profile_picker_choice_submits_the_profile_name() {
+        let picker = TuiPicker {
+            options: vec![ProfileChoice {
+                name: "strict".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-strict".to_owned(),
+                active: false,
+                create: false,
+            }],
+        };
+        assert_eq!(
+            profile_picker_choice(&picker, 0),
+            Some(ProfilePickerChoice::Select("strict".to_owned()))
+        );
     }
 
     #[test]
