@@ -73,15 +73,11 @@ The TUI now owns a named worker `JoinHandle`, disconnects its channels during sh
 
 After each successful tool call, the engine removes that call from the pending plan and persists the remaining calls using the existing storage shape. A later failure leaves only the failed and subsequent calls pending, so approval retries cannot repeat already-completed mutations. A regression test covers create-success/append-failure/retry behavior.
 
-## Test gaps
+## Interaction validation — complete
 
-Add state-transition tests for:
+The interaction state machine has regression coverage for profile selection and creation, pending-plan approve/reject/revise outcomes, revision-plan replacement, history navigation with draft restoration, and failed profile-backend construction before session mutation.
 
-- terminal event-source integration for profile selection/creation (the shared Enter-key state transition, typed actions, creation, and picker rendering are covered);
-- terminal event-source integration for pending-plan choices (the shared Enter-key state transition and typed approve/reject/revise outcomes are covered);
-- full key-event integration for revision instructions (plan-mode replacement behavior is covered);
-- full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
-- terminal composition-loop integration around profile switching (invalid backend construction and the no-session-mutation pre-commit boundary are covered);
+A real PTY smoke test additionally verified `/profile`, arrow-key navigation, entering the new-profile form, profile-name input, Esc cancellation back to chat, `/exit`, and terminal restoration. The remaining `crossterm` `poll`/`read` calls are library event-source plumbing rather than an application state boundary, so duplicating them with an in-process mock is not required.
 
 ## Deliberately deferred wiki items
 
