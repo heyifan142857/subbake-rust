@@ -8,7 +8,9 @@ pub mod tools;
 pub mod tui;
 
 pub use decision::EchoDecisionBackend;
-pub use engine::{AgentEngine, EngineObserver, PlanDecision, StreamingObserver};
+pub use engine::{
+    AgentEngine, EngineObserver, PlanDecision, ProfileChoice, SessionChoice, StreamingObserver,
+};
 pub use guard::FileGuard;
 pub use session::*;
 pub use subbake_core::{CancellationGuard, CancellationToken};

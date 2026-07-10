@@ -27,7 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::engine::{EngineObserver, SessionChoice};
+use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::session::iso_now;
 use subbake_core::{CancellationGuard, CancellationToken};
 
@@ -62,7 +62,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "show the active model"),
     ("/profile", "list or switch profiles"),
     ("/undo", "undo the last file operation"),
-    ("/sessions", "resume a saved session"),
+    ("/sessions", "choose a saved session"),
     ("/history", "show conversation history"),
     ("/clear", "start a new session"),
     ("/exit", "exit SubBake"),
@@ -77,10 +77,8 @@ const APPROVAL_OPTIONS: &[(&str, &str)] = &[
         "revise the plan with your instructions",
     ),
 ];
-const NEW_PROFILE_OPTION: &str = "new profile…";
-
 struct TuiPicker {
-    pub options: Vec<String>,
+    pub options: Vec<ProfileChoice>,
 }
 
 struct SessionPicker {
@@ -97,7 +95,7 @@ pub enum TuiInteraction {
     },
     ProfilePicker {
         message: String,
-        options: Vec<String>,
+        options: Vec<ProfileChoice>,
     },
     SessionChanged {
         input_history: Vec<String>,
@@ -408,11 +406,9 @@ impl SubBakeTui {
                             self.render_response(message, RenderPolicy::Immediate);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
-                            let mut options = options;
-                            options.push(NEW_PROFILE_OPTION.to_owned());
                             self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
                             self.suggestion_index = 0;
-                            self.render_response(message, RenderPolicy::Immediate);
+                            let _ = message;
                         }
                         Ok(TuiInteraction::SessionChanged {
                             input_history,
@@ -431,6 +427,7 @@ impl SubBakeTui {
                             let _ = message;
                         }
                         Err(error) => {
+                            self.input_mode = InputMode::Editing;
                             if let Ok(mut view) = self.msg_view.lock() {
                                 if error.kind() == io::ErrorKind::Interrupted {
                                     self.input_mode = InputMode::Editing;
@@ -476,7 +473,7 @@ impl SubBakeTui {
   /model    —  show active model
   /profile [NAME] — list or switch profiles
   /undo     —  undo last file operation
-  /sessions —  choose and resume a saved session
+  /sessions [ID] — choose or resume a saved session
   /history [LIMIT] — show recent history
   /clear    —  start a new session
   /exit /quit — exit
@@ -587,6 +584,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
             InputMode::ChoosingSession(picker) => self
                 .suggestion_index
                 .min(picker.options.len().saturating_sub(1)),
+            InputMode::ChoosingProfile(picker) => self
+                .suggestion_index
+                .min(picker.options.len().saturating_sub(1)),
             _ => self
                 .suggestion_index
                 .min(suggestions.len().saturating_sub(1)),
@@ -597,6 +597,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
             InputMode::ChoosingSession(picker) => Some(picker.options.clone()),
             _ => None,
         };
+        let profile_picker = match &self.input_mode {
+            InputMode::ChoosingProfile(picker) => Some(picker.options.clone()),
+            _ => None,
+        };
+        let creating_profile = matches!(self.input_mode, InputMode::CreatingProfile);
+        let profile_name_input = self.input.clone();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -646,6 +652,111 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         .wrap(Wrap { trim: false }),
                     area,
                 );
+                return;
+            }
+            if let Some(options) = &profile_picker {
+                frame.render_widget(Clear, area);
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        "Choose a model profile",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Profiles from the active SubBake configuration",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                ];
+                for (index, profile) in options.iter().enumerate() {
+                    let selected = index == selected_suggestion;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let marker = if profile.active { "●" } else { " " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker}  {}", profile.name),
+                        style.add_modifier(Modifier::BOLD),
+                    )));
+                    let details = if profile.create {
+                        profile.model.clone()
+                    } else {
+                        format!("   {} / {}", profile.provider, profile.model)
+                    };
+                    lines.push(Line::from(Span::styled(details, style)));
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(Span::styled(
+                    "↑↓←→ navigate · Enter select · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+                return;
+            }
+            if creating_profile {
+                frame.render_widget(Clear, area);
+                let name = if profile_name_input.is_empty() {
+                    "profile name…".to_owned()
+                } else {
+                    profile_name_input.clone()
+                };
+                let name_style = if profile_name_input.is_empty() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                };
+                let lines = vec![
+                    Line::from(Span::styled(
+                        "Create a model profile",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Copy the active settings into a new profile",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Profile name",
+                        Style::default().fg(Color::Cyan),
+                    )),
+                    Line::from(Span::styled(format!("> {name}"), name_style)),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Allowed: letters, numbers, - and _",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::styled(
+                        "Inline API keys and auth headers will not be copied.",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Enter create · Esc cancel",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+                frame.set_cursor_position((
+                    area.x + 3 + profile_name_input.chars().count() as u16,
+                    area.y + 5,
+                ));
                 return;
             }
             let chunks = Layout::default()
@@ -839,7 +950,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         {
                             let index = self.suggestion_index.min(picker.options.len() - 1);
                             let option = &picker.options[index];
-                            if option == NEW_PROFILE_OPTION {
+                            if option.create {
                                 self.input_mode = InputMode::CreatingProfile;
                                 self.suggestion_index = 0;
                                 if let Ok(mut view) = self.msg_view.lock() {
@@ -851,7 +962,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                                 }
                                 return Ok(());
                             }
-                            Some(TuiAction::SelectProfile(option.clone()))
+                            Some(TuiAction::SelectProfile(option.name.clone()))
                         } else if self.input.is_empty()
                             && let InputMode::ChoosingSession(picker) = &self.input_mode
                             && !picker.options.is_empty()
@@ -936,16 +1047,32 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     })?;
                 }
                 KeyCode::Char(ch) => {
-                    self.input_mode = InputMode::Editing;
+                    if matches!(self.input_mode, InputMode::CreatingProfile)
+                        && !is_profile_name_character(ch)
+                    {
+                        return Ok(());
+                    }
+                    if !matches!(self.input_mode, InputMode::CreatingProfile) {
+                        self.input_mode = InputMode::Editing;
+                    }
                     self.input.push(ch);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
-                    self.input_mode = InputMode::Editing;
+                    if !matches!(self.input_mode, InputMode::CreatingProfile) {
+                        self.input_mode = InputMode::Editing;
+                    }
                     self.input.pop();
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
+                    if let InputMode::ChoosingProfile(picker) = &self.input_mode {
+                        if !picker.options.is_empty() {
+                            self.suggestion_index =
+                                previous_suggestion(self.suggestion_index, picker.options.len());
+                        }
+                        return Ok(());
+                    }
                     if let InputMode::ChoosingSession(picker) = &self.input_mode {
                         if !picker.options.is_empty() {
                             self.suggestion_index =
@@ -962,6 +1089,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::Down => {
+                    if let InputMode::ChoosingProfile(picker) = &self.input_mode {
+                        if !picker.options.is_empty() {
+                            self.suggestion_index =
+                                (self.suggestion_index + 1) % picker.options.len();
+                        }
+                        return Ok(());
+                    }
                     if let InputMode::ChoosingSession(picker) = &self.input_mode {
                         if !picker.options.is_empty() {
                             self.suggestion_index =
@@ -977,13 +1111,16 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::Left | KeyCode::Right => {
-                    if let InputMode::ChoosingSession(picker) = &self.input_mode
-                        && !picker.options.is_empty()
-                    {
+                    let option_count = match &self.input_mode {
+                        InputMode::ChoosingSession(picker) => picker.options.len(),
+                        InputMode::ChoosingProfile(picker) => picker.options.len(),
+                        _ => 0,
+                    };
+                    if option_count > 0 {
                         self.suggestion_index = if key.code == KeyCode::Left {
-                            previous_suggestion(self.suggestion_index, picker.options.len())
+                            previous_suggestion(self.suggestion_index, option_count)
                         } else {
-                            (self.suggestion_index + 1) % picker.options.len()
+                            (self.suggestion_index + 1) % option_count
                         };
                     }
                 }
@@ -1061,18 +1198,7 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
             .iter()
             .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
             .collect(),
-        InputMode::ChoosingProfile(picker) if input.is_empty() => picker
-            .options
-            .iter()
-            .map(|option| {
-                let description = if option == NEW_PROFILE_OPTION {
-                    "copy active settings without credentials".to_owned()
-                } else {
-                    "configured profile".to_owned()
-                };
-                (option.clone(), description)
-            })
-            .collect(),
+        InputMode::ChoosingProfile(_) => Vec::new(),
         InputMode::CreatingProfile => Vec::new(),
         InputMode::ChoosingSession(_) => Vec::new(),
         _ => slash_suggestions(input)
@@ -1161,11 +1287,18 @@ fn previous_suggestion(current: usize, count: usize) -> usize {
     }
 }
 
+fn is_profile_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::engine::ProfileChoice;
+
     use super::{
         ApprovalChoice, InputMode, TuiAction, TuiPicker, approval_choice, history_down, history_up,
-        previous_suggestion, push_immediate_response, slash_suggestions, suggestions_for,
+        is_profile_name_character, previous_suggestion, push_immediate_response, slash_suggestions,
+        suggestions_for,
     };
 
     #[test]
@@ -1196,22 +1329,30 @@ mod tests {
         let action = TuiAction::CreateProfile("review_copy".to_owned());
         assert_eq!(action.visible_text(), "create profile review_copy");
         let mode = InputMode::ChoosingProfile(TuiPicker {
-            options: vec![super::NEW_PROFILE_OPTION.to_owned()],
+            options: vec![ProfileChoice {
+                name: "new profile…".to_owned(),
+                provider: String::new(),
+                model: "copy active settings without credentials".to_owned(),
+                active: false,
+                create: true,
+            }],
         });
-        let choices = suggestions_for("", &mode);
-        assert_eq!(choices[0].0, super::NEW_PROFILE_OPTION);
-        assert!(choices[0].1.contains("without credentials"));
+        assert!(suggestions_for("", &mode).is_empty());
+        assert!(is_profile_name_character('_'));
+        assert!(is_profile_name_character('9'));
+        assert!(!is_profile_name_character('.'));
+        assert!(!is_profile_name_character('中'));
     }
 
     #[test]
     fn history_round_trip_restores_the_unsubmitted_draft() {
-        let history = vec!["first".to_owned(), "/session".to_owned()];
+        let history = vec!["first".to_owned(), "/sessions".to_owned()];
         let (mode, input) = history_up(&history, "draft", &InputMode::Editing).expect("up");
-        assert_eq!(input, "/session");
+        assert_eq!(input, "/sessions");
         let (mode, input) = history_up(&history, &input, &mode).expect("up again");
         assert_eq!(input, "first");
         let (mode, input) = history_down(&history, &mode).expect("down");
-        assert_eq!(input, "/session");
+        assert_eq!(input, "/sessions");
         let (mode, input) = history_down(&history, &mode).expect("restore draft");
         assert!(matches!(mode, InputMode::Editing));
         assert_eq!(input, "draft");
@@ -1220,9 +1361,15 @@ mod tests {
     #[test]
     fn active_picker_and_approval_modes_take_priority_over_slash_completion() {
         let profile = InputMode::ChoosingProfile(TuiPicker {
-            options: vec!["fast".to_owned(), "strict".to_owned()],
+            options: vec![ProfileChoice {
+                name: "fast".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-fast".to_owned(),
+                active: true,
+                create: false,
+            }],
         });
-        assert_eq!(suggestions_for("", &profile)[0].0, "fast");
+        assert!(suggestions_for("", &profile).is_empty());
         assert_eq!(
             suggestions_for("", &InputMode::AwaitingPlanDecision)[0].0,
             "approve"

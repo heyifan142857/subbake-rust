@@ -52,6 +52,16 @@ pub struct SessionChoice {
     pub active: bool,
 }
 
+/// A configured model profile row for the interactive picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileChoice {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub active: bool,
+    pub create: bool,
+}
+
 /// Observer that prints everything to stdout (mirrors Python `trace._AgentLoopTrace`).
 pub struct StreamingObserver;
 
@@ -514,6 +524,40 @@ impl AgentEngine {
         };
         let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
         profiles.sort();
+        Ok(profiles)
+    }
+
+    pub fn profile_picker_choices(&self) -> std::io::Result<Vec<ProfileChoice>> {
+        let Some((_, config)) = self.load_project_config()? else {
+            return Ok(Vec::new());
+        };
+        let active = self
+            .session
+            .as_ref()
+            .and_then(|session| session.profile.as_deref())
+            .or(config.default_profile.as_deref());
+        let mut profiles = config
+            .profiles
+            .keys()
+            .map(|name| {
+                let settings = self.settings_for_profile(&config, Some(name));
+                ProfileChoice {
+                    name: name.clone(),
+                    provider: settings.provider,
+                    model: settings.model,
+                    active: active == Some(name.as_str()),
+                    create: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+        profiles.push(ProfileChoice {
+            name: "new profile…".to_owned(),
+            provider: String::new(),
+            model: "copy active settings without credentials".to_owned(),
+            active: false,
+            create: true,
+        });
         Ok(profiles)
     }
 

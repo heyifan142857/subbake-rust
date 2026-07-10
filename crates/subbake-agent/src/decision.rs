@@ -1028,7 +1028,7 @@ impl AgentEngine {
         Ok(self.settings_for_profile(&config, profile))
     }
 
-    fn settings_for_profile(
+    pub(crate) fn settings_for_profile(
         &self,
         config: &ConfigFile,
         profile: Option<&str>,
@@ -1566,6 +1566,32 @@ mod tests {
             session.config_path.as_deref(),
             Some(root.join("subbake.toml").to_string_lossy().as_ref())
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_picker_rows_include_active_model_metadata_and_new_choice() {
+        let root = temp_root("profile-picker-rows");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("subbake.toml"),
+            "default_profile = \"fast\"\n\
+             [defaults]\nprovider = \"mock\"\n\
+             [profiles.fast]\nmodel = \"mock-fast\"\n\
+             [profiles.strict]\nmodel = \"mock-strict\"\n",
+        )
+        .expect("write config");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let rows = engine.profile_picker_choices().expect("profile rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "fast");
+        assert!(rows[0].active);
+        assert_eq!(rows[0].model, "mock-fast");
+        assert_eq!(rows[1].name, "strict");
+        assert!(rows[2].create);
+        assert_eq!(rows[2].name, "new profile…");
         let _ = std::fs::remove_dir_all(&root);
     }
 

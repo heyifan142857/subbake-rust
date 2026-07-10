@@ -171,7 +171,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
 
         let profile_options = submitted_text
             .is_some_and(|input| matches!(input.trim(), "/model" | "/profile"))
-            .then(|| engine.profile_choices())
+            .then(|| engine.profile_picker_choices())
             .transpose()?
             .filter(|options| !options.is_empty());
         let session_options = submitted_text
