@@ -15,8 +15,8 @@ use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{
     ConfigFile, SubtitleEditRequest, TranscriptionRequest, TranscriptionSettings,
     TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest, default_output_path,
-    diagnose_failure_path, edit_subtitle, is_supported_subtitle_path, load_diagnostic_reports,
-    transcribe_media, translate_subtitle,
+    diagnose_failure_path, edit_subtitle_cancellable, is_supported_subtitle_path,
+    load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
 };
 use subbake_core::diagnostics::{diagnose_text as diagnose_failure_text, format_diagnostic_report};
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
@@ -149,6 +149,7 @@ impl AgentEngine {
     ///
     /// Returns the response text to show to the user.
     pub fn run_line(&mut self, input: &str, backend: &mut dyn LlmBackend) -> io::Result<String> {
+        self.check_cancelled()?;
         self.record_if_active(EventKind::User {
             text: input.to_owned(),
         })?;
@@ -166,6 +167,7 @@ impl AgentEngine {
         };
 
         loop {
+            self.check_cancelled()?;
             if state.step >= state.max_steps {
                 let msg = format!(
                     "I've tried {} steps without reaching a final action. Could you clarify?",
@@ -322,7 +324,7 @@ impl AgentEngine {
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
-        let result = backend.generate_raw_json(&messages);
+        let result = backend.generate_raw_json_cancellable(&messages, &self.operation_guard);
         match result {
             Ok((decision, _usage)) => match self.parse_decision_value(&decision) {
                 Ok(decision) => Ok(decision),
@@ -341,6 +343,12 @@ impl AgentEngine {
                 }
             },
             Err(e) => {
+                if matches!(e, subbake_core::CoreError::Cancelled) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "operation cancelled",
+                    ));
+                }
                 if let Some(ref mut obs) = self.observer {
                     obs.on_error(&e.to_string());
                 }
@@ -566,6 +574,7 @@ impl AgentEngine {
 
     /// Execute a tool by name with arguments. Returns a text summary.
     pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> io::Result<String> {
+        self.check_cancelled()?;
         self.record_if_active(EventKind::ToolCall {
             tool_name: name.to_owned(),
             arguments: args.clone(),
@@ -714,7 +723,7 @@ impl AgentEngine {
                     output_path: None,
                     settings,
                 };
-                let outcome = translate_subtitle(request)?;
+                let outcome = translate_subtitle_cancellable(request, &self.operation_guard)?;
                 if outcome.output_path.is_some() {
                     self.record_file_operation(&undo_snapshot)?;
                 }
@@ -766,7 +775,10 @@ impl AgentEngine {
                     overwrite,
                     settings,
                 };
-                let outcome = subbake_adapters::translate_subtitle_batch(request)?;
+                let outcome = subbake_adapters::translate_subtitle_batch_cancellable(
+                    request,
+                    &self.operation_guard,
+                )?;
                 let group_id = format!("translate-series-{}", crate::session::iso_now());
                 for output in &outcome.outputs {
                     if let Some((_, snapshot)) =
@@ -788,15 +800,18 @@ impl AgentEngine {
                 let instruction = req_string_arg(args, "instruction")?;
                 let target_path = self.guard.resolve_path(&path)?;
                 let snapshot = self.guard.snapshot_write(&target_path)?;
-                let outcome = edit_subtitle(SubtitleEditRequest {
-                    target_path: target_path.clone(),
-                    instruction,
-                    settings: self.active_translation_settings()?,
-                    allow_non_generated: args
-                        .get("allow_non_generated")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false),
-                })?;
+                let outcome = edit_subtitle_cancellable(
+                    SubtitleEditRequest {
+                        target_path: target_path.clone(),
+                        instruction,
+                        settings: self.active_translation_settings()?,
+                        allow_non_generated: args
+                            .get("allow_non_generated")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                    },
+                    &self.operation_guard,
+                )?;
                 self.record_file_operation(&snapshot)?;
                 let mut lines = vec![format!("Edited: {}", target_path.display())];
                 if !outcome.edit_notes.trim().is_empty() {
@@ -814,7 +829,8 @@ impl AgentEngine {
                     output_path: None,
                     settings: TranscriptionSettings::default(),
                 };
-                match transcribe_media(request) {
+                match transcribe_media_cancellable(request, &self.operation_guard) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
                     Ok(outcome) => Ok(format!("Transcribed: {}", outcome.output_path.display())),
                     Err(e) => Ok(format!("Transcription needs setup: {e}")),
                 }
@@ -853,7 +869,8 @@ impl AgentEngine {
                     binary_path: None,
                     models_dir: None,
                 };
-                match subbake_adapters::run_whisper(request) {
+                match subbake_adapters::run_whisper_cancellable(request, &self.operation_guard) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
                     Ok(_) => Ok("whisper: done".to_owned()),
                     Err(e) => Ok(format!("whisper: {e}")),
                 }
@@ -1315,6 +1332,28 @@ mod tests {
             engine.set_plan_mode(false).expect("off again"),
             "Plan mode off."
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancellation_prevents_the_next_tool_side_effect() {
+        let root = temp_root("cancel-tool");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let token = engine.cancellation_token();
+        let queued_guard = token.guard();
+        token.cancel();
+        engine.begin_operation(queued_guard);
+
+        let error = engine
+            .run_tool(
+                "create_file",
+                &json!({"path": "cancelled.txt", "content": "no"}),
+            )
+            .expect_err("cancelled tool must not run");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!root.join("cancelled.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

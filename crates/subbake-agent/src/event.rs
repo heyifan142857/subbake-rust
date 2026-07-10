@@ -53,6 +53,7 @@ pub enum EventKind {
     Error {
         text: String,
     },
+    Cancelled,
 }
 
 /// Stub for a tool call within a pending plan.

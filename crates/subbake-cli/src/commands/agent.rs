@@ -65,12 +65,14 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
     let input_history = engine.input_history();
     let session_events = engine.session_events();
     let mut tui = SubBakeTui::new()?;
+    tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
     tui.set_session_replay(session_events);
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));
 
-    tui.run(move |action, _obs| {
+    tui.run(move |action, guard, _obs| {
+        engine.begin_operation(guard);
         let submitted_text = match &action {
             TuiAction::SubmitText(text) => Some(text.as_str()),
             _ => None,
@@ -115,19 +117,30 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             None
         };
 
-        let result = match &action {
-            TuiAction::SubmitText(input) if input.trim().starts_with('/') => {
-                engine.record(EventKind::User {
-                    text: input.clone(),
-                })?;
-                engine.handle_slash_command(input)?
+        let operation_result = (|| -> io::Result<String> {
+            Ok(match &action {
+                TuiAction::SubmitText(input) if input.trim().starts_with('/') => {
+                    engine.record(EventKind::User {
+                        text: input.clone(),
+                    })?;
+                    engine.handle_slash_command(input)?
+                }
+                TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
+                TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
+                TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
+                TuiAction::SelectProfile(name) => engine.select_profile(name)?,
+                TuiAction::SelectSession(id) => engine.select_session(id)?,
+                TuiAction::TogglePlan => engine.handle_toggle_plan()?,
+            })
+        })();
+        let result = match operation_result {
+            Ok(result) => result,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                let _ = engine.record(EventKind::Cancelled);
+                let _ = engine.save();
+                return Err(error);
             }
-            TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
-            TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
-            TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
-            TuiAction::SelectProfile(name) => engine.select_profile(name)?,
-            TuiAction::SelectSession(id) => engine.select_session(id)?,
-            TuiAction::TogglePlan => engine.handle_toggle_plan()?,
+            Err(error) => return Err(error),
         };
 
         if let Some(candidate) = candidate_backend {

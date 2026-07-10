@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, FailureLog, GlossaryEntry,
     PipelineOptions, PipelineResult, SplitRetryLog, SubtitleDocument, SubtitleSegment,
@@ -39,6 +40,7 @@ pub struct SubtitlePipeline<B, D> {
     translation_memory_hits: usize,
     cache_hits: usize,
     agent_repairs: Vec<AgentRepairRecord>,
+    cancellation: CancellationGuard,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -60,7 +62,13 @@ where
             translation_memory_hits: 0,
             cache_hits: 0,
             agent_repairs: Vec::new(),
+            cancellation: CancellationGuard::never(),
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationGuard) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Attach a runtime store for glossary/TM persistence.
@@ -75,6 +83,7 @@ where
     }
 
     pub fn run_document(&mut self, document: &SubtitleDocument) -> CoreResult<PipelineRun> {
+        self.cancellation.check()?;
         if self.options.batch_size == 0 {
             return Err(CoreError::InvalidTranslation(
                 "batch size must be greater than zero".to_owned(),
@@ -83,6 +92,7 @@ where
 
         // Load persisted glossary into context memory at start.
         if let Some(ref store) = self.store {
+            self.cancellation.check()?;
             let entries = store.load_glossary()?;
             self.memory.load_glossary(&entries);
         }
@@ -149,6 +159,7 @@ where
             .enumerate()
             .skip(resume.translation_batches_completed)
         {
+            self.cancellation.check()?;
             // TM lookup: split batch into TM-matched (by segment text) and pending.
             let (tm_hits, pending): (HashMap<String, String>, Vec<SubtitleSegment>) = {
                 let mut hits = HashMap::new();
@@ -188,6 +199,7 @@ where
 
             // Persist glossary, TM, batch segments after each batch.
             if let Some(ref store) = self.store {
+                self.cancellation.check()?;
                 let glossary_entries: Vec<(String, String)> = self
                     .memory
                     .glossary
@@ -211,6 +223,7 @@ where
             }
 
             translated_segments.extend(translated_batch);
+            self.cancellation.check()?;
             self.save_run_state(
                 batch_index + 1,
                 resume.review_batches_completed,
@@ -220,6 +233,7 @@ where
         }
 
         validate_full_alignment(&document.segments, &translated_segments)?;
+        self.cancellation.check()?;
         self.save_run_state(batches.len(), resume.review_batches_completed, true, usage)?;
         self.dashboard.mark_done("TRANSLATE");
 
@@ -258,12 +272,14 @@ where
             for (review_index, review_batch) in
                 review_plan.iter().enumerate().skip(resumed_review_batches)
             {
+                self.cancellation.check()?;
                 let review_position = review_index + 1;
                 let reviewed = self.review_batch(review_position, review_batch)?;
                 usage.add(reviewed.usage);
                 self.dashboard.add_usage(reviewed.usage);
                 let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
                 if let Some(ref store) = self.store {
+                    self.cancellation.check()?;
                     store.save_batch_segments(
                         BatchShardKind::Reviewed,
                         review_position,
@@ -278,6 +294,7 @@ where
             validate_full_alignment(&document.segments, &output_segments)?;
             self.dashboard.mark_done("FINAL_REVIEW");
         }
+        self.cancellation.check()?;
         self.save_run_state(batches.len(), review_plan.len(), true, usage)?;
 
         Ok(PipelineRun {
@@ -317,6 +334,7 @@ where
         let mut last_error = None;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
+            self.cancellation.check()?;
             let mut messages =
                 build_translation_messages(&self.options, batch_index, batch, &self.memory);
             if let Some(error) = last_error.as_ref() {
@@ -326,6 +344,12 @@ where
             match self.translate_once(batch, &messages, &request_hash) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
+                    if matches!(error, CoreError::Cancelled) {
+                        return Err(error);
+                    }
+                    if matches!(error, CoreError::Cancelled) {
+                        return Err(error);
+                    }
                     let failure_messages = messages.clone();
                     let mut attempt_log = AttemptLog {
                         attempt,
@@ -403,6 +427,7 @@ where
         request_hash: &str,
     ) -> CoreResult<BatchWithUsage> {
         let cached_response = if self.options.use_cache {
+            self.cancellation.check()?;
             self.store
                 .as_ref()
                 .map(|store| store.load_cached_response(CacheStage::Translate, request_hash))
@@ -417,7 +442,9 @@ where
                 self.cache_hits += 1;
                 response
             }
-            None => self.backend.generate_json(messages)?,
+            None => self
+                .backend
+                .generate_json_cancellable(messages, &self.cancellation)?,
         };
         let BackendPayload::Translation(result) = &backend_result.payload else {
             return Err(CoreError::Data(
@@ -429,6 +456,7 @@ where
             && !cached
             && let Some(store) = self.store.as_ref()
         {
+            self.cancellation.check()?;
             store.save_cached_response(CacheStage::Translate, request_hash, &backend_result)?;
         }
         let BackendPayload::Translation(result) = backend_result.payload else {
@@ -474,6 +502,7 @@ where
         let mut last_error = None;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
+            self.cancellation.check()?;
             let mut messages = build_review_messages(
                 &self.options,
                 &batch.source,
@@ -488,6 +517,9 @@ where
             match self.review_once(batch, &messages, &request_hash) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
+                    if matches!(error, CoreError::Cancelled) {
+                        return Err(error);
+                    }
                     let failure_messages = messages.clone();
                     attempts.push(AttemptLog {
                         attempt,
@@ -522,6 +554,7 @@ where
         messages: &[ChatMessage],
         request_hash: &str,
     ) -> CoreResult<ReviewWithUsage> {
+        self.cancellation.check()?;
         let cached_response = if self.options.use_cache {
             self.store
                 .as_ref()
@@ -538,7 +571,9 @@ where
                 response
             }
             None => {
-                let (payload, usage) = self.backend.generate_raw_json(messages)?;
+                let (payload, usage) = self
+                    .backend
+                    .generate_raw_json_cancellable(messages, &self.cancellation)?;
                 BackendJsonResult {
                     payload: BackendPayload::Review(parse_review_payload(&payload)?),
                     usage,
@@ -555,6 +590,7 @@ where
             && !cached
             && let Some(store) = self.store.as_ref()
         {
+            self.cancellation.check()?;
             store.save_cached_response(CacheStage::Review, request_hash, &backend_result)?;
         }
         let BackendPayload::Review(result) = backend_result.payload else {
@@ -581,6 +617,10 @@ where
         messages: Vec<ChatMessage>,
         attempts: Vec<AttemptLog>,
     ) -> CoreResult<BatchWithUsage> {
+        if matches!(error, CoreError::Cancelled) {
+            return Err(error);
+        }
+        self.cancellation.check()?;
         let repair =
             self.run_agent_repair("translate", batch_index, batch, None, &error, &attempts)?;
         if let Some(outcome) = repair.as_ref()
@@ -625,6 +665,10 @@ where
         messages: Vec<ChatMessage>,
         attempts: Vec<AttemptLog>,
     ) -> CoreResult<ReviewWithUsage> {
+        if matches!(error, CoreError::Cancelled) {
+            return Err(error);
+        }
+        self.cancellation.check()?;
         let repair = self.run_agent_repair(
             "review",
             batch_index,
@@ -690,6 +734,7 @@ where
         let mut total_usage = Usage::default();
         let mut log_path = PathBuf::new();
         for attempt in 1..=self.options.agent_repair_attempts {
+            self.cancellation.check()?;
             let messages = build_agent_repair_messages(
                 stage,
                 source,
@@ -717,7 +762,7 @@ where
                 }
                 None => self
                     .backend
-                    .generate_raw_json(&messages)
+                    .generate_raw_json_cancellable(&messages, &self.cancellation)
                     .and_then(|(payload, usage)| {
                         total_usage.add(usage);
                         let payload = if stage == "translate" {

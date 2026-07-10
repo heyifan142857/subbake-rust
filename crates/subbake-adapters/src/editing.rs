@@ -5,6 +5,7 @@ use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_pa
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
 use subbake_core::ports::LlmBackend;
+use subbake_core::{CancellationGuard, CoreError};
 
 use crate::fs::{is_supported_subtitle_path, read_document, render_and_write_document};
 use crate::providers::build_backend;
@@ -25,6 +26,14 @@ pub struct SubtitleEditOutcome {
 }
 
 pub fn edit_subtitle(request: SubtitleEditRequest) -> io::Result<SubtitleEditOutcome> {
+    edit_subtitle_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn edit_subtitle_cancellable(
+    request: SubtitleEditRequest,
+    cancellation: &CancellationGuard,
+) -> io::Result<SubtitleEditOutcome> {
+    cancellation.check().map_err(core_error)?;
     if !request.target_path.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -56,12 +65,13 @@ pub fn edit_subtitle(request: SubtitleEditRequest) -> io::Result<SubtitleEditOut
     let mut backend =
         build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
     let (payload, _) = backend
-        .generate_raw_json(&messages)
-        .map_err(io::Error::other)?;
+        .generate_raw_json_cancellable(&messages, cancellation)
+        .map_err(core_error)?;
     let payload =
         parse_subtitle_edit_payload(payload, &document.segments).map_err(io::Error::other)?;
 
     let translations = merge_segments(&document.segments, &payload.lines);
+    cancellation.check().map_err(core_error)?;
     render_and_write_document(
         &document,
         &translations,
@@ -73,6 +83,14 @@ pub fn edit_subtitle(request: SubtitleEditRequest) -> io::Result<SubtitleEditOut
         target_path: request.target_path,
         edit_notes: payload.edit_notes,
     })
+}
+
+fn core_error(error: CoreError) -> io::Error {
+    if matches!(error, CoreError::Cancelled) {
+        io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
+    } else {
+        io::Error::other(error)
+    }
 }
 
 fn merge_segments(

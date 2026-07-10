@@ -12,6 +12,7 @@ mod review;
 pub mod storage;
 pub mod validation;
 
+pub use cancellation::{CancellationGuard, CancellationToken};
 pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
@@ -21,3 +22,4 @@ pub use entities::{
 };
 pub use error::{CoreError, CoreResult};
 pub use memory::ContextMemory;
+pub mod cancellation;

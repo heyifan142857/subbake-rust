@@ -5,6 +5,7 @@ pub type CoreResult<T> = Result<T, CoreError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {
+    Cancelled,
     UnsupportedFormat(String),
     MalformedSubtitle(String),
     InvalidTranslation(String),
@@ -15,6 +16,7 @@ pub enum CoreError {
 impl Display for CoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            CoreError::Cancelled => write!(formatter, "cancelled"),
             CoreError::UnsupportedFormat(value) => {
                 write!(formatter, "unsupported subtitle format: {value}")
             }

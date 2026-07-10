@@ -6,6 +6,7 @@
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
 use std::path::PathBuf;
+use subbake_core::{CancellationGuard, CancellationToken};
 
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
@@ -104,6 +105,8 @@ pub struct AgentEngine {
     pub guard: FileGuard,
     pub session: Option<crate::session::AgentSession>,
     pub observer: Option<Box<dyn EngineObserver>>,
+    cancellation: CancellationToken,
+    pub(crate) operation_guard: CancellationGuard,
 }
 
 impl AgentEngine {
@@ -116,6 +119,27 @@ impl AgentEngine {
             guard,
             session: None,
             observer: None,
+            cancellation: CancellationToken::default(),
+            operation_guard: CancellationGuard::never(),
+        }
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn begin_operation(&mut self, guard: CancellationGuard) {
+        self.operation_guard = guard;
+    }
+
+    pub(crate) fn check_cancelled(&self) -> std::io::Result<()> {
+        if self.operation_guard.is_cancelled() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "operation cancelled",
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -752,6 +776,11 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
         EventKind::Undo => ("undo".into(), String::new(), serde_json::json!({})),
         EventKind::Profile { name } => ("profile".into(), name.clone(), serde_json::json!({})),
         EventKind::Error { text } => ("error".into(), text.clone(), serde_json::json!({})),
+        EventKind::Cancelled => (
+            "cancelled".into(),
+            "Cancelled.".into(),
+            serde_json::json!({}),
+        ),
     }
 }
 

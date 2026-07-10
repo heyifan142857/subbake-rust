@@ -6,11 +6,13 @@
 // translation path (no ambient runtime); the agent path (stage 5) will reach
 // the pipeline through `spawn_blocking` so a runtime is never nested.
 
+use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{Value as JsonValue, json};
+use subbake_core::CancellationGuard;
 use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine, Usage};
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
@@ -40,6 +42,25 @@ fn missing_api_key(provider_label: &str) -> CoreError {
     CoreError::Backend(format!(
         "Missing API key for {provider_label} provider. Set the provider's environment variable or use --api-key."
     ))
+}
+
+async fn await_http<F, T>(
+    future: F,
+    cancellation: &CancellationGuard,
+    context: &str,
+) -> CoreResult<T>
+where
+    F: Future<Output = Result<T, reqwest::Error>>,
+{
+    cancellation.check()?;
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            result = &mut future => return result.map_err(|error| CoreError::Backend(format!("{context}: {error}"))),
+            _ = interval.tick() => cancellation.check()?,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,25 +102,29 @@ impl OpenAiCompatibleBackend {
         })
     }
 
-    async fn generate_once(&self, payload: &JsonValue) -> CoreResult<(JsonValue, Usage)> {
+    async fn generate_once(
+        &self,
+        payload: &JsonValue,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(JsonValue, Usage)> {
         let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(payload)
-            .send()
-            .await
-            .map_err(|error| {
-                CoreError::Backend(format!("{} request failed: {error}", self.provider_label))
-            })?;
+        let response = await_http(
+            self.client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(payload)
+                .send(),
+            cancellation,
+            &format!("{} request failed", self.provider_label),
+        )
+        .await?;
         let status = response.status();
-        let text = response.text().await.map_err(|error| {
-            CoreError::Backend(format!(
-                "{} response read failed: {error}",
-                self.provider_label
-            ))
-        })?;
+        let text = await_http(
+            response.text(),
+            cancellation,
+            &format!("{} response read failed", self.provider_label),
+        )
+        .await?;
         if !status.is_success() {
             return Err(CoreError::Backend(format!(
                 "{} rejected request ({status}): {text}",
@@ -190,23 +215,36 @@ impl LlmBackend for OpenAiCompatibleBackend {
     }
 
     fn generate_raw_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(JsonValue, Usage)> {
+        self.generate_raw_json_cancellable(messages, &CancellationGuard::never())
+    }
+
+    fn generate_raw_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(JsonValue, Usage)> {
         let messages_value: Vec<JsonValue> = messages.iter().map(message_json).collect();
         let payload_with_format = json!({
             "model": self.model,
             "messages": &messages_value,
             "response_format": {"type": "json_object"},
         });
-        let result = runtime().block_on(async { self.generate_once(&payload_with_format).await });
+        let result = runtime()
+            .block_on(async { self.generate_once(&payload_with_format, cancellation).await });
         let (parsed, usage) = match result {
             Ok(value) => value,
             Err(error) => {
+                if matches!(error, CoreError::Cancelled) {
+                    return Err(error);
+                }
                 let message = error.to_string();
                 // Endpoints that don't understand `response_format` (status 400
                 // whose body mentions the field) retry with a plain chat request,
                 // mirroring the Python client.
                 if message.contains("(400") && message.contains("response_format") {
                     let payload = json!({"model": self.model, "messages": &messages_value});
-                    runtime().block_on(async { self.generate_once(&payload).await })?
+                    runtime()
+                        .block_on(async { self.generate_once(&payload, cancellation).await })?
                 } else {
                     return Err(error);
                 }
@@ -230,6 +268,7 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 pub struct AnthropicBackend {
     model: String,
     api_key: String,
+    base_url: String,
     client: Client,
 }
 
@@ -241,14 +280,24 @@ impl AnthropicBackend {
             .ok_or_else(|| missing_api_key("Anthropic"))?
             .clone();
         let client = build_client(duration_from_seconds(timeout_seconds))?;
+        let base_url = config
+            .base_url
+            .as_deref()
+            .map(trim_trailing_slash)
+            .unwrap_or_else(|| ANTHROPIC_BASE_URL.to_owned());
         Ok(Self {
             model: config.model.clone(),
             api_key,
+            base_url,
             client,
         })
     }
 
-    async fn generate_once(&self, messages: &[ChatMessage]) -> CoreResult<(JsonValue, Usage)> {
+    async fn generate_once(
+        &self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(JsonValue, Usage)> {
         let system = messages
             .iter()
             .filter(|message| message.role == "system")
@@ -272,20 +321,25 @@ impl AnthropicBackend {
             "messages": body_messages,
         });
 
-        let url = format!("{ANTHROPIC_BASE_URL}/messages");
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|error| CoreError::Backend(format!("Anthropic request failed: {error}")))?;
+        let url = format!("{}/messages", self.base_url);
+        let response = await_http(
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION)
+                .json(&payload)
+                .send(),
+            cancellation,
+            "Anthropic request failed",
+        )
+        .await?;
         let status = response.status();
-        let text = response.text().await.map_err(|error| {
-            CoreError::Backend(format!("Anthropic response read failed: {error}"))
-        })?;
+        let text = await_http(
+            response.text(),
+            cancellation,
+            "Anthropic response read failed",
+        )
+        .await?;
         if !status.is_success() {
             return Err(CoreError::Backend(format!(
                 "Anthropic rejected request ({status}): {text}"
@@ -310,7 +364,7 @@ impl AnthropicBackend {
     }
 
     async fn check_once(&self) -> CoreResult<(bool, String)> {
-        let url = format!("{ANTHROPIC_BASE_URL}/models");
+        let url = format!("{}/models", self.base_url);
         let response = self
             .client
             .get(&url)
@@ -361,7 +415,16 @@ impl LlmBackend for AnthropicBackend {
     }
 
     fn generate_raw_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(JsonValue, Usage)> {
-        let (parsed, usage) = runtime().block_on(async { self.generate_once(messages).await })?;
+        self.generate_raw_json_cancellable(messages, &CancellationGuard::never())
+    }
+
+    fn generate_raw_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(JsonValue, Usage)> {
+        let (parsed, usage) =
+            runtime().block_on(async { self.generate_once(messages, cancellation).await })?;
         Ok((parsed, usage))
     }
 

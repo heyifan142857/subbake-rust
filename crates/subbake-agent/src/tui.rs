@@ -29,6 +29,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::engine::EngineObserver;
 use crate::session::iso_now;
+use subbake_core::{CancellationGuard, CancellationToken};
 
 // ---------------------------------------------------------------------------
 // Message types for the scrollback buffer
@@ -280,6 +281,8 @@ pub struct SubBakeTui {
     suggestion_index: usize,
     processing: bool,
     animation_started_at: std::time::Instant,
+    cancellation: Option<CancellationToken>,
+    cancellation_requested: bool,
 }
 
 impl SubBakeTui {
@@ -300,11 +303,17 @@ impl SubBakeTui {
             suggestion_index: 0,
             processing: false,
             animation_started_at: std::time::Instant::now(),
+            cancellation: None,
+            cancellation_requested: false,
         })
     }
 
     pub fn observer(&self) -> TuiObserver {
         TuiObserver::new(self.msg_view.clone())
+    }
+
+    pub fn set_cancellation_token(&mut self, token: CancellationToken) {
+        self.cancellation = Some(token);
     }
 
     pub fn set_input_history(&mut self, history: Vec<String>) {
@@ -327,6 +336,7 @@ impl SubBakeTui {
                     "file_operation" => (MsgStyle::Observation, format!("◀ {}", event.text)),
                     "plan" => (MsgStyle::System, format!("Plan: {}", event.text)),
                     "error" => (MsgStyle::Error, format!("✖ {}", event.text)),
+                    "cancelled" => (MsgStyle::System, "Cancelled.".to_owned()),
                     _ => continue,
                 };
                 if view.messages.len() >= view.max {
@@ -347,19 +357,21 @@ impl SubBakeTui {
     /// response text.
     pub fn run<F>(&mut self, mut process_fn: F) -> io::Result<()>
     where
-        F: FnMut(TuiAction, &mut TuiObserver) -> io::Result<TuiInteraction> + Send + 'static,
+        F: FnMut(TuiAction, CancellationGuard, &mut TuiObserver) -> io::Result<TuiInteraction>
+            + Send
+            + 'static,
     {
         let mut observer = self.observer();
         self.welcome(&mut observer)?;
         let worker_observer = self.observer();
-        let (request_tx, request_rx) = mpsc::channel::<TuiAction>();
+        let (request_tx, request_rx) = mpsc::channel::<(TuiAction, CancellationGuard)>();
         let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiInteraction>>();
         let worker = thread::Builder::new()
             .name("subbake-agent-worker".to_owned())
             .spawn(move || {
                 let mut observer = worker_observer;
-                while let Ok(action) = request_rx.recv() {
-                    let result = process_fn(action, &mut observer);
+                while let Ok((action, guard)) = request_rx.recv() {
+                    let result = process_fn(action, guard, &mut observer);
                     if response_tx.send(result).is_err() {
                         break;
                     }
@@ -370,6 +382,7 @@ impl SubBakeTui {
             while self.running {
                 if let Ok(result) = response_rx.try_recv() {
                     self.processing = false;
+                    self.cancellation_requested = false;
                     match result {
                         Ok(TuiInteraction::Message { message, render }) => {
                             self.input_mode = InputMode::Editing;
@@ -402,7 +415,19 @@ impl SubBakeTui {
                         }
                         Err(error) => {
                             if let Ok(mut view) = self.msg_view.lock() {
-                                view.push(MsgStyle::Error, format!("Error: {error}"));
+                                if error.kind() == io::ErrorKind::Interrupted {
+                                    self.input_mode = InputMode::Editing;
+                                    if let Some(index) = view
+                                        .messages
+                                        .iter()
+                                        .rposition(|message| message.style == MsgStyle::Thinking)
+                                    {
+                                        view.messages.remove(index);
+                                    }
+                                    view.push(MsgStyle::System, "Cancelled.".to_owned());
+                                } else {
+                                    view.push(MsgStyle::Error, format!("Error: {error}"));
+                                }
                             }
                         }
                     }
@@ -684,7 +709,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
         Ok(())
     }
 
-    fn handle_event(&mut self, request_tx: &mpsc::Sender<TuiAction>) -> io::Result<()> {
+    fn handle_event(
+        &mut self,
+        request_tx: &mpsc::Sender<(TuiAction, CancellationGuard)>,
+    ) -> io::Result<()> {
         if !event::poll(STREAM_INTERVAL)? {
             return Ok(());
         }
@@ -699,6 +727,23 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 }
                 KeyCode::Char('q') if self.input.is_empty() => {
                     self.running = false;
+                }
+                KeyCode::Esc => {
+                    if self.processing {
+                        if !self.cancellation_requested {
+                            self.cancellation_requested = true;
+                            if let Some(token) = &self.cancellation {
+                                token.cancel();
+                            }
+                            if let Ok(mut view) = self.msg_view.lock() {
+                                view.push(MsgStyle::System, "Cancellation requested…".to_owned());
+                            }
+                        }
+                    } else {
+                        self.input.clear();
+                        self.input_mode = InputMode::Editing;
+                        self.suggestion_index = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     if self.processing {
@@ -789,8 +834,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         view.push(MsgStyle::Thinking, "Deciding next action…".to_owned());
                     }
                     self.processing = true;
+                    self.cancellation_requested = false;
                     self.animation_started_at = std::time::Instant::now();
-                    request_tx.send(action).map_err(|_| {
+                    let guard = self
+                        .cancellation
+                        .as_ref()
+                        .map(CancellationToken::guard)
+                        .unwrap_or_default();
+                    request_tx.send((action, guard)).map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped")
                     })?;
                 }
@@ -840,8 +891,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         view.push(MsgStyle::Thinking, "Updating mode…".to_owned());
                     }
                     self.processing = true;
+                    self.cancellation_requested = false;
                     self.animation_started_at = std::time::Instant::now();
-                    request_tx.send(action).map_err(|_| {
+                    let guard = self
+                        .cancellation
+                        .as_ref()
+                        .map(CancellationToken::guard)
+                        .unwrap_or_default();
+                    request_tx.send((action, guard)).map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped")
                     })?;
                 }

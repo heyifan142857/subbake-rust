@@ -11,6 +11,7 @@ pub use decision::EchoDecisionBackend;
 pub use engine::{AgentEngine, EngineObserver, PlanDecision, StreamingObserver};
 pub use guard::FileGuard;
 pub use session::*;
+pub use subbake_core::{CancellationGuard, CancellationToken};
 pub use tools::{ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES, ToolKind};
 pub use tui::{
     Msg, MsgStyle, MsgView, RenderPolicy, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,

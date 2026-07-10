@@ -3,12 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use subbake_core::PipelineResult;
 use subbake_core::formats::RenderOptions;
 use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
 use subbake_core::storage::{build_runtime_paths, input_signature_from_bytes};
+use subbake_core::{CancellationGuard, CoreError, PipelineResult};
 
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
@@ -46,6 +46,14 @@ pub struct BatchTranslationOutcome {
 }
 
 pub fn translate_subtitle(request: TranslationRequest) -> io::Result<TranslationOutcome> {
+    translate_subtitle_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn translate_subtitle_cancellable(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+) -> io::Result<TranslationOutcome> {
+    check_cancelled(cancellation)?;
     if !is_supported_subtitle_path(&request.input_path) {
         return Err(io::Error::other(
             "`translate` accepts subtitle files only; use `pipeline` for combined media workflows",
@@ -88,9 +96,10 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
     store.ensure_layout().map_err(io::Error::other)?;
 
     let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options)
-        .with_input_signature(input_signature);
+        .with_input_signature(input_signature)
+        .with_cancellation(cancellation.clone());
     pipeline = pipeline.with_store(Box::new(store));
-    let run = pipeline.run_document(&document).map_err(io::Error::other)?;
+    let run = pipeline.run_document(&document).map_err(core_error)?;
 
     if request.settings.dry_run {
         return Ok(TranslationOutcome {
@@ -103,6 +112,7 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
         request.settings.bilingual,
         request.settings.output_format.clone(),
     );
+    check_cancelled(cancellation)?;
     render_and_write_document(
         &document,
         &run.translated_segments,
@@ -121,12 +131,20 @@ pub fn translate_subtitle(request: TranslationRequest) -> io::Result<Translation
 pub fn translate_subtitle_batch(
     request: BatchTranslationRequest,
 ) -> io::Result<BatchTranslationOutcome> {
+    translate_subtitle_batch_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn translate_subtitle_batch_cancellable(
+    request: BatchTranslationRequest,
+    cancellation: &CancellationGuard,
+) -> io::Result<BatchTranslationOutcome> {
     let files = discover_subtitle_files(&request.root, request.recursive)?;
     let mut processed = 0usize;
     let mut skipped = Vec::new();
     let mut outputs = Vec::new();
 
     for input_path in files {
+        check_cancelled(cancellation)?;
         let output_path = default_output_path(
             &input_path,
             request.settings.output_format(),
@@ -137,11 +155,14 @@ pub fn translate_subtitle_batch(
             continue;
         }
 
-        let outcome = translate_subtitle(TranslationRequest {
-            input_path,
-            output_path: None,
-            settings: request.settings.clone(),
-        })?;
+        let outcome = translate_subtitle_cancellable(
+            TranslationRequest {
+                input_path,
+                output_path: None,
+                settings: request.settings.clone(),
+            },
+            cancellation,
+        )?;
         if let Some(output_path) = outcome.output_path {
             outputs.push(output_path);
         }
@@ -153,6 +174,18 @@ pub fn translate_subtitle_batch(
         skipped,
         outputs,
     })
+}
+
+fn check_cancelled(cancellation: &CancellationGuard) -> io::Result<()> {
+    cancellation.check().map_err(core_error)
+}
+
+fn core_error(error: CoreError) -> io::Error {
+    if matches!(error, CoreError::Cancelled) {
+        io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
+    } else {
+        io::Error::other(error)
+    }
 }
 
 fn discover_subtitle_files(dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {

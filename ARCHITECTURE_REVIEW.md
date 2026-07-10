@@ -85,6 +85,6 @@ Add state-transition tests for:
 
 ## Deliberately deferred wiki items
 
-- **Esc cancellation:** the worker is synchronous and provider HTTP calls do not accept a cancellation token. Esc must not claim to cancel while a request continues mutating state. Add this only after cancellation crosses the backend, agent-loop, and tool-execution boundaries.
+- **Provider-call interruption:** Esc now sets a shared cooperative cancellation token. The agent checks it between reasoning steps and immediately before tool execution, preventing new side effects after cancellation. A currently blocking provider HTTP call cannot yet be interrupted and must return before the agent reaches the next cancellation check; the TUI reports this honestly.
 - **Profile picker `new`:** profile creation is not currently available because the config adapter has a reader but no comment-preserving, atomic writer or credential-safe creation workflow. The picker should expose `new` only after that boundary exists.
 - **Top-level `sbake resume`:** the Rust CLI intentionally uses `sbake agent resume [SESSION_ID]` per the repository CLI direction; the Python/wiki alias is not reintroduced.

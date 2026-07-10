@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, BatchTranslationResult, FailureLog, ReviewResult, SubtitleSegment, Usage,
 };
@@ -65,6 +66,14 @@ pub trait LlmBackend: Send {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;
+    fn generate_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<BackendJsonResult> {
+        cancellation.check()?;
+        self.generate_json(messages)
+    }
     fn generate_raw_json(
         &mut self,
         _messages: &[ChatMessage],
@@ -73,6 +82,14 @@ pub trait LlmBackend: Send {
             "{} backend does not support raw JSON generation",
             self.provider_name()
         )))
+    }
+    fn generate_raw_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        cancellation.check()?;
+        self.generate_raw_json(messages)
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -98,12 +115,26 @@ where
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
         (**self).generate_json(messages)
     }
+    fn generate_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<BackendJsonResult> {
+        (**self).generate_json_cancellable(messages, cancellation)
+    }
 
     fn generate_raw_json(
         &mut self,
         messages: &[ChatMessage],
     ) -> CoreResult<(serde_json::Value, Usage)> {
         (**self).generate_raw_json(messages)
+    }
+    fn generate_raw_json_cancellable(
+        &mut self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        (**self).generate_raw_json_cancellable(messages, cancellation)
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {

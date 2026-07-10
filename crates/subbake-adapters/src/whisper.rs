@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use subbake_core::CancellationGuard;
 use tokio::runtime::Runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,16 @@ pub struct WhisperModel {
 }
 
 pub fn run_whisper(request: WhisperRequest) -> io::Result<WhisperOutcome> {
+    run_whisper_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn run_whisper_cancellable(
+    request: WhisperRequest,
+    cancellation: &CancellationGuard,
+) -> io::Result<WhisperOutcome> {
+    cancellation
+        .check()
+        .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"))?;
     match request.action {
         WhisperAction::Status => Ok(WhisperOutcome::Status(inspect_status(&request))),
         WhisperAction::ListModels => Ok(WhisperOutcome::ModelList(list_models(&request)?)),

@@ -18,7 +18,9 @@ pub use config::{
     parse_translation_settings_patch,
 };
 pub use diagnostics::{diagnose_failure_path, load_diagnostic_reports};
-pub use editing::{SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle};
+pub use editing::{
+    SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle, edit_subtitle_cancellable,
+};
 pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };
@@ -37,13 +39,14 @@ pub use settings::{TranslationSettings, TranslationSettingsPatch};
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{
     TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest, TranscriptionSettings,
-    transcribe_media,
+    transcribe_media, transcribe_media_cancellable,
 };
 pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
-    translate_subtitle, translate_subtitle_batch,
+    translate_subtitle, translate_subtitle_batch, translate_subtitle_batch_cancellable,
+    translate_subtitle_cancellable,
 };
 pub use whisper::{
     WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,
-    default_whisper_binary_path, run_whisper,
+    default_whisper_binary_path, run_whisper, run_whisper_cancellable,
 };

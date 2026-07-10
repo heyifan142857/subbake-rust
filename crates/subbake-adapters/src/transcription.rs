@@ -4,13 +4,13 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use reqwest::multipart;
-use subbake_core::SubtitleDocument;
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
+use subbake_core::{CancellationGuard, SubtitleDocument};
 use tokio::runtime::Runtime;
 
 use crate::fs::{read_document, render_and_write_document};
@@ -113,6 +113,16 @@ pub trait TranscriberBackend {
         language: Option<&str>,
         output_format: TranscriptionFormat,
     ) -> io::Result<SubtitleDocument>;
+    fn transcribe_cancellable(
+        &self,
+        audio_path: &Path,
+        language: Option<&str>,
+        output_format: TranscriptionFormat,
+        cancellation: &CancellationGuard,
+    ) -> io::Result<SubtitleDocument> {
+        check_cancelled(cancellation)?;
+        self.transcribe(audio_path, language, output_format)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +163,23 @@ impl TranscriberBackend for WhisperApiTranscriber {
         language: Option<&str>,
         output_format: TranscriptionFormat,
     ) -> io::Result<SubtitleDocument> {
+        self.transcribe_cancellable(
+            audio_path,
+            language,
+            output_format,
+            &CancellationGuard::never(),
+        )
+    }
+
+    fn transcribe_cancellable(
+        &self,
+        audio_path: &Path,
+        language: Option<&str>,
+        output_format: TranscriptionFormat,
+        cancellation: &CancellationGuard,
+    ) -> io::Result<SubtitleDocument> {
         runtime().block_on(async {
+            check_cancelled(cancellation)?;
             let url = format!(
                 "{}/audio/transcriptions",
                 self.base_url.trim_end_matches('/')
@@ -180,20 +206,25 @@ impl TranscriberBackend for WhisperApiTranscriber {
                 form = form.text("language", lang.to_owned());
             }
 
-            let resp = self
-                .client
+            let request = self.client
                 .post(&url)
                 .bearer_auth(&self.api_key)
                 .multipart(form)
-                .send()
-                .await
-                .map_err(|e| io::Error::other(format!("whisper api request: {e}")))?;
+                .send();
+            tokio::pin!(request);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+            let resp = loop { tokio::select! {
+                result = &mut request => break result.map_err(|e| io::Error::other(format!("whisper api request: {e}")))?,
+                _ = interval.tick() => check_cancelled(cancellation)?,
+            }};
 
             let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| io::Error::other(format!("whisper api response: {e}")))?;
+            let response = resp.text();
+            tokio::pin!(response);
+            let body = loop { tokio::select! {
+                result = &mut response => break result.map_err(|e| io::Error::other(format!("whisper api response: {e}")))?,
+                _ = interval.tick() => check_cancelled(cancellation)?,
+            }};
             if !status.is_success() {
                 return Err(io::Error::other(format!(
                     "whisper api rejected ({status}): {body}"
@@ -231,6 +262,22 @@ impl TranscriberBackend for WhisperCppTranscriber {
         language: Option<&str>,
         output_format: TranscriptionFormat,
     ) -> io::Result<SubtitleDocument> {
+        self.transcribe_cancellable(
+            audio_path,
+            language,
+            output_format,
+            &CancellationGuard::never(),
+        )
+    }
+
+    fn transcribe_cancellable(
+        &self,
+        audio_path: &Path,
+        language: Option<&str>,
+        output_format: TranscriptionFormat,
+        cancellation: &CancellationGuard,
+    ) -> io::Result<SubtitleDocument> {
+        check_cancelled(cancellation)?;
         let output_dir = audio_path.parent().unwrap_or_else(|| Path::new("."));
         let base_name = audio_path
             .file_stem()
@@ -263,9 +310,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
             cmd.arg(arg);
         }
 
-        let out = cmd
-            .output()
-            .map_err(|e| io::Error::other(format!("whisper.cpp execution: {e}")))?;
+        let out = run_command_cancellable(&mut cmd, cancellation, "whisper.cpp execution")?;
         if !out.status.success() {
             return Err(io::Error::other(format!(
                 "whisper.cpp exited {}: {}",
@@ -305,16 +350,25 @@ impl TranscriberBackend for WhisperCppTranscriber {
 // ---------------------------------------------------------------------------
 
 pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<TranscriptionOutcome> {
+    transcribe_media_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn transcribe_media_cancellable(
+    request: TranscriptionRequest,
+    cancellation: &CancellationGuard,
+) -> io::Result<TranscriptionOutcome> {
+    check_cancelled(cancellation)?;
     let output_path = request.output_path.unwrap_or_else(|| {
         default_output_path(&request.media_path, request.settings.output_format)
     });
 
     if let Some(ref sidecar_path) = request.settings.sidecar_path {
+        check_cancelled(cancellation)?;
         render_sidecar(sidecar_path, &output_path, request.settings.output_format)?;
         return Ok(TranscriptionOutcome { output_path });
     }
 
-    let audio_path = ensure_audio(&request.media_path)?;
+    let audio_path = ensure_audio(&request.media_path, cancellation)?;
     let fmt = request.settings.output_format;
 
     let doc = match request.settings.provider.as_str() {
@@ -341,7 +395,12 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
                 .clone()
                 .unwrap_or_else(|| "whisper-1".to_owned());
             let t = WhisperApiTranscriber::new(api_key, base_url, model, 120.0)?;
-            t.transcribe(&audio_path, request.settings.language.as_deref(), fmt)?
+            t.transcribe_cancellable(
+                &audio_path,
+                request.settings.language.as_deref(),
+                fmt,
+                cancellation,
+            )?
         }
         "whisper_cpp" => {
             let model = request
@@ -352,7 +411,12 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
             let binary = locate_whisper_binary()?;
             let model_path = locate_whisper_model(&model)?;
             let t = WhisperCppTranscriber::new(binary, model_path, Vec::new());
-            t.transcribe(&audio_path, request.settings.language.as_deref(), fmt)?
+            t.transcribe_cancellable(
+                &audio_path,
+                request.settings.language.as_deref(),
+                fmt,
+                cancellation,
+            )?
         }
         other => {
             return Err(io::Error::other(format!(
@@ -361,6 +425,7 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
         }
     };
 
+    check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
     render_and_write_document(&doc, &doc.segments, &output_path, &opts)?;
     Ok(TranscriptionOutcome { output_path })
@@ -370,7 +435,8 @@ pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<Transcripti
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ensure_audio(media_path: &Path) -> io::Result<PathBuf> {
+fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> io::Result<PathBuf> {
+    check_cancelled(cancellation)?;
     if is_audio_ext(media_path) {
         return Ok(media_path.to_path_buf());
     }
@@ -385,26 +451,65 @@ fn ensure_audio(media_path: &Path) -> io::Result<PathBuf> {
         .map_err(|e| io::Error::other(format!("create tmp dir: {e}")))?;
     let output = tmp_dir.join(format!("{stem}_audio.wav"));
 
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            &media_path.to_string_lossy(),
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            &output.to_string_lossy(),
-        ])
-        .status()
-        .map_err(|e| io::Error::other(format!("ffmpeg not found: {e}")))?;
-    if !status.success() {
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-y",
+        "-i",
+        &media_path.to_string_lossy(),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        &output.to_string_lossy(),
+    ]);
+    let result = run_command_cancellable(&mut command, cancellation, "ffmpeg execution");
+    if result.is_err() {
+        let _ = std::fs::remove_file(&output);
+    }
+    let out = result?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&output);
         return Err(io::Error::other("ffmpeg audio extraction failed"));
     }
+    check_cancelled(cancellation).inspect_err(|_| {
+        let _ = std::fs::remove_file(&output);
+    })?;
     Ok(output)
+}
+
+fn check_cancelled(cancellation: &CancellationGuard) -> io::Result<()> {
+    cancellation
+        .check()
+        .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"))
+}
+
+fn run_command_cancellable(
+    command: &mut Command,
+    cancellation: &CancellationGuard,
+    context: &str,
+) -> io::Result<Output> {
+    check_cancelled(cancellation)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| io::Error::other(format!("{context}: {e}")))?;
+    loop {
+        if cancellation.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "operation cancelled",
+            ));
+        }
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 fn is_audio_ext(path: &Path) -> bool {
