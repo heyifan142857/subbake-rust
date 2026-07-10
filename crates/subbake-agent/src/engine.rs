@@ -299,11 +299,21 @@ impl AgentEngine {
     }
 
     pub fn toggle_plan_mode(&mut self) -> std::io::Result<String> {
+        let enabled = self
+            .session
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("no active session"))?
+            .mode
+            != "plan";
+        self.set_plan_mode(enabled)
+    }
+
+    pub fn set_plan_mode(&mut self, enabled: bool) -> std::io::Result<String> {
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        if session.mode == "plan" {
+        if !enabled {
             session.mode = "chat".to_owned();
             session.pending_plan = None;
             self.session_store.save(session)?;
@@ -521,6 +531,8 @@ impl AgentEngine {
         let trimmed = input.trim();
         let result = match trimmed {
             "/plan" => return self.handle_toggle_plan(),
+            "/plan on" => self.set_plan_mode(true),
+            "/plan off" => self.set_plan_mode(false),
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),

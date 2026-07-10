@@ -57,7 +57,7 @@ const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
-    ("/plan", "toggle plan mode"),
+    ("/plan", "toggle plan mode; accepts on/off"),
     ("/model", "show the active model"),
     ("/profile", "list or switch profiles"),
     ("/undo", "undo the last file operation"),
@@ -429,7 +429,7 @@ impl SubBakeTui {
         match input {
             "/help" | "/h" => r#"Commands:
   /help /h  —  this menu
-  /plan     —  toggle plan mode
+  /plan [on|off] — toggle or set plan mode
   /model    —  show active model
   /profile [NAME] — list or switch profiles
   /undo     —  undo last file operation

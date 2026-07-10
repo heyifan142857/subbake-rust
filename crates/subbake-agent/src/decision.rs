@@ -1296,6 +1296,29 @@ mod tests {
     }
 
     #[test]
+    fn explicit_plan_on_and_off_are_idempotent() {
+        let root = temp_root("explicit-plan-mode");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        assert_eq!(
+            engine.set_plan_mode(true).expect("on"),
+            "Plan mode on. Mutating tools will wait for your approval."
+        );
+        assert_eq!(
+            engine.set_plan_mode(true).expect("on again"),
+            "Plan mode on. Mutating tools will wait for your approval."
+        );
+        assert_eq!(engine.set_plan_mode(false).expect("off"), "Plan mode off.");
+        assert_eq!(
+            engine.set_plan_mode(false).expect("off again"),
+            "Plan mode off."
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn invalid_llm_tool_call_becomes_clarification() {
         let root = temp_root("invalid-decision");
         std::fs::create_dir_all(&root).expect("create root");
