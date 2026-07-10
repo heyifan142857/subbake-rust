@@ -82,3 +82,9 @@ Add state-transition tests for:
 - revision instructions while a plan remains pending;
 - full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
 - full profile-switch integration around failed backend construction (invalid backend failure and pre-commit ordering are covered);
+
+## Deliberately deferred wiki items
+
+- **Esc cancellation:** the worker is synchronous and provider HTTP calls do not accept a cancellation token. Esc must not claim to cancel while a request continues mutating state. Add this only after cancellation crosses the backend, agent-loop, and tool-execution boundaries.
+- **Profile picker `new`:** profile creation is not currently available because the config adapter has a reader but no comment-preserving, atomic writer or credential-safe creation workflow. The picker should expose `new` only after that boundary exists.
+- **Top-level `sbake resume`:** the Rust CLI intentionally uses `sbake agent resume [SESSION_ID]` per the repository CLI direction; the Python/wiki alias is not reintroduced.

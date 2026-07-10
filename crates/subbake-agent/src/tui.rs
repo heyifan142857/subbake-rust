@@ -66,6 +66,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/history", "show conversation history"),
     ("/clear", "start a new session"),
     ("/resume", "resume the latest session"),
+    ("/exit", "exit SubBake"),
     ("/quit", "exit SubBake"),
 ];
 
@@ -438,7 +439,7 @@ impl SubBakeTui {
   /history [LIMIT] — show recent history
   /clear    —  start a new session
   /resume   —  resume latest session
-  /quit     —  exit
+  /exit /quit — exit
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
@@ -991,7 +992,7 @@ mod tests {
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
-        assert_eq!(slash_suggestions("/").len(), 11);
+        assert_eq!(slash_suggestions("/").len(), 12);
         assert_eq!(
             slash_suggestions("/mod"),
             vec![("/model", "show the active model")]
