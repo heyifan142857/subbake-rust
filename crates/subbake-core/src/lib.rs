@@ -22,4 +22,5 @@ pub use entities::{
 };
 pub use error::{CoreError, CoreResult};
 pub use memory::ContextMemory;
+pub use ports::{GenerationRequest, GenerationResponse, ResponseContract};
 pub mod cancellation;

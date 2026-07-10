@@ -352,6 +352,22 @@ pub fn build_request_hash(provider: &str, model: &str, stage: &str, messages: Js
     ]))
 }
 
+pub fn build_request_hash_v2(
+    provider_fingerprint: &str,
+    stage: &str,
+    messages: JsonValue,
+) -> String {
+    stable_hash(&JsonValue::Object(vec![
+        ("version".to_owned(), JsonValue::Number("2".to_owned())),
+        (
+            "provider_fingerprint".to_owned(),
+            JsonValue::String(provider_fingerprint.to_owned()),
+        ),
+        ("stage".to_owned(), JsonValue::String(stage.to_owned())),
+        ("messages".to_owned(), messages),
+    ]))
+}
+
 pub fn stable_hash(payload: &JsonValue) -> String {
     sha1_hex(canonical_json(payload).as_bytes())
 }

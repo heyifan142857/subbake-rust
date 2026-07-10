@@ -23,7 +23,7 @@ use crate::review::{
     restore_review_progress,
 };
 use crate::storage::{
-    InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash,
+    InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash, build_request_hash_v2,
     build_translation_fingerprint,
 };
 use crate::validation::{validate_full_alignment, validate_translation_batch};
@@ -1070,6 +1070,9 @@ fn messages_json(messages: &[ChatMessage]) -> JsonValue {
 }
 
 fn request_hash(options: &PipelineOptions, stage: CacheStage, messages: &[ChatMessage]) -> String {
+    if let Some(fingerprint) = &options.provider_fingerprint {
+        return build_request_hash_v2(fingerprint, stage.as_str(), messages_json(messages));
+    }
     build_request_hash(
         &options.provider,
         &options.model,

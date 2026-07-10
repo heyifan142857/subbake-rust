@@ -27,8 +27,8 @@ pub use fs::{
 pub use mock::MockBackend;
 pub use pipeline::{PipelineOutcome, PipelineRequest, run_pipeline};
 pub use providers::{
-    BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend, check_provider,
-    default_api_key_env, resolve_env_var,
+    ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
+    check_provider, default_api_key_env, resolve_env_var,
 };
 pub use runtime::{
     RuntimeAction, RuntimeCleanOutcome, RuntimeInspection, RuntimeOutcome, RuntimeRequest,

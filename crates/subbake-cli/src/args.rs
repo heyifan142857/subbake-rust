@@ -2,8 +2,8 @@ use std::io;
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, default_api_key_env, discover_config_path, load_and_resolve, resolve_env_var,
+    ApiFormat, BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings,
+    TranslationSettings, WhisperAction, discover_config_path, load_and_resolve,
 };
 use subbake_agent::AgentAction;
 
@@ -79,30 +79,30 @@ impl TranslateArgs {
 }
 
 pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
-    let action = match args.first().map(String::as_str) {
-        None => AgentAction {
-            kind: "start".to_owned(),
-            session_id: None,
-        },
-        Some("resume") => {
-            if args.len() > 2 {
-                return Err(io::Error::other(
-                    "agent resume accepts at most one session id",
-                ));
-            }
-            AgentAction {
-                kind: "resume".to_owned(),
-                session_id: args.get(1).cloned(),
-            }
-        }
-        Some(_) => {
-            return Err(io::Error::other(
-                "unsupported agent command; use `agent resume [SESSION_ID]`",
-            ));
-        }
+    if !args.is_empty() {
+        return Err(io::Error::other(
+            "unsupported agent command; start the agent with `sbake`",
+        ));
+    }
+
+    let action = AgentAction {
+        kind: "start".to_owned(),
+        session_id: None,
     };
 
     Ok(AgentArgs { action })
+}
+
+pub fn parse_resume_args(args: &[String]) -> io::Result<AgentArgs> {
+    if args.len() > 1 {
+        return Err(io::Error::other("resume accepts at most one session id"));
+    }
+    Ok(AgentArgs {
+        action: AgentAction {
+            kind: "resume".to_owned(),
+            session_id: args.first().cloned(),
+        },
+    })
 }
 
 pub fn parse_translate_args(args: &[String]) -> io::Result<TranslateArgs> {
@@ -348,6 +348,11 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
     let mut model = "mock-zh".to_owned();
     let mut api_key = None;
     let mut base_url = None;
+    let mut api_format = None;
+    let mut endpoint_url = None;
+    let mut api_key_env = None;
+    let mut auth_header = None;
+    let mut auth_prefix = None;
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -355,6 +360,24 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
             "--model" => model = required_value(args, &mut index, "--model")?,
             "--api-key" => api_key = Some(required_value(args, &mut index, "--api-key")?),
             "--base-url" => base_url = Some(required_value(args, &mut index, "--base-url")?),
+            "--api-format" => {
+                api_format = Some(
+                    ApiFormat::parse(&required_value(args, &mut index, "--api-format")?)
+                        .map_err(io::Error::other)?,
+                )
+            }
+            "--endpoint-url" => {
+                endpoint_url = Some(required_value(args, &mut index, "--endpoint-url")?)
+            }
+            "--api-key-env" => {
+                api_key_env = Some(required_value(args, &mut index, "--api-key-env")?)
+            }
+            "--auth-header" => {
+                auth_header = Some(required_value(args, &mut index, "--auth-header")?)
+            }
+            "--auth-prefix" => {
+                auth_prefix = Some(required_value(args, &mut index, "--auth-prefix")?)
+            }
             other => {
                 return Err(io::Error::other(format!(
                     "unknown provider option `{other}`"
@@ -364,15 +387,19 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
         index += 1;
     }
 
-    // Resolve API key: explicit value > provider-default env var
-    let resolved_api_key = api_key.or_else(|| resolve_env_var(default_api_key_env(&provider)));
-
     Ok(ProviderArgs {
         config: BackendConfig {
-            provider,
+            id: provider.clone(),
+            provider: provider.clone(),
+            display_name: provider,
+            api_format,
             model,
-            api_key: resolved_api_key,
+            api_key,
             base_url,
+            endpoint_url,
+            api_key_env,
+            auth_header,
+            auth_prefix,
         },
     })
 }
@@ -492,6 +519,16 @@ fn parse_translation_setting_option(
         "--model" => settings.model = required_value(args, index, option)?,
         "--api-key" => settings.api_key = Some(required_value(args, index, option)?),
         "--base-url" => settings.base_url = Some(required_value(args, index, option)?),
+        "--api-format" => {
+            settings.api_format = Some(
+                ApiFormat::parse(&required_value(args, index, option)?)
+                    .map_err(io::Error::other)?,
+            )
+        }
+        "--endpoint-url" => settings.endpoint_url = Some(required_value(args, index, option)?),
+        "--api-key-env" => settings.api_key_env = Some(required_value(args, index, option)?),
+        "--auth-header" => settings.auth_header = Some(required_value(args, index, option)?),
+        "--auth-prefix" => settings.auth_prefix = Some(required_value(args, index, option)?),
         "--source-lang" => settings.source_language = required_value(args, index, option)?,
         "--target-lang" => settings.target_language = required_value(args, index, option)?,
         "--batch-size" => settings.batch_size = parse_batch_size(args, index)?,
@@ -582,10 +619,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_resume_accepts_optional_session() {
-        let args = vec!["resume".to_owned(), "abc".to_owned()];
+    fn parse_resume_accepts_optional_session() {
+        let args = vec!["abc".to_owned()];
 
-        let parsed = parse_agent_args(&args).expect("agent resume should parse");
+        let parsed = parse_resume_args(&args).expect("resume should parse");
 
         assert_eq!(
             parsed.action,

@@ -3,6 +3,7 @@ fn cli_exposes_redesigned_commands() {
     let names = subbake_cli::command_names();
 
     assert!(names.contains(&"agent"));
+    assert!(names.contains(&"resume"));
     assert!(names.contains(&"translate"));
     assert!(names.contains(&"batch"));
     assert!(names.contains(&"pipeline"));
@@ -47,7 +48,7 @@ fn agent_rejects_unknown_subcommand() {
     let error = subbake_cli::run(vec!["agent".to_owned(), "bogus".to_owned()])
         .expect_err("unknown agent command should fail");
 
-    assert!(error.to_string().contains("agent resume"));
+    assert!(error.to_string().contains("start the agent"));
 }
 
 #[test]

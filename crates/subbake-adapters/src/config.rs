@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::providers::ApiFormat;
 use crate::settings::TranslationSettingsPatch;
 
 pub fn load_translation_settings_patch(path: &Path) -> io::Result<TranslationSettingsPatch> {
@@ -205,6 +206,14 @@ fn apply_key_value(
         "model" => patch.model = Some(value.into_string(key)?),
         "api_key" => patch.api_key = Some(value.into_string(key)?),
         "base_url" => patch.base_url = Some(value.into_string(key)?),
+        "api_format" => {
+            patch.api_format =
+                Some(ApiFormat::parse(&value.into_string(key)?).map_err(|e| e.to_string())?)
+        }
+        "endpoint_url" => patch.endpoint_url = Some(value.into_string(key)?),
+        "api_key_env" => patch.api_key_env = Some(value.into_string(key)?),
+        "auth_header" => patch.auth_header = Some(value.into_string(key)?),
+        "auth_prefix" => patch.auth_prefix = Some(value.into_string(key)?),
         "source_language" | "source_lang" => patch.source_language = Some(value.into_string(key)?),
         "target_language" | "target_lang" => patch.target_language = Some(value.into_string(key)?),
         "batch_size" => patch.batch_size = Some(value.into_usize(key)?),

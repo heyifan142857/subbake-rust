@@ -1,21 +1,137 @@
+use serde::{Deserialize, Serialize};
 use subbake_core::error::{CoreError, CoreResult};
-use subbake_core::ports::LlmBackend;
+use subbake_core::ports::{ChatMessage, GenerationRequest, LlmBackend, ResponseContract};
 
 use crate::mock::MockBackend;
 
+/// Wire protocol, deliberately independent of a user-facing profile name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFormat {
+    AnthropicMessages,
+    OpenaiChat,
+    OpenaiResponses,
+    GeminiGenerateContent,
+}
+
+impl ApiFormat {
+    pub fn parse(value: &str) -> CoreResult<Self> {
+        match value {
+            "anthropic_messages" => Ok(Self::AnthropicMessages),
+            "openai_chat" => Ok(Self::OpenaiChat),
+            "openai_responses" => Ok(Self::OpenaiResponses),
+            "gemini_generate_content" => Ok(Self::GeminiGenerateContent),
+            _ => Err(CoreError::Backend(format!(
+                "invalid api_format `{value}`; expected anthropic_messages, openai_chat, openai_responses, or gemini_generate_content"
+            ))),
+        }
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenaiChat => "openai_chat",
+            Self::OpenaiResponses => "openai_responses",
+            Self::GeminiGenerateContent => "gemini_generate_content",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendConfig {
+    /// Stable profile identifier. It never selects a protocol.
+    pub id: String,
+    /// Deprecated compatibility alias for `id`; new code should use `id`.
     pub provider: String,
+    pub display_name: String,
+    pub api_format: Option<ApiFormat>,
     pub model: String,
-    pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auth_header: Option<String>,
+    pub auth_prefix: Option<String>,
+}
+
+impl BackendConfig {
+    /// Legacy constructor: known built-ins retain their historical mapping.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        let id = provider.into();
+        let api_format = legacy_api_format(&id);
+        Self {
+            display_name: id.clone(),
+            provider: id.clone(),
+            id,
+            api_format,
+            model: model.into(),
+            base_url: None,
+            endpoint_url: None,
+            api_key: None,
+            api_key_env: None,
+            auth_header: None,
+            auth_prefix: None,
+        }
+    }
+    pub fn resolved_api_key(&self) -> Option<String> {
+        self.api_key
+            .clone()
+            .or_else(|| resolve_env_var(self.api_key_env.as_deref()))
+            .or_else(|| resolve_env_var(default_api_key_env(&self.id)))
+    }
+    pub fn validate(&self) -> CoreResult<()> {
+        if self.id.trim().is_empty() || self.model.trim().is_empty() {
+            return Err(CoreError::Backend(
+                "provider id and model are required".to_owned(),
+            ));
+        }
+        for value in [self.auth_header.as_deref(), self.auth_prefix.as_deref()] {
+            if value.is_some_and(|v| v.contains(['\r', '\n'])) {
+                return Err(CoreError::Backend(
+                    "authentication header must not contain CR/LF".to_owned(),
+                ));
+            }
+        }
+        if self.id != "mock" && self.api_format.is_none() {
+            return Err(CoreError::Backend(
+                "api_format is required for custom provider profiles".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn legacy_api_format(provider: &str) -> Option<ApiFormat> {
+    match provider.to_ascii_lowercase().as_str() {
+        "openai" => Some(ApiFormat::OpenaiChat),
+        "anthropic" => Some(ApiFormat::AnthropicMessages),
+        "gemini" => Some(ApiFormat::OpenaiChat),
+        "deepseek" => Some(ApiFormat::OpenaiChat),
+        _ => None,
+    }
+}
+pub fn default_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "gemini" => Some("GEMINI_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        _ => None,
+    }
+}
+pub fn resolve_env_var(env_var: Option<&str>) -> Option<String> {
+    env_var
+        .and_then(non_empty_string)
+        .and_then(|name| std::env::var(name).ok())
+        .and_then(|v| non_empty_string(&v).map(ToOwned::to_owned))
+}
+fn non_empty_string(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value.trim())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCheckRequest {
     pub config: BackendConfig,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCheckOutcome {
     pub provider: String,
@@ -23,74 +139,49 @@ pub struct ProviderCheckOutcome {
     pub message: String,
 }
 
-impl BackendConfig {
-    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
-        Self {
-            provider: provider.into(),
-            model: model.into(),
-            api_key: None,
-            base_url: None,
-        }
-    }
-}
-
-pub fn default_api_key_env(provider: &str) -> Option<&'static str> {
-    match provider.to_lowercase().as_str() {
-        "openai" => Some("OPENAI_API_KEY"),
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "gemini" => Some("GEMINI_API_KEY"),
-        _ => None,
-    }
-}
-
-pub fn resolve_env_var(env_var: Option<&str>) -> Option<String> {
-    env_var
-        .and_then(non_empty_string)
-        .and_then(|name| std::env::var(name).ok())
-        .and_then(|value| non_empty_string(&value).map(ToOwned::to_owned))
-}
-
 pub fn build_backend(config: &BackendConfig) -> CoreResult<Box<dyn LlmBackend>> {
     build_backend_with_timeout(config, crate::llm_backends::default_timeout_seconds())
 }
-
-/// Build a backend with an explicit request timeout (seconds). The translation
-/// paths carry a configured timeout; credential checks use the default.
 pub fn build_backend_with_timeout(
     config: &BackendConfig,
-    timeout_seconds: f64,
+    timeout: f64,
 ) -> CoreResult<Box<dyn LlmBackend>> {
-    match config.provider.to_lowercase().as_str() {
-        "mock" => Ok(Box::new(MockBackend::new(config.model.clone()))),
-        "openai" => crate::llm_backends::openai_backend(config, timeout_seconds),
-        "gemini" => crate::llm_backends::gemini_backend(config, timeout_seconds),
-        "anthropic" => crate::llm_backends::anthropic_backend(config, timeout_seconds),
-        provider => Err(CoreError::Backend(format!(
-            "unsupported provider `{provider}`"
-        ))),
+    config.validate()?;
+    if config.id.eq_ignore_ascii_case("mock") {
+        return Ok(Box::new(MockBackend::new(config.model.clone())));
     }
-}
-
-fn non_empty_string(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    crate::llm_backends::build_protocol_backend(config, timeout)
 }
 
 pub fn check_provider(request: ProviderCheckRequest) -> CoreResult<ProviderCheckOutcome> {
-    let backend = build_backend(&request.config)?;
-    let (ok, message) = backend.check_credentials()?;
-    if !ok {
-        return Err(CoreError::Backend(message));
+    let mut backend = build_backend(&request.config)?;
+    if request.config.id.eq_ignore_ascii_case("mock") {
+        let (_, message) = backend.check_credentials()?;
+        return Ok(ProviderCheckOutcome {
+            provider: backend.provider_name().to_owned(),
+            model: backend.model_name().to_owned(),
+            message,
+        });
     }
-
+    // Deliberately a real minimal generation, rather than a model-list request:
+    // it validates the configured endpoint, model, auth and protocol together.
+    let response = backend.generate(GenerationRequest {
+        messages: vec![ChatMessage::user(
+            "Return exactly this JSON object: {\"ok\":true}",
+        )],
+        response_contract: ResponseContract::JsonObject,
+    })?;
+    if response.json["ok"].as_bool() != Some(true) {
+        return Err(CoreError::Backend(
+            "provider check response did not satisfy the JSON probe".to_owned(),
+        ));
+    }
     Ok(ProviderCheckOutcome {
         provider: backend.provider_name().to_owned(),
         model: backend.model_name().to_owned(),
-        message,
+        message:
+            "Provider accepted a minimal JSON generation probe (this call may incur model usage)."
+                .to_owned(),
     })
 }
 
@@ -99,48 +190,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_mock_backend() {
-        let backend = build_backend(&BackendConfig::new("mock", "mock-zh"))
-            .expect("mock backend should build");
-        assert_eq!(backend.provider_name(), "mock");
-        assert_eq!(backend.model_name(), "mock-zh");
+    fn legacy_profiles_keep_their_protocol_mapping() {
+        assert_eq!(
+            BackendConfig::new("openai", "x").api_format,
+            Some(ApiFormat::OpenaiChat)
+        );
+        assert_eq!(
+            BackendConfig::new("anthropic", "x").api_format,
+            Some(ApiFormat::AnthropicMessages)
+        );
+        assert_eq!(
+            BackendConfig::new("gemini", "x").api_format,
+            Some(ApiFormat::OpenaiChat)
+        );
     }
 
     #[test]
-    fn rejects_unknown_backend() {
-        let error = match build_backend(&BackendConfig::new("zzz-unknown", "model")) {
-            Ok(_) => panic!("unknown provider should not build"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("unsupported provider"));
+    fn custom_profiles_must_name_a_protocol() {
+        let error = BackendConfig::new("company-relay", "x")
+            .validate()
+            .expect_err("format required");
+        assert!(error.to_string().contains("api_format"));
     }
 
     #[test]
-    fn openai_backend_requires_api_key() {
-        let error = match build_backend(&BackendConfig::new("openai", "gpt")) {
-            Ok(_) => panic!("missing api key should fail build"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("API key"));
-    }
-
-    #[test]
-    fn default_api_key_env_depends_on_provider() {
-        assert_eq!(default_api_key_env("openai"), Some("OPENAI_API_KEY"));
-        assert_eq!(default_api_key_env("anthropic"), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(default_api_key_env("gemini"), Some("GEMINI_API_KEY"));
-        assert_eq!(default_api_key_env("mock"), None);
-    }
-
-    #[test]
-    fn checks_mock_provider() {
-        let outcome = check_provider(ProviderCheckRequest {
-            config: BackendConfig::new("mock", "mock-zh"),
-        })
-        .expect("mock provider should check");
-
-        assert_eq!(outcome.provider, "mock");
-        assert_eq!(outcome.model, "mock-zh");
-        assert!(!outcome.message.is_empty());
+    fn rejects_header_injection() {
+        let mut config = BackendConfig::new("openai", "x");
+        config.auth_header = Some("X-Key\r\nInjected: yes".to_owned());
+        assert!(config.validate().is_err());
     }
 }

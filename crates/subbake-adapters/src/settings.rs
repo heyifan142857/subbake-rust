@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{DEFAULT_BATCH_SIZE, PipelineOptions};
 
-use crate::providers::{BackendConfig, default_api_key_env, resolve_env_var};
+use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationSettings {
@@ -11,6 +11,11 @@ pub struct TranslationSettings {
     pub model: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub api_format: Option<ApiFormat>,
+    pub endpoint_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auth_header: Option<String>,
+    pub auth_prefix: Option<String>,
     pub source_language: String,
     pub target_language: String,
     pub batch_size: usize,
@@ -44,6 +49,21 @@ impl TranslationSettingsPatch {
         }
         if let Some(value) = other.base_url {
             self.base_url = Some(value);
+        }
+        if let Some(value) = other.api_format {
+            self.api_format = Some(value);
+        }
+        if let Some(value) = other.endpoint_url {
+            self.endpoint_url = Some(value);
+        }
+        if let Some(value) = other.api_key_env {
+            self.api_key_env = Some(value);
+        }
+        if let Some(value) = other.auth_header {
+            self.auth_header = Some(value);
+        }
+        if let Some(value) = other.auth_prefix {
+            self.auth_prefix = Some(value);
         }
         if let Some(value) = other.source_language {
             self.source_language = Some(value);
@@ -97,6 +117,11 @@ pub struct TranslationSettingsPatch {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    pub api_format: Option<ApiFormat>,
+    pub endpoint_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub auth_header: Option<String>,
+    pub auth_prefix: Option<String>,
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     pub batch_size: Option<usize>,
@@ -121,6 +146,11 @@ impl Default for TranslationSettings {
             model: "mock-zh".to_owned(),
             api_key: None,
             base_url: None,
+            api_format: None,
+            endpoint_url: None,
+            api_key_env: None,
+            auth_header: None,
+            auth_prefix: None,
             source_language: "Auto".to_owned(),
             target_language: "Chinese".to_owned(),
             batch_size: DEFAULT_BATCH_SIZE,
@@ -160,6 +190,21 @@ impl TranslationSettings {
         }
         if let Some(value) = patch.base_url {
             self.base_url = Some(value);
+        }
+        if let Some(value) = patch.api_format {
+            self.api_format = Some(value);
+        }
+        if let Some(value) = patch.endpoint_url {
+            self.endpoint_url = Some(value);
+        }
+        if let Some(value) = patch.api_key_env {
+            self.api_key_env = Some(value);
+        }
+        if let Some(value) = patch.auth_header {
+            self.auth_header = Some(value);
+        }
+        if let Some(value) = patch.auth_prefix {
+            self.auth_prefix = Some(value);
         }
         if let Some(value) = patch.source_language {
             self.source_language = value;
@@ -207,19 +252,20 @@ impl TranslationSettings {
 
     pub fn backend_config(&self) -> BackendConfig {
         BackendConfig {
+            id: self.provider.clone(),
             provider: self.provider.clone(),
+            display_name: self.provider.clone(),
+            api_format: self
+                .api_format
+                .or_else(|| legacy_api_format(&self.provider)),
             model: self.model.clone(),
-            api_key: self.resolve_api_key(),
+            api_key: self.api_key.clone(),
+            api_key_env: self.api_key_env.clone(),
             base_url: self.base_url.clone(),
+            endpoint_url: self.endpoint_url.clone(),
+            auth_header: self.auth_header.clone(),
+            auth_prefix: self.auth_prefix.clone(),
         }
-    }
-
-    /// Resolve the API key: use the already-resolved direct/env value, or fall back
-    /// to the provider-default environment variable (e.g. OPENAI_API_KEY for "openai").
-    fn resolve_api_key(&self) -> Option<String> {
-        self.api_key
-            .clone()
-            .or_else(|| resolve_env_var(default_api_key_env(&self.provider)))
     }
 
     pub fn to_pipeline_options(
@@ -234,6 +280,7 @@ impl TranslationSettings {
         options.model = self.model.clone();
         options.api_key = self.backend_config().api_key;
         options.base_url = self.base_url.clone();
+        options.provider_fingerprint = self.provider_fingerprint();
         options.source_language = self.source_language.clone();
         options.target_language = self.target_language.clone();
         options.batch_size = self.batch_size;
@@ -261,6 +308,22 @@ impl TranslationSettings {
 
     pub fn glossary_path(&self) -> Option<&Path> {
         self.glossary_path.as_deref()
+    }
+
+    fn provider_fingerprint(&self) -> Option<String> {
+        if self.provider.eq_ignore_ascii_case("mock") {
+            return None;
+        }
+        let config = self.backend_config();
+        let format = config.api_format?.as_str();
+        let endpoint = config.endpoint_url.or(config.base_url).unwrap_or_default();
+        Some(format!(
+            "{}|{}|{}|{}",
+            config.id,
+            format,
+            endpoint.trim_end_matches('/'),
+            config.model
+        ))
     }
 }
 

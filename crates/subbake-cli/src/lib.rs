@@ -7,6 +7,7 @@ pub mod output;
 pub fn command_names() -> &'static [&'static str] {
     &[
         "agent",
+        "resume",
         "translate",
         "batch",
         "transcribe",

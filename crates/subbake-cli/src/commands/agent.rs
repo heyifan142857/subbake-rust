@@ -40,7 +40,7 @@ fn start_interactive() -> io::Result<()> {
     let mut engine = AgentEngine::new(project_root);
     engine.start_session()?;
 
-    run_tui_with_engine(engine)
+    run_tui_with_engine(engine, false)
 }
 
 fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
@@ -48,10 +48,10 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
     let mut engine = AgentEngine::new(project_root);
     engine.resume_session(session_id)?;
 
-    run_tui_with_engine(engine)
+    run_tui_with_engine(engine, session_id.is_none())
 }
 
-fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
+fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io::Result<()> {
     let config_path = discover_config_path();
     engine.set_config_path(config_path.as_deref())?;
     let initial_profile = engine
@@ -68,6 +68,9 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
     tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
     tui.set_session_replay(session_events);
+    if open_session_picker {
+        tui.open_session_picker(engine.session_choices(20)?);
+    }
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));
 
@@ -90,7 +93,7 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             TuiAction::SelectSession(id) => Some(id.as_str()),
             TuiAction::SubmitText(input) => input
                 .trim()
-                .strip_prefix("/session ")
+                .strip_prefix("/sessions ")
                 .map(str::trim)
                 .filter(|id| !id.is_empty()),
             _ => None,
@@ -151,8 +154,7 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             backend = candidate;
         }
 
-        let changed_session =
-            submitted_text.is_some_and(|input| matches!(input.trim(), "/clear" | "/resume"));
+        let changed_session = submitted_text.is_some_and(|input| input.trim() == "/clear");
         if changed_session {
             engine.set_config_path(config_path.as_deref())?;
             let profile = engine
@@ -171,7 +173,7 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             .transpose()?
             .filter(|options| !options.is_empty());
         let session_options = submitted_text
-            .is_some_and(|input| input.trim() == "/session")
+            .is_some_and(|input| input.trim() == "/sessions")
             .then(|| engine.session_choices(20))
             .transpose()?
             .filter(|options| !options.is_empty());
@@ -250,7 +252,7 @@ mod tests {
             RenderPolicy::Immediate
         );
         assert_eq!(
-            render_policy(&TuiAction::SubmitText("/session".to_owned()), "session"),
+            render_policy(&TuiAction::SubmitText("/sessions".to_owned()), "session"),
             RenderPolicy::Immediate
         );
         assert_eq!(

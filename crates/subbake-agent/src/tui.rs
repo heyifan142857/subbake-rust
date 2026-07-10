@@ -25,9 +25,9 @@ use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::engine::EngineObserver;
+use crate::engine::{EngineObserver, SessionChoice};
 use crate::session::iso_now;
 use subbake_core::{CancellationGuard, CancellationToken};
 
@@ -62,11 +62,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "show the active model"),
     ("/profile", "list or switch profiles"),
     ("/undo", "undo the last file operation"),
-    ("/session", "show session info"),
-    ("/sessions", "list recent sessions"),
+    ("/sessions", "resume a saved session"),
     ("/history", "show conversation history"),
     ("/clear", "start a new session"),
-    ("/resume", "resume the latest session"),
     ("/exit", "exit SubBake"),
     ("/quit", "exit SubBake"),
 ];
@@ -82,6 +80,10 @@ const APPROVAL_OPTIONS: &[(&str, &str)] = &[
 
 struct TuiPicker {
     pub options: Vec<String>,
+}
+
+struct SessionPicker {
+    pub options: Vec<SessionChoice>,
 }
 
 pub enum TuiInteraction {
@@ -102,7 +104,7 @@ pub enum TuiInteraction {
     },
     SessionPicker {
         message: String,
-        options: Vec<String>,
+        options: Vec<SessionChoice>,
     },
 }
 
@@ -116,7 +118,7 @@ enum InputMode {
     Editing,
     BrowsingHistory { index: usize, draft: String },
     ChoosingProfile(TuiPicker),
-    ChoosingSession(TuiPicker),
+    ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
 }
 
@@ -143,7 +145,7 @@ impl TuiAction {
             Self::ApprovePlan => "approve".to_owned(),
             Self::RejectPlan => "reject".to_owned(),
             Self::SelectProfile(name) => format!("/profile {name}"),
-            Self::SelectSession(id) => format!("/session {id}"),
+            Self::SelectSession(id) => format!("/sessions {id}"),
             Self::TogglePlan => "toggle plan mode".to_owned(),
         }
     }
@@ -352,6 +354,13 @@ impl SubBakeTui {
         self.scroll_offset = 0;
     }
 
+    /// Show the same resume picker used by the `/sessions` command on startup.
+    pub fn open_session_picker(&mut self, options: Vec<SessionChoice>) {
+        self.input.clear();
+        self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
+        self.suggestion_index = 0;
+    }
+
     /// Run the event loop. `process_fn` is called with the user's input each
     /// time they press Enter; it should run the agent engine and return the
     /// response text.
@@ -409,9 +418,11 @@ impl SubBakeTui {
                             self.set_session_replay(events);
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
-                            self.input_mode = InputMode::ChoosingSession(TuiPicker { options });
+                            self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
                             self.suggestion_index = 0;
-                            self.render_response(message, RenderPolicy::Immediate);
+                            // `/sessions` opens a picker; its textual summary would only
+                            // duplicate the rows already visible in that picker.
+                            let _ = message;
                         }
                         Err(error) => {
                             if let Ok(mut view) = self.msg_view.lock() {
@@ -459,17 +470,14 @@ impl SubBakeTui {
   /model    —  show active model
   /profile [NAME] — list or switch profiles
   /undo     —  undo last file operation
-  /session  —  show session info
-  /sessions —  list recent sessions
+  /sessions —  choose and resume a saved session
   /history [LIMIT] — show recent history
   /clear    —  start a new session
-  /resume   —  resume latest session
   /exit /quit — exit
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
-            "/plan" | "/model" | "/profile" | "/undo" | "/session" | "/sessions" | "/history"
-            | "/clear" | "/resume" => {
+            "/plan" | "/model" | "/profile" | "/undo" | "/sessions" | "/history" | "/clear" => {
                 format!(
                     "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
                 )
@@ -569,14 +577,71 @@ Or just type what you want, e.g. "translate @clip.srt""#
             .unwrap_or_default();
         let scroll = self.scroll_offset;
         let suggestions = self.suggestions();
-        let selected_suggestion = self
-            .suggestion_index
-            .min(suggestions.len().saturating_sub(1));
+        let selected_suggestion = match &self.input_mode {
+            InputMode::ChoosingSession(picker) => self
+                .suggestion_index
+                .min(picker.options.len().saturating_sub(1)),
+            _ => self
+                .suggestion_index
+                .min(suggestions.len().saturating_sub(1)),
+        };
         let processing = self.processing;
         let animation_tick = self.animation_started_at.elapsed().as_millis() / 80;
+        let session_picker = match &self.input_mode {
+            InputMode::ChoosingSession(picker) => Some(picker.options.clone()),
+            _ => None,
+        };
 
         self.terminal.draw(|frame| {
             let area = frame.area();
+            if let Some(options) = &session_picker {
+                frame.render_widget(Clear, area);
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        "Resume a previous session",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "Sessions for this project · newest activity first",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                ];
+                for (index, session) in options.iter().enumerate() {
+                    let selected = index == selected_suggestion;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let metadata = format!(
+                        "{}  {}  ·  {}  ·  {} events",
+                        if session.active { "●" } else { " " },
+                        session.updated_at,
+                        session.cwd,
+                        session.event_count,
+                    );
+                    lines.push(Line::from(Span::styled(metadata, style)));
+                    lines.push(Line::from(Span::styled(
+                        format!("   {}", session.title),
+                        style.add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(Span::styled(
+                    "↑↓←→ navigate · Enter resume · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+                return;
+            }
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -773,7 +838,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             && !picker.options.is_empty()
                         {
                             let index = self.suggestion_index.min(picker.options.len() - 1);
-                            Some(TuiAction::SelectSession(picker.options[index].clone()))
+                            Some(TuiAction::SelectSession(picker.options[index].id.clone()))
                         } else if !suggestions.is_empty()
                             && !suggestions.iter().any(|item| item.0 == self.input)
                         {
@@ -819,19 +884,19 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         TuiAction::SubmitText(trimmed)
                     };
                     self.scroll_offset = 0;
+                    let opens_session_picker =
+                        matches!(&action, TuiAction::SubmitText(input) if input == "/sessions");
 
-                    // Show user message.
-                    if let Ok(mut v) = self.msg_view.lock() {
-                        v.push(
-                            MsgStyle::User,
-                            format!("[{:?}] {}", iso_now(), action.visible_text()),
-                        );
-                    }
-
-                    // Paint the submitted message and initial thinking state
-                    // before the potentially slow engine call begins.
-                    if let Ok(mut view) = self.msg_view.lock() {
-                        view.push(MsgStyle::Thinking, "Deciding next action…".to_owned());
+                    if !opens_session_picker {
+                        // Paint the submitted message and initial thinking state
+                        // before the potentially slow engine call begins.
+                        if let Ok(mut view) = self.msg_view.lock() {
+                            view.push(
+                                MsgStyle::User,
+                                format!("[{:?}] {}", iso_now(), action.visible_text()),
+                            );
+                            view.push(MsgStyle::Thinking, "Deciding next action…".to_owned());
+                        }
                     }
                     self.processing = true;
                     self.cancellation_requested = false;
@@ -856,6 +921,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
+                    if let InputMode::ChoosingSession(picker) = &self.input_mode {
+                        if !picker.options.is_empty() {
+                            self.suggestion_index =
+                                previous_suggestion(self.suggestion_index, picker.options.len());
+                        }
+                        return Ok(());
+                    }
                     let suggestions = self.suggestions();
                     if suggestions.is_empty() {
                         self.navigate_history_up();
@@ -865,11 +937,29 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::Down => {
+                    if let InputMode::ChoosingSession(picker) = &self.input_mode {
+                        if !picker.options.is_empty() {
+                            self.suggestion_index =
+                                (self.suggestion_index + 1) % picker.options.len();
+                        }
+                        return Ok(());
+                    }
                     let suggestions = self.suggestions();
                     if suggestions.is_empty() {
                         self.navigate_history_down();
                     } else {
                         self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
+                    }
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if let InputMode::ChoosingSession(picker) = &self.input_mode
+                        && !picker.options.is_empty()
+                    {
+                        self.suggestion_index = if key.code == KeyCode::Left {
+                            previous_suggestion(self.suggestion_index, picker.options.len())
+                        } else {
+                            (self.suggestion_index + 1) % picker.options.len()
+                        };
                     }
                 }
                 KeyCode::PageUp => {
@@ -905,8 +995,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 KeyCode::Tab => {
                     if self.input.starts_with('/') {
                         let matches = slash_suggestions(&self.input);
-                        if matches.len() == 1 {
-                            self.input = matches[0].0.to_owned();
+                        if !matches.is_empty() {
+                            let index = self.suggestion_index.min(matches.len() - 1);
+                            self.input = matches[index].0.to_owned();
+                            self.suggestion_index = (index + 1) % matches.len();
                         }
                         return Ok(());
                     }
@@ -949,11 +1041,7 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
             .iter()
             .map(|option| (option.clone(), "configured profile".to_owned()))
             .collect(),
-        InputMode::ChoosingSession(picker) if input.is_empty() => picker
-            .options
-            .iter()
-            .map(|option| (option.clone(), "saved session".to_owned()))
-            .collect(),
+        InputMode::ChoosingSession(_) => Vec::new(),
         _ => slash_suggestions(input)
             .into_iter()
             .map(|(command, description)| (command.to_owned(), description.to_owned()))
@@ -1049,7 +1137,7 @@ mod tests {
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
-        assert_eq!(slash_suggestions("/").len(), 12);
+        assert_eq!(slash_suggestions("/").len(), 10);
         assert_eq!(
             slash_suggestions("/mod"),
             vec![("/model", "show the active model")]

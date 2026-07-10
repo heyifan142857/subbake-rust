@@ -154,6 +154,9 @@ pub struct PipelineOptions {
     pub timeout_seconds: f64,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Non-secret identity of the configured API route, used to isolate v2
+    /// cache entries across protocols and relay endpoints.
+    pub provider_fingerprint: Option<String>,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -181,6 +184,7 @@ impl PipelineOptions {
             timeout_seconds: default_timeout_seconds(),
             api_key: None,
             base_url: None,
+            provider_fingerprint: None,
             dry_run: false,
             resume: true,
             use_cache: true,

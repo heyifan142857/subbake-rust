@@ -41,6 +41,17 @@ pub trait EngineObserver: Send {
     fn on_step_limit(&mut self) {}
 }
 
+/// A compact, human-readable session row for the resume picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionChoice {
+    pub id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub cwd: String,
+    pub event_count: usize,
+    pub active: bool,
+}
+
 /// Observer that prints everything to stdout (mirrors Python `trace._AgentLoopTrace`).
 pub struct StreamingObserver;
 
@@ -401,10 +412,34 @@ impl AgentEngine {
             .join("\n"))
     }
 
-    pub fn session_choices(&self, limit: usize) -> std::io::Result<Vec<String>> {
-        self.session_store
-            .list(limit)
-            .map(|sessions| sessions.into_iter().map(|session| session.id).collect())
+    pub fn session_choices(&self, limit: usize) -> std::io::Result<Vec<SessionChoice>> {
+        let active_id = self.session.as_ref().map(|session| session.id.as_str());
+        self.session_store.list(limit).map(|sessions| {
+            sessions
+                .into_iter()
+                .map(|session| {
+                    let title = session
+                        .events
+                        .iter()
+                        .find(|event| event.kind == "user" && !event.text.trim().is_empty())
+                        .map(|event| truncate_session_title(&event.text, 48))
+                        .unwrap_or_else(|| "New session".to_owned());
+                    let cwd = std::path::Path::new(&session.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&session.cwd)
+                        .to_owned();
+                    SessionChoice {
+                        active: Some(session.id.as_str()) == active_id,
+                        id: session.id,
+                        title,
+                        updated_at: session.updated_at,
+                        cwd,
+                        event_count: session.events.len(),
+                    }
+                })
+                .collect()
+        })
     }
 
     pub fn session_profile(&self, id: &str) -> std::io::Result<Option<String>> {
@@ -457,18 +492,6 @@ impl AgentEngine {
         }
         self.save()?;
         Ok("Started a new session.".to_owned())
-    }
-
-    pub fn resume_previous_session(&mut self) -> std::io::Result<String> {
-        let active_id = self.session.as_ref().map(|session| session.id.clone());
-        let target = self
-            .session_store
-            .list(20)?
-            .into_iter()
-            .find(|session| Some(&session.id) != active_id.as_ref())
-            .ok_or_else(|| std::io::Error::other("no previous session to resume"))?;
-        self.session = Some(target);
-        self.session_summary()
     }
 
     pub fn has_pending_plan(&self) -> bool {
@@ -560,10 +583,8 @@ impl AgentEngine {
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
-            "/session" => self.session_summary(),
             "/sessions" => self.sessions_summary(20),
             "/clear" => self.clear_session(),
-            "/resume" => self.resume_previous_session(),
             "/model" => self.active_model_summary(),
             "/profile" => self.run_tool("list_profiles", &serde_json::json!({})),
             command if command.starts_with("/profile ") => {
@@ -574,8 +595,8 @@ impl AgentEngine {
                     return self.select_profile(name);
                 }
             }
-            command if command.starts_with("/session ") => {
-                let id = command.trim_start_matches("/session ").trim();
+            command if command.starts_with("/sessions ") => {
+                let id = command.trim_start_matches("/sessions ").trim();
                 return self.select_session(id);
             }
             command if command == "/history" || command.starts_with("/history ") => {
@@ -730,6 +751,21 @@ impl AgentEngine {
     /// List tool specs filtered by category for the LLM context.
     pub fn tool_specs_for_llm(&self, categories: &[ToolKind]) -> Vec<&crate::tools::ToolSpec> {
         crate::tools::tool_specs_for_categories(ALL_TOOL_SPECS, categories)
+    }
+}
+
+fn truncate_session_title(title: &str, max_chars: usize) -> String {
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        format!(
+            "{}…",
+            normalized
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
 

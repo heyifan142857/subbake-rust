@@ -15,6 +15,25 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// A protocol-neutral request for a model generation.  Business code owns the
+/// JSON schema it asks for; HTTP adapters only transport and normalize it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationRequest {
+    pub messages: Vec<ChatMessage>,
+    pub response_contract: ResponseContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseContract {
+    JsonObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationResponse {
+    pub json: serde_json::Value,
+    pub usage: Usage,
+}
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
@@ -92,6 +111,23 @@ pub trait LlmBackend: Send {
         self.generate_raw_json(messages)
     }
 
+    /// The protocol-neutral generation API.  The legacy raw methods remain as
+    /// compatibility shims while callers migrate their business contracts.
+    fn generate(&mut self, request: GenerationRequest) -> CoreResult<GenerationResponse> {
+        let (json, usage) = self.generate_raw_json(&request.messages)?;
+        Ok(GenerationResponse { json, usage })
+    }
+
+    fn generate_cancellable(
+        &mut self,
+        request: GenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<GenerationResponse> {
+        cancellation.check()?;
+        let (json, usage) = self.generate_raw_json_cancellable(&request.messages, cancellation)?;
+        Ok(GenerationResponse { json, usage })
+    }
+
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
         Ok((
             true,
@@ -135,6 +171,17 @@ where
         cancellation: &CancellationGuard,
     ) -> CoreResult<(serde_json::Value, Usage)> {
         (**self).generate_raw_json_cancellable(messages, cancellation)
+    }
+
+    fn generate(&mut self, request: GenerationRequest) -> CoreResult<GenerationResponse> {
+        (**self).generate(request)
+    }
+    fn generate_cancellable(
+        &mut self,
+        request: GenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<GenerationResponse> {
+        (**self).generate_cancellable(request, cancellation)
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
