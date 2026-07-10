@@ -975,7 +975,10 @@ impl AgentEngine {
                 ))
             }
 
-            _ => Ok(format!("[{name}: not yet wired]")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown agent tool `{name}`"),
+            )),
         }
     }
 
@@ -1457,6 +1460,21 @@ mod tests {
                 .kind,
             "ask_user"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_tool_never_reports_placeholder_success() {
+        let root = temp_root("unknown-tool");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let error = engine
+            .run_tool("not_registered", &json!({}))
+            .expect_err("unknown tool must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unknown agent tool"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
