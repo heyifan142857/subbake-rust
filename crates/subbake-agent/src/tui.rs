@@ -23,7 +23,7 @@ use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::engine::EngineObserver;
 use crate::session::iso_now;
@@ -48,6 +48,25 @@ pub enum MsgStyle {
     Response,
     Error,
     System,
+}
+
+const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show commands"),
+    ("/plan", "toggle plan mode"),
+    ("/approve", "execute the pending plan"),
+    ("/reject", "discard the pending plan"),
+    ("/undo", "undo the last file operation"),
+    ("/session", "show session info"),
+    ("/quit", "exit SubBake"),
+];
+
+struct StreamingResponse {
+    chars: Vec<char>,
+    position: usize,
+    message_index: usize,
+    next_at: std::time::Instant,
 }
 
 /// Bounded scrollback buffer that also serves as the `EngineObserver`.
@@ -116,9 +135,9 @@ impl EngineObserver for TuiObserver {
     }
 
     fn on_response(&mut self, text: &str) {
-        if let Ok(mut v) = self.view.lock() {
-            v.push(MsgStyle::Response, format!("➔ {text}"));
-        }
+        // Final responses are returned to `SubBakeTui::run`, which animates
+        // them. Pushing here as well would display every answer twice.
+        let _ = text;
     }
 }
 
@@ -132,6 +151,7 @@ pub struct SubBakeTui {
     input: String,
     scroll_offset: u16,
     running: bool,
+    streaming: Option<StreamingResponse>,
 }
 
 impl SubBakeTui {
@@ -146,6 +166,7 @@ impl SubBakeTui {
             input: String::new(),
             scroll_offset: 0,
             running: true,
+            streaming: None,
         })
     }
 
@@ -164,6 +185,7 @@ impl SubBakeTui {
         self.welcome(&mut observer)?;
 
         while self.running {
+            self.advance_stream();
             self.draw()?;
             self.handle_event(&mut observer, &mut process_fn)?;
         }
@@ -198,8 +220,64 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn welcome(&mut self, obs: &mut TuiObserver) -> io::Result<()> {
-        obs.on_response("SubBake agent ready. Type a message or /help for commands.");
+        if let Ok(mut v) = obs.view.lock() {
+            v.push(
+                MsgStyle::Response,
+                "➔ SubBake agent ready. Type a message or /help for commands.".to_owned(),
+            );
+        }
         Ok(())
+    }
+
+    fn start_stream(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.finish_stream();
+        if let Ok(mut view) = self.msg_view.lock() {
+            view.push(MsgStyle::Response, "➔ ".to_owned());
+            self.streaming = Some(StreamingResponse {
+                chars: text.chars().collect(),
+                position: 0,
+                message_index: view.messages.len() - 1,
+                next_at: std::time::Instant::now(),
+            });
+        }
+    }
+
+    fn finish_stream(&mut self) {
+        let Some(stream) = self.streaming.take() else {
+            return;
+        };
+        if let Ok(mut view) = self.msg_view.lock()
+            && let Some(message) = view.messages.get_mut(stream.message_index)
+        {
+            message.text.extend(&stream.chars[stream.position..]);
+        }
+    }
+
+    fn advance_stream(&mut self) {
+        let Some(stream) = self.streaming.as_mut() else {
+            return;
+        };
+        if std::time::Instant::now() < stream.next_at {
+            return;
+        }
+        if let Ok(mut view) = self.msg_view.lock()
+            && let Some(message) = view.messages.get_mut(stream.message_index)
+            && let Some(ch) = stream.chars.get(stream.position)
+        {
+            message.text.push(*ch);
+            stream.position += 1;
+            stream.next_at = std::time::Instant::now() + STREAM_INTERVAL;
+        }
+        if stream.position >= stream.chars.len() {
+            self.streaming = None;
+        }
+    }
+
+    fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        slash_suggestions(&self.input)
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -209,19 +287,24 @@ Or just type what you want, e.g. "translate @clip.srt""#
             .map(|v| v.all().to_vec())
             .unwrap_or_default();
         let scroll = self.scroll_offset;
+        let suggestions = self.slash_suggestions();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(3)])
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(suggestions.len() as u16),
+                    Constraint::Length(3),
+                ])
                 .split(area);
 
             // -- Output pane --
             let output_area = chunks[0];
             let items: Vec<Line<'_>> = messages
                 .iter()
-                .map(|msg| {
+                .flat_map(|msg| {
                     let style = match msg.style {
                         MsgStyle::User => Style::default()
                             .fg(Color::Cyan)
@@ -235,21 +318,46 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
                         }
                     };
-                    Line::from(Span::styled(&msg.text, style))
+                    let lines = msg.text.split('\n').collect::<Vec<_>>();
+                    lines
+                        .into_iter()
+                        .map(move |line| Line::from(Span::styled(line, style)))
                 })
                 .collect();
 
-            let max_scroll =
-                (items.len() as u16).saturating_sub(output_area.height.saturating_sub(2));
-            let offset = scroll.min(max_scroll);
+            let visual_line_count = items
+                .iter()
+                .map(|line| {
+                    let width = usize::from(output_area.width.max(1));
+                    line.width().max(1).div_ceil(width)
+                })
+                .sum::<usize>();
 
             let paragraph = Paragraph::new(items)
                 .block(Block::default().borders(Borders::NONE))
-                .scroll((offset, 0));
+                .wrap(Wrap { trim: false });
+            let max_scroll = (visual_line_count as u16).saturating_sub(output_area.height);
+            // `scroll_offset` is the number of visual lines above the newest
+            // output, so zero follows a growing/streaming response.
+            let offset = max_scroll.saturating_sub(scroll.min(max_scroll));
+            let paragraph = paragraph.scroll((offset, 0));
             frame.render_widget(paragraph, output_area);
 
+            // -- Slash command suggestions --
+            let suggestion_area = chunks[1];
+            let suggestion_lines = suggestions.iter().map(|(command, description)| {
+                Line::from(vec![
+                    Span::styled(format!("  {command:<10}"), Style::default().fg(Color::Cyan)),
+                    Span::styled(*description, Style::default().fg(Color::DarkGray)),
+                ])
+            });
+            frame.render_widget(
+                Paragraph::new(suggestion_lines.collect::<Vec<_>>()),
+                suggestion_area,
+            );
+
             // -- Input bar --
-            let input_area = chunks[1];
+            let input_area = chunks[2];
             let input_style = Style::default().fg(Color::Cyan);
             let input_widget = Paragraph::new(Line::from(Span::styled(
                 format!("> {}", self.input),
@@ -276,7 +384,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
     where
         F: FnMut(&str, &mut TuiObserver) -> io::Result<String>,
     {
-        if !event::poll(std::time::Duration::from_millis(100))? {
+        if !event::poll(STREAM_INTERVAL)? {
             return Ok(());
         }
 
@@ -323,9 +431,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     // Process.
                     match process_fn(&trimmed, observer) {
                         Ok(response) => {
-                            if let Ok(mut v) = self.msg_view.lock() {
-                                v.push(MsgStyle::Response, response);
-                            }
+                            self.start_stream(response);
                         }
                         Err(e) => {
                             if let Ok(mut v) = self.msg_view.lock() {
@@ -353,7 +459,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 }
                 KeyCode::Tab => {
-                    // Simple completion: "tra" → "translate "
+                    if self.input.starts_with('/') {
+                        let matches = slash_suggestions(&self.input);
+                        if matches.len() == 1 {
+                            self.input = matches[0].0.to_owned();
+                        }
+                        return Ok(());
+                    }
+                    // Simple natural-language completion: "tra" → "translate "
                     let completions = [
                         "translate ",
                         "transcribe ",
@@ -377,5 +490,32 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
 
         Ok(())
+    }
+}
+
+fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let query = input.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(command, _)| command.starts_with(&query))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slash_suggestions;
+
+    #[test]
+    fn slash_displays_all_commands_and_filters_as_the_user_types() {
+        assert_eq!(slash_suggestions("/").len(), 7);
+        assert_eq!(
+            slash_suggestions("/app"),
+            vec![("/approve", "execute the pending plan")]
+        );
+        assert!(slash_suggestions("hello /").is_empty());
     }
 }
