@@ -963,7 +963,7 @@ impl AgentEngine {
         }))
     }
 
-    fn load_project_config(&self) -> io::Result<Option<(PathBuf, ConfigFile)>> {
+    pub(crate) fn load_project_config(&self) -> io::Result<Option<(PathBuf, ConfigFile)>> {
         let candidates = [
             self.session
                 .as_ref()

@@ -12,7 +12,7 @@ pub use engine::{AgentEngine, EngineObserver, StreamingObserver};
 pub use guard::FileGuard;
 pub use session::*;
 pub use tools::{ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES, ToolKind};
-pub use tui::{Msg, MsgStyle, MsgView, SubBakeTui, TuiObserver, TuiProcessResult};
+pub use tui::{Msg, MsgStyle, MsgView, SubBakeTui, TuiObserver, TuiPicker, TuiProcessResult};
 
 // ---------------------------------------------------------------------------
 // Compatibility API — used by the CLI while the interactive engine is built.

@@ -77,6 +77,12 @@ const APPROVAL_OPTIONS: &[(&str, &str)] = &[
 pub struct TuiProcessResult {
     pub response: String,
     pub pending_plan: bool,
+    pub picker: Option<TuiPicker>,
+}
+
+pub struct TuiPicker {
+    pub command: String,
+    pub options: Vec<String>,
 }
 
 struct StreamingResponse {
@@ -171,11 +177,15 @@ pub struct SubBakeTui {
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     input: String,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     scroll_offset: u16,
     running: bool,
     streaming: Option<StreamingResponse>,
     suggestion_index: usize,
     awaiting_approval: bool,
+    picker: Option<TuiPicker>,
     processing: bool,
     animation_started_at: std::time::Instant,
 }
@@ -190,11 +200,15 @@ impl SubBakeTui {
             terminal,
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(1000))),
             input: String::new(),
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             scroll_offset: 0,
             running: true,
             streaming: None,
             suggestion_index: 0,
             awaiting_approval: false,
+            picker: None,
             processing: false,
             animation_started_at: std::time::Instant::now(),
         })
@@ -232,6 +246,7 @@ impl SubBakeTui {
                 match result {
                     Ok(result) => {
                         self.awaiting_approval = result.pending_plan;
+                        self.picker = result.picker;
                         self.suggestion_index = 0;
                         self.start_stream(result.response);
                     }
@@ -333,11 +348,27 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
     }
 
-    fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
-        if self.awaiting_approval && self.input.is_empty() {
-            APPROVAL_OPTIONS.to_vec()
+    fn suggestions(&self) -> Vec<(String, String)> {
+        if self.history_index.is_some() {
+            Vec::new()
+        } else if self.awaiting_approval && self.input.is_empty() {
+            APPROVAL_OPTIONS
+                .iter()
+                .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
+                .collect()
+        } else if self.input.is_empty()
+            && let Some(picker) = &self.picker
+        {
+            picker
+                .options
+                .iter()
+                .map(|option| (option.clone(), "configured profile".to_owned()))
+                .collect()
         } else {
             slash_suggestions(&self.input)
+                .into_iter()
+                .map(|(command, description)| (command.to_owned(), description.to_owned()))
+                .collect()
         }
     }
 
@@ -348,7 +379,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
             .map(|v| v.all().to_vec())
             .unwrap_or_default();
         let scroll = self.scroll_offset;
-        let suggestions = self.slash_suggestions();
+        let suggestions = self.suggestions();
         let selected_suggestion = self
             .suggestion_index
             .min(suggestions.len().saturating_sub(1));
@@ -457,7 +488,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         };
                         Line::from(vec![
                             Span::styled(format!("› {command:<10}"), command_style),
-                            Span::styled(*description, description_style),
+                            Span::styled(description.clone(), description_style),
                         ])
                     });
             frame.render_widget(
@@ -509,7 +540,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     if self.processing {
                         return Ok(());
                     }
-                    let suggestions = self.slash_suggestions();
+                    let suggestions = self.suggestions();
                     if self.awaiting_approval && self.input.is_empty() {
                         match self.suggestion_index.min(APPROVAL_OPTIONS.len() - 1) {
                             0 => self.input = "/approve".to_owned(),
@@ -520,13 +551,19 @@ Or just type what you want, e.g. "translate @clip.srt""#
                                 return Ok(());
                             }
                         }
+                    } else if self.input.is_empty()
+                        && let Some(picker) = &self.picker
+                        && !picker.options.is_empty()
+                    {
+                        let index = self.suggestion_index.min(picker.options.len() - 1);
+                        self.input = format!("{} {}", picker.command, picker.options[index]);
                     }
                     if !suggestions.is_empty()
                         && !self.awaiting_approval
                         && !suggestions.iter().any(|item| item.0 == self.input)
                     {
                         let index = self.suggestion_index.min(suggestions.len() - 1);
-                        self.input = suggestions[index].0.to_owned();
+                        self.input = suggestions[index].0.clone();
                         self.suggestion_index = 0;
                         return Ok(());
                     }
@@ -536,6 +573,17 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
                     if trimmed.is_empty() {
                         return Ok(());
+                    }
+
+                    self.history_index = None;
+                    self.history_draft.clear();
+                    if !matches!(trimmed.as_str(), "/approve" | "/reject")
+                        && self
+                            .input_history
+                            .last()
+                            .is_none_or(|previous| previous != &trimmed)
+                    {
+                        self.input_history.push(trimmed.clone());
                     }
 
                     if trimmed == "/quit" || trimmed == "/exit" {
@@ -578,26 +626,30 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     })?;
                 }
                 KeyCode::Char(ch) => {
+                    self.picker = None;
+                    self.history_index = None;
                     self.input.push(ch);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
+                    self.picker = None;
+                    self.history_index = None;
                     self.input.pop();
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
-                    let suggestions = self.slash_suggestions();
+                    let suggestions = self.suggestions();
                     if suggestions.is_empty() {
-                        self.scroll_offset = self.scroll_offset.saturating_add(1);
+                        self.navigate_history_up();
                     } else {
                         self.suggestion_index =
                             previous_suggestion(self.suggestion_index, suggestions.len());
                     }
                 }
                 KeyCode::Down => {
-                    let suggestions = self.slash_suggestions();
+                    let suggestions = self.suggestions();
                     if suggestions.is_empty() {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        self.navigate_history_down();
                     } else {
                         self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
                     }
@@ -640,6 +692,35 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
 
         Ok(())
+    }
+
+    fn navigate_history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = self.input.clone();
+                self.input_history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.input.clone_from(&self.input_history[index]);
+    }
+
+    fn navigate_history_down(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.input_history.len() {
+            let next = index + 1;
+            self.history_index = Some(next);
+            self.input.clone_from(&self.input_history[next]);
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
     }
 }
 

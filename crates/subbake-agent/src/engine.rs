@@ -291,6 +291,15 @@ impl AgentEngine {
         ))
     }
 
+    pub fn profile_choices(&self) -> std::io::Result<Vec<String>> {
+        let Some((_, config)) = self.load_project_config()? else {
+            return Ok(Vec::new());
+        };
+        let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
+        profiles.sort();
+        Ok(profiles)
+    }
+
     pub fn conversation_context_summary(&self, limit: usize) -> Option<String> {
         let session = self.session.as_ref()?;
         let mut lines = session

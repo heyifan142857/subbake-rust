@@ -3,7 +3,9 @@ use std::io;
 use subbake_adapters::{
     TranslationSettings, build_backend, discover_config_path, load_and_resolve,
 };
-use subbake_agent::{AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui, TuiProcessResult};
+use subbake_agent::{
+    AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui, TuiPicker, TuiProcessResult,
+};
 
 use crate::args::AgentArgs;
 use crate::output::print_agent_outcome;
@@ -77,9 +79,20 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
         // Save session after each interaction.
         let _ = engine.save();
 
+        let picker = matches!(input.trim(), "/model" | "/profile")
+            .then(|| engine.profile_choices())
+            .transpose()?
+            .and_then(|options| {
+                (!options.is_empty()).then_some(TuiPicker {
+                    command: "/profile".to_owned(),
+                    options,
+                })
+            });
+
         Ok(TuiProcessResult {
             response: result,
             pending_plan: engine.has_pending_plan(),
+            picker,
         })
     })
 }
