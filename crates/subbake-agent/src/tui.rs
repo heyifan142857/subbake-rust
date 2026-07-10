@@ -44,6 +44,8 @@ pub struct Msg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgStyle {
+    WelcomeTitle,
+    WelcomeTagline,
     User,
     Thinking,
     ToolCall,
@@ -507,8 +509,17 @@ Or just type what you want, e.g. "translate @clip.srt""#
     fn welcome(&mut self, obs: &mut TuiObserver) -> io::Result<()> {
         if let Ok(mut v) = obs.view.lock() {
             v.push(
-                MsgStyle::Response,
-                "➔ SubBake agent ready. Type a message or /help for commands.".to_owned(),
+                MsgStyle::WelcomeTitle,
+                format!("SubBake {}", env!("CARGO_PKG_VERSION")),
+            );
+            v.push(
+                MsgStyle::WelcomeTagline,
+                "Fast AI subtitle translation".to_owned(),
+            );
+            v.push(MsgStyle::System, String::new());
+            v.push(
+                MsgStyle::System,
+                "Type a message or /help for commands.".to_owned(),
             );
         }
         Ok(())
@@ -829,6 +840,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             .iter()
                             .any(|later| later.style == MsgStyle::Thinking);
                     let style = match msg.style {
+                        MsgStyle::WelcomeTitle => Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        MsgStyle::WelcomeTagline => Style::default().fg(Color::DarkGray),
                         MsgStyle::User => Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
