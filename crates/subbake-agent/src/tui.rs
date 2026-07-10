@@ -556,9 +556,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         && !picker.options.is_empty()
                     {
                         let index = self.suggestion_index.min(picker.options.len() - 1);
-                        self.input = format!("{} {}", picker.command, picker.options[index]);
-                    }
-                    if !suggestions.is_empty()
+                        self.input = picker_submission(picker, index);
+                    } else if !suggestions.is_empty()
                         && !self.awaiting_approval
                         && !suggestions.iter().any(|item| item.0 == self.input)
                     {
@@ -744,9 +743,13 @@ fn previous_suggestion(current: usize, count: usize) -> usize {
     }
 }
 
+fn picker_submission(picker: &TuiPicker, index: usize) -> String {
+    format!("{} {}", picker.command, picker.options[index])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{previous_suggestion, slash_suggestions};
+    use super::{TuiPicker, picker_submission, previous_suggestion, slash_suggestions};
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
@@ -763,5 +766,15 @@ mod tests {
         assert_eq!(previous_suggestion(0, 7), 6);
         assert_eq!(previous_suggestion(4, 7), 3);
         assert_eq!((6 + 1) % 7, 0);
+    }
+
+    #[test]
+    fn picker_submission_keeps_the_command_and_selected_profile() {
+        let picker = TuiPicker {
+            command: "/profile".to_owned(),
+            options: vec!["fast".to_owned(), "strict".to_owned()],
+        };
+
+        assert_eq!(picker_submission(&picker, 1), "/profile strict");
     }
 }
