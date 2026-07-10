@@ -225,7 +225,9 @@ fn build_agent_decision_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::render_policy;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{build_agent_decision_backend, render_policy};
     use subbake_agent::{RenderPolicy, TuiAction};
 
     #[test]
@@ -242,5 +244,25 @@ mod tests {
             render_policy(&TuiAction::SubmitText("hello".to_owned()), "hello!"),
             RenderPolicy::Stream
         );
+    }
+
+    #[test]
+    fn invalid_profile_backend_fails_instead_of_falling_back_to_mock() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("subbake-agent-bad-profile-{nonce}.toml"));
+        std::fs::write(
+            &path,
+            "[profiles.bad]\nprovider = \"not-a-provider\"\nmodel = \"none\"\n",
+        )
+        .expect("write config");
+
+        let error = build_agent_decision_backend(Some(&path), Some("bad"))
+            .err()
+            .expect("invalid provider must fail");
+        assert!(error.to_string().contains("build agent backend"));
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -78,8 +78,7 @@ After each successful tool call, the engine removes that call from the pending p
 Add state-transition tests for:
 
 - profile picker selection and submission;
-- all pending-plan choices;
+- full key-event integration for pending-plan choices (typed approve/reject/revise outcomes are covered);
 - revision instructions while a plan remains pending;
 - full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
-- failed backend construction and profile rollback;
-- immediate versus streamed rendering.
+- full profile-switch integration around failed backend construction (invalid backend failure and pre-commit ordering are covered);

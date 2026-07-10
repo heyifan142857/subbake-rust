@@ -128,6 +128,12 @@ pub enum TuiAction {
     TogglePlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalChoice {
+    Submit(TuiAction),
+    Revise,
+}
+
 impl TuiAction {
     fn visible_text(&self) -> String {
         match self {
@@ -459,18 +465,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn start_stream(&mut self, text: String) {
-        if text.is_empty() {
-            return;
-        }
         self.finish_stream();
         if let Ok(mut view) = self.msg_view.lock() {
-            view.push(MsgStyle::Response, "➔ ".to_owned());
-            self.streaming = Some(StreamingResponse {
-                chars: text.chars().collect(),
-                position: 0,
-                message_index: view.messages.len() - 1,
-                next_at: std::time::Instant::now(),
-            });
+            self.streaming = begin_stream(&mut view, text);
         }
     }
 
@@ -479,10 +476,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
             RenderPolicy::Stream => self.start_stream(text),
             RenderPolicy::Immediate => {
                 self.finish_stream();
-                if !text.is_empty()
-                    && let Ok(mut view) = self.msg_view.lock()
-                {
-                    view.push(MsgStyle::Response, format!("➔ {text}"));
+                if let Ok(mut view) = self.msg_view.lock() {
+                    push_immediate_response(&mut view, text);
                 }
             }
         }
@@ -713,10 +708,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         if matches!(self.input_mode, InputMode::AwaitingPlanDecision)
                             && self.input.is_empty()
                         {
-                            match self.suggestion_index.min(APPROVAL_OPTIONS.len() - 1) {
-                                0 => Some(TuiAction::ApprovePlan),
-                                1 => Some(TuiAction::RejectPlan),
-                                _ => {
+                            match approval_choice(self.suggestion_index) {
+                                ApprovalChoice::Submit(action) => Some(action),
+                                ApprovalChoice::Revise => {
                                     self.input_mode = InputMode::Editing;
                                     self.suggestion_index = 0;
                                     return Ok(());
@@ -909,6 +903,33 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
     }
 }
 
+fn approval_choice(index: usize) -> ApprovalChoice {
+    match index.min(APPROVAL_OPTIONS.len() - 1) {
+        0 => ApprovalChoice::Submit(TuiAction::ApprovePlan),
+        1 => ApprovalChoice::Submit(TuiAction::RejectPlan),
+        _ => ApprovalChoice::Revise,
+    }
+}
+
+fn begin_stream(view: &mut MsgView, text: String) -> Option<StreamingResponse> {
+    if text.is_empty() {
+        return None;
+    }
+    view.push(MsgStyle::Response, "➔ ".to_owned());
+    Some(StreamingResponse {
+        chars: text.chars().collect(),
+        position: 0,
+        message_index: view.messages.len() - 1,
+        next_at: std::time::Instant::now(),
+    })
+}
+
+fn push_immediate_response(view: &mut MsgView, text: String) {
+    if !text.is_empty() {
+        view.push(MsgStyle::Response, format!("➔ {text}"));
+    }
+}
+
 fn history_up(history: &[String], input: &str, mode: &InputMode) -> Option<(InputMode, String)> {
     if history.is_empty() {
         return None;
@@ -964,8 +985,8 @@ fn previous_suggestion(current: usize, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputMode, TuiAction, TuiPicker, history_down, history_up, previous_suggestion,
-        slash_suggestions, suggestions_for,
+        ApprovalChoice, InputMode, TuiAction, TuiPicker, approval_choice, history_down, history_up,
+        previous_suggestion, push_immediate_response, slash_suggestions, suggestions_for,
     };
 
     #[test]
@@ -1020,5 +1041,30 @@ mod tests {
             draft: String::new(),
         };
         assert!(suggestions_for("/", &history).is_empty());
+    }
+
+    #[test]
+    fn immediate_response_is_complete_without_a_stream_placeholder() {
+        let mut view = super::MsgView::new(10);
+        push_immediate_response(&mut view, "one.srt\ntwo.srt".to_owned());
+        assert_eq!(view.all().len(), 1);
+        assert_eq!(view.all()[0].text, "➔ one.srt\ntwo.srt");
+
+        let stream = super::begin_stream(&mut view, "hello".to_owned()).expect("stream");
+        assert_eq!(view.all()[stream.message_index].text, "➔ ");
+        assert_eq!(stream.chars.iter().collect::<String>(), "hello");
+    }
+
+    #[test]
+    fn all_plan_approval_choices_have_distinct_typed_outcomes() {
+        assert_eq!(
+            approval_choice(0),
+            ApprovalChoice::Submit(TuiAction::ApprovePlan)
+        );
+        assert_eq!(
+            approval_choice(1),
+            ApprovalChoice::Submit(TuiAction::RejectPlan)
+        );
+        assert_eq!(approval_choice(2), ApprovalChoice::Revise);
     }
 }
