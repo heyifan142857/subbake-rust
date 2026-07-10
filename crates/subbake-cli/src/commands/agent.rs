@@ -100,14 +100,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             _ => None,
         };
         let candidate_backend = if let Some(profile) = requested_profile {
-            if engine.profile_choices()?.iter().any(|name| name == profile) {
-                Some(build_agent_decision_backend(
-                    config_path.as_deref(),
-                    Some(profile),
-                )?)
-            } else {
-                None
-            }
+            prepare_profile_backend(&engine, config_path.as_deref(), profile)?
         } else {
             None
         };
@@ -207,6 +200,17 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
     })
 }
 
+fn prepare_profile_backend(
+    engine: &AgentEngine,
+    config_path: Option<&Path>,
+    profile: &str,
+) -> io::Result<Option<Box<dyn subbake_core::ports::LlmBackend>>> {
+    if !engine.profile_choices()?.iter().any(|name| name == profile) {
+        return Ok(None);
+    }
+    build_agent_decision_backend(config_path, Some(profile)).map(Some)
+}
+
 fn render_policy(action: &TuiAction, response: &str) -> RenderPolicy {
     if !matches!(action, TuiAction::SubmitText(input) if !input.trim().starts_with('/'))
         || response.contains('\n')
@@ -244,8 +248,8 @@ fn build_agent_decision_backend(
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_agent_decision_backend, render_policy};
-    use subbake_agent::{RenderPolicy, TuiAction};
+    use super::{build_agent_decision_backend, prepare_profile_backend, render_policy};
+    use subbake_agent::{AgentEngine, RenderPolicy, TuiAction};
 
     #[test]
     fn structured_and_command_responses_render_immediately() {
@@ -281,5 +285,34 @@ mod tests {
             .expect("invalid provider must fail");
         assert!(error.to_string().contains("build agent backend"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_profile_backend_preparation_does_not_mutate_the_session() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-profile-atomic-{nonce}"));
+        std::fs::create_dir_all(&root).expect("create root");
+        let path = root.join("subbake.toml");
+        std::fs::write(
+            &path,
+            "[profiles.bad]\nprovider = \"not-a-provider\"\nmodel = \"none\"\n",
+        )
+        .expect("write config");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine.set_config_path(Some(&path)).expect("pin config");
+
+        prepare_profile_backend(&engine, Some(&path), "bad")
+            .err()
+            .expect("invalid backend must fail before switching");
+        assert_eq!(
+            engine.session.as_ref().expect("session").profile,
+            None,
+            "backend preparation must not commit the requested profile"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

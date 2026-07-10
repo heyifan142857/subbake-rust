@@ -77,11 +77,11 @@ After each successful tool call, the engine removes that call from the pending p
 
 Add state-transition tests for:
 
-- full key-event integration for profile selection/creation (typed selection, creation, and picker-option behavior are covered);
-- full key-event integration for pending-plan choices (typed approve/reject/revise outcomes are covered);
+- terminal event-source integration for profile selection/creation (the shared Enter-key state transition, typed actions, creation, and picker rendering are covered);
+- terminal event-source integration for pending-plan choices (the shared Enter-key state transition and typed approve/reject/revise outcomes are covered);
 - full key-event integration for revision instructions (plan-mode replacement behavior is covered);
 - full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
-- full profile-switch integration around failed backend construction (invalid backend failure and pre-commit ordering are covered);
+- terminal composition-loop integration around profile switching (invalid backend construction and the no-session-mutation pre-commit boundary are covered);
 
 ## Deliberately deferred wiki items
 

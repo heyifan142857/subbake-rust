@@ -145,6 +145,13 @@ enum ProfilePickerChoice {
     Create,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmptyModeChoice {
+    Submit(TuiAction),
+    RevisePlan,
+    CreateProfile,
+}
+
 impl TuiAction {
     fn visible_text(&self) -> String {
         match self {
@@ -938,56 +945,44 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         return Ok(());
                     }
                     let suggestions = self.suggestions();
-                    let selected_action =
-                        if matches!(self.input_mode, InputMode::AwaitingPlanDecision)
-                            && self.input.is_empty()
-                        {
-                            match approval_choice(self.suggestion_index) {
-                                ApprovalChoice::Submit(action) => Some(action),
-                                ApprovalChoice::Revise => {
-                                    self.input_mode = InputMode::Editing;
-                                    self.suggestion_index = 0;
-                                    return Ok(());
-                                }
+                    let selected_action = if self.input.is_empty() {
+                        match empty_mode_choice(&self.input_mode, self.suggestion_index) {
+                            Some(EmptyModeChoice::Submit(action)) => Some(action),
+                            Some(EmptyModeChoice::RevisePlan) => {
+                                self.input_mode = InputMode::Editing;
+                                self.suggestion_index = 0;
+                                return Ok(());
                             }
-                        } else if self.input.is_empty()
-                            && let InputMode::ChoosingProfile(picker) = &self.input_mode
-                            && !picker.options.is_empty()
-                        {
-                            match profile_picker_choice(picker, self.suggestion_index) {
-                                Some(ProfilePickerChoice::Create) => {
-                                    self.input_mode = InputMode::CreatingProfile;
-                                    self.suggestion_index = 0;
-                                    if let Ok(mut view) = self.msg_view.lock() {
-                                        view.push(
-                                            MsgStyle::System,
-                                            "Enter a new profile name (letters, numbers, - and _)."
-                                                .to_owned(),
-                                        );
-                                    }
-                                    return Ok(());
+                            Some(EmptyModeChoice::CreateProfile) => {
+                                self.input_mode = InputMode::CreatingProfile;
+                                self.suggestion_index = 0;
+                                if let Ok(mut view) = self.msg_view.lock() {
+                                    view.push(
+                                        MsgStyle::System,
+                                        "Enter a new profile name (letters, numbers, - and _)."
+                                            .to_owned(),
+                                    );
                                 }
-                                Some(ProfilePickerChoice::Select(name)) => {
-                                    Some(TuiAction::SelectProfile(name))
-                                }
-                                None => None,
+                                return Ok(());
                             }
-                        } else if self.input.is_empty()
-                            && let InputMode::ChoosingSession(picker) = &self.input_mode
-                            && !picker.options.is_empty()
-                        {
-                            let index = self.suggestion_index.min(picker.options.len() - 1);
-                            Some(TuiAction::SelectSession(picker.options[index].id.clone()))
-                        } else if !suggestions.is_empty()
-                            && !suggestions.iter().any(|item| item.0 == self.input)
-                        {
-                            let index = self.suggestion_index.min(suggestions.len() - 1);
-                            self.input = suggestions[index].0.clone();
-                            self.suggestion_index = 0;
-                            return Ok(());
-                        } else {
-                            None
-                        };
+                            None if !suggestions.is_empty() => {
+                                let index = self.suggestion_index.min(suggestions.len() - 1);
+                                self.input = suggestions[index].0.clone();
+                                self.suggestion_index = 0;
+                                return Ok(());
+                            }
+                            None => None,
+                        }
+                    } else if !suggestions.is_empty()
+                        && !suggestions.iter().any(|item| item.0 == self.input)
+                    {
+                        let index = self.suggestion_index.min(suggestions.len() - 1);
+                        self.input = suggestions[index].0.clone();
+                        self.suggestion_index = 0;
+                        return Ok(());
+                    } else {
+                        None
+                    };
 
                     let action = if let Some(action) = selected_action {
                         action
@@ -1236,6 +1231,26 @@ fn profile_picker_choice(picker: &TuiPicker, index: usize) -> Option<ProfilePick
     }
 }
 
+fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyModeChoice> {
+    match mode {
+        InputMode::AwaitingPlanDecision => match approval_choice(index) {
+            ApprovalChoice::Submit(action) => Some(EmptyModeChoice::Submit(action)),
+            ApprovalChoice::Revise => Some(EmptyModeChoice::RevisePlan),
+        },
+        InputMode::ChoosingProfile(picker) => match profile_picker_choice(picker, index)? {
+            ProfilePickerChoice::Select(name) => {
+                Some(EmptyModeChoice::Submit(TuiAction::SelectProfile(name)))
+            }
+            ProfilePickerChoice::Create => Some(EmptyModeChoice::CreateProfile),
+        },
+        InputMode::ChoosingSession(picker) => picker
+            .options
+            .get(index.min(picker.options.len().saturating_sub(1)))
+            .map(|session| EmptyModeChoice::Submit(TuiAction::SelectSession(session.id.clone()))),
+        _ => None,
+    }
+}
+
 fn begin_stream(view: &mut MsgView, text: String) -> Option<StreamingResponse> {
     if text.is_empty() {
         return None;
@@ -1316,9 +1331,10 @@ mod tests {
     use crate::engine::ProfileChoice;
 
     use super::{
-        ApprovalChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker, approval_choice,
-        history_down, history_up, is_profile_name_character, previous_suggestion,
-        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
+        ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
+        approval_choice, empty_mode_choice, history_down, history_up, is_profile_name_character,
+        previous_suggestion, profile_picker_choice, push_immediate_response, slash_suggestions,
+        suggestions_for,
     };
 
     #[test]
@@ -1446,5 +1462,17 @@ mod tests {
             ApprovalChoice::Submit(TuiAction::RejectPlan)
         );
         assert_eq!(approval_choice(2), ApprovalChoice::Revise);
+        assert_eq!(
+            empty_mode_choice(&InputMode::AwaitingPlanDecision, 0),
+            Some(EmptyModeChoice::Submit(TuiAction::ApprovePlan))
+        );
+        assert_eq!(
+            empty_mode_choice(&InputMode::AwaitingPlanDecision, 1),
+            Some(EmptyModeChoice::Submit(TuiAction::RejectPlan))
+        );
+        assert_eq!(
+            empty_mode_choice(&InputMode::AwaitingPlanDecision, 2),
+            Some(EmptyModeChoice::RevisePlan)
+        );
     }
 }
