@@ -14,6 +14,7 @@ use subbake_core::formats::RenderOptions;
 use tokio::runtime::Runtime;
 
 use crate::fs::{read_document, render_and_write_document};
+use crate::whisper::default_whisper_binary_path;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -419,7 +420,7 @@ fn default_whisper_api_key() -> Option<String> {
 }
 
 fn locate_whisper_binary() -> io::Result<PathBuf> {
-    let p = PathBuf::from(".subbake/whisper/bin/whisper-cli");
+    let p = default_whisper_binary_path();
     if p.exists() {
         Ok(p)
     } else {

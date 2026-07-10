@@ -45,5 +45,5 @@ pub use translation::{
 };
 pub use whisper::{
     WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,
-    run_whisper,
+    default_whisper_binary_path, run_whisper,
 };

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,15 +86,28 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-const GITHUB_REPO_OWNER: &str = "ggerganov";
+const GITHUB_REPO_OWNER: &str = "ggml-org";
 const GITHUB_REPO_NAME: &str = "whisper.cpp";
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/ggerganov/whisper.cpp/releases";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/ggml-org/whisper.cpp/releases";
 const HF_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const INSTALL_MANIFEST_NAME: &str = "install-manifest.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallManifest {
+    version: u32,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleasePlatform {
+    Linux,
+    Windows,
+}
 
 struct PlatformAssets {
-    os_terms: &'static [&'static str],
+    release_platform: ReleasePlatform,
     arch_terms: &'static [&'static str],
-    binary_name: &'static str,
+    executable_names: &'static [&'static str],
 }
 
 fn detect_platform() -> Option<PlatformAssets> {
@@ -101,46 +115,39 @@ fn detect_platform() -> Option<PlatformAssets> {
     let os = std::env::consts::OS;
     match (os, arch) {
         ("linux", "x86_64") => Some(PlatformAssets {
-            os_terms: &["linux"],
+            release_platform: ReleasePlatform::Linux,
             arch_terms: &["x64", "x86_64", "amd64"],
-            binary_name: "whisper-cli",
+            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
         }),
-        ("macos", "aarch64") => Some(PlatformAssets {
-            os_terms: &["macos", "darwin", "osx"],
+        ("linux", "aarch64") => Some(PlatformAssets {
+            release_platform: ReleasePlatform::Linux,
             arch_terms: &["arm64", "aarch64"],
-            binary_name: "whisper-cli",
-        }),
-        ("macos", "x86_64") => Some(PlatformAssets {
-            os_terms: &["macos", "darwin", "osx"],
-            arch_terms: &["x64", "x86_64", "amd64"],
-            binary_name: "whisper-cli",
+            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
         }),
         ("windows", "x86_64") => Some(PlatformAssets {
-            os_terms: &["windows", "win"],
+            release_platform: ReleasePlatform::Windows,
             arch_terms: &["x64", "x86_64", "amd64"],
-            binary_name: "whisper-cli.exe",
+            executable_names: &["whisper-whisper-cli.exe", "whisper-cli.exe", "main.exe"],
         }),
         _ => None,
     }
 }
 
 fn install_binary(request: &WhisperRequest) -> io::Result<()> {
-    let bin_dir = request
-        .binary_path
-        .clone()
-        .map(|p| {
-            p.parent()
-                .unwrap_or_else(|| Path::new(".subbake/whisper/bin"))
-                .to_path_buf()
-        })
-        .unwrap_or_else(|| PathBuf::from(".subbake/whisper/bin"));
+    let binary_path = whisper_binary_path(request);
+    let bin_dir = binary_path
+        .parent()
+        .unwrap_or_else(|| Path::new(".subbake/whisper/bin"))
+        .to_path_buf();
     let version_tag = "latest";
     let target_dir = bin_dir.clone();
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| io::Error::other(format!("create binary dir: {e}")))?;
 
-    if let Some(platform) = detect_platform() {
-        let asset = runtime().block_on(async { find_latest_release_asset(&platform).await })?;
+    if let Some(platform) = detect_platform()
+        && let Some(asset) =
+            runtime().block_on(async { find_latest_release_asset(&platform).await })?
+    {
         let download_dir = std::env::temp_dir().join("subbake-whisper-install");
         let extract_dir = download_dir.join("extract");
         std::fs::create_dir_all(&download_dir)
@@ -158,20 +165,23 @@ fn install_binary(request: &WhisperRequest) -> io::Result<()> {
         } else if asset.name.ends_with(".zip") {
             extract_zip_system(&archive_path, &extract_dir)?;
         } else {
-            let direct_path = extract_dir.join(platform.binary_name);
+            let direct_path = extract_dir.join(platform.executable_names[0]);
             std::fs::copy(&archive_path, &direct_path)
                 .map_err(|e| io::Error::other(format!("copy direct binary: {e}")))?;
         }
 
         // Promote binary to final location.
-        promote_binary(&extract_dir, &target_dir, platform.binary_name)?;
+        remove_managed_install_files(&target_dir)?;
+        let runtime_libraries = promote_runtime_libraries(&extract_dir, &target_dir)?;
+        promote_binary(&extract_dir, &binary_path, platform.executable_names)?;
         write_version_file(&target_dir, &asset.tag)?;
+        write_install_manifest(&target_dir, &binary_path, runtime_libraries)?;
         let _ = std::fs::remove_dir_all(&download_dir);
         return Ok(());
     }
 
     // Fallback: cmake from source
-    build_from_source(&target_dir, version_tag)
+    build_from_source(&target_dir, &binary_path, version_tag)
 }
 
 struct ReleaseAsset {
@@ -180,7 +190,7 @@ struct ReleaseAsset {
     tag: String,
 }
 
-async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<ReleaseAsset> {
+async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<Option<ReleaseAsset>> {
     let client = reqwest::Client::builder()
         .user_agent("subbake/0.1")
         .timeout(std::time::Duration::from_secs(30))
@@ -210,7 +220,7 @@ async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<Rele
         .as_array()
         .ok_or_else(|| io::Error::other("release metadata does not contain an assets array"))?;
 
-    assets
+    Ok(assets
         .iter()
         .filter_map(|asset| {
             let name = asset["name"].as_str()?;
@@ -219,38 +229,49 @@ async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<Rele
             Some((score, name.to_owned(), url.to_owned()))
         })
         .max_by_key(|(score, _, _)| *score)
-        .map(|(_, name, url)| ReleaseAsset { name, url, tag })
-        .ok_or_else(|| io::Error::other("no matching whisper.cpp release asset for this platform"))
+        .map(|(_, name, url)| ReleaseAsset { name, url, tag }))
 }
 
 fn asset_match_score(name: &str, platform: &PlatformAssets) -> Option<usize> {
     let lower = name.to_lowercase();
     let supported_archive =
         lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip");
-    let direct_binary = lower.ends_with(platform.binary_name);
+    let direct_binary = platform
+        .executable_names
+        .iter()
+        .any(|binary_name| lower.ends_with(binary_name));
     if !supported_archive && !direct_binary {
         return None;
     }
-    if !platform.os_terms.iter().any(|term| lower.contains(term)) {
+    if !lower.contains("whisper-bin") {
         return None;
     }
     if !platform.arch_terms.iter().any(|term| lower.contains(term)) {
         return None;
     }
-    let mut score = 1usize;
-    if lower.contains("whisper") {
-        score += 4;
+    if ["blas", "cublas", "cuda", "metal", "vulkan", "opencl"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        return None;
     }
-    if lower.contains("cli") {
-        score += 4;
+    match platform.release_platform {
+        ReleasePlatform::Linux
+            if !["ubuntu", "linux", "debian", "manylinux"]
+                .iter()
+                .any(|term| lower.contains(term)) =>
+        {
+            None
+        }
+        ReleasePlatform::Windows
+            if ["ubuntu", "linux", "debian", "macos", "darwin", "osx"]
+                .iter()
+                .any(|term| lower.contains(term)) =>
+        {
+            None
+        }
+        _ => Some(1),
     }
-    if lower.contains(platform.binary_name) {
-        score += 2;
-    }
-    if lower.ends_with(".tar.gz") || lower.ends_with(".zip") {
-        score += 1;
-    }
-    Some(score)
 }
 
 async fn download_file(url: &str, dest: &Path) -> io::Result<()> {
@@ -315,43 +336,87 @@ fn extract_tar_gz(archive: &Path, target: &Path) -> io::Result<()> {
 fn extract_zip_system(archive: &Path, target: &Path) -> io::Result<()> {
     std::fs::create_dir_all(target)
         .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
-    let status = Command::new("unzip")
-        .args([
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("tar");
+        command.args([
+            "-xf",
+            &archive.to_string_lossy(),
+            "-C",
+            &target.to_string_lossy(),
+        ]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("unzip");
+        command.args([
             "-o",
             &archive.to_string_lossy(),
             "-d",
             &target.to_string_lossy(),
-        ])
+        ]);
+        command
+    };
+    let status = command
         .status()
-        .map_err(|e| io::Error::other(format!("unzip not found: {e}")))?;
+        .map_err(|e| io::Error::other(format!("zip extractor not found: {e}")))?;
     if !status.success() {
         return Err(io::Error::other("unzip extraction failed"));
     }
     Ok(())
 }
 
-fn promote_binary(download_dir: &Path, target_dir: &Path, binary_name: &str) -> io::Result<()> {
+fn promote_binary(
+    download_dir: &Path,
+    destination: &Path,
+    executable_names: &[&str],
+) -> io::Result<()> {
     // Search for the binary recursively in the extraction directory.
-    for entry in walk_dir(download_dir) {
-        if entry
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == binary_name || n == "main" || n == "whisper-cli")
-        {
-            let dest = target_dir.join("whisper-cli");
-            std::fs::copy(&entry, &dest)
+    let extracted_files = walk_dir(download_dir);
+    for executable_name in executable_names {
+        if let Some(entry) = extracted_files.iter().find(|entry| {
+            entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == *executable_name)
+        }) {
+            std::fs::copy(entry, destination)
                 .map_err(|e| io::Error::other(format!("copy binary: {e}")))?;
             // chmod +x
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o755))
                     .map_err(|e| io::Error::other(format!("chmod binary: {e}")))?;
             }
             return Ok(());
         }
     }
     Err(io::Error::other("could not find extracted binary"))
+}
+
+fn promote_runtime_libraries(source_dir: &Path, target_dir: &Path) -> io::Result<Vec<String>> {
+    let mut installed = Vec::new();
+    for entry in walk_dir(source_dir) {
+        let Some(name) = entry.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_runtime_library(name) {
+            continue;
+        }
+        std::fs::copy(&entry, target_dir.join(name))
+            .map_err(|e| io::Error::other(format!("copy runtime library `{name}`: {e}")))?;
+        installed.push(name.to_owned());
+    }
+    installed.sort();
+    installed.dedup();
+    Ok(installed)
+}
+
+fn is_runtime_library(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains(".so") || lower.ends_with(".dylib") || lower.ends_with(".dll")
 }
 
 fn walk_dir(dir: &Path) -> Vec<PathBuf> {
@@ -379,7 +444,30 @@ fn write_version_file(target_dir: &Path, version: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
+fn write_install_manifest(
+    target_dir: &Path,
+    binary_path: &Path,
+    mut runtime_libraries: Vec<String>,
+) -> io::Result<()> {
+    let binary_name = binary_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("whisper binary path has no valid file name"))?;
+    runtime_libraries.push(binary_name.to_owned());
+    runtime_libraries.push("version.txt".to_owned());
+    runtime_libraries.sort();
+    runtime_libraries.dedup();
+    let manifest = InstallManifest {
+        version: 1,
+        files: runtime_libraries,
+    };
+    let content = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| io::Error::other(format!("serialize install manifest: {e}")))?;
+    std::fs::write(target_dir.join(INSTALL_MANIFEST_NAME), content)
+        .map_err(|e| io::Error::other(format!("write install manifest: {e}")))
+}
+
+fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io::Result<()> {
     // cmake source build: clone/download source, cmake + make.
     let build_dir = std::env::temp_dir().join("subbake-whisper-build");
     let src_dir = build_dir.join("source");
@@ -470,24 +558,25 @@ fn build_from_source(target_dir: &Path, _version: &str) -> io::Result<()> {
     // Find and copy the built binary.
     std::fs::create_dir_all(target_dir)
         .map_err(|e| io::Error::other(format!("create target dir: {e}")))?;
-
     for entry in walk_dir(&build_out_dir) {
         if entry
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n == "whisper-cli" || n == "main" || n == "whisper-cli.exe")
         {
-            let dest = target_dir.join("whisper-cli");
-            std::fs::copy(&entry, &dest)
+            remove_managed_install_files(target_dir)?;
+            let runtime_libraries = promote_runtime_libraries(&build_out_dir, target_dir)?;
+            std::fs::copy(&entry, binary_path)
                 .map_err(|e| io::Error::other(format!("copy built binary: {e}")))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+                std::fs::set_permissions(binary_path, std::fs::Permissions::from_mode(0o755))
                     .map_err(|e| io::Error::other(format!("chmod binary: {e}")))?;
             }
             let _ = std::fs::remove_dir_all(&build_dir);
-            write_version_file(target_dir, _version)?;
+            write_version_file(target_dir, version)?;
+            write_install_manifest(target_dir, binary_path, runtime_libraries)?;
             return Ok(());
         }
     }
@@ -596,6 +685,9 @@ fn uninstall_whisper(request: &WhisperRequest, keep_models: bool) -> io::Result<
         fs::remove_file(&binary_path)
             .map_err(|error| io::Error::other(format!("remove whisper binary: {error}")))?;
     }
+    if let Some(parent) = binary_path.parent() {
+        remove_managed_install_files(parent)?;
+    }
     if let Some(parent) = binary_path.parent()
         && parent.is_dir()
         && fs::read_dir(parent)?.next().is_none()
@@ -617,6 +709,42 @@ fn uninstall_whisper(request: &WhisperRequest, keep_models: bool) -> io::Result<
     Ok(())
 }
 
+fn remove_managed_install_files(bin_dir: &Path) -> io::Result<()> {
+    let manifest_path = bin_dir.join(INSTALL_MANIFEST_NAME);
+    if manifest_path.is_file() {
+        let content = fs::read(&manifest_path)
+            .map_err(|error| io::Error::other(format!("read install manifest: {error}")))?;
+        let manifest: InstallManifest = serde_json::from_slice(&content)
+            .map_err(|error| io::Error::other(format!("parse install manifest: {error}")))?;
+        for name in manifest.files {
+            if Path::new(&name)
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some(name.as_str())
+            {
+                return Err(io::Error::other(format!(
+                    "invalid file name in install manifest: {name}"
+                )));
+            }
+            let path = bin_dir.join(name);
+            if path.is_file() {
+                fs::remove_file(&path).map_err(|error| {
+                    io::Error::other(format!("remove managed whisper file: {error}"))
+                })?;
+            }
+        }
+        fs::remove_file(&manifest_path)
+            .map_err(|error| io::Error::other(format!("remove install manifest: {error}")))?;
+    } else {
+        let version_path = bin_dir.join("version.txt");
+        if version_path.is_file() {
+            fs::remove_file(version_path)
+                .map_err(|error| io::Error::other(format!("remove version file: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn is_whisper_model_file(path: &std::path::Path) -> bool {
     matches!(
         path.extension().and_then(|value| value.to_str()),
@@ -624,8 +752,23 @@ fn is_whisper_model_file(path: &std::path::Path) -> bool {
     )
 }
 
-fn default_whisper_binary_path() -> PathBuf {
-    PathBuf::from(".subbake/whisper/bin/whisper-cli")
+pub fn default_whisper_binary_path() -> PathBuf {
+    PathBuf::from(".subbake/whisper/bin").join(default_whisper_binary_name())
+}
+
+const fn default_whisper_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    }
+}
+
+fn whisper_binary_path(request: &WhisperRequest) -> PathBuf {
+    request
+        .binary_path
+        .clone()
+        .unwrap_or_else(default_whisper_binary_path)
 }
 
 fn default_whisper_models_dir() -> PathBuf {
@@ -656,20 +799,105 @@ mod tests {
     }
 
     #[test]
-    fn install_attempts_download() {
-        let error = run_whisper(WhisperRequest {
-            action: WhisperAction::Install,
-            binary_path: None,
-            models_dir: None,
-        })
-        .expect_err("install should attempt download");
+    fn current_release_asset_names_select_cpu_builds() {
+        let linux_x64 = PlatformAssets {
+            release_platform: ReleasePlatform::Linux,
+            arch_terms: &["x64", "x86_64", "amd64"],
+            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
+        };
+        let linux_arm64 = PlatformAssets {
+            release_platform: ReleasePlatform::Linux,
+            arch_terms: &["arm64", "aarch64"],
+            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
+        };
+        let windows_x64 = PlatformAssets {
+            release_platform: ReleasePlatform::Windows,
+            arch_terms: &["x64", "x86_64", "amd64"],
+            executable_names: &["whisper-whisper-cli.exe", "whisper-cli.exe", "main.exe"],
+        };
 
-        let msg = error.to_string();
-        // The old stub said "pending adapter migration".
-        assert!(
-            !msg.contains("pending"),
-            "should no longer be a stub: {msg}"
-        );
+        assert!(asset_match_score("whisper-bin-ubuntu-x64.tar.gz", &linux_x64).is_some());
+        assert!(asset_match_score("whisper-bin-ubuntu-arm64.tar.gz", &linux_arm64).is_some());
+        assert!(asset_match_score("whisper-bin-x64.zip", &windows_x64).is_some());
+        assert!(asset_match_score("whisper-blas-bin-x64.zip", &windows_x64).is_none());
+        assert!(asset_match_score("whisper-cublas-12.4.0-bin-x64.zip", &windows_x64).is_none());
+        assert!(asset_match_score("whisper-bin-ubuntu-x64.tar.gz", &windows_x64).is_none());
+    }
+
+    #[test]
+    fn promote_binary_preserves_requested_destination() {
+        let root = temp_root("promote");
+        let extracted = root.join("extract").join("bin");
+        let destination = root.join("custom").join("whisper");
+        fs::create_dir_all(&extracted).expect("create extract dir");
+        fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("create destination dir");
+        fs::write(extracted.join("whisper-cli"), b"deprecated").expect("write fallback binary");
+        fs::write(extracted.join("whisper-whisper-cli"), b"current").expect("write binary");
+
+        promote_binary(
+            &root.join("extract"),
+            &destination,
+            &["whisper-whisper-cli", "whisper-cli", "main"],
+        )
+        .expect("promote binary");
+        let content = fs::read(&destination).expect("read promoted binary");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(content, b"current");
+    }
+
+    #[test]
+    fn promote_runtime_libraries_copies_shared_objects_only() {
+        let root = temp_root("libraries");
+        let extracted = root.join("extract").join("lib");
+        let destination = root.join("destination");
+        fs::create_dir_all(&extracted).expect("create extract dir");
+        fs::create_dir_all(&destination).expect("create destination dir");
+        fs::write(extracted.join("libwhisper.so.1"), b"linux").expect("write linux library");
+        fs::write(extracted.join("whisper.dll"), b"windows").expect("write windows library");
+        fs::write(extracted.join("README.txt"), b"ignore").expect("write ignored file");
+
+        let installed = promote_runtime_libraries(&root.join("extract"), &destination)
+            .expect("promote runtime libraries");
+        let linux_library = fs::read(destination.join("libwhisper.so.1")).expect("read library");
+        let windows_library = fs::read(destination.join("whisper.dll")).expect("read library");
+        let ignored_exists = destination.join("README.txt").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(linux_library, b"linux");
+        assert_eq!(windows_library, b"windows");
+        assert!(!ignored_exists);
+        assert_eq!(installed, vec!["libwhisper.so.1", "whisper.dll"]);
+    }
+
+    #[test]
+    fn uninstall_removes_manifest_managed_files_only() {
+        let root = temp_root("managed-uninstall");
+        let bin_dir = root.join("bin");
+        let binary_path = bin_dir.join("whisper-cli");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::write(&binary_path, b"binary").expect("write binary");
+        fs::write(bin_dir.join("libwhisper.so.1"), b"library").expect("write library");
+        fs::write(bin_dir.join("keep.txt"), b"user file").expect("write user file");
+        write_version_file(&bin_dir, "v1").expect("write version");
+        write_install_manifest(&bin_dir, &binary_path, vec!["libwhisper.so.1".to_owned()])
+            .expect("write manifest");
+
+        run_whisper(WhisperRequest {
+            action: WhisperAction::Uninstall { keep_models: true },
+            binary_path: Some(binary_path),
+            models_dir: Some(root.join("models")),
+        })
+        .expect("uninstall whisper");
+        let user_file_exists = bin_dir.join("keep.txt").is_file();
+        let library_exists = bin_dir.join("libwhisper.so.1").exists();
+        let manifest_exists = bin_dir.join(INSTALL_MANIFEST_NAME).exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(user_file_exists);
+        assert!(!library_exists);
+        assert!(!manifest_exists);
     }
 
     #[test]
