@@ -254,7 +254,7 @@ impl AgentEngine {
         } else {
             session.mode = "plan".to_owned();
             self.session_store.save(session)?;
-            Ok("Plan mode on. Mutating tools will wait for `/approve`.".to_owned())
+            Ok("Plan mode on. Mutating tools will wait for your approval.".to_owned())
         }
     }
 
@@ -274,6 +274,20 @@ impl AgentEngine {
             session.mode,
             session.events.len(),
             pending
+        ))
+    }
+
+    pub fn has_pending_plan(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.pending_plan.is_some())
+    }
+
+    pub fn active_model_summary(&self) -> std::io::Result<String> {
+        let settings = self.active_translation_settings()?;
+        Ok(format!(
+            "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
+            settings.provider, settings.model
         ))
     }
 
@@ -309,12 +323,23 @@ impl AgentEngine {
     }
 
     pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
-        let result = match input.trim() {
+        let trimmed = input.trim();
+        let result = match trimmed {
             "/plan" => self.toggle_plan_mode(),
             "/approve" => self.approve_plan(),
             "/reject" => self.reject_plan(),
             "/undo" => self.undo_last(),
             "/session" => self.session_summary(),
+            "/model" => self.active_model_summary(),
+            "/profile" => self.run_tool("list_profiles", &serde_json::json!({})),
+            command if command.starts_with("/profile ") => {
+                let name = command.trim_start_matches("/profile ").trim();
+                if name.is_empty() {
+                    self.run_tool("list_profiles", &serde_json::json!({}))
+                } else {
+                    self.run_tool("switch_profile", &serde_json::json!({"name": name}))
+                }
+            }
             other => Ok(format!("Unknown command `{other}`. Try /help.")),
         }?;
         self.record_if_active(EventKind::Assistant {

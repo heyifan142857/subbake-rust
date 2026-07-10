@@ -222,7 +222,7 @@ impl AgentEngine {
                 "plan" => {
                     self.store_plan(&decision.text, decision.tool_calls)?;
                     return self.finish_response(
-                        "I've prepared a plan for your approval. Use `/approve` to execute."
+                        "I've prepared a plan for your approval. Choose an action below."
                             .to_owned(),
                         false,
                         true,
@@ -550,7 +550,7 @@ impl AgentEngine {
             };
             self.store_plan("", vec![draft])?;
             return Ok(
-                "I've prepared a plan for your approval. Use `/approve` to execute.".to_owned(),
+                "I've prepared a plan for your approval. Choose an action below.".to_owned(),
             );
         }
 
@@ -979,7 +979,7 @@ impl AgentEngine {
         Ok(None)
     }
 
-    fn active_translation_settings(&self) -> io::Result<TranslationSettings> {
+    pub(crate) fn active_translation_settings(&self) -> io::Result<TranslationSettings> {
         let profile = self
             .session
             .as_ref()
@@ -1226,7 +1226,7 @@ mod tests {
         };
 
         let response = engine.run_line("create notes", &mut backend).expect("plan");
-        assert!(response.contains("/approve"));
+        assert!(response.contains("Choose an action below"));
         assert!(!root.join("notes.txt").exists());
         assert_eq!(
             engine

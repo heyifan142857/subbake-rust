@@ -58,12 +58,26 @@ const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/plan", "toggle plan mode"),
-    ("/approve", "execute the pending plan"),
-    ("/reject", "discard the pending plan"),
+    ("/model", "show the active model"),
+    ("/profile", "list or switch profiles"),
     ("/undo", "undo the last file operation"),
     ("/session", "show session info"),
     ("/quit", "exit SubBake"),
 ];
+
+const APPROVAL_OPTIONS: &[(&str, &str)] = &[
+    ("approve", "execute the pending plan"),
+    ("reject", "discard the pending plan"),
+    (
+        "tell agent what to do",
+        "revise the plan with your instructions",
+    ),
+];
+
+pub struct TuiProcessResult {
+    pub response: String,
+    pub pending_plan: bool,
+}
 
 struct StreamingResponse {
     chars: Vec<char>,
@@ -161,6 +175,7 @@ pub struct SubBakeTui {
     running: bool,
     streaming: Option<StreamingResponse>,
     suggestion_index: usize,
+    awaiting_approval: bool,
     processing: bool,
     animation_started_at: std::time::Instant,
 }
@@ -179,6 +194,7 @@ impl SubBakeTui {
             running: true,
             streaming: None,
             suggestion_index: 0,
+            awaiting_approval: false,
             processing: false,
             animation_started_at: std::time::Instant::now(),
         })
@@ -193,13 +209,13 @@ impl SubBakeTui {
     /// response text.
     pub fn run<F>(&mut self, mut process_fn: F) -> io::Result<()>
     where
-        F: FnMut(&str, &mut TuiObserver) -> io::Result<String> + Send + 'static,
+        F: FnMut(&str, &mut TuiObserver) -> io::Result<TuiProcessResult> + Send + 'static,
     {
         let mut observer = self.observer();
         self.welcome(&mut observer)?;
         let worker_observer = self.observer();
         let (request_tx, request_rx) = mpsc::channel::<String>();
-        let (response_tx, response_rx) = mpsc::channel::<io::Result<String>>();
+        let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiProcessResult>>();
         thread::spawn(move || {
             let mut observer = worker_observer;
             while let Ok(input) = request_rx.recv() {
@@ -214,7 +230,11 @@ impl SubBakeTui {
             if let Ok(result) = response_rx.try_recv() {
                 self.processing = false;
                 match result {
-                    Ok(response) => self.start_stream(response),
+                    Ok(result) => {
+                        self.awaiting_approval = result.pending_plan;
+                        self.suggestion_index = 0;
+                        self.start_stream(result.response);
+                    }
                     Err(error) => {
                         if let Ok(mut view) = self.msg_view.lock() {
                             view.push(MsgStyle::Error, format!("Error: {error}"));
@@ -237,15 +257,15 @@ impl SubBakeTui {
             "/help" | "/h" => r#"Commands:
   /help /h  —  this menu
   /plan     —  toggle plan mode
-  /approve  —  approve pending plan
-  /reject   —  reject pending plan
+  /model    —  show active model
+  /profile [NAME] — list or switch profiles
   /undo     —  undo last file operation
   /session  —  show session info
   /quit     —  exit
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
-            "/plan" | "/approve" | "/reject" | "/undo" | "/session" => {
+            "/plan" | "/model" | "/profile" | "/undo" | "/session" => {
                 format!(
                     "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
                 )
@@ -314,7 +334,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
-        slash_suggestions(&self.input)
+        if self.awaiting_approval && self.input.is_empty() {
+            APPROVAL_OPTIONS.to_vec()
+        } else {
+            slash_suggestions(&self.input)
+        }
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -486,7 +510,19 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         return Ok(());
                     }
                     let suggestions = self.slash_suggestions();
+                    if self.awaiting_approval && self.input.is_empty() {
+                        match self.suggestion_index.min(APPROVAL_OPTIONS.len() - 1) {
+                            0 => self.input = "/approve".to_owned(),
+                            1 => self.input = "/reject".to_owned(),
+                            _ => {
+                                self.awaiting_approval = false;
+                                self.suggestion_index = 0;
+                                return Ok(());
+                            }
+                        }
+                    }
                     if !suggestions.is_empty()
+                        && !self.awaiting_approval
                         && !suggestions.iter().any(|item| item.0 == self.input)
                     {
                         let index = self.suggestion_index.min(suggestions.len() - 1);
@@ -509,7 +545,15 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
                     // Show user message.
                     if let Ok(mut v) = self.msg_view.lock() {
-                        v.push(MsgStyle::User, format!("[{:?}] {}", iso_now(), trimmed));
+                        let visible_input = match trimmed.as_str() {
+                            "/approve" if self.awaiting_approval => "approve",
+                            "/reject" if self.awaiting_approval => "reject",
+                            _ => &trimmed,
+                        };
+                        v.push(
+                            MsgStyle::User,
+                            format!("[{:?}] {}", iso_now(), visible_input),
+                        );
                     }
 
                     // Handle help locally; engine-backed slash commands need
@@ -627,8 +671,8 @@ mod tests {
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
         assert_eq!(slash_suggestions("/").len(), 7);
         assert_eq!(
-            slash_suggestions("/app"),
-            vec![("/approve", "execute the pending plan")]
+            slash_suggestions("/mod"),
+            vec![("/model", "show the active model")]
         );
         assert!(slash_suggestions("hello /").is_empty());
     }

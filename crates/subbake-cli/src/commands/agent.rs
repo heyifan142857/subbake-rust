@@ -3,7 +3,7 @@ use std::io;
 use subbake_adapters::{
     TranslationSettings, build_backend, discover_config_path, load_and_resolve,
 };
-use subbake_agent::{AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui};
+use subbake_agent::{AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui, TuiProcessResult};
 
 use crate::args::AgentArgs;
 use crate::output::print_agent_outcome;
@@ -47,7 +47,11 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 }
 
 fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
-    let mut backend = build_agent_decision_backend();
+    let initial_profile = engine
+        .session
+        .as_ref()
+        .and_then(|session| session.profile.clone());
+    let mut backend = build_agent_decision_backend(initial_profile.as_deref());
 
     // Create the TUI with an observer attached to the engine.
     let mut tui = SubBakeTui::new()?;
@@ -62,17 +66,28 @@ fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
             engine.run_line(input, &mut *backend)?
         };
 
+        if input.trim().starts_with("/profile ") {
+            let profile = engine
+                .session
+                .as_ref()
+                .and_then(|session| session.profile.clone());
+            backend = build_agent_decision_backend(profile.as_deref());
+        }
+
         // Save session after each interaction.
         let _ = engine.save();
 
-        Ok(result)
+        Ok(TuiProcessResult {
+            response: result,
+            pending_plan: engine.has_pending_plan(),
+        })
     })
 }
 
-fn build_agent_decision_backend() -> Box<dyn subbake_core::ports::LlmBackend> {
+fn build_agent_decision_backend(profile: Option<&str>) -> Box<dyn subbake_core::ports::LlmBackend> {
     let mut settings = TranslationSettings::default();
     if let Some(path) = discover_config_path()
-        && let Ok(Some(patch)) = load_and_resolve(&path, None)
+        && let Ok(Some(patch)) = load_and_resolve(&path, profile)
     {
         settings.apply_patch(patch);
     }
