@@ -17,7 +17,10 @@ use std::sync::mpsc;
 use std::thread;
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -25,7 +28,9 @@ use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::session::iso_now;
@@ -199,7 +204,10 @@ struct TerminalSessionGuard {
 impl TerminalSessionGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
+        if let Err(error) = io::stdout()
+            .execute(EnterAlternateScreen)
+            .and_then(|stdout| stdout.execute(EnableMouseCapture))
+        {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -212,7 +220,10 @@ impl TerminalSessionGuard {
         }
         self.active = false;
         let raw_result = disable_raw_mode();
-        let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
+        let screen_result = io::stdout()
+            .execute(DisableMouseCapture)
+            .and_then(|stdout| stdout.execute(LeaveAlternateScreen))
+            .map(|_| ());
         raw_result.and(screen_result)
     }
 }
@@ -840,66 +851,59 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .split(area);
 
             // -- Output pane --
-            let output_area = chunks[0];
-            let output_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(8), Constraint::Min(1)])
-                .split(output_area);
-            let startup = Paragraph::new(startup_lines(&startup_info)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
-            frame.render_widget(startup, output_chunks[0]);
-            let transcript_area = output_chunks[1];
-            let items: Vec<Line<'_>> = messages
-                .iter()
-                .enumerate()
-                .flat_map(|(index, msg)| {
-                    let is_active_thinking = processing
-                        && msg.style == MsgStyle::Thinking
-                        && !messages[index + 1..]
-                            .iter()
-                            .any(|later| later.style == MsgStyle::Thinking);
-                    let style = match msg.style {
-                        MsgStyle::User => Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                        MsgStyle::Thinking if is_active_thinking => {
-                            let colors = [Color::Yellow, Color::LightYellow, Color::White];
-                            Style::default()
-                                .fg(colors[(animation_tick as usize / 2) % colors.len()])
-                                .add_modifier(Modifier::BOLD)
-                        }
-                        MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
-                        MsgStyle::ToolCall => Style::default().fg(Color::Green),
-                        MsgStyle::Observation => Style::default().fg(Color::DarkGray),
-                        MsgStyle::Response => Style::default().fg(Color::White),
-                        MsgStyle::Error => Style::default().fg(Color::Red),
-                        MsgStyle::System => {
-                            Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
-                        }
-                    };
-                    let display_text = if msg.style == MsgStyle::Thinking {
-                        let marker = if is_active_thinking {
-                            THINKING_FRAMES[animation_tick as usize % THINKING_FRAMES.len()]
-                        } else {
-                            "⎿"
+            let transcript_area = chunks[0];
+            let mut items =
+                startup_panel_lines(&startup_info, transcript_area.width.saturating_sub(1));
+            items.push(Line::from(""));
+            items.extend(
+                messages
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, msg)| {
+                        let is_active_thinking = processing
+                            && msg.style == MsgStyle::Thinking
+                            && !messages[index + 1..]
+                                .iter()
+                                .any(|later| later.style == MsgStyle::Thinking);
+                        let style = match msg.style {
+                            MsgStyle::User => Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                            MsgStyle::Thinking if is_active_thinking => {
+                                let colors = [Color::Yellow, Color::LightYellow, Color::White];
+                                Style::default()
+                                    .fg(colors[(animation_tick as usize / 2) % colors.len()])
+                                    .add_modifier(Modifier::BOLD)
+                            }
+                            MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
+                            MsgStyle::ToolCall => Style::default().fg(Color::Green),
+                            MsgStyle::Observation => Style::default().fg(Color::DarkGray),
+                            MsgStyle::Response => Style::default().fg(Color::White),
+                            MsgStyle::Error => Style::default().fg(Color::Red),
+                            MsgStyle::System => {
+                                Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
+                            }
                         };
-                        format!("{marker} {}", msg.text)
-                    } else {
-                        msg.text.clone()
-                    };
-                    let lines = display_text
-                        .split('\n')
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    lines
-                        .into_iter()
-                        .map(move |line| Line::from(Span::styled(line, style)))
-                })
-                .collect();
+                        let display_text = if msg.style == MsgStyle::Thinking {
+                            let marker = if is_active_thinking {
+                                THINKING_FRAMES[animation_tick as usize % THINKING_FRAMES.len()]
+                            } else {
+                                "⎿"
+                            };
+                            format!("{marker} {}", msg.text)
+                        } else {
+                            msg.text.clone()
+                        };
+                        let lines = display_text
+                            .split('\n')
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        lines
+                            .into_iter()
+                            .map(move |line| Line::from(Span::styled(line, style)))
+                    })
+                    .collect::<Vec<Line<'_>>>(),
+            );
 
             let visual_line_count = items
                 .iter()
@@ -912,12 +916,26 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let paragraph = Paragraph::new(items)
                 .block(Block::default().borders(Borders::NONE))
                 .wrap(Wrap { trim: false });
-            let max_scroll = (visual_line_count as u16).saturating_sub(transcript_area.height);
+            let max_scroll = visual_line_count
+                .saturating_sub(usize::from(transcript_area.height))
+                .min(usize::from(u16::MAX)) as u16;
             // `scroll_offset` is the number of visual lines above the newest
             // output, so zero follows a growing/streaming response.
             let offset = max_scroll.saturating_sub(scroll.min(max_scroll));
             let paragraph = paragraph.scroll((offset, 0));
             frame.render_widget(paragraph, transcript_area);
+            if max_scroll > 0 {
+                let mut scrollbar_state =
+                    ScrollbarState::new(usize::from(max_scroll)).position(usize::from(offset));
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .track_style(Style::default().fg(Color::Black))
+                    .thumb_symbol("█")
+                    .thumb_style(Style::default().fg(Color::DarkGray));
+                frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
+            }
 
             // -- Slash command suggestions --
             let suggestion_area = chunks[1];
@@ -1195,10 +1213,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::PageUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(10);
+                    self.scroll_up(10);
                 }
                 KeyCode::PageDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                    self.scroll_down(10);
                 }
                 KeyCode::BackTab => {
                     if self.processing {
@@ -1254,10 +1272,23 @@ Or just type what you want, e.g. "translate @clip.srt""#
             Event::Resize(_, _) => {
                 self.scroll_offset = 0;
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_up(3),
+                MouseEventKind::ScrollDown => self.scroll_down(3),
+                _ => {}
+            },
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn scroll_up(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 }
 
@@ -1269,23 +1300,48 @@ const INPUT_HINTS: &[&str] = &[
     "Use /history to revisit earlier requests",
 ];
 
-fn startup_lines(info: &StartupInfo) -> Vec<Line<'_>> {
+fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'_>> {
+    let width = usize::from(width.max(4));
+    let inner_width = width.saturating_sub(2);
     let value_style = Style::default().fg(Color::Cyan);
+    let border_style = Style::default().fg(Color::DarkGray);
     let row = |label: &'static str, value: &str| {
+        let prefix = format!("  {label:<10}");
+        let available = inner_width.saturating_sub(prefix.chars().count());
+        let value = truncate_with_ellipsis(value, available);
+        let padding = " ".repeat(available.saturating_sub(value.chars().count()));
         Line::from(vec![
-            Span::styled(
-                format!("  {label:<10}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(value.to_owned(), value_style),
+            Span::styled("│", border_style),
+            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+            Span::styled(value, value_style),
+            Span::raw(padding),
+            Span::styled("│", border_style),
         ])
     };
+    let blank = || {
+        Line::from(vec![
+            Span::styled("│", border_style),
+            Span::raw(" ".repeat(inner_width)),
+            Span::styled("│", border_style),
+        ])
+    };
+    let title = truncate_with_ellipsis(
+        &format!("  SubBake v{}", env!("CARGO_PKG_VERSION")),
+        inner_width,
+    );
+    let title_padding = " ".repeat(inner_width.saturating_sub(title.chars().count()));
     vec![
         Line::from(Span::styled(
-            format!("  SubBake v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("╭{}╮", "─".repeat(inner_width)),
+            border_style,
         )),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("│", border_style),
+            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(title_padding),
+            Span::styled("│", border_style),
+        ]),
+        blank(),
         row("Provider", &info.provider),
         row("Model", &info.model),
         row("Config", &info.config),
@@ -1297,7 +1353,24 @@ fn startup_lines(info: &StartupInfo) -> Vec<Line<'_>> {
                 "Disabled"
             },
         ),
+        Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(inner_width)),
+            border_style,
+        )),
     ]
+}
+
+fn truncate_with_ellipsis(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    value.chars().take(width - 1).chain(['…']).collect()
 }
 
 fn session_input_hint() -> &'static str {
