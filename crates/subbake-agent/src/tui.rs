@@ -74,15 +74,54 @@ const APPROVAL_OPTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-pub struct TuiProcessResult {
-    pub response: String,
-    pub pending_plan: bool,
-    pub picker: Option<TuiPicker>,
+struct TuiPicker {
+    pub options: Vec<String>,
 }
 
-pub struct TuiPicker {
-    pub command: String,
-    pub options: Vec<String>,
+pub enum TuiInteraction {
+    Message {
+        message: String,
+        render: RenderPolicy,
+    },
+    PlanApproval {
+        message: String,
+    },
+    ProfilePicker {
+        message: String,
+        options: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPolicy {
+    Stream,
+    Immediate,
+}
+
+enum InputMode {
+    Editing,
+    BrowsingHistory { index: usize, draft: String },
+    ChoosingProfile(TuiPicker),
+    AwaitingPlanDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiAction {
+    SubmitText(String),
+    ApprovePlan,
+    RejectPlan,
+    SelectProfile(String),
+}
+
+impl TuiAction {
+    fn visible_text(&self) -> String {
+        match self {
+            Self::SubmitText(text) => text.clone(),
+            Self::ApprovePlan => "approve".to_owned(),
+            Self::RejectPlan => "reject".to_owned(),
+            Self::SelectProfile(name) => format!("/profile {name}"),
+        }
+    }
 }
 
 struct StreamingResponse {
@@ -90,6 +129,37 @@ struct StreamingResponse {
     position: usize,
     message_index: usize,
     next_at: std::time::Instant,
+}
+
+struct TerminalSessionGuard {
+    active: bool,
+}
+
+impl TerminalSessionGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self { active: true })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let raw_result = disable_raw_mode();
+        let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
+        raw_result.and(screen_result)
+    }
+}
+
+impl Drop for TerminalSessionGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 /// Bounded scrollback buffer that also serves as the `EngineObserver`.
@@ -174,41 +244,36 @@ impl EngineObserver for TuiObserver {
 // ---------------------------------------------------------------------------
 
 pub struct SubBakeTui {
+    terminal_session: TerminalSessionGuard,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     input: String,
     input_history: Vec<String>,
-    history_index: Option<usize>,
-    history_draft: String,
+    input_mode: InputMode,
     scroll_offset: u16,
     running: bool,
     streaming: Option<StreamingResponse>,
     suggestion_index: usize,
-    awaiting_approval: bool,
-    picker: Option<TuiPicker>,
     processing: bool,
     animation_started_at: std::time::Instant,
 }
 
 impl SubBakeTui {
     pub fn new() -> io::Result<Self> {
-        enable_raw_mode()?;
-        io::stdout().execute(EnterAlternateScreen)?;
+        let terminal_session = TerminalSessionGuard::enter()?;
         let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend)?;
         Ok(Self {
+            terminal_session,
             terminal,
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(1000))),
             input: String::new(),
             input_history: Vec::new(),
-            history_index: None,
-            history_draft: String::new(),
+            input_mode: InputMode::Editing,
             scroll_offset: 0,
             running: true,
             streaming: None,
             suggestion_index: 0,
-            awaiting_approval: false,
-            picker: None,
             processing: false,
             animation_started_at: std::time::Instant::now(),
         })
@@ -218,53 +283,79 @@ impl SubBakeTui {
         TuiObserver::new(self.msg_view.clone())
     }
 
+    pub fn set_input_history(&mut self, history: Vec<String>) {
+        self.input_history = history;
+        self.input_mode = InputMode::Editing;
+    }
+
     /// Run the event loop. `process_fn` is called with the user's input each
     /// time they press Enter; it should run the agent engine and return the
     /// response text.
     pub fn run<F>(&mut self, mut process_fn: F) -> io::Result<()>
     where
-        F: FnMut(&str, &mut TuiObserver) -> io::Result<TuiProcessResult> + Send + 'static,
+        F: FnMut(TuiAction, &mut TuiObserver) -> io::Result<TuiInteraction> + Send + 'static,
     {
         let mut observer = self.observer();
         self.welcome(&mut observer)?;
         let worker_observer = self.observer();
-        let (request_tx, request_rx) = mpsc::channel::<String>();
-        let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiProcessResult>>();
-        thread::spawn(move || {
-            let mut observer = worker_observer;
-            while let Ok(input) = request_rx.recv() {
-                let result = process_fn(&input, &mut observer);
-                if response_tx.send(result).is_err() {
-                    break;
-                }
-            }
-        });
-
-        while self.running {
-            if let Ok(result) = response_rx.try_recv() {
-                self.processing = false;
-                match result {
-                    Ok(result) => {
-                        self.awaiting_approval = result.pending_plan;
-                        self.picker = result.picker;
-                        self.suggestion_index = 0;
-                        self.start_stream(result.response);
+        let (request_tx, request_rx) = mpsc::channel::<TuiAction>();
+        let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiInteraction>>();
+        let worker = thread::Builder::new()
+            .name("subbake-agent-worker".to_owned())
+            .spawn(move || {
+                let mut observer = worker_observer;
+                while let Ok(action) = request_rx.recv() {
+                    let result = process_fn(action, &mut observer);
+                    if response_tx.send(result).is_err() {
+                        break;
                     }
-                    Err(error) => {
-                        if let Ok(mut view) = self.msg_view.lock() {
-                            view.push(MsgStyle::Error, format!("Error: {error}"));
+                }
+            })?;
+
+        let loop_result = (|| -> io::Result<()> {
+            while self.running {
+                if let Ok(result) = response_rx.try_recv() {
+                    self.processing = false;
+                    match result {
+                        Ok(TuiInteraction::Message { message, render }) => {
+                            self.input_mode = InputMode::Editing;
+                            self.suggestion_index = 0;
+                            self.render_response(message, render);
+                        }
+                        Ok(TuiInteraction::PlanApproval { message }) => {
+                            self.input_mode = InputMode::AwaitingPlanDecision;
+                            self.suggestion_index = 0;
+                            self.render_response(message, RenderPolicy::Immediate);
+                        }
+                        Ok(TuiInteraction::ProfilePicker { message, options }) => {
+                            self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
+                            self.suggestion_index = 0;
+                            self.render_response(message, RenderPolicy::Immediate);
+                        }
+                        Err(error) => {
+                            if let Ok(mut view) = self.msg_view.lock() {
+                                view.push(MsgStyle::Error, format!("Error: {error}"));
+                            }
                         }
                     }
                 }
+                self.advance_stream();
+                self.draw()?;
+                self.handle_event(&request_tx)?;
             }
-            self.advance_stream();
-            self.draw()?;
-            self.handle_event(&request_tx)?;
-        }
+            Ok(())
+        })();
 
-        disable_raw_mode()?;
-        io::stdout().execute(LeaveAlternateScreen)?;
-        Ok(())
+        drop(request_tx);
+        drop(response_rx);
+        let terminal_result = self.terminal_session.restore();
+        let worker_result = worker
+            .join()
+            .map_err(|_| io::Error::other("agent worker panicked"));
+
+        loop_result?;
+        terminal_result?;
+        worker_result
     }
 
     fn handle_slash(&self, input: &str) -> String {
@@ -317,6 +408,20 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
     }
 
+    fn render_response(&mut self, text: String, policy: RenderPolicy) {
+        match policy {
+            RenderPolicy::Stream => self.start_stream(text),
+            RenderPolicy::Immediate => {
+                self.finish_stream();
+                if !text.is_empty()
+                    && let Ok(mut view) = self.msg_view.lock()
+                {
+                    view.push(MsgStyle::Response, format!("➔ {text}"));
+                }
+            }
+        }
+    }
+
     fn finish_stream(&mut self) {
         let Some(stream) = self.streaming.take() else {
             return;
@@ -349,26 +454,21 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn suggestions(&self) -> Vec<(String, String)> {
-        if self.history_index.is_some() {
-            Vec::new()
-        } else if self.awaiting_approval && self.input.is_empty() {
-            APPROVAL_OPTIONS
+        match &self.input_mode {
+            InputMode::BrowsingHistory { .. } => Vec::new(),
+            InputMode::AwaitingPlanDecision if self.input.is_empty() => APPROVAL_OPTIONS
                 .iter()
                 .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
-                .collect()
-        } else if self.input.is_empty()
-            && let Some(picker) = &self.picker
-        {
-            picker
+                .collect(),
+            InputMode::ChoosingProfile(picker) if self.input.is_empty() => picker
                 .options
                 .iter()
                 .map(|option| (option.clone(), "configured profile".to_owned()))
-                .collect()
-        } else {
-            slash_suggestions(&self.input)
+                .collect(),
+            _ => slash_suggestions(&self.input)
                 .into_iter()
                 .map(|(command, description)| (command.to_owned(), description.to_owned()))
-                .collect()
+                .collect(),
         }
     }
 
@@ -520,7 +620,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         Ok(())
     }
 
-    fn handle_event(&mut self, request_tx: &mpsc::Sender<String>) -> io::Result<()> {
+    fn handle_event(&mut self, request_tx: &mpsc::Sender<TuiAction>) -> io::Result<()> {
         if !event::poll(STREAM_INTERVAL)? {
             return Ok(());
         }
@@ -541,76 +641,77 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         return Ok(());
                     }
                     let suggestions = self.suggestions();
-                    if self.awaiting_approval && self.input.is_empty() {
-                        match self.suggestion_index.min(APPROVAL_OPTIONS.len() - 1) {
-                            0 => self.input = "/approve".to_owned(),
-                            1 => self.input = "/reject".to_owned(),
-                            _ => {
-                                self.awaiting_approval = false;
-                                self.suggestion_index = 0;
-                                return Ok(());
+                    let selected_action =
+                        if matches!(self.input_mode, InputMode::AwaitingPlanDecision)
+                            && self.input.is_empty()
+                        {
+                            match self.suggestion_index.min(APPROVAL_OPTIONS.len() - 1) {
+                                0 => Some(TuiAction::ApprovePlan),
+                                1 => Some(TuiAction::RejectPlan),
+                                _ => {
+                                    self.input_mode = InputMode::Editing;
+                                    self.suggestion_index = 0;
+                                    return Ok(());
+                                }
                             }
+                        } else if self.input.is_empty()
+                            && let InputMode::ChoosingProfile(picker) = &self.input_mode
+                            && !picker.options.is_empty()
+                        {
+                            let index = self.suggestion_index.min(picker.options.len() - 1);
+                            Some(TuiAction::SelectProfile(picker.options[index].clone()))
+                        } else if !suggestions.is_empty()
+                            && !suggestions.iter().any(|item| item.0 == self.input)
+                        {
+                            let index = self.suggestion_index.min(suggestions.len() - 1);
+                            self.input = suggestions[index].0.clone();
+                            self.suggestion_index = 0;
+                            return Ok(());
+                        } else {
+                            None
+                        };
+
+                    let action = if let Some(action) = selected_action {
+                        action
+                    } else {
+                        let input = std::mem::take(&mut self.input);
+                        let trimmed = input.trim().to_owned();
+
+                        if trimmed.is_empty() {
+                            return Ok(());
                         }
-                    } else if self.input.is_empty()
-                        && let Some(picker) = &self.picker
-                        && !picker.options.is_empty()
-                    {
-                        let index = self.suggestion_index.min(picker.options.len() - 1);
-                        self.input = picker_submission(picker, index);
-                    } else if !suggestions.is_empty()
-                        && !self.awaiting_approval
-                        && !suggestions.iter().any(|item| item.0 == self.input)
-                    {
-                        let index = self.suggestion_index.min(suggestions.len() - 1);
-                        self.input = suggestions[index].0.clone();
-                        self.suggestion_index = 0;
-                        return Ok(());
-                    }
-                    let input = std::mem::take(&mut self.input);
-                    let trimmed = input.trim().to_owned();
-                    self.scroll_offset = 0;
 
-                    if trimmed.is_empty() {
-                        return Ok(());
-                    }
-
-                    self.history_index = None;
-                    self.history_draft.clear();
-                    if !matches!(trimmed.as_str(), "/approve" | "/reject")
-                        && self
+                        self.input_mode = InputMode::Editing;
+                        if self
                             .input_history
                             .last()
                             .is_none_or(|previous| previous != &trimmed)
-                    {
-                        self.input_history.push(trimmed.clone());
-                    }
+                        {
+                            self.input_history.push(trimmed.clone());
+                        }
 
-                    if trimmed == "/quit" || trimmed == "/exit" {
-                        self.running = false;
-                        return Ok(());
-                    }
+                        if trimmed == "/quit" || trimmed == "/exit" {
+                            self.running = false;
+                            return Ok(());
+                        }
+
+                        if matches!(trimmed.as_str(), "/help" | "/h") {
+                            let response = self.handle_slash(&trimmed);
+                            if let Ok(mut view) = self.msg_view.lock() {
+                                view.push(MsgStyle::Response, response);
+                            }
+                            return Ok(());
+                        }
+                        TuiAction::SubmitText(trimmed)
+                    };
+                    self.scroll_offset = 0;
 
                     // Show user message.
                     if let Ok(mut v) = self.msg_view.lock() {
-                        let visible_input = match trimmed.as_str() {
-                            "/approve" if self.awaiting_approval => "approve",
-                            "/reject" if self.awaiting_approval => "reject",
-                            _ => &trimmed,
-                        };
                         v.push(
                             MsgStyle::User,
-                            format!("[{:?}] {}", iso_now(), visible_input),
+                            format!("[{:?}] {}", iso_now(), action.visible_text()),
                         );
-                    }
-
-                    // Handle help locally; engine-backed slash commands need
-                    // session state, so route them through `process_fn`.
-                    if trimmed.starts_with('/') && matches!(trimmed.as_str(), "/help" | "/h") {
-                        let response = self.handle_slash(&trimmed);
-                        if let Ok(mut v) = self.msg_view.lock() {
-                            v.push(MsgStyle::Response, response);
-                        }
-                        return Ok(());
                     }
 
                     // Paint the submitted message and initial thinking state
@@ -620,19 +721,17 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                     self.processing = true;
                     self.animation_started_at = std::time::Instant::now();
-                    request_tx.send(trimmed).map_err(|_| {
+                    request_tx.send(action).map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped")
                     })?;
                 }
                 KeyCode::Char(ch) => {
-                    self.picker = None;
-                    self.history_index = None;
+                    self.input_mode = InputMode::Editing;
                     self.input.push(ch);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
-                    self.picker = None;
-                    self.history_index = None;
+                    self.input_mode = InputMode::Editing;
                     self.input.pop();
                     self.suggestion_index = 0;
                 }
@@ -697,28 +796,27 @@ Or just type what you want, e.g. "translate @clip.srt""#
         if self.input_history.is_empty() {
             return;
         }
-        let index = match self.history_index {
-            Some(index) => index.saturating_sub(1),
-            None => {
-                self.history_draft = self.input.clone();
-                self.input_history.len() - 1
-            }
+        let (index, draft) = match &self.input_mode {
+            InputMode::BrowsingHistory { index, draft } => (index.saturating_sub(1), draft.clone()),
+            _ => (self.input_history.len() - 1, self.input.clone()),
         };
-        self.history_index = Some(index);
+        self.input_mode = InputMode::BrowsingHistory { index, draft };
         self.input.clone_from(&self.input_history[index]);
     }
 
     fn navigate_history_down(&mut self) {
-        let Some(index) = self.history_index else {
+        let InputMode::BrowsingHistory { index, draft } = &self.input_mode else {
             return;
         };
+        let index = *index;
+        let draft = draft.clone();
         if index + 1 < self.input_history.len() {
             let next = index + 1;
-            self.history_index = Some(next);
+            self.input_mode = InputMode::BrowsingHistory { index: next, draft };
             self.input.clone_from(&self.input_history[next]);
         } else {
-            self.history_index = None;
-            self.input = std::mem::take(&mut self.history_draft);
+            self.input_mode = InputMode::Editing;
+            self.input = draft;
         }
     }
 }
@@ -743,13 +841,9 @@ fn previous_suggestion(current: usize, count: usize) -> usize {
     }
 }
 
-fn picker_submission(picker: &TuiPicker, index: usize) -> String {
-    format!("{} {}", picker.command, picker.options[index])
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{TuiPicker, picker_submission, previous_suggestion, slash_suggestions};
+    use super::{TuiAction, previous_suggestion, slash_suggestions};
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
@@ -769,12 +863,8 @@ mod tests {
     }
 
     #[test]
-    fn picker_submission_keeps_the_command_and_selected_profile() {
-        let picker = TuiPicker {
-            command: "/profile".to_owned(),
-            options: vec!["fast".to_owned(), "strict".to_owned()],
-        };
-
-        assert_eq!(picker_submission(&picker, 1), "/profile strict");
+    fn typed_profile_action_has_a_stable_visible_form() {
+        let action = TuiAction::SelectProfile("strict".to_owned());
+        assert_eq!(action.visible_text(), "/profile strict");
     }
 }

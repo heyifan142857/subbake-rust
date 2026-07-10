@@ -43,6 +43,12 @@ pub trait EngineObserver: Send {
 /// Observer that prints everything to stdout (mirrors Python `trace._AgentLoopTrace`).
 pub struct StreamingObserver;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanDecision {
+    Approve,
+    Reject,
+}
+
 impl Default for StreamingObserver {
     fn default() -> Self {
         Self
@@ -151,6 +157,18 @@ impl AgentEngine {
         Ok(())
     }
 
+    /// Pin configuration discovery to the path chosen by the composition
+    /// layer so profile listing, model reporting, and backend construction use
+    /// the same source of truth.
+    pub fn set_config_path(&mut self, path: Option<&std::path::Path>) -> std::io::Result<()> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        session.config_path = path.map(|path| path.to_string_lossy().into_owned());
+        self.session_store.save(session)
+    }
+
     /// Record an event in the active session and persist.
     pub fn record(&mut self, kind: EventKind) -> std::io::Result<()> {
         let session = self
@@ -200,16 +218,36 @@ impl AgentEngine {
     }
 
     pub fn approve_plan(&mut self) -> std::io::Result<String> {
-        let pending = self
-            .session
+        self.session
             .as_ref()
-            .and_then(|session| session.pending_plan.clone())
+            .and_then(|session| session.pending_plan.as_ref())
             .ok_or_else(|| std::io::Error::other("no pending plan to approve"))?;
 
         let mut outputs = Vec::new();
-        for call in &pending.tool_calls {
+        loop {
+            let call = self
+                .session
+                .as_ref()
+                .and_then(|session| session.pending_plan.as_ref())
+                .and_then(|plan| plan.tool_calls.first())
+                .cloned();
+            let Some(call) = call else {
+                break;
+            };
+
             let result = self.run_tool(&call.tool_name, &call.arguments)?;
             outputs.push(format!("{}: {}", call.tool_name, result));
+
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("no active session"))?;
+            let plan = session
+                .pending_plan
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("pending plan disappeared"))?;
+            plan.tool_calls.remove(0);
+            self.session_store.save(session)?;
         }
 
         let session = self
@@ -239,6 +277,25 @@ impl AgentEngine {
         session.pending_plan = None;
         self.record(EventKind::Reject)?;
         Ok("Rejected pending plan.".to_owned())
+    }
+
+    pub fn handle_plan_decision(&mut self, decision: PlanDecision) -> std::io::Result<String> {
+        let result = match decision {
+            PlanDecision::Approve => self.approve_plan(),
+            PlanDecision::Reject => self.reject_plan(),
+        }?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
+    }
+
+    pub fn select_profile(&mut self, name: &str) -> std::io::Result<String> {
+        let result = self.run_tool("switch_profile", &serde_json::json!({"name": name}))?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
     }
 
     pub fn toggle_plan_mode(&mut self) -> std::io::Result<String> {
@@ -331,12 +388,31 @@ impl AgentEngine {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
+    pub fn input_history(&self) -> Vec<String> {
+        self.session
+            .as_ref()
+            .map(|session| {
+                session
+                    .events
+                    .iter()
+                    .filter(|event| event.kind == "user" && !event.text.trim().is_empty())
+                    .map(|event| event.text.clone())
+                    .fold(Vec::<String>::new(), |mut history, input| {
+                        if history.last() != Some(&input) {
+                            history.push(input);
+                        }
+                        history
+                    })
+            })
+            .unwrap_or_default()
+    }
+
     pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
         let trimmed = input.trim();
         let result = match trimmed {
             "/plan" => self.toggle_plan_mode(),
-            "/approve" => self.approve_plan(),
-            "/reject" => self.reject_plan(),
+            "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
+            "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
             "/session" => self.session_summary(),
             "/model" => self.active_model_summary(),
@@ -346,7 +422,7 @@ impl AgentEngine {
                 if name.is_empty() {
                     self.run_tool("list_profiles", &serde_json::json!({}))
                 } else {
-                    self.run_tool("switch_profile", &serde_json::json!({"name": name}))
+                    return self.select_profile(name);
                 }
             }
             other => Ok(format!("Unknown command `{other}`. Try /help.")),

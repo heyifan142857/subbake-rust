@@ -1250,6 +1250,52 @@ mod tests {
     }
 
     #[test]
+    fn failed_plan_keeps_only_unfinished_tool_calls() {
+        let root = temp_root("partial-plan");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine
+            .store_plan(
+                "Create then append",
+                vec![
+                    ToolCallDraft {
+                        tool_name: "create_file".to_owned(),
+                        arguments: json!({"path": "notes.txt", "content": "hello"}),
+                    },
+                    ToolCallDraft {
+                        tool_name: "rename_path".to_owned(),
+                        arguments: json!({"from": "notes.txt"}),
+                    },
+                ],
+            )
+            .expect("store plan");
+
+        engine.approve_plan().expect_err("rename must fail");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).expect("first call completed"),
+            "hello"
+        );
+        let remaining = &engine
+            .session
+            .as_ref()
+            .expect("session")
+            .pending_plan
+            .as_ref()
+            .expect("pending")
+            .tool_calls;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tool_name, "rename_path");
+
+        engine.approve_plan().expect_err("retry still fails");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).expect("not recreated"),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn invalid_llm_tool_call_becomes_clarification() {
         let root = temp_root("invalid-decision");
         std::fs::create_dir_all(&root).expect("create root");

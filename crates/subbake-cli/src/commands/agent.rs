@@ -1,10 +1,13 @@
 use std::io;
+use std::path::Path;
 
 use subbake_adapters::{
     TranslationSettings, build_backend, discover_config_path, load_and_resolve,
 };
+use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentEngine, AgentRequest, EchoDecisionBackend, SubBakeTui, TuiPicker, TuiProcessResult,
+    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, RenderPolicy, SubBakeTui,
+    TuiAction, TuiInteraction,
 };
 
 use crate::args::AgentArgs;
@@ -49,66 +52,143 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 }
 
 fn run_tui_with_engine(mut engine: AgentEngine) -> io::Result<()> {
+    let config_path = discover_config_path();
+    engine.set_config_path(config_path.as_deref())?;
     let initial_profile = engine
         .session
         .as_ref()
         .and_then(|session| session.profile.clone());
-    let mut backend = build_agent_decision_backend(initial_profile.as_deref());
+    let mut backend =
+        build_agent_decision_backend(config_path.as_deref(), initial_profile.as_deref())?;
 
     // Create the TUI with an observer attached to the engine.
+    let input_history = engine.input_history();
     let mut tui = SubBakeTui::new()?;
+    tui.set_input_history(input_history);
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));
 
-    tui.run(move |input, _obs| {
-        // Each user input: run through the engine's decision pipeline.
-        let result = if input.trim().starts_with('/') {
-            engine.handle_slash_command(input)?
+    tui.run(move |action, _obs| {
+        let submitted_text = match &action {
+            TuiAction::SubmitText(text) => Some(text.as_str()),
+            _ => None,
+        };
+        let requested_profile = match &action {
+            TuiAction::SelectProfile(name) => Some(name.as_str()),
+            TuiAction::SubmitText(input) => input
+                .trim()
+                .strip_prefix("/profile ")
+                .map(str::trim)
+                .filter(|name| !name.is_empty()),
+            _ => None,
+        };
+        let candidate_backend = if let Some(profile) = requested_profile {
+            if engine.profile_choices()?.iter().any(|name| name == profile) {
+                Some(build_agent_decision_backend(
+                    config_path.as_deref(),
+                    Some(profile),
+                )?)
+            } else {
+                None
+            }
         } else {
-            engine.run_line(input, &mut *backend)?
+            None
         };
 
-        if input.trim().starts_with("/profile ") {
-            let profile = engine
-                .session
-                .as_ref()
-                .and_then(|session| session.profile.clone());
-            backend = build_agent_decision_backend(profile.as_deref());
+        let result = match &action {
+            TuiAction::SubmitText(input) if input.trim().starts_with('/') => {
+                engine.record(EventKind::User {
+                    text: input.clone(),
+                })?;
+                engine.handle_slash_command(input)?
+            }
+            TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
+            TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
+            TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
+            TuiAction::SelectProfile(name) => engine.select_profile(name)?,
+        };
+
+        if let Some(candidate) = candidate_backend {
+            backend = candidate;
         }
 
         // Save session after each interaction.
         let _ = engine.save();
 
-        let picker = matches!(input.trim(), "/model" | "/profile")
+        let profile_options = submitted_text
+            .is_some_and(|input| matches!(input.trim(), "/model" | "/profile"))
             .then(|| engine.profile_choices())
             .transpose()?
-            .and_then(|options| {
-                (!options.is_empty()).then_some(TuiPicker {
-                    command: "/profile".to_owned(),
-                    options,
-                })
-            });
+            .filter(|options| !options.is_empty());
 
-        Ok(TuiProcessResult {
-            response: result,
-            pending_plan: engine.has_pending_plan(),
-            picker,
-        })
+        if engine.has_pending_plan() {
+            Ok(TuiInteraction::PlanApproval { message: result })
+        } else if let Some(options) = profile_options {
+            Ok(TuiInteraction::ProfilePicker {
+                message: result,
+                options,
+            })
+        } else {
+            let render = render_policy(&action, &result);
+            Ok(TuiInteraction::Message {
+                message: result,
+                render,
+            })
+        }
     })
 }
 
-fn build_agent_decision_backend(profile: Option<&str>) -> Box<dyn subbake_core::ports::LlmBackend> {
-    let mut settings = TranslationSettings::default();
-    if let Some(path) = discover_config_path()
-        && let Ok(Some(patch)) = load_and_resolve(&path, profile)
+fn render_policy(action: &TuiAction, response: &str) -> RenderPolicy {
+    if !matches!(action, TuiAction::SubmitText(input) if !input.trim().starts_with('/'))
+        || response.contains('\n')
     {
+        RenderPolicy::Immediate
+    } else {
+        RenderPolicy::Stream
+    }
+}
+
+fn build_agent_decision_backend(
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> io::Result<Box<dyn subbake_core::ports::LlmBackend>> {
+    let mut settings = TranslationSettings::default();
+    if let Some(path) = config_path {
+        let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("configuration disappeared: {}", path.display()),
+            )
+        })?;
         settings.apply_patch(patch);
     }
 
     if settings.provider == "mock" {
-        return Box::new(EchoDecisionBackend::new("mock-decision"));
+        return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
     }
 
     build_backend(&settings.backend_config())
-        .unwrap_or_else(|_| Box::new(EchoDecisionBackend::new("mock-decision")))
+        .map_err(|error| io::Error::other(format!("build agent backend: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_policy;
+    use subbake_agent::{RenderPolicy, TuiAction};
+
+    #[test]
+    fn structured_and_command_responses_render_immediately() {
+        assert_eq!(
+            render_policy(&TuiAction::SubmitText("ls".to_owned()), "one.srt\ntwo.srt"),
+            RenderPolicy::Immediate
+        );
+        assert_eq!(
+            render_policy(&TuiAction::SubmitText("/session".to_owned()), "session"),
+            RenderPolicy::Immediate
+        );
+        assert_eq!(
+            render_policy(&TuiAction::SubmitText("hello".to_owned()), "hello!"),
+            RenderPolicy::Stream
+        );
+    }
 }
