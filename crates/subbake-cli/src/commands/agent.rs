@@ -6,8 +6,8 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, RenderPolicy, SubBakeTui,
-    TuiAction, TuiInteraction,
+    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, RenderPolicy, StartupInfo,
+    SubBakeTui, TuiAction, TuiInteraction,
 };
 
 use crate::args::AgentArgs;
@@ -60,11 +60,21 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         .and_then(|session| session.profile.clone());
     let mut backend =
         build_agent_decision_backend(config_path.as_deref(), initial_profile.as_deref())?;
+    let startup_settings = resolved_settings(config_path.as_deref(), initial_profile.as_deref())?;
 
     // Create the TUI with an observer attached to the engine.
     let input_history = engine.input_history();
     let session_events = engine.session_events();
     let mut tui = SubBakeTui::new()?;
+    tui.set_startup_info(StartupInfo {
+        provider: startup_settings.provider,
+        model: startup_settings.model,
+        config: config_path
+            .as_deref()
+            .map(display_config_path)
+            .unwrap_or_else(|| "Not configured".to_owned()),
+        cache_enabled: startup_settings.use_cache,
+    });
     tui.set_has_config_file(config_path.is_some());
     tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
@@ -243,6 +253,31 @@ fn build_agent_decision_backend(
 
     build_backend(&settings.backend_config())
         .map_err(|error| io::Error::other(format!("build agent backend: {error}")))
+}
+
+fn resolved_settings(
+    config_path: Option<&Path>,
+    profile: Option<&str>,
+) -> io::Result<TranslationSettings> {
+    let mut settings = TranslationSettings::default();
+    if let Some(path) = config_path {
+        let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("configuration disappeared: {}", path.display()),
+            )
+        })?;
+        settings.apply_patch(patch);
+    }
+    Ok(settings)
+}
+
+fn display_config_path(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    home.as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(test)]

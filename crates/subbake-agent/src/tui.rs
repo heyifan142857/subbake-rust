@@ -25,7 +25,7 @@ use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::session::iso_now;
@@ -44,8 +44,6 @@ pub struct Msg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgStyle {
-    WelcomeTitle,
-    WelcomeTagline,
     User,
     Thinking,
     ToolCall,
@@ -53,6 +51,25 @@ pub enum MsgStyle {
     Response,
     Error,
     System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupInfo {
+    pub provider: String,
+    pub model: String,
+    pub config: String,
+    pub cache_enabled: bool,
+}
+
+impl Default for StartupInfo {
+    fn default() -> Self {
+        Self {
+            provider: "mock".to_owned(),
+            model: "mock-zh".to_owned(),
+            config: "Not configured".to_owned(),
+            cache_enabled: true,
+        }
+    }
 }
 
 const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
@@ -303,6 +320,7 @@ pub struct SubBakeTui {
     cancellation: Option<CancellationToken>,
     cancellation_requested: bool,
     input_hint: &'static str,
+    startup_info: StartupInfo,
 }
 
 impl SubBakeTui {
@@ -326,7 +344,12 @@ impl SubBakeTui {
             cancellation: None,
             cancellation_requested: false,
             input_hint: session_input_hint(),
+            startup_info: StartupInfo::default(),
         })
+    }
+
+    pub fn set_startup_info(&mut self, startup_info: StartupInfo) {
+        self.startup_info = startup_info;
     }
 
     pub fn set_has_config_file(&mut self, has_config_file: bool) {
@@ -395,8 +418,6 @@ impl SubBakeTui {
             + Send
             + 'static,
     {
-        let mut observer = self.observer();
-        self.welcome(&mut observer)?;
         let worker_observer = self.observer();
         let (request_tx, request_rx) = mpsc::channel::<(TuiAction, CancellationGuard)>();
         let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiInteraction>>();
@@ -514,20 +535,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
     }
 
-    fn welcome(&mut self, obs: &mut TuiObserver) -> io::Result<()> {
-        if let Ok(mut v) = obs.view.lock() {
-            v.push(
-                MsgStyle::WelcomeTitle,
-                format!("SubBake {}", env!("CARGO_PKG_VERSION")),
-            );
-            v.push(
-                MsgStyle::WelcomeTagline,
-                "Fast AI subtitle translation".to_owned(),
-            );
-        }
-        Ok(())
-    }
-
     fn start_stream(&mut self, text: String) {
         self.finish_stream();
         if let Ok(mut view) = self.msg_view.lock() {
@@ -630,6 +637,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         };
         let creating_profile = matches!(self.input_mode, InputMode::CreatingProfile);
         let profile_name_input = self.input.clone();
+        let startup_info = self.startup_info.clone();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -833,6 +841,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // -- Output pane --
             let output_area = chunks[0];
+            let output_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(8), Constraint::Min(1)])
+                .split(output_area);
+            let startup = Paragraph::new(startup_lines(&startup_info)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            frame.render_widget(startup, output_chunks[0]);
+            let transcript_area = output_chunks[1];
             let items: Vec<Line<'_>> = messages
                 .iter()
                 .enumerate()
@@ -843,10 +863,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             .iter()
                             .any(|later| later.style == MsgStyle::Thinking);
                     let style = match msg.style {
-                        MsgStyle::WelcomeTitle => Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                        MsgStyle::WelcomeTagline => Style::default().fg(Color::DarkGray),
                         MsgStyle::User => Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -888,7 +904,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let visual_line_count = items
                 .iter()
                 .map(|line| {
-                    let width = usize::from(output_area.width.max(1));
+                    let width = usize::from(transcript_area.width.max(1));
                     line.width().max(1).div_ceil(width)
                 })
                 .sum::<usize>();
@@ -896,12 +912,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let paragraph = Paragraph::new(items)
                 .block(Block::default().borders(Borders::NONE))
                 .wrap(Wrap { trim: false });
-            let max_scroll = (visual_line_count as u16).saturating_sub(output_area.height);
+            let max_scroll = (visual_line_count as u16).saturating_sub(transcript_area.height);
             // `scroll_offset` is the number of visual lines above the newest
             // output, so zero follows a growing/streaming response.
             let offset = max_scroll.saturating_sub(scroll.min(max_scroll));
             let paragraph = paragraph.scroll((offset, 0));
-            frame.render_widget(paragraph, output_area);
+            frame.render_widget(paragraph, transcript_area);
 
             // -- Slash command suggestions --
             let suggestion_area = chunks[1];
@@ -1252,6 +1268,37 @@ const INPUT_HINTS: &[&str] = &[
     "Use /plan to review the next steps before changes",
     "Use /history to revisit earlier requests",
 ];
+
+fn startup_lines(info: &StartupInfo) -> Vec<Line<'_>> {
+    let value_style = Style::default().fg(Color::Cyan);
+    let row = |label: &'static str, value: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {label:<10}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(value.to_owned(), value_style),
+        ])
+    };
+    vec![
+        Line::from(Span::styled(
+            format!("  SubBake v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        row("Provider", &info.provider),
+        row("Model", &info.model),
+        row("Config", &info.config),
+        row(
+            "Cache",
+            if info.cache_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        ),
+    ]
+}
 
 fn session_input_hint() -> &'static str {
     let index = std::time::SystemTime::now()
