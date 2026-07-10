@@ -80,8 +80,6 @@ Add state-transition tests for:
 - profile picker selection and submission;
 - all pending-plan choices;
 - revision instructions while a plan remains pending;
-- history navigation and draft restoration;
-- history containing slash commands;
-- picker/history/slash-completion priority;
+- full key-event integration around history navigation (the pure state transitions and draft restoration are covered);
 - failed backend construction and profile rollback;
 - immediate versus streamed rendering.

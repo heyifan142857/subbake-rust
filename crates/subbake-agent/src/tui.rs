@@ -520,27 +520,24 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn suggestions(&self) -> Vec<(String, String)> {
-        match &self.input_mode {
-            InputMode::BrowsingHistory { .. } => Vec::new(),
-            InputMode::AwaitingPlanDecision if self.input.is_empty() => APPROVAL_OPTIONS
-                .iter()
-                .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
-                .collect(),
-            InputMode::ChoosingProfile(picker) if self.input.is_empty() => picker
-                .options
-                .iter()
-                .map(|option| (option.clone(), "configured profile".to_owned()))
-                .collect(),
-            InputMode::ChoosingSession(picker) if self.input.is_empty() => picker
-                .options
-                .iter()
-                .map(|option| (option.clone(), "saved session".to_owned()))
-                .collect(),
-            _ => slash_suggestions(&self.input)
-                .into_iter()
-                .map(|(command, description)| (command.to_owned(), description.to_owned()))
-                .collect(),
-        }
+        suggestions_for(&self.input, &self.input_mode)
+    }
+
+    fn navigate_history_up(&mut self) {
+        let Some((mode, input)) = history_up(&self.input_history, &self.input, &self.input_mode)
+        else {
+            return;
+        };
+        self.input_mode = mode;
+        self.input = input;
+    }
+
+    fn navigate_history_down(&mut self) {
+        let Some((mode, input)) = history_down(&self.input_history, &self.input_mode) else {
+            return;
+        };
+        self.input_mode = mode;
+        self.input = input;
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -886,33 +883,61 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
         Ok(())
     }
+}
 
-    fn navigate_history_up(&mut self) {
-        if self.input_history.is_empty() {
-            return;
-        }
-        let (index, draft) = match &self.input_mode {
-            InputMode::BrowsingHistory { index, draft } => (index.saturating_sub(1), draft.clone()),
-            _ => (self.input_history.len() - 1, self.input.clone()),
-        };
-        self.input_mode = InputMode::BrowsingHistory { index, draft };
-        self.input.clone_from(&self.input_history[index]);
+fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
+    match mode {
+        InputMode::BrowsingHistory { .. } => Vec::new(),
+        InputMode::AwaitingPlanDecision if input.is_empty() => APPROVAL_OPTIONS
+            .iter()
+            .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
+            .collect(),
+        InputMode::ChoosingProfile(picker) if input.is_empty() => picker
+            .options
+            .iter()
+            .map(|option| (option.clone(), "configured profile".to_owned()))
+            .collect(),
+        InputMode::ChoosingSession(picker) if input.is_empty() => picker
+            .options
+            .iter()
+            .map(|option| (option.clone(), "saved session".to_owned()))
+            .collect(),
+        _ => slash_suggestions(input)
+            .into_iter()
+            .map(|(command, description)| (command.to_owned(), description.to_owned()))
+            .collect(),
     }
+}
 
-    fn navigate_history_down(&mut self) {
-        let InputMode::BrowsingHistory { index, draft } = &self.input_mode else {
-            return;
-        };
-        let index = *index;
-        let draft = draft.clone();
-        if index + 1 < self.input_history.len() {
-            let next = index + 1;
-            self.input_mode = InputMode::BrowsingHistory { index: next, draft };
-            self.input.clone_from(&self.input_history[next]);
-        } else {
-            self.input_mode = InputMode::Editing;
-            self.input = draft;
-        }
+fn history_up(history: &[String], input: &str, mode: &InputMode) -> Option<(InputMode, String)> {
+    if history.is_empty() {
+        return None;
+    }
+    let (index, draft) = match mode {
+        InputMode::BrowsingHistory { index, draft } => (index.saturating_sub(1), draft.clone()),
+        _ => (history.len() - 1, input.to_owned()),
+    };
+    Some((
+        InputMode::BrowsingHistory { index, draft },
+        history[index].clone(),
+    ))
+}
+
+fn history_down(history: &[String], mode: &InputMode) -> Option<(InputMode, String)> {
+    let InputMode::BrowsingHistory { index, draft } = mode else {
+        return None;
+    };
+    if index + 1 < history.len() {
+        let next = index + 1;
+        Some((
+            InputMode::BrowsingHistory {
+                index: next,
+                draft: draft.clone(),
+            },
+            history[next].clone(),
+        ))
+    } else {
+        Some((InputMode::Editing, draft.clone()))
     }
 }
 
@@ -938,7 +963,10 @@ fn previous_suggestion(current: usize, count: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiAction, previous_suggestion, slash_suggestions};
+    use super::{
+        InputMode, TuiAction, TuiPicker, history_down, history_up, previous_suggestion,
+        slash_suggestions, suggestions_for,
+    };
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
@@ -961,5 +989,36 @@ mod tests {
     fn typed_profile_action_has_a_stable_visible_form() {
         let action = TuiAction::SelectProfile("strict".to_owned());
         assert_eq!(action.visible_text(), "/profile strict");
+    }
+
+    #[test]
+    fn history_round_trip_restores_the_unsubmitted_draft() {
+        let history = vec!["first".to_owned(), "/session".to_owned()];
+        let (mode, input) = history_up(&history, "draft", &InputMode::Editing).expect("up");
+        assert_eq!(input, "/session");
+        let (mode, input) = history_up(&history, &input, &mode).expect("up again");
+        assert_eq!(input, "first");
+        let (mode, input) = history_down(&history, &mode).expect("down");
+        assert_eq!(input, "/session");
+        let (mode, input) = history_down(&history, &mode).expect("restore draft");
+        assert!(matches!(mode, InputMode::Editing));
+        assert_eq!(input, "draft");
+    }
+
+    #[test]
+    fn active_picker_and_approval_modes_take_priority_over_slash_completion() {
+        let profile = InputMode::ChoosingProfile(TuiPicker {
+            options: vec!["fast".to_owned(), "strict".to_owned()],
+        });
+        assert_eq!(suggestions_for("", &profile)[0].0, "fast");
+        assert_eq!(
+            suggestions_for("", &InputMode::AwaitingPlanDecision)[0].0,
+            "approve"
+        );
+        let history = InputMode::BrowsingHistory {
+            index: 0,
+            draft: String::new(),
+        };
+        assert!(suggestions_for("/", &history).is_empty());
     }
 }
