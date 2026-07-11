@@ -17,10 +17,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -205,10 +202,7 @@ struct TerminalSessionGuard {
 impl TerminalSessionGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = io::stdout()
-            .execute(EnterAlternateScreen)
-            .and_then(|stdout| stdout.execute(EnableMouseCapture))
-        {
+        if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -221,10 +215,7 @@ impl TerminalSessionGuard {
         }
         self.active = false;
         let raw_result = disable_raw_mode();
-        let screen_result = io::stdout()
-            .execute(DisableMouseCapture)
-            .and_then(|stdout| stdout.execute(LeaveAlternateScreen))
-            .map(|_| ());
+        let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
         raw_result.and(screen_result)
     }
 }
@@ -1273,11 +1264,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
             Event::Resize(_, _) => {
                 self.scroll_offset = 0;
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_up(3),
-                MouseEventKind::ScrollDown => self.scroll_down(3),
-                _ => {}
-            },
             _ => {}
         }
 
