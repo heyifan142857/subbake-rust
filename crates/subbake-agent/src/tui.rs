@@ -62,6 +62,7 @@ pub struct StartupInfo {
     pub model: String,
     pub config: String,
     pub cache_enabled: bool,
+    pub cwd: String,
 }
 
 impl Default for StartupInfo {
@@ -71,6 +72,7 @@ impl Default for StartupInfo {
             model: "mock-zh".to_owned(),
             config: "Not configured".to_owned(),
             cache_enabled: true,
+            cwd: String::new(),
         }
     }
 }
@@ -122,10 +124,19 @@ pub enum TuiInteraction {
     SessionChanged {
         input_history: Vec<String>,
         events: Vec<crate::session::AgentEvent>,
+        plan_mode: bool,
+        model: String,
     },
     SessionPicker {
         message: String,
         options: Vec<SessionChoice>,
+    },
+    PlanModeChanged {
+        enabled: bool,
+    },
+    ModelChanged {
+        model: String,
+        message: String,
     },
 }
 
@@ -142,6 +153,13 @@ enum InputMode {
     CreatingProfile,
     ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalNavigation {
+    Selection(usize),
+    History,
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,9 +232,9 @@ impl TerminalSessionGuard {
             return Ok(());
         }
         self.active = false;
-        let raw_result = disable_raw_mode();
         let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
-        raw_result.and(screen_result)
+        let raw_result = disable_raw_mode();
+        screen_result.and(raw_result)
     }
 }
 
@@ -324,6 +342,8 @@ pub struct SubBakeTui {
     cancellation_requested: bool,
     input_hint: &'static str,
     startup_info: StartupInfo,
+    plan_mode: bool,
+    transcript_page_lines: u16,
 }
 
 impl SubBakeTui {
@@ -348,11 +368,17 @@ impl SubBakeTui {
             cancellation_requested: false,
             input_hint: session_input_hint(),
             startup_info: StartupInfo::default(),
+            plan_mode: false,
+            transcript_page_lines: 10,
         })
     }
 
     pub fn set_startup_info(&mut self, startup_info: StartupInfo) {
         self.startup_info = startup_info;
+    }
+
+    pub fn set_plan_mode(&mut self, enabled: bool) {
+        self.plan_mode = enabled;
     }
 
     pub fn set_has_config_file(&mut self, has_config_file: bool) {
@@ -460,11 +486,15 @@ impl SubBakeTui {
                         Ok(TuiInteraction::SessionChanged {
                             input_history,
                             events,
+                            plan_mode,
+                            model,
                         }) => {
                             self.input_history = input_history;
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
                             self.set_session_replay(events);
+                            self.plan_mode = plan_mode;
+                            self.startup_info.model = model;
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
                             self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
@@ -472,6 +502,17 @@ impl SubBakeTui {
                             // `/sessions` opens a picker; its textual summary would only
                             // duplicate the rows already visible in that picker.
                             let _ = message;
+                        }
+                        Ok(TuiInteraction::PlanModeChanged { enabled }) => {
+                            self.plan_mode = enabled;
+                            self.input_mode = InputMode::Editing;
+                            self.suggestion_index = 0;
+                        }
+                        Ok(TuiInteraction::ModelChanged { model, message }) => {
+                            self.startup_info.model = model;
+                            self.input_mode = InputMode::Editing;
+                            self.suggestion_index = 0;
+                            self.render_response(message, RenderPolicy::Immediate);
                         }
                         Err(error) => {
                             self.input_mode = InputMode::Editing;
@@ -641,6 +682,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let creating_profile = matches!(self.input_mode, InputMode::CreatingProfile);
         let profile_name_input = self.input.clone();
         let startup_info = self.startup_info.clone();
+        let plan_mode = self.plan_mode;
+        let mut transcript_page_lines = self.transcript_page_lines;
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -838,12 +881,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .constraints([
                     Constraint::Min(1),
                     Constraint::Length(suggestions.len() as u16),
-                    Constraint::Length(3),
+                    Constraint::Length(4),
                 ])
                 .split(area);
 
             // -- Output pane --
             let transcript_area = chunks[0];
+            transcript_page_lines = transcript_area.height.max(1);
             let mut items =
                 startup_panel_lines(&startup_info, transcript_area.width.saturating_sub(1));
             items.push(Line::from(""));
@@ -962,20 +1006,70 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // -- Input bar --
             let input_area = chunks[2];
-            let input_line = input_line(&self.input, &self.input_mode, processing, self.input_hint);
+            let input_entry_area = ratatui::layout::Rect::new(
+                input_area.x,
+                input_area.y,
+                input_area.width,
+                input_area.height.saturating_sub(1),
+            );
+            let status_area = ratatui::layout::Rect::new(
+                input_area.x,
+                input_area.bottom().saturating_sub(1),
+                input_area.width,
+                1,
+            );
+            let available_input_width = input_entry_area.width.saturating_sub(2);
+            let input_line = input_line(
+                &self.input,
+                &self.input_mode,
+                processing,
+                self.input_hint,
+                available_input_width,
+            );
             let input_widget = Paragraph::new(input_line).block(
                 Block::default()
-                    .borders(Borders::TOP)
+                    .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(Style::default().fg(Color::DarkGray)),
             );
-            frame.render_widget(input_widget, input_area);
+            frame.render_widget(input_widget, input_entry_area);
+            let status_spans = vec![
+                Span::styled(
+                    startup_info.model.clone(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(startup_info.cwd.clone(), Style::default().fg(Color::Green)),
+            ];
+            frame.render_widget(
+                Paragraph::new(Line::from(status_spans)).wrap(Wrap { trim: false }),
+                status_area,
+            );
+            if plan_mode && status_area.width >= 4 {
+                let plan_area = ratatui::layout::Rect::new(
+                    status_area.right().saturating_sub(4),
+                    status_area.y,
+                    4,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "Plan",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ))
+                    .alignment(ratatui::layout::Alignment::Right),
+                    plan_area,
+                );
+            }
 
             // Set cursor position at end of input.
             frame.set_cursor_position((
-                input_area.x + 2 + terminal_width(&self.input),
-                input_area.y + 1,
+                input_entry_area.x
+                    + 2
+                    + terminal_width(&self.input).min(available_input_width.saturating_sub(2)),
+                input_entry_area.y + 1,
             ));
         })?;
+        self.transcript_page_lines = transcript_page_lines;
 
         Ok(())
     }
@@ -1102,8 +1196,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.scroll_offset = 0;
                     let opens_session_picker =
                         matches!(&action, TuiAction::SubmitText(input) if input == "/sessions");
+                    let changes_plan_mode = matches!(&action, TuiAction::TogglePlan)
+                        || matches!(&action, TuiAction::SubmitText(input) if input.trim().starts_with("/plan"));
 
-                    if !opens_session_picker {
+                    if !opens_session_picker && !changes_plan_mode {
                         // Paint the submitted message and initial thinking state
                         // before the potentially slow engine call begins.
                         if let Ok(mut view) = self.msg_view.lock() {
@@ -1146,48 +1242,22 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
-                    if let InputMode::ChoosingProfile(picker) = &self.input_mode {
-                        if !picker.options.is_empty() {
+                    match vertical_navigation(&self.input_mode, self.suggestions().len()) {
+                        VerticalNavigation::Selection(count) => {
                             self.suggestion_index =
-                                previous_suggestion(self.suggestion_index, picker.options.len());
+                                previous_suggestion(self.suggestion_index, count);
                         }
-                        return Ok(());
-                    }
-                    if let InputMode::ChoosingSession(picker) = &self.input_mode {
-                        if !picker.options.is_empty() {
-                            self.suggestion_index =
-                                previous_suggestion(self.suggestion_index, picker.options.len());
-                        }
-                        return Ok(());
-                    }
-                    let suggestions = self.suggestions();
-                    if suggestions.is_empty() {
-                        self.navigate_history_up();
-                    } else {
-                        self.suggestion_index =
-                            previous_suggestion(self.suggestion_index, suggestions.len());
+                        VerticalNavigation::History => self.navigate_history_up(),
+                        VerticalNavigation::Disabled => {}
                     }
                 }
                 KeyCode::Down => {
-                    if let InputMode::ChoosingProfile(picker) = &self.input_mode {
-                        if !picker.options.is_empty() {
-                            self.suggestion_index =
-                                (self.suggestion_index + 1) % picker.options.len();
+                    match vertical_navigation(&self.input_mode, self.suggestions().len()) {
+                        VerticalNavigation::Selection(count) => {
+                            self.suggestion_index = (self.suggestion_index + 1) % count;
                         }
-                        return Ok(());
-                    }
-                    if let InputMode::ChoosingSession(picker) = &self.input_mode {
-                        if !picker.options.is_empty() {
-                            self.suggestion_index =
-                                (self.suggestion_index + 1) % picker.options.len();
-                        }
-                        return Ok(());
-                    }
-                    let suggestions = self.suggestions();
-                    if suggestions.is_empty() {
-                        self.navigate_history_down();
-                    } else {
-                        self.suggestion_index = (self.suggestion_index + 1) % suggestions.len();
+                        VerticalNavigation::History => self.navigate_history_down(),
+                        VerticalNavigation::Disabled => {}
                     }
                 }
                 KeyCode::Left | KeyCode::Right => {
@@ -1205,23 +1275,16 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::PageUp => {
-                    self.scroll_up(10);
+                    self.scroll_up(self.transcript_page_lines);
                 }
                 KeyCode::PageDown => {
-                    self.scroll_down(10);
+                    self.scroll_down(self.transcript_page_lines);
                 }
                 KeyCode::BackTab => {
                     if self.processing {
                         return Ok(());
                     }
                     let action = TuiAction::TogglePlan;
-                    if let Ok(mut view) = self.msg_view.lock() {
-                        view.push(
-                            MsgStyle::User,
-                            format!("[{:?}] {}", iso_now(), action.visible_text()),
-                        );
-                        view.push(MsgStyle::Thinking, "Updating mode…".to_owned());
-                    }
                     self.processing = true;
                     self.cancellation_requested = false;
                     self.animation_started_at = std::time::Instant::now();
@@ -1373,15 +1436,23 @@ fn session_input_hint() -> &'static str {
     INPUT_HINTS[index]
 }
 
-fn input_line<'a>(input: &'a str, mode: &InputMode, processing: bool, hint: &'a str) -> Line<'a> {
+fn input_line<'a>(
+    input: &'a str,
+    mode: &InputMode,
+    processing: bool,
+    hint: &'a str,
+    width: u16,
+) -> Line<'a> {
+    let truncate =
+        |value: &str| truncate_with_ellipsis(value, usize::from(width.saturating_sub(2)));
     if input.is_empty() && matches!(mode, InputMode::Editing) && !processing {
         Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate(hint), Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(Span::styled(
-            format!("> {input}"),
+            format!("> {}", truncate(input)),
             Style::default().fg(Color::Cyan),
         ))
     }
@@ -1409,6 +1480,28 @@ fn approval_choice(index: usize) -> ApprovalChoice {
         0 => ApprovalChoice::Submit(TuiAction::ApprovePlan),
         1 => ApprovalChoice::Submit(TuiAction::RejectPlan),
         _ => ApprovalChoice::Revise,
+    }
+}
+
+fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> VerticalNavigation {
+    match mode {
+        InputMode::ChoosingProfile(picker) if !picker.options.is_empty() => {
+            VerticalNavigation::Selection(picker.options.len())
+        }
+        InputMode::ChoosingSession(picker) if !picker.options.is_empty() => {
+            VerticalNavigation::Selection(picker.options.len())
+        }
+        InputMode::AwaitingPlanDecision if suggestion_count > 0 => {
+            VerticalNavigation::Selection(suggestion_count)
+        }
+        InputMode::Editing if suggestion_count > 0 => {
+            VerticalNavigation::Selection(suggestion_count)
+        }
+        InputMode::Editing | InputMode::BrowsingHistory { .. } => VerticalNavigation::History,
+        InputMode::ChoosingProfile(_)
+        | InputMode::ChoosingSession(_)
+        | InputMode::AwaitingPlanDecision
+        | InputMode::CreatingProfile => VerticalNavigation::Disabled,
     }
 }
 
@@ -1539,9 +1632,10 @@ mod tests {
 
     use super::{
         ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
-        approval_choice, empty_mode_choice, history_down, history_up, input_line,
-        is_profile_name_character, picker_viewport, previous_suggestion, profile_picker_choice,
-        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
+        VerticalNavigation, approval_choice, empty_mode_choice, history_down, history_up,
+        input_line, is_profile_name_character, picker_viewport, previous_suggestion,
+        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
+        terminal_width, vertical_navigation,
     };
 
     #[test]
@@ -1563,15 +1657,15 @@ mod tests {
 
     #[test]
     fn input_hint_only_appears_for_idle_empty_editing() {
-        let line = input_line("", &InputMode::Editing, false, "A helpful hint");
+        let line = input_line("", &InputMode::Editing, false, "A helpful hint", 80);
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[1].content, "A helpful hint");
 
-        let typed = input_line("hello", &InputMode::Editing, false, "hidden");
+        let typed = input_line("hello", &InputMode::Editing, false, "hidden", 80);
         assert_eq!(typed.spans.len(), 1);
         assert_eq!(typed.spans[0].content, "> hello");
 
-        let processing = input_line("", &InputMode::Editing, true, "hidden");
+        let processing = input_line("", &InputMode::Editing, true, "hidden", 80);
         assert_eq!(processing.spans.len(), 1);
         assert_eq!(processing.spans[0].content, "> ");
     }
@@ -1581,6 +1675,40 @@ mod tests {
         assert_eq!(previous_suggestion(0, 7), 6);
         assert_eq!(previous_suggestion(4, 7), 3);
         assert_eq!((6 + 1) % 7, 0);
+    }
+
+    #[test]
+    fn visible_slash_and_approval_options_take_vertical_navigation_priority() {
+        assert_eq!(
+            vertical_navigation(&InputMode::Editing, slash_suggestions("/").len()),
+            VerticalNavigation::Selection(10)
+        );
+        assert_eq!(
+            vertical_navigation(&InputMode::AwaitingPlanDecision, 3),
+            VerticalNavigation::Selection(3)
+        );
+    }
+
+    #[test]
+    fn history_is_only_active_in_editing_and_history_modes_without_suggestions() {
+        assert_eq!(
+            vertical_navigation(&InputMode::Editing, 0),
+            VerticalNavigation::History
+        );
+        assert_eq!(
+            vertical_navigation(
+                &InputMode::BrowsingHistory {
+                    index: 0,
+                    draft: String::new(),
+                },
+                0,
+            ),
+            VerticalNavigation::History
+        );
+        assert_eq!(
+            vertical_navigation(&InputMode::CreatingProfile, 0),
+            VerticalNavigation::Disabled
+        );
     }
 
     #[test]

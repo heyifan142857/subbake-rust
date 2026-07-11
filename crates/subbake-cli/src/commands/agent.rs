@@ -52,6 +52,7 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 }
 
 fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io::Result<()> {
+    let project_root = engine.project_root.clone();
     let config_path = discover_config_path();
     engine.set_config_path(config_path.as_deref())?;
     let initial_profile = engine
@@ -65,6 +66,10 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
     // Create the TUI with an observer attached to the engine.
     let input_history = engine.input_history();
     let session_events = engine.session_events();
+    let initial_plan_mode = engine
+        .session
+        .as_ref()
+        .is_some_and(|session| session.mode == "plan");
     let mut tui = SubBakeTui::new()?;
     tui.set_startup_info(StartupInfo {
         provider: startup_settings.provider,
@@ -74,11 +79,13 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             .map(display_config_path)
             .unwrap_or_else(|| "Not configured".to_owned()),
         cache_enabled: startup_settings.use_cache,
+        cwd: project_root.to_string_lossy().into_owned(),
     });
     tui.set_has_config_file(config_path.is_some());
     tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
     tui.set_session_replay(session_events);
+    tui.set_plan_mode(initial_plan_mode);
     if open_session_picker {
         tui.open_session_picker(engine.session_choices(20)?);
     }
@@ -128,9 +135,11 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         let operation_result = (|| -> io::Result<String> {
             Ok(match &action {
                 TuiAction::SubmitText(input) if input.trim().starts_with('/') => {
-                    engine.record(EventKind::User {
-                        text: input.clone(),
-                    })?;
+                    if !input.trim().starts_with("/plan") {
+                        engine.record(EventKind::User {
+                            text: input.clone(),
+                        })?;
+                    }
                     engine.handle_slash_command(input)?
                 }
                 TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
@@ -161,6 +170,8 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         }
 
         let changed_session = submitted_text.is_some_and(|input| input.trim() == "/clear");
+        let changed_plan_mode = matches!(action, TuiAction::TogglePlan)
+            || submitted_text.is_some_and(|input| input.trim().starts_with("/plan"));
         if changed_session {
             engine.set_config_path(config_path.as_deref())?;
             let profile = engine
@@ -185,9 +196,40 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             .filter(|options| !options.is_empty());
 
         if requested_session.is_some() || changed_session {
+            let profile = engine
+                .session
+                .as_ref()
+                .and_then(|session| session.profile.as_deref());
+            let model = resolved_settings(config_path.as_deref(), profile)?.model;
             Ok(TuiInteraction::SessionChanged {
                 input_history: engine.input_history(),
                 events: engine.session_events(),
+                plan_mode: engine
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.mode == "plan"),
+                model,
+            })
+        } else if changed_plan_mode {
+            Ok(TuiInteraction::PlanModeChanged {
+                enabled: engine
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.mode == "plan"),
+            })
+        } else if matches!(
+            action,
+            TuiAction::SelectProfile(_) | TuiAction::CreateProfile(_)
+        ) || requested_profile.is_some()
+        {
+            let profile = engine
+                .session
+                .as_ref()
+                .and_then(|session| session.profile.as_deref());
+            let settings = resolved_settings(config_path.as_deref(), profile)?;
+            Ok(TuiInteraction::ModelChanged {
+                model: settings.model,
+                message: result,
             })
         } else if let Some(options) = session_options {
             Ok(TuiInteraction::SessionPicker {

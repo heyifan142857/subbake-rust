@@ -88,13 +88,19 @@ impl AgentSessionStore {
 
     pub fn create(&self) -> std::io::Result<AgentSession> {
         let id = format!("{}-{}", iso_now(), hex_id());
-        let session = AgentSession::new(id.clone());
-        self.save(&session)?;
-        Ok(session)
+        Ok(AgentSession::new(id))
     }
 
     pub fn save(&self, session: &AgentSession) -> std::io::Result<()> {
         let path = self.path_for(&session.id);
+        if session.events.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| std::io::Error::other(format!("create session dir: {e}")))?;
@@ -222,7 +228,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_and_loads_session() {
+    fn empty_session_is_not_persisted() {
         let dir = std::env::temp_dir().join(format!("subbake-agent-sessions-{}", hex_id()));
         let store = AgentSessionStore::new(dir.clone());
         let session = store.create().expect("create session");
@@ -231,8 +237,8 @@ mod tests {
         assert_eq!(session.mode, "chat");
         assert!(session.events.is_empty());
 
-        let loaded = store.load(&session.id).expect("load session");
-        assert_eq!(loaded.id, session.id);
+        assert!(!store.path_for(&session.id).exists());
+        assert!(store.list(20).expect("list sessions").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -261,8 +267,12 @@ mod tests {
     fn latest_returns_most_recent() {
         let dir = std::env::temp_dir().join(format!("subbake-agent-latest-{}", hex_id()));
         let store = AgentSessionStore::new(dir.clone());
-        let _s1 = store.create().expect("session 1");
-        let s2 = store.create().expect("session 2");
+        let mut s1 = store.create().expect("session 1");
+        s1.record_event("user", "first", serde_json::json!({}));
+        store.save(&s1).expect("save session 1");
+        let mut s2 = store.create().expect("session 2");
+        s2.record_event("user", "second", serde_json::json!({}));
+        store.save(&s2).expect("save session 2");
         let latest = store.latest().expect("latest").expect("some session");
         assert_eq!(latest.id, s2.id);
 

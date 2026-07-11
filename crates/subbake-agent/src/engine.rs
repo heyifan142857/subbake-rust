@@ -371,11 +371,7 @@ impl AgentEngine {
     }
 
     pub fn handle_toggle_plan(&mut self) -> std::io::Result<String> {
-        let result = self.toggle_plan_mode()?;
-        self.record_if_active(EventKind::Assistant {
-            text: result.clone(),
-        })?;
-        Ok(result)
+        self.toggle_plan_mode()
     }
 
     pub fn session_summary(&self) -> std::io::Result<String> {
@@ -510,6 +506,27 @@ impl AgentEngine {
             .is_some_and(|session| session.pending_plan.is_some())
     }
 
+    pub fn pending_plan_summary(&self) -> String {
+        let Some(plan) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_plan.as_ref())
+        else {
+            return "No pending plan.".to_owned();
+        };
+        let mut lines = vec!["Plan awaiting approval:".to_owned()];
+        if !plan.message.trim().is_empty() {
+            lines.push(plan.message.trim().to_owned());
+        }
+        lines.extend(
+            plan.tool_calls.iter().enumerate().map(|(index, call)| {
+                format!("{}. {} {}", index + 1, call.tool_name, call.arguments)
+            }),
+        );
+        lines.push("Choose an action below: approve, reject, or revise the plan.".to_owned());
+        lines.join("\n")
+    }
+
     pub fn active_model_summary(&self) -> std::io::Result<String> {
         let settings = self.active_translation_settings()?;
         Ok(format!(
@@ -622,8 +639,8 @@ impl AgentEngine {
         let trimmed = input.trim();
         let result = match trimmed {
             "/plan" => return self.handle_toggle_plan(),
-            "/plan on" => self.set_plan_mode(true),
-            "/plan off" => self.set_plan_mode(false),
+            "/plan on" => return self.set_plan_mode(true),
+            "/plan off" => return self.set_plan_mode(false),
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),

@@ -256,13 +256,26 @@ impl AgentEngine {
                 }
 
                 "plan" => {
-                    self.store_plan(&decision.text, decision.tool_calls)?;
-                    return self.finish_response(
-                        "I've prepared a plan for your approval. Choose an action below."
-                            .to_owned(),
-                        false,
-                        true,
-                    );
+                    if self.is_in_plan_mode() {
+                        self.store_plan(&decision.text, decision.tool_calls)?;
+                        return self.finish_response(self.pending_plan_summary(), false, true);
+                    }
+
+                    let mut outputs = Vec::new();
+                    for call in decision.tool_calls {
+                        self.check_cancelled()?;
+                        outputs.push(format!(
+                            "{}: {}",
+                            call.tool_name,
+                            self.run_tool(&call.tool_name, &call.arguments)?
+                        ));
+                    }
+                    let response = if outputs.is_empty() {
+                        decision.text
+                    } else {
+                        outputs.join("\n")
+                    };
+                    return self.finish_response(response, false, true);
                 }
 
                 other => {
@@ -622,15 +635,13 @@ impl AgentEngine {
             obs.on_tool_call(tool_name, args);
         }
 
-        if self.tool_requires_approval(tool_name) || self.is_in_plan_mode() {
+        if self.is_in_plan_mode() {
             let draft = crate::event::ToolCallDraft {
                 tool_name: tool_name.to_owned(),
                 arguments: args.clone(),
             };
             self.store_plan("", vec![draft])?;
-            return Ok(
-                "I've prepared a plan for your approval. Choose an action below.".to_owned(),
-            );
+            return Ok(self.pending_plan_summary());
         }
 
         self.run_tool(tool_name, args)
@@ -1431,6 +1442,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create root");
         let mut engine = AgentEngine::new(root.clone());
         engine.start_session().expect("start session");
+        engine.set_plan_mode(true).expect("enable plan mode");
         let mut backend = RawDecisionBackend {
             decision: json!({
                 "action": "plan",
