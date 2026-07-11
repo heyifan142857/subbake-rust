@@ -6,8 +6,8 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, RenderPolicy, StartupInfo,
-    SubBakeTui, TuiAction, TuiInteraction,
+    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
+    TuiAction, TuiInteraction,
 };
 
 use crate::args::AgentArgs;
@@ -254,11 +254,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                 options,
             })
         } else {
-            let render = render_policy(&action, &result);
-            Ok(TuiInteraction::Message {
-                message: result,
-                render,
-            })
+            Ok(TuiInteraction::Message { message: result })
         }
     })
 }
@@ -272,16 +268,6 @@ fn prepare_profile_backend(
         return Ok(None);
     }
     build_agent_decision_backend(config_path, Some(profile)).map(Some)
-}
-
-fn render_policy(action: &TuiAction, response: &str) -> RenderPolicy {
-    if !matches!(action, TuiAction::SubmitText(input) if !input.trim().starts_with('/'))
-        || response.contains('\n')
-    {
-        RenderPolicy::Immediate
-    } else {
-        RenderPolicy::Stream
-    }
 }
 
 fn build_agent_decision_backend(
@@ -336,24 +322,8 @@ fn display_config_path(path: &Path) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_agent_decision_backend, prepare_profile_backend, render_policy};
-    use subbake_agent::{AgentEngine, RenderPolicy, TuiAction};
-
-    #[test]
-    fn structured_and_command_responses_render_immediately() {
-        assert_eq!(
-            render_policy(&TuiAction::SubmitText("ls".to_owned()), "one.srt\ntwo.srt"),
-            RenderPolicy::Immediate
-        );
-        assert_eq!(
-            render_policy(&TuiAction::SubmitText("/sessions".to_owned()), "session"),
-            RenderPolicy::Immediate
-        );
-        assert_eq!(
-            render_policy(&TuiAction::SubmitText("hello".to_owned()), "hello!"),
-            RenderPolicy::Stream
-        );
-    }
+    use super::{build_agent_decision_backend, prepare_profile_backend};
+    use subbake_agent::AgentEngine;
 
     #[test]
     fn invalid_profile_backend_fails_instead_of_falling_back_to_mock() {

@@ -4,7 +4,7 @@
 //! Layout (inspired by Codex / OpenCode):
 //!
 //! ┌─────────────────────────────────┐
-//! │  Agent Output (scrollable)      │
+//! │  Terminal-native scrollback     │
 //! │  [You] translate hello.srt      │
 //! │  ⚡ translate_file ✓            │
 //! │  ➔ Translated: out.srt         │
@@ -49,7 +49,6 @@ pub struct Msg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgStyle {
     User,
-    Thinking,
     ToolCall,
     Observation,
     Response,
@@ -78,7 +77,7 @@ impl Default for StartupInfo {
     }
 }
 
-const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -112,7 +111,6 @@ struct SessionPicker {
 pub enum TuiInteraction {
     Message {
         message: String,
-        render: RenderPolicy,
     },
     PlanApproval {
         message: String,
@@ -138,12 +136,6 @@ pub enum TuiInteraction {
         model: String,
         message: String,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenderPolicy {
-    Stream,
-    Immediate,
 }
 
 enum InputMode {
@@ -293,14 +285,7 @@ impl TuiObserver {
 
 impl EngineObserver for TuiObserver {
     fn on_thinking(&mut self, text: &str) {
-        if let Ok(mut v) = self.view.lock()
-            && !v
-                .messages
-                .last()
-                .is_some_and(|message| message.style == MsgStyle::Thinking && message.text == text)
-        {
-            v.push(MsgStyle::Thinking, text.to_owned());
-        }
+        let _ = text;
     }
 
     fn on_tool_call(&mut self, name: &str, arguments: &serde_json::Value) {
@@ -343,6 +328,7 @@ pub struct SubBakeTui {
     running: bool,
     suggestion_index: usize,
     processing: bool,
+    pending_plan_toggle: Option<bool>,
     cancellation: Option<CancellationToken>,
     cancellation_requested: bool,
     input_hint: &'static str,
@@ -374,6 +360,7 @@ impl SubBakeTui {
             running: true,
             suggestion_index: 0,
             processing: false,
+            pending_plan_toggle: None,
             cancellation: None,
             cancellation_requested: false,
             input_hint: session_input_hint(),
@@ -482,15 +469,15 @@ impl SubBakeTui {
                     self.processing = false;
                     self.cancellation_requested = false;
                     match result {
-                        Ok(TuiInteraction::Message { message, render }) => {
+                        Ok(TuiInteraction::Message { message }) => {
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
-                            self.render_response(message, render);
+                            self.render_response(message);
                         }
                         Ok(TuiInteraction::PlanApproval { message }) => {
                             self.input_mode = InputMode::AwaitingPlanDecision;
                             self.suggestion_index = 0;
-                            self.render_response(message, RenderPolicy::Immediate);
+                            self.render_response(message);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
                             self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
@@ -519,6 +506,7 @@ impl SubBakeTui {
                         }
                         Ok(TuiInteraction::PlanModeChanged { enabled }) => {
                             self.plan_mode = enabled;
+                            self.pending_plan_toggle = None;
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
                         }
@@ -526,20 +514,16 @@ impl SubBakeTui {
                             self.startup_info.model = model;
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
-                            self.render_response(message, RenderPolicy::Immediate);
+                            self.render_response(message);
                         }
                         Err(error) => {
+                            if let Some(previous) = self.pending_plan_toggle.take() {
+                                self.plan_mode = previous;
+                            }
                             self.input_mode = InputMode::Editing;
                             if let Ok(mut view) = self.msg_view.lock() {
                                 if error.kind() == io::ErrorKind::Interrupted {
                                     self.input_mode = InputMode::Editing;
-                                    if let Some(index) = view
-                                        .messages
-                                        .iter()
-                                        .rposition(|message| message.style == MsgStyle::Thinking)
-                                    {
-                                        view.messages.remove(index);
-                                    }
                                     view.push(MsgStyle::System, "Cancelled.".to_owned());
                                 } else {
                                     view.push(MsgStyle::Error, format!("Error: {error}"));
@@ -597,17 +581,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
     }
 
-    fn render_response(&mut self, text: String, policy: RenderPolicy) {
-        let _ = policy;
+    fn render_response(&mut self, text: String) {
         if let Ok(mut view) = self.msg_view.lock() {
-            if let Some(index) = view
-                .messages
-                .iter()
-                .rposition(|message| message.style == MsgStyle::Thinking)
-                && index >= self.history_cursor
-            {
-                view.messages.remove(index);
-            }
             push_immediate_response(&mut view, text);
         }
     }
@@ -999,13 +974,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 ),
                 Span::styled("  ", Style::default()),
                 Span::styled(startup_info.cwd.clone(), Style::default().fg(Color::Green)),
-                if processing {
+                if processing && self.pending_plan_toggle.is_none() {
                     Span::styled("  Working · Esc cancel", Style::default().fg(Color::Yellow))
                 } else {
-                    Span::styled(
-                        "  Enter send · Shift+Enter/Ctrl+J newline",
-                        Style::default().fg(Color::DarkGray),
-                    )
+                    Span::raw("")
                 },
             ];
             frame.render_widget(
@@ -1043,7 +1015,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         &mut self,
         request_tx: &mpsc::Sender<(TuiAction, CancellationGuard)>,
     ) -> io::Result<()> {
-        if !event::poll(STREAM_INTERVAL)? {
+        if !event::poll(EVENT_POLL_INTERVAL)? {
             return Ok(());
         }
 
@@ -1259,16 +1231,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         }
                     }
                 }
-                KeyCode::PageUp => {
-                    // Conversation scrolling belongs to the terminal emulator.
-                }
-                KeyCode::PageDown => {
-                    // Conversation scrolling belongs to the terminal emulator.
-                }
                 KeyCode::BackTab => {
                     if self.processing {
                         return Ok(());
                     }
+                    let previous = self.plan_mode;
+                    self.plan_mode = !previous;
+                    self.pending_plan_toggle = Some(previous);
                     let action = TuiAction::TogglePlan;
                     self.processing = true;
                     self.cancellation_requested = false;
@@ -1335,26 +1304,16 @@ fn message_lines(message: &Msg) -> Vec<Line<'static>> {
         MsgStyle::User => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
         MsgStyle::ToolCall => Style::default().fg(Color::Green),
         MsgStyle::Observation => Style::default().fg(Color::DarkGray),
         MsgStyle::Response => Style::default().fg(Color::White),
         MsgStyle::Error => Style::default().fg(Color::Red),
         MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
     };
-    let prefix = if message.style == MsgStyle::Thinking {
-        "⎿ "
-    } else {
-        ""
-    };
     message
         .text
         .split('\n')
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 { prefix } else { "" };
-            Line::from(Span::styled(format!("{prefix}{line}"), style))
-        })
+        .map(|line| Line::from(Span::styled(line.to_owned(), style)))
         .collect()
 }
 
@@ -1789,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn immediate_response_is_complete_without_a_stream_placeholder() {
+    fn response_is_committed_as_one_complete_message() {
         let mut view = super::MsgView::new(10);
         push_immediate_response(&mut view, "one.srt\ntwo.srt".to_owned());
         assert_eq!(view.all().len(), 1);

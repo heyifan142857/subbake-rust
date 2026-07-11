@@ -17,8 +17,7 @@ pub use session::*;
 pub use subbake_core::{CancellationGuard, CancellationToken};
 pub use tools::{ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES, ToolKind};
 pub use tui::{
-    Msg, MsgStyle, MsgView, RenderPolicy, StartupInfo, SubBakeTui, TuiAction, TuiInteraction,
-    TuiObserver,
+    Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,
 };
 
 // ---------------------------------------------------------------------------
