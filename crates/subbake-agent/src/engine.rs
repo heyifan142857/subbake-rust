@@ -234,6 +234,19 @@ impl AgentEngine {
         Ok(())
     }
 
+    /// Persist an interactive operation error and return the session log path
+    /// that now contains it.
+    pub fn record_error(&mut self, error: &str) -> std::io::Result<PathBuf> {
+        self.record(EventKind::Error {
+            text: error.to_owned(),
+        })?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        Ok(self.session_store.path_for(&session.id))
+    }
+
     // ------------------------------------------------------------------
     // Plan mode
     // ------------------------------------------------------------------
@@ -887,5 +900,30 @@ fn truncate_summary(text: &str, limit: usize) -> String {
         format!("{value}...")
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod error_persistence_tests {
+    use super::AgentEngine;
+
+    #[test]
+    fn interactive_errors_are_persisted_in_the_active_session() {
+        let root = std::env::temp_dir().join(format!(
+            "subbake-agent-error-{}",
+            crate::session::iso_now().replace([':', '.'], "-")
+        ));
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        let path = engine
+            .record_error("provider request failed")
+            .expect("persist error");
+        let saved = std::fs::read_to_string(&path).expect("read session log");
+
+        assert!(path.starts_with(root.join(".subbake/agent/sessions")));
+        assert!(saved.contains("\"kind\": \"error\""));
+        assert!(saved.contains("provider request failed"));
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 }

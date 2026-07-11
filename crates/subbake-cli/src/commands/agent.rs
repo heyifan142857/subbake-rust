@@ -158,7 +158,17 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                 let _ = engine.save();
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let kind = error.kind();
+                let message = error.to_string();
+                let displayed = match engine.record_error(&message) {
+                    Ok(path) => format!("{message}\nError details saved to:\n{}", path.display()),
+                    Err(save_error) => {
+                        format!("{message}\nWarning: failed to save error details: {save_error}")
+                    }
+                };
+                return Err(io::Error::new(kind, displayed));
+            }
         };
 
         if let Some(candidate) = candidate_backend {

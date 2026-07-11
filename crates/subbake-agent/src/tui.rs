@@ -17,9 +17,14 @@ use std::sync::mpsc;
 use std::thread;
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -31,6 +36,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
+use crate::input_editor::InputEditor;
 use crate::session::iso_now;
 use subbake_core::{CancellationGuard, CancellationToken};
 
@@ -215,6 +221,7 @@ struct StreamingResponse {
 
 struct TerminalSessionGuard {
     active: bool,
+    keyboard_enhancement: bool,
 }
 
 impl TerminalSessionGuard {
@@ -224,7 +231,26 @@ impl TerminalSessionGuard {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        Ok(Self { active: true })
+        if let Err(error) = io::stdout().execute(EnableMouseCapture) {
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+        if keyboard_enhancement
+            && let Err(error) = io::stdout().execute(PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ))
+        {
+            let _ = io::stdout().execute(DisableMouseCapture);
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self {
+            active: true,
+            keyboard_enhancement,
+        })
     }
 
     fn restore(&mut self) -> io::Result<()> {
@@ -232,9 +258,20 @@ impl TerminalSessionGuard {
             return Ok(());
         }
         self.active = false;
+        let keyboard_result = if self.keyboard_enhancement {
+            io::stdout()
+                .execute(PopKeyboardEnhancementFlags)
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let mouse_result = io::stdout().execute(DisableMouseCapture).map(|_| ());
         let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
         let raw_result = disable_raw_mode();
-        screen_result.and(raw_result)
+        keyboard_result
+            .and(mouse_result)
+            .and(screen_result)
+            .and(raw_result)
     }
 }
 
@@ -329,7 +366,7 @@ pub struct SubBakeTui {
     terminal_session: TerminalSessionGuard,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
-    input: String,
+    input: InputEditor,
     input_history: Vec<String>,
     input_mode: InputMode,
     scroll_offset: u16,
@@ -355,7 +392,7 @@ impl SubBakeTui {
             terminal_session,
             terminal,
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(1000))),
-            input: String::new(),
+            input: InputEditor::default(),
             input_history: Vec::new(),
             input_mode: InputMode::Editing,
             scroll_offset: 0,
@@ -630,16 +667,17 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn suggestions(&self) -> Vec<(String, String)> {
-        suggestions_for(&self.input, &self.input_mode)
+        suggestions_for(self.input.text(), &self.input_mode)
     }
 
     fn navigate_history_up(&mut self) {
-        let Some((mode, input)) = history_up(&self.input_history, &self.input, &self.input_mode)
+        let Some((mode, input)) =
+            history_up(&self.input_history, self.input.text(), &self.input_mode)
         else {
             return;
         };
         self.input_mode = mode;
-        self.input = input;
+        self.input.set_text(input);
     }
 
     fn navigate_history_down(&mut self) {
@@ -647,10 +685,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
             return;
         };
         self.input_mode = mode;
-        self.input = input;
+        self.input.set_text(input);
     }
 
     fn draw(&mut self) -> io::Result<()> {
+        let terminal_area = self.terminal.size()?;
         let messages = self
             .msg_view
             .lock()
@@ -680,10 +719,23 @@ Or just type what you want, e.g. "translate @clip.srt""#
             _ => None,
         };
         let creating_profile = matches!(self.input_mode, InputMode::CreatingProfile);
-        let profile_name_input = self.input.clone();
+        let profile_name_input = self.input.text().to_owned();
         let startup_info = self.startup_info.clone();
         let plan_mode = self.plan_mode;
         let mut transcript_page_lines = self.transcript_page_lines;
+
+        let input_width = terminal_area.width.saturating_sub(4).max(1);
+        let max_input_lines = (terminal_area.height.saturating_mul(40) / 100).max(1);
+        let input_line_count = self.input.desired_height(input_width).min(max_input_lines);
+        let input_total_height = input_line_count.saturating_add(3);
+        let suggestion_height = (suggestions.len() as u16).min(
+            terminal_area
+                .height
+                .saturating_sub(input_total_height)
+                .saturating_sub(1),
+        );
+        let visible_input_lines = self.input.visible_lines(input_width, input_line_count);
+        let (input_cursor_x, input_cursor_y) = self.input.cursor_position(input_width);
 
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -880,8 +932,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1),
-                    Constraint::Length(suggestions.len() as u16),
-                    Constraint::Length(4),
+                    Constraint::Length(suggestion_height),
+                    Constraint::Length(input_total_height),
                 ])
                 .split(area);
 
@@ -1018,15 +1070,31 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 input_area.width,
                 1,
             );
-            let available_input_width = input_entry_area.width.saturating_sub(2);
-            let input_line = input_line(
-                &self.input,
-                &self.input_mode,
-                processing,
-                self.input_hint,
-                available_input_width,
-            );
-            let input_widget = Paragraph::new(input_line).block(
+            let input_lines = if self.input.is_empty()
+                && matches!(self.input_mode, InputMode::Editing)
+                && !processing
+            {
+                vec![Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        truncate_with_ellipsis(self.input_hint, usize::from(input_width)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])]
+            } else {
+                visible_input_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let prefix = if index == 0 { "> " } else { "  " };
+                        Line::from(Span::styled(
+                            format!("{prefix}{line}"),
+                            Style::default().fg(Color::Cyan),
+                        ))
+                    })
+                    .collect()
+            };
+            let input_widget = Paragraph::new(input_lines).block(
                 Block::default()
                     .borders(Borders::TOP | Borders::BOTTOM)
                     .border_style(Style::default().fg(Color::DarkGray)),
@@ -1039,6 +1107,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 ),
                 Span::styled("  ", Style::default()),
                 Span::styled(startup_info.cwd.clone(), Style::default().fg(Color::Green)),
+                Span::styled(
+                    "  Enter send · Shift+Enter/Ctrl+J newline",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ];
             frame.render_widget(
                 Paragraph::new(Line::from(status_spans)).wrap(Wrap { trim: false }),
@@ -1061,12 +1133,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 );
             }
 
-            // Set cursor position at end of input.
+            // Keep the terminal cursor aligned with the logical editing cursor.
             frame.set_cursor_position((
-                input_entry_area.x
-                    + 2
-                    + terminal_width(&self.input).min(available_input_width.saturating_sub(2)),
-                input_entry_area.y + 1,
+                input_entry_area.x + 2 + input_cursor_x.min(input_width),
+                input_entry_area.y + 1 + input_cursor_y.min(input_line_count.saturating_sub(1)),
             ));
         })?;
         self.transcript_page_lines = transcript_page_lines;
@@ -1110,6 +1180,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         self.suggestion_index = 0;
                     }
                 }
+                _ if is_insert_newline_key(key)
+                    && !matches!(self.input_mode, InputMode::CreatingProfile) =>
+                {
+                    self.input.insert_newline();
+                    self.input_mode = InputMode::Editing;
+                    self.suggestion_index = 0;
+                }
                 KeyCode::Enter => {
                     if self.processing {
                         return Ok(());
@@ -1137,17 +1214,17 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             }
                             None if !suggestions.is_empty() => {
                                 let index = self.suggestion_index.min(suggestions.len() - 1);
-                                self.input = suggestions[index].0.clone();
+                                self.input.set_text(suggestions[index].0.clone());
                                 self.suggestion_index = 0;
                                 return Ok(());
                             }
                             None => None,
                         }
                     } else if !suggestions.is_empty()
-                        && !suggestions.iter().any(|item| item.0 == self.input)
+                        && !suggestions.iter().any(|item| item.0 == self.input.text())
                     {
                         let index = self.suggestion_index.min(suggestions.len() - 1);
-                        self.input = suggestions[index].0.clone();
+                        self.input.set_text(suggestions[index].0.clone());
                         self.suggestion_index = 0;
                         return Ok(());
                     } else {
@@ -1157,7 +1234,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     let action = if let Some(action) = selected_action {
                         action
                     } else {
-                        let input = std::mem::take(&mut self.input);
+                        let input = self.input.take();
                         let trimmed = input.trim().to_owned();
 
                         if trimmed.is_empty() {
@@ -1231,14 +1308,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     if !matches!(self.input_mode, InputMode::CreatingProfile) {
                         self.input_mode = InputMode::Editing;
                     }
-                    self.input.push(ch);
+                    self.input.insert_char(ch);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
                     if !matches!(self.input_mode, InputMode::CreatingProfile) {
                         self.input_mode = InputMode::Editing;
                     }
-                    self.input.pop();
+                    self.input.backspace();
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
@@ -1247,7 +1324,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             self.suggestion_index =
                                 previous_suggestion(self.suggestion_index, count);
                         }
-                        VerticalNavigation::History => self.navigate_history_up(),
+                        VerticalNavigation::History => {
+                            let width = self.terminal.size()?.width.saturating_sub(4).max(1);
+                            if !self.input.move_up(width) {
+                                self.navigate_history_up();
+                            }
+                        }
                         VerticalNavigation::Disabled => {}
                     }
                 }
@@ -1256,7 +1338,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         VerticalNavigation::Selection(count) => {
                             self.suggestion_index = (self.suggestion_index + 1) % count;
                         }
-                        VerticalNavigation::History => self.navigate_history_down(),
+                        VerticalNavigation::History => {
+                            let width = self.terminal.size()?.width.saturating_sub(4).max(1);
+                            if !self.input.move_down(width) {
+                                self.navigate_history_down();
+                            }
+                        }
                         VerticalNavigation::Disabled => {}
                     }
                 }
@@ -1272,6 +1359,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         } else {
                             (self.suggestion_index + 1) % option_count
                         };
+                    } else if !self.processing {
+                        if key.code == KeyCode::Left {
+                            self.input.move_left();
+                        } else {
+                            self.input.move_right();
+                        }
                     }
                 }
                 KeyCode::PageUp => {
@@ -1298,11 +1391,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     })?;
                 }
                 KeyCode::Tab => {
-                    if self.input.starts_with('/') {
-                        let matches = slash_suggestions(&self.input);
+                    if self.input.text().starts_with('/') {
+                        let matches = slash_suggestions(self.input.text());
                         if !matches.is_empty() {
                             let index = self.suggestion_index.min(matches.len() - 1);
-                            self.input = matches[index].0.to_owned();
+                            self.input.set_text(matches[index].0.to_owned());
                             self.suggestion_index = (index + 1) % matches.len();
                         }
                         return Ok(());
@@ -1317,15 +1410,32 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         "whisper ",
                     ];
                     if !self.input.is_empty()
-                        && let Some(c) = completions.iter().find(|c| c.starts_with(&self.input))
+                        && let Some(c) = completions
+                            .iter()
+                            .find(|c| c.starts_with(self.input.text()))
                     {
-                        self.input = c.to_string();
+                        self.input.set_text(c.to_string());
                     }
                 }
                 _ => {}
             },
             Event::Resize(_, _) => {
                 self.scroll_offset = 0;
+            }
+            Event::Mouse(mouse) => {
+                let picker_or_form = matches!(
+                    self.input_mode,
+                    InputMode::ChoosingSession(_)
+                        | InputMode::ChoosingProfile(_)
+                        | InputMode::CreatingProfile
+                );
+                if !picker_or_form {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => self.scroll_up(self.transcript_page_lines),
+                        MouseEventKind::ScrollDown => self.scroll_down(self.transcript_page_lines),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
@@ -1436,26 +1546,9 @@ fn session_input_hint() -> &'static str {
     INPUT_HINTS[index]
 }
 
-fn input_line<'a>(
-    input: &'a str,
-    mode: &InputMode,
-    processing: bool,
-    hint: &'a str,
-    width: u16,
-) -> Line<'a> {
-    let truncate =
-        |value: &str| truncate_with_ellipsis(value, usize::from(width.saturating_sub(2)));
-    if input.is_empty() && matches!(mode, InputMode::Editing) && !processing {
-        Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Cyan)),
-            Span::styled(truncate(hint), Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            format!("> {}", truncate(input)),
-            Style::default().fg(Color::Cyan),
-        ))
-    }
+fn is_insert_newline_key(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+        || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
@@ -1628,12 +1721,14 @@ fn is_profile_name_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use crate::engine::ProfileChoice;
 
     use super::{
         ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
         VerticalNavigation, approval_choice, empty_mode_choice, history_down, history_up,
-        input_line, is_profile_name_character, picker_viewport, previous_suggestion,
+        is_insert_newline_key, is_profile_name_character, picker_viewport, previous_suggestion,
         profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
         terminal_width, vertical_navigation,
     };
@@ -1646,6 +1741,22 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_and_control_j_are_newline_keys() {
+        assert!(is_insert_newline_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(is_insert_newline_key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_insert_newline_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
         assert_eq!(slash_suggestions("/").len(), 10);
         assert_eq!(
@@ -1653,21 +1764,6 @@ mod tests {
             vec![("/model", "show the active model")]
         );
         assert!(slash_suggestions("hello /").is_empty());
-    }
-
-    #[test]
-    fn input_hint_only_appears_for_idle_empty_editing() {
-        let line = input_line("", &InputMode::Editing, false, "A helpful hint", 80);
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[1].content, "A helpful hint");
-
-        let typed = input_line("hello", &InputMode::Editing, false, "hidden", 80);
-        assert_eq!(typed.spans.len(), 1);
-        assert_eq!(typed.spans[0].content, "> hello");
-
-        let processing = input_line("", &InputMode::Editing, true, "hidden", 80);
-        assert_eq!(processing.spans.len(), 1);
-        assert_eq!(processing.spans[0].content, "> ");
     }
 
     #[test]

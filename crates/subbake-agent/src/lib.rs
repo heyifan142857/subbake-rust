@@ -3,6 +3,7 @@ mod discovery;
 pub mod engine;
 pub mod event;
 pub mod guard;
+mod input_editor;
 pub mod session;
 pub mod tools;
 pub mod tui;
