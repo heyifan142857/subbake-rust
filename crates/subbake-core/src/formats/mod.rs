@@ -62,7 +62,7 @@ pub fn render_document(
     };
 
     match target_format.as_str() {
-        "srt" => srt::render(translations, options.bilingual),
+        "srt" => srt::render(&document.segments, translations, options.bilingual),
         "vtt" => vtt::render(document, translations, options.bilingual),
         "txt" => txt::render(&document.segments, translations, options.bilingual),
         _ => Err(CoreError::UnsupportedFormat(target_format)),
@@ -165,5 +165,37 @@ mod tests {
         let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
             .expect("render txt");
         assert_eq!(rendered, "hello\n你好\nworld\n世界\n");
+    }
+
+    #[test]
+    fn renders_bilingual_srt() {
+        let path = PathBuf::from("clip.srt");
+        let doc = parse_document_text(&path, "1\n00:00:00,000 --> 00:00:01,000\nHello\n", None)
+            .expect("parse srt");
+        let mut translated = doc.segments.clone();
+        translated[0].text = "你好".to_owned();
+
+        let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
+            .expect("render srt");
+        assert!(rendered.contains("Hello\n你好"));
+        assert!(rendered.contains("00:00:00,000 --> 00:00:01,000"));
+    }
+
+    #[test]
+    fn renders_bilingual_vtt_without_losing_metadata() {
+        let path = PathBuf::from("clip.vtt");
+        let doc = parse_document_text(
+            &path,
+            "WEBVTT\n\nNOTE hello\n\nc1\n00:00.000 --> 00:01.000 align:start\nHello\n",
+            None,
+        )
+        .expect("parse vtt");
+        let mut translated = doc.segments.clone();
+        translated[0].text = "你好".to_owned();
+
+        let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
+            .expect("render vtt");
+        assert!(rendered.contains("NOTE hello"));
+        assert!(rendered.contains("c1\n00:00.000 --> 00:01.000 align:start\nHello\n你好"));
     }
 }

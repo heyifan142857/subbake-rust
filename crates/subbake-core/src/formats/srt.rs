@@ -38,7 +38,11 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
     })
 }
 
-pub fn render(segments: &[SubtitleSegment], _bilingual: bool) -> CoreResult<String> {
+pub fn render(
+    source_segments: &[SubtitleSegment],
+    segments: &[SubtitleSegment],
+    bilingual: bool,
+) -> CoreResult<String> {
     let mut blocks = Vec::new();
 
     for segment in segments {
@@ -54,11 +58,20 @@ pub fn render(segments: &[SubtitleSegment], _bilingual: bool) -> CoreResult<Stri
             timing_line.push_str(settings);
         }
 
+        let text = if bilingual {
+            source_segments
+                .iter()
+                .find(|source| source.id == segment.id)
+                .map(|source| format!("{}\n{}", source.text, segment.text))
+                .unwrap_or_else(|| segment.text.clone())
+        } else {
+            segment.text.clone()
+        };
         let mut block = format!(
             "{}\n{}\n{}",
             segment.identifier.as_deref().unwrap_or(&segment.id),
             timing_line,
-            segment.text
+            text
         );
         while block.ends_with('\n') {
             block.pop();

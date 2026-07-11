@@ -25,6 +25,169 @@ pub struct ToolSpec {
     pub description: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArgKind {
+    String,
+    Boolean,
+}
+
+impl ToolArgKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Boolean => "boolean",
+        }
+    }
+
+    fn matches(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Boolean => value.is_boolean(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolArgSpec {
+    pub name: &'static str,
+    pub kind: ToolArgKind,
+    pub required: bool,
+    pub description: &'static str,
+}
+
+impl ToolSpec {
+    pub fn arguments(&self) -> Vec<ToolArgSpec> {
+        tool_arguments(self.name)
+    }
+
+    pub fn prompt_line(&self) -> String {
+        let arguments = self
+            .arguments()
+            .iter()
+            .map(|argument| {
+                let requirement = if argument.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+                format!(
+                    "{}: {} {requirement} ({})",
+                    argument.name,
+                    argument.kind.name(),
+                    argument.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if arguments.is_empty() {
+            format!("- {}: {} Arguments: {{}}", self.name, self.description)
+        } else {
+            format!(
+                "- {}: {} Arguments: {{{arguments}}}",
+                self.name, self.description
+            )
+        }
+    }
+}
+
+const fn arg(
+    name: &'static str,
+    kind: ToolArgKind,
+    required: bool,
+    description: &'static str,
+) -> ToolArgSpec {
+    ToolArgSpec {
+        name,
+        kind,
+        required,
+        description,
+    }
+}
+
+pub fn tool_arguments(name: &str) -> Vec<ToolArgSpec> {
+    use ToolArgKind::{Boolean, String};
+    match name {
+        "translate_file" => vec![
+            arg("path", String, true, "subtitle file path"),
+            arg(
+                "bilingual",
+                Boolean,
+                false,
+                "override bilingual output for this call",
+            ),
+        ],
+        "translate_series" => vec![
+            arg(
+                "path",
+                String,
+                true,
+                "directory path; use . for the current directory",
+            ),
+            arg("recursive", Boolean, false, "include nested directories"),
+            arg("overwrite", Boolean, false, "replace existing outputs"),
+            arg(
+                "bilingual",
+                Boolean,
+                false,
+                "override bilingual output for this call",
+            ),
+        ],
+        "edit_subtitle" => vec![
+            arg("path", String, true, "generated subtitle path"),
+            arg("instruction", String, true, "requested edit"),
+            arg(
+                "allow_non_generated",
+                Boolean,
+                false,
+                "allow editing a source file",
+            ),
+        ],
+        "transcribe_audio" | "read_file" | "read_file_preview" | "delete_file"
+        | "diagnose_path" => vec![arg("path", String, true, "project-local path")],
+        "list_files" => vec![arg("path", String, false, "directory path; defaults to .")],
+        "search_files" => vec![
+            arg("path", String, false, "directory path; defaults to ."),
+            arg("pattern", String, false, "filename search pattern"),
+        ],
+        "candidate_subtitles" => vec![
+            arg("path", String, false, "directory path; defaults to ."),
+            arg("query", String, false, "text used to rank candidates"),
+        ],
+        "create_file" | "append_file" => vec![
+            arg("path", String, true, "project-local path"),
+            arg("content", String, false, "file content"),
+        ],
+        "replace_in_file" => vec![
+            arg("path", String, true, "project-local path"),
+            arg("old", String, false, "text to replace"),
+            arg("new", String, false, "replacement text"),
+        ],
+        "rename_path" => vec![
+            arg("from", String, true, "existing path"),
+            arg("to", String, true, "new path"),
+        ],
+        "diagnose_text" => vec![arg("text", String, true, "diagnostic text")],
+        "switch_profile" => vec![arg("name", String, true, "profile name")],
+        "manage_whisper" => vec![
+            arg(
+                "action",
+                String,
+                false,
+                "status, install, update, uninstall, list-models, or download",
+            ),
+            arg(
+                "keep_models",
+                Boolean,
+                false,
+                "keep models when uninstalling",
+            ),
+            arg("model", String, false, "model name to download"),
+        ],
+        "recent_translations" | "list_profiles" => vec![],
+        _ => vec![],
+    }
+}
+
 /// The 19 tools from the Python agent, grouped by category.
 pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
     // -- translate --
@@ -284,25 +447,34 @@ pub fn ranked_tool_specs(input: &str) -> Vec<&'static ToolSpec> {
 }
 
 pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(), String> {
-    if !ALL_TOOL_SPECS.iter().any(|spec| spec.name == name) {
+    let Some(spec) = ALL_TOOL_SPECS.iter().find(|spec| spec.name == name) else {
         return Err(format!("unknown tool `{name}`"));
-    }
+    };
     let object = arguments
         .as_object()
         .ok_or_else(|| format!("arguments for `{name}` must be a JSON object"))?;
-    let required: &[&str] = match name {
-        "translate_file" | "translate_series" | "transcribe_audio" | "read_file"
-        | "read_file_preview" | "create_file" | "append_file" | "replace_in_file"
-        | "delete_file" | "diagnose_path" => &["path"],
-        "edit_subtitle" => &["path", "instruction"],
-        "rename_path" => &["from", "to"],
-        "diagnose_text" => &["text"],
-        "switch_profile" => &["name"],
-        _ => &[],
-    };
-    for key in required {
-        if object.get(*key).and_then(|value| value.as_str()).is_none() {
-            return Err(format!("tool `{name}` requires string argument `{key}`"));
+    for key in object.keys() {
+        if !spec.arguments().iter().any(|argument| argument.name == key) {
+            return Err(format!("tool `{name}` does not accept argument `{key}`"));
+        }
+    }
+    for argument in spec.arguments() {
+        match object.get(argument.name) {
+            None if argument.required => {
+                return Err(format!(
+                    "tool `{name}` requires {} argument `{}`",
+                    argument.kind.name(),
+                    argument.name
+                ));
+            }
+            Some(value) if !argument.kind.matches(value) => {
+                return Err(format!(
+                    "argument `{}` for tool `{name}` must be {}",
+                    argument.name,
+                    argument.kind.name()
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -330,5 +502,37 @@ mod tests {
         assert!(
             validate_tool_call("translate_file", &serde_json::json!({"path": "clip.srt"})).is_ok()
         );
+        assert!(
+            validate_tool_call(
+                "translate_series",
+                &serde_json::json!({"path": ".", "bilingual": true})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_call(
+                "translate_series",
+                &serde_json::json!({"path": ".", "bilingual": "yes"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_call(
+                "translate_file",
+                &serde_json::json!({"path": "clip.srt", "unexpected": true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prompt_contract_describes_translation_arguments() {
+        let spec = ALL_TOOL_SPECS
+            .iter()
+            .find(|spec| spec.name == "translate_series")
+            .expect("translate series spec");
+        let line = spec.prompt_line();
+        assert!(line.contains("path: string required"));
+        assert!(line.contains("bilingual: boolean optional"));
     }
 }

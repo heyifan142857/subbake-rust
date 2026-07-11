@@ -141,6 +141,19 @@ struct Decision {
     confidence: f64,
 }
 
+fn invalid_decision_response(error: &io::Error) -> Decision {
+    Decision {
+        action: "ask_user".into(),
+        text: format!(
+            "I couldn't execute the proposed action because its arguments were invalid: {error}"
+        ),
+        tool_name: None,
+        arguments: None,
+        tool_calls: Vec::new(),
+        confidence: 1.0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Engine entry point
 // ---------------------------------------------------------------------------
@@ -341,7 +354,7 @@ impl AgentEngine {
         user_input: &str,
         state: &LoopState,
     ) -> io::Result<Decision> {
-        let messages = self.build_decision_messages(user_input, state);
+        let messages = self.build_decision_messages(user_input, state, None);
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
@@ -349,18 +362,42 @@ impl AgentEngine {
         match result {
             Ok((decision, _usage)) => match self.parse_decision_value(&decision) {
                 Ok(decision) => Ok(decision),
-                Err(error) => {
+                Err(first_error) => {
                     if let Some(ref mut obs) = self.observer {
-                        obs.on_error(&error.to_string());
+                        obs.on_error(&first_error.to_string());
                     }
-                    Ok(Decision {
-                        action: "ask_user".into(),
-                        text: "I couldn't validate the proposed action. Could you clarify the file and operation?".into(),
-                        tool_name: None,
-                        arguments: None,
-                        tool_calls: Vec::new(),
-                        confidence: 1.0,
-                    })
+                    let repair_messages = self.build_decision_messages(
+                        user_input,
+                        state,
+                        Some(&first_error.to_string()),
+                    );
+                    match backend
+                        .generate_raw_json_cancellable(&repair_messages, &self.operation_guard)
+                    {
+                        Ok((repaired, _usage)) => match self.parse_decision_value(&repaired) {
+                            Ok(decision) => Ok(decision),
+                            Err(second_error) => {
+                                if let Some(ref mut obs) = self.observer {
+                                    obs.on_error(&second_error.to_string());
+                                }
+                                Ok(invalid_decision_response(&second_error))
+                            }
+                        },
+                        Err(subbake_core::CoreError::Cancelled) => Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "operation cancelled",
+                        )),
+                        Err(error) => Ok(Decision {
+                            action: "ask_user".into(),
+                            text: format!(
+                                "The proposed action was invalid ({first_error}), and the repair attempt failed: {error}"
+                            ),
+                            tool_name: None,
+                            arguments: None,
+                            tool_calls: Vec::new(),
+                            confidence: 1.0,
+                        }),
+                    }
                 }
             },
             Err(e) => {
@@ -386,12 +423,17 @@ impl AgentEngine {
     }
 
     /// Build the LLM message context for the decision call.
-    fn build_decision_messages(&self, user_input: &str, state: &LoopState) -> Vec<ChatMessage> {
+    fn build_decision_messages(
+        &self,
+        user_input: &str,
+        state: &LoopState,
+        repair_error: Option<&str>,
+    ) -> Vec<ChatMessage> {
         let mut system = String::new();
         system.push_str("You are SubBake, a subtitle translation assistant.\n\n");
         system.push_str("Relevant available tools:\n");
         for spec in ranked_tool_specs(user_input) {
-            system.push_str(&format!("- {}: {}", spec.name, spec.description));
+            system.push_str(&spec.prompt_line());
             if spec.mutating {
                 system.push_str(" (mutating)");
             }
@@ -409,6 +451,14 @@ impl AgentEngine {
             "Keep confidence high (≥0.85) for direct tool calls, lower for clarification.\n",
         );
         system.push_str("Preserve subtitle id order, never merge or drop entries.\n");
+        system.push_str("Use translate_file for one explicit subtitle file and translate_series for a directory, batch, or all-files request.\n");
+        system.push_str("Reuse exact paths from discovery observations. Use path `.` for the current directory.\n");
+        system.push_str("When the user explicitly requests bilingual subtitles, pass bilingual=true to the translation tool.\n");
+        if let Some(error) = repair_error {
+            system.push_str("\nYour previous decision was rejected by local validation. Return one corrected JSON decision and do not repeat the error:\n");
+            system.push_str(error);
+            system.push('\n');
+        }
 
         let mut user = String::new();
         user.push_str("User: ");
@@ -735,7 +785,10 @@ impl AgentEngine {
             "translate_file" => {
                 let path = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&path)?;
-                let settings = self.active_translation_settings()?;
+                let mut settings = self.active_translation_settings()?;
+                if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
+                    settings.bilingual = bilingual;
+                }
                 let output_path =
                     default_output_path(&input, settings.output_format(), settings.bilingual)?;
                 let undo_snapshot = self.guard.snapshot_write(&output_path)?;
@@ -764,7 +817,10 @@ impl AgentEngine {
                     .get("overwrite")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let settings = self.active_translation_settings()?;
+                let mut settings = self.active_translation_settings()?;
+                if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
+                    settings.bilingual = bilingual;
+                }
                 let source_files = if recursive {
                     self.guard.search_files(&input, "")?
                 } else {
@@ -1124,6 +1180,7 @@ struct QuickResult {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1131,6 +1188,104 @@ mod tests {
 
     struct RawDecisionBackend {
         decision: JsonValue,
+    }
+
+    struct SequenceDecisionBackend {
+        decisions: VecDeque<JsonValue>,
+        prompts: Vec<Vec<ChatMessage>>,
+    }
+
+    impl LlmBackend for SequenceDecisionBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "sequence"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            EchoDecisionBackend::new("test").generate_json(messages)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            messages: &[ChatMessage],
+        ) -> CoreResult<(JsonValue, Usage)> {
+            self.prompts.push(messages.to_vec());
+            Ok((
+                self.decisions
+                    .pop_front()
+                    .unwrap_or_else(|| json!({"action": "respond", "text": "done"})),
+                Usage::default(),
+            ))
+        }
+    }
+
+    #[test]
+    fn invalid_tool_call_gets_one_contextual_repair_attempt() {
+        let root = temp_root("decision-repair");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = SequenceDecisionBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action": "tool_call",
+                    "tool_name": "translate_file",
+                    "arguments": {},
+                    "confidence": 0.95
+                }),
+                json!({"action": "respond", "text": "repaired", "confidence": 1.0}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("翻译目录下的字幕", &mut backend)
+            .expect("run decision loop");
+        assert_eq!(response, "repaired");
+        assert_eq!(backend.prompts.len(), 2);
+        let repair_system = backend.prompts[1]
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("repair system prompt");
+        assert!(
+            repair_system
+                .content
+                .contains("requires string argument `path`")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn translation_prompt_distinguishes_directory_and_bilingual_requests() {
+        let root = temp_root("translation-prompt");
+        let engine = AgentEngine::new(root);
+        let messages = engine.build_decision_messages(
+            "翻译目录下的srt文件成为中英双语字幕",
+            &LoopState {
+                step: 1,
+                max_steps: AGENT_LOOP_MAX_STEPS,
+                observations: vec![Observation {
+                    tool_name: "list_files".to_owned(),
+                    text: "/project/movie.srt".to_owned(),
+                    summary: "1 file".to_owned(),
+                }],
+            },
+            None,
+        );
+        let system = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("system prompt");
+        let user = messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("user prompt");
+        assert!(system.content.contains("translate_series"));
+        assert!(system.content.contains("bilingual=true"));
+        assert!(user.content.contains("/project/movie.srt"));
     }
 
     impl LlmBackend for RawDecisionBackend {
@@ -1189,6 +1344,28 @@ mod tests {
         assert!(!root.join("clip.translated.txt").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn translation_tool_bilingual_argument_overrides_settings_for_one_call() {
+        let root = temp_root("bilingual-override");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("clip.txt"), "hello\n").expect("write subtitle");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+
+        engine
+            .run_tool(
+                "translate_file",
+                &json!({"path": "clip.txt", "bilingual": true}),
+            )
+            .expect("translate bilingual");
+
+        let output = root.join("clip.bilingual.txt");
+        assert!(output.exists());
+        let content = std::fs::read_to_string(output).expect("read output");
+        assert!(content.lines().count() >= 2, "{content}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1430,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_llm_tool_call_becomes_clarification() {
+    fn repeatedly_invalid_llm_tool_call_reports_specific_validation_error() {
         let root = temp_root("invalid-decision");
         std::fs::create_dir_all(&root).expect("create root");
         let mut engine = AgentEngine::new(root.clone());
@@ -1448,7 +1625,7 @@ mod tests {
             .run_line("do something", &mut backend)
             .expect("clarification");
 
-        assert!(response.contains("clarify"));
+        assert!(response.contains("unknown tool `shell`"), "{response}");
         assert_eq!(
             engine
                 .session

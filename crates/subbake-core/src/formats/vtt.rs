@@ -61,7 +61,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
 pub fn render(
     document: &SubtitleDocument,
     segments: &[SubtitleSegment],
-    _bilingual: bool,
+    bilingual: bool,
 ) -> CoreResult<String> {
     let mut blocks = Vec::new();
 
@@ -101,10 +101,20 @@ pub fn render(
         }
         cue_lines.push(timing_line);
 
-        if segment.text.is_empty() {
+        let text = if bilingual {
+            document
+                .segments
+                .iter()
+                .find(|source| source.id == segment.id)
+                .map(|source| format!("{}\n{}", source.text, segment.text))
+                .unwrap_or_else(|| segment.text.clone())
+        } else {
+            segment.text.clone()
+        };
+        if text.is_empty() {
             cue_lines.push(String::new());
         } else {
-            cue_lines.extend(segment.text.lines().map(ToOwned::to_owned));
+            cue_lines.extend(text.lines().map(ToOwned::to_owned));
         }
 
         blocks.push(cue_lines.join("\n").trim_end().to_owned());
