@@ -677,11 +677,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         if lines.is_empty() {
             return Ok(());
         }
-        let height = lines
-            .iter()
-            .map(|line| line.width().max(1).div_ceil(usize::from(width)))
-            .sum::<usize>()
-            .min(usize::from(u16::MAX)) as u16;
+        let height = history_lines_height(&lines, width);
         self.terminal.insert_before(height.max(1), move |buffer| {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -1380,6 +1376,14 @@ fn message_lines(message: &Msg) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn history_lines_height(lines: &[Line<'static>], width: u16) -> u16 {
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(usize::from(width.max(1))))
+        .sum::<usize>()
+        .min(usize::from(u16::MAX)) as u16
+}
+
 fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(4));
     let inner_width = width.saturating_sub(2);
@@ -1629,11 +1633,12 @@ mod tests {
     use crate::engine::ProfileChoice;
 
     use super::{
-        ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
-        VerticalNavigation, approval_choice, empty_mode_choice, history_down, history_up,
-        is_insert_newline_key, is_profile_name_character, picker_viewport, previous_suggestion,
-        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
-        terminal_width, vertical_navigation,
+        ApprovalChoice, EmptyModeChoice, InputMode, Msg, MsgStyle, ProfilePickerChoice, TuiAction,
+        TuiPicker, VerticalNavigation, approval_choice, empty_mode_choice, history_down,
+        history_lines_height, history_up, is_insert_newline_key, is_profile_name_character,
+        message_lines, picker_viewport, previous_suggestion, profile_picker_choice,
+        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
+        vertical_navigation,
     };
 
     #[test]
@@ -1641,6 +1646,18 @@ mod tests {
         assert_eq!(terminal_width("hello"), 5);
         assert_eq!(terminal_width("中文"), 4);
         assert_eq!(terminal_width("a中"), 3);
+    }
+
+    #[test]
+    fn history_height_uses_display_width_for_mixed_cjk_text() {
+        let message = Msg {
+            style: MsgStyle::Response,
+            text: "➔ 翻译此文件：<i>[Robert, the 17th Earl of Bruce:]</i>".to_owned(),
+            stamp: String::new(),
+        };
+        let lines = message_lines(&message);
+        assert_eq!(history_lines_height(&lines, 40), 2);
+        assert!(lines[0].width() > 40);
     }
 
     #[test]
