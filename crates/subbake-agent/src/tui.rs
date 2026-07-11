@@ -31,6 +31,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::session::iso_now;
@@ -836,7 +837,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     area,
                 );
                 frame.set_cursor_position((
-                    area.x + 3 + profile_name_input.chars().count() as u16,
+                    area.x + 3 + terminal_width(&profile_name_input),
                     area.y + 5,
                 ));
                 return;
@@ -980,7 +981,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
             // Set cursor position at end of input.
             frame.set_cursor_position((
-                input_area.x + 2 + self.input.len() as u16,
+                input_area.x + 2 + terminal_width(&self.input),
                 input_area.y + 1,
             ));
         })?;
@@ -1300,6 +1301,10 @@ const INPUT_HINTS: &[&str] = &[
     "Use /history to revisit earlier requests",
 ];
 
+fn terminal_width(value: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(value)).unwrap_or(u16::MAX)
+}
+
 fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'_>> {
     let width = usize::from(width.max(4));
     let inner_width = width.saturating_sub(2);
@@ -1550,8 +1555,15 @@ mod tests {
         ApprovalChoice, EmptyModeChoice, InputMode, ProfilePickerChoice, TuiAction, TuiPicker,
         approval_choice, empty_mode_choice, history_down, history_up, input_line,
         is_profile_name_character, picker_viewport, previous_suggestion, profile_picker_choice,
-        push_immediate_response, slash_suggestions, suggestions_for,
+        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
     };
+
+    #[test]
+    fn terminal_width_uses_display_columns_for_unicode_input() {
+        assert_eq!(terminal_width("hello"), 5);
+        assert_eq!(terminal_width("中文"), 4);
+        assert_eq!(terminal_width("a中"), 3);
+    }
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
