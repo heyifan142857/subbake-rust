@@ -301,6 +301,31 @@ mod tests {
         assert_eq!(output, "existing\n");
     }
 
+    #[test]
+    fn batch_parse_error_identifies_the_malformed_file_and_block() {
+        let root = temp_root("batch-malformed");
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("broken.srt");
+        fs::write(
+            &input_path,
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n\nas a warning.\n",
+        )
+        .expect("write malformed subtitle");
+
+        let error = translate_subtitle_batch(BatchTranslationRequest {
+            root: root.clone(),
+            recursive: false,
+            overwrite: false,
+            settings: TranslationSettings::default(),
+        })
+        .expect_err("malformed subtitle should stop the batch");
+        let message = error.to_string();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(message.contains(&input_path.display().to_string()));
+        assert!(message.contains("Malformed SRT block:\nas a warning."));
+    }
+
     fn temp_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)

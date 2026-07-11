@@ -14,7 +14,8 @@ pub fn is_supported_subtitle_path(path: &Path) -> bool {
 
 pub fn read_document(path: &Path) -> io::Result<SubtitleDocument> {
     let text = fs::read_to_string(path)?;
-    parse_document_text(path, &text, None).map_err(io::Error::other)
+    parse_document_text(path, &text, None)
+        .map_err(|error| io::Error::other(format!("failed to parse {}: {error}", path.display())))
 }
 
 pub fn render_and_write_document(

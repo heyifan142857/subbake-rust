@@ -124,31 +124,7 @@ impl AgentSessionStore {
     }
 
     pub fn latest(&self) -> std::io::Result<Option<AgentSession>> {
-        if !self.root.is_dir() {
-            return Ok(None);
-        }
-        let mut entries: Vec<_> = std::fs::read_dir(&self.root)
-            .map_err(|e| std::io::Error::other(format!("list sessions: {e}")))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-            .collect();
-        // Sort by modification time (newest last), skipping un-stat-able entries.
-        entries.sort_by(|a, b| {
-            let a_time = a.path().metadata().ok().and_then(|m| m.modified().ok());
-            let b_time = b.path().metadata().ok().and_then(|m| m.modified().ok());
-            a_time.cmp(&b_time)
-        });
-        if let Some(latest) = entries.into_iter().last() {
-            let path = latest.path();
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_owned();
-            self.load(&id).map(Some)
-        } else {
-            Ok(None)
-        }
+        Ok(self.list(1)?.into_iter().next())
     }
 
     pub fn list(&self, limit: usize) -> std::io::Result<Vec<AgentSession>> {
@@ -171,8 +147,11 @@ impl AgentSessionStore {
                 sessions.push(session);
             }
         }
-        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        sessions.reverse();
+        sessions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         sessions.truncate(limit);
         Ok(sessions)
     }
@@ -264,17 +243,46 @@ mod tests {
     }
 
     #[test]
-    fn latest_returns_most_recent() {
+    fn sessions_are_ordered_by_latest_activity() {
         let dir = std::env::temp_dir().join(format!("subbake-agent-latest-{}", hex_id()));
         let store = AgentSessionStore::new(dir.clone());
         let mut s1 = store.create().expect("session 1");
         s1.record_event("user", "first", serde_json::json!({}));
+        s1.created_at = "2026-07-11T01:00:00Z".to_owned();
+        s1.updated_at = "2026-07-11T03:00:00Z".to_owned();
         store.save(&s1).expect("save session 1");
         let mut s2 = store.create().expect("session 2");
         s2.record_event("user", "second", serde_json::json!({}));
+        s2.created_at = "2026-07-11T02:00:00Z".to_owned();
+        s2.updated_at = "2026-07-11T02:00:00Z".to_owned();
         store.save(&s2).expect("save session 2");
+
+        let sessions = store.list(20).expect("list sessions");
         let latest = store.latest().expect("latest").expect("some session");
-        assert_eq!(latest.id, s2.id);
+
+        assert_eq!(sessions[0].id, s1.id);
+        assert_eq!(sessions[1].id, s2.id);
+        assert_eq!(latest.id, s1.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_order_is_stable_when_update_times_match() {
+        let dir = std::env::temp_dir().join(format!("subbake-agent-tie-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+        let mut first = AgentSession::new("session-a".to_owned());
+        first.record_event("user", "first", serde_json::json!({}));
+        first.updated_at = "2026-07-11T03:00:00Z".to_owned();
+        store.save(&first).expect("save first session");
+        let mut second = AgentSession::new("session-b".to_owned());
+        second.record_event("user", "second", serde_json::json!({}));
+        second.updated_at = first.updated_at.clone();
+        store.save(&second).expect("save second session");
+
+        let sessions = store.list(20).expect("list sessions");
+        assert_eq!(sessions[0].id, "session-b");
+        assert_eq!(sessions[1].id, "session-a");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
