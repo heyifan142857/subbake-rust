@@ -1047,7 +1047,14 @@ fn build_translation_messages(
     );
 
     vec![
-        ChatMessage::system("TASK_START\ntranslate_subtitles\nTASK_END"),
+        ChatMessage::system(
+            "TASK_START\ntranslate_subtitles\nTASK_END\n\
+Return JSON only with this shape:\n\
+{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}],\"summary\":\"\",\"glossary_updates\":[]}\n\
+Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
+The translated text must be in the translation field; do not return it in text or translated_text.\n\
+Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.",
+        ),
         ChatMessage::user(user),
     ]
 }

@@ -303,11 +303,9 @@ pub(crate) fn parse_translation_payload(v: &Value) -> CoreResult<BatchTranslatio
         .as_array()
         .ok_or_else(|| CoreError::InvalidTranslation("response missing lines array".to_owned()))?
         .iter()
-        .map(|x| TranslationLine {
-            id: x["id"].as_str().unwrap_or_default().to_owned(),
-            translation: x["translation"].as_str().unwrap_or_default().to_owned(),
-        })
-        .collect();
+        .enumerate()
+        .map(|(index, line)| parse_translation_line(line, index))
+        .collect::<CoreResult<Vec<_>>>()?;
     let glossary_updates = match &v["glossary_updates"] {
         Value::Array(a) => a
             .iter()
@@ -329,6 +327,23 @@ pub(crate) fn parse_translation_payload(v: &Value) -> CoreResult<BatchTranslatio
         lines,
         summary: v["summary"].as_str().unwrap_or_default().to_owned(),
         glossary_updates,
+    })
+}
+fn parse_translation_line(v: &Value, index: usize) -> CoreResult<TranslationLine> {
+    let id = v["id"].as_str().ok_or_else(|| {
+        CoreError::InvalidTranslation(format!("line {} is missing string field `id`", index + 1))
+    })?;
+    let translation = ["translation", "translated_text", "text"]
+        .into_iter()
+        .find_map(|field| v[field].as_str())
+        .ok_or_else(|| {
+            CoreError::InvalidTranslation(format!(
+                "translation for id `{id}` is missing string field `translation`"
+            ))
+        })?;
+    Ok(TranslationLine {
+        id: id.to_owned(),
+        translation: translation.to_owned(),
     })
 }
 fn usage(format: ApiFormat, b: &Value, text: &str, p: &Value) -> Usage {
@@ -364,4 +379,39 @@ fn usage(format: ApiFormat, b: &Value, text: &str, p: &Value) -> Usage {
 }
 fn estimate(s: &str) -> usize {
     s.chars().count().div_ceil(4).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_translation_payload;
+
+    #[test]
+    fn translation_payload_accepts_migration_field_aliases() {
+        let payload = parse_translation_payload(&json!({
+            "lines": [
+                {"id": "1", "translated_text": "你好"},
+                {"id": "2", "text": "再见"}
+            ]
+        }))
+        .expect("migration aliases should parse");
+
+        assert_eq!(payload.lines[0].translation, "你好");
+        assert_eq!(payload.lines[1].translation, "再见");
+    }
+
+    #[test]
+    fn translation_payload_reports_a_missing_translation_field() {
+        let error = parse_translation_payload(&json!({
+            "lines": [{"id": "1", "content": "你好"}]
+        }))
+        .expect_err("unknown fields must not become an empty translation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing string field `translation`")
+        );
+    }
 }

@@ -87,11 +87,9 @@ pub(crate) fn parse_translation_payload(
         .as_array()
         .ok_or_else(|| CoreError::InvalidTranslation("response missing lines array".to_owned()))?
         .iter()
-        .map(|line| TranslationLine {
-            id: line["id"].as_str().unwrap_or_default().to_owned(),
-            translation: line["translation"].as_str().unwrap_or_default().to_owned(),
-        })
-        .collect();
+        .enumerate()
+        .map(|(index, line)| parse_translation_line(line, index))
+        .collect::<CoreResult<Vec<_>>>()?;
     let glossary_updates = match &payload["glossary_updates"] {
         serde_json::Value::Array(entries) => entries
             .iter()
@@ -113,6 +111,24 @@ pub(crate) fn parse_translation_payload(
         lines,
         summary: payload["summary"].as_str().unwrap_or_default().to_owned(),
         glossary_updates,
+    })
+}
+
+fn parse_translation_line(line: &serde_json::Value, index: usize) -> CoreResult<TranslationLine> {
+    let id = line["id"].as_str().ok_or_else(|| {
+        CoreError::InvalidTranslation(format!("line {} is missing string field `id`", index + 1))
+    })?;
+    let translation = ["translation", "translated_text", "text"]
+        .into_iter()
+        .find_map(|field| line[field].as_str())
+        .ok_or_else(|| {
+            CoreError::InvalidTranslation(format!(
+                "translation for id `{id}` is missing string field `translation`"
+            ))
+        })?;
+    Ok(TranslationLine {
+        id: id.to_owned(),
+        translation: translation.to_owned(),
     })
 }
 
