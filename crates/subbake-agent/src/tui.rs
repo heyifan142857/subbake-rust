@@ -1,4 +1,5 @@
-//! Chat‑style TUI: scrollable output pane above, fixed input bar below.
+//! Chat-style inline TUI: committed output is written to the terminal's native
+//! scrollback while the composer and active picker are redrawn below it.
 //!
 //! Layout (inspired by Codex / OpenCode):
 //!
@@ -18,21 +19,15 @@ use std::thread;
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
-};
-use ratatui::Terminal;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
@@ -84,7 +79,6 @@ impl Default for StartupInfo {
 }
 
 const STREAM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
-const THINKING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
@@ -212,13 +206,6 @@ impl TuiAction {
     }
 }
 
-struct StreamingResponse {
-    chars: Vec<char>,
-    position: usize,
-    message_index: usize,
-    next_at: std::time::Instant,
-}
-
 struct TerminalSessionGuard {
     active: bool,
     keyboard_enhancement: bool,
@@ -227,23 +214,12 @@ struct TerminalSessionGuard {
 impl TerminalSessionGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(error);
-        }
-        if let Err(error) = io::stdout().execute(EnableMouseCapture) {
-            let _ = io::stdout().execute(LeaveAlternateScreen);
-            let _ = disable_raw_mode();
-            return Err(error);
-        }
         let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
         if keyboard_enhancement
             && let Err(error) = io::stdout().execute(PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
             ))
         {
-            let _ = io::stdout().execute(DisableMouseCapture);
-            let _ = io::stdout().execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -265,13 +241,8 @@ impl TerminalSessionGuard {
         } else {
             Ok(())
         };
-        let mouse_result = io::stdout().execute(DisableMouseCapture).map(|_| ());
-        let screen_result = io::stdout().execute(LeaveAlternateScreen).map(|_| ());
         let raw_result = disable_raw_mode();
-        keyboard_result
-            .and(mouse_result)
-            .and(screen_result)
-            .and(raw_result)
+        keyboard_result.and(raw_result)
     }
 }
 
@@ -291,14 +262,14 @@ pub struct MsgView {
 impl MsgView {
     pub fn new(max: usize) -> Self {
         Self {
-            messages: Vec::with_capacity(max),
+            messages: Vec::with_capacity(max.min(4096)),
             max,
         }
     }
 
     pub fn push(&mut self, style: MsgStyle, text: String) {
         let stamp = iso_now();
-        if self.messages.len() >= self.max {
+        if self.max != usize::MAX && self.messages.len() >= self.max {
             self.messages.remove(0);
         }
         self.messages.push(Msg { style, text, stamp });
@@ -369,44 +340,47 @@ pub struct SubBakeTui {
     input: InputEditor,
     input_history: Vec<String>,
     input_mode: InputMode,
-    scroll_offset: u16,
     running: bool,
-    streaming: Option<StreamingResponse>,
     suggestion_index: usize,
     processing: bool,
-    animation_started_at: std::time::Instant,
     cancellation: Option<CancellationToken>,
     cancellation_requested: bool,
     input_hint: &'static str,
     startup_info: StartupInfo,
     plan_mode: bool,
-    transcript_page_lines: u16,
+    history_cursor: usize,
+    startup_pending: bool,
 }
 
 impl SubBakeTui {
     pub fn new() -> io::Result<Self> {
         let terminal_session = TerminalSessionGuard::enter()?;
         let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::new(backend)?;
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )?;
         Ok(Self {
             terminal_session,
             terminal,
-            msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(1000))),
+            // The terminal emulator owns scrollback retention. Keep the source
+            // items for this process lifetime so the commit cursor stays stable.
+            msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(usize::MAX))),
             input: InputEditor::default(),
             input_history: Vec::new(),
             input_mode: InputMode::Editing,
-            scroll_offset: 0,
             running: true,
-            streaming: None,
             suggestion_index: 0,
             processing: false,
-            animation_started_at: std::time::Instant::now(),
             cancellation: None,
             cancellation_requested: false,
             input_hint: session_input_hint(),
             startup_info: StartupInfo::default(),
             plan_mode: false,
-            transcript_page_lines: 10,
+            history_cursor: 0,
+            startup_pending: true,
         })
     }
 
@@ -438,9 +412,13 @@ impl SubBakeTui {
     }
 
     pub fn set_session_replay(&mut self, events: Vec<crate::session::AgentEvent>) {
-        self.finish_stream();
         if let Ok(mut view) = self.msg_view.lock() {
-            view.messages.clear();
+            if !view.messages.is_empty() {
+                view.push(
+                    MsgStyle::System,
+                    "──────── resumed session ────────".to_owned(),
+                );
+            }
             for event in events {
                 let (style, text) = match event.kind.as_str() {
                     "user" => (
@@ -465,7 +443,6 @@ impl SubBakeTui {
                 });
             }
         }
-        self.scroll_offset = 0;
     }
 
     /// Show the same resume picker used by the `/sessions` command on startup.
@@ -571,7 +548,7 @@ impl SubBakeTui {
                         }
                     }
                 }
-                self.advance_stream();
+                self.flush_history()?;
                 self.draw()?;
                 self.handle_event(&request_tx)?;
             }
@@ -580,12 +557,16 @@ impl SubBakeTui {
 
         drop(request_tx);
         drop(response_rx);
+        let clear_result = self.terminal.clear();
+        let cursor_result = self.terminal.show_cursor();
         let terminal_result = self.terminal_session.restore();
         let worker_result = worker
             .join()
             .map_err(|_| io::Error::other("agent worker panicked"));
 
         loop_result?;
+        clear_result?;
+        cursor_result?;
         terminal_result?;
         worker_result
     }
@@ -616,53 +597,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
         }
     }
 
-    fn start_stream(&mut self, text: String) {
-        self.finish_stream();
-        if let Ok(mut view) = self.msg_view.lock() {
-            self.streaming = begin_stream(&mut view, text);
-        }
-    }
-
     fn render_response(&mut self, text: String, policy: RenderPolicy) {
-        match policy {
-            RenderPolicy::Stream => self.start_stream(text),
-            RenderPolicy::Immediate => {
-                self.finish_stream();
-                if let Ok(mut view) = self.msg_view.lock() {
-                    push_immediate_response(&mut view, text);
-                }
+        let _ = policy;
+        if let Ok(mut view) = self.msg_view.lock() {
+            if let Some(index) = view
+                .messages
+                .iter()
+                .rposition(|message| message.style == MsgStyle::Thinking)
+                && index >= self.history_cursor
+            {
+                view.messages.remove(index);
             }
-        }
-    }
-
-    fn finish_stream(&mut self) {
-        let Some(stream) = self.streaming.take() else {
-            return;
-        };
-        if let Ok(mut view) = self.msg_view.lock()
-            && let Some(message) = view.messages.get_mut(stream.message_index)
-        {
-            message.text.extend(&stream.chars[stream.position..]);
-        }
-    }
-
-    fn advance_stream(&mut self) {
-        let Some(stream) = self.streaming.as_mut() else {
-            return;
-        };
-        if std::time::Instant::now() < stream.next_at {
-            return;
-        }
-        if let Ok(mut view) = self.msg_view.lock()
-            && let Some(message) = view.messages.get_mut(stream.message_index)
-            && let Some(ch) = stream.chars.get(stream.position)
-        {
-            message.text.push(*ch);
-            stream.position += 1;
-            stream.next_at = std::time::Instant::now() + STREAM_INTERVAL;
-        }
-        if stream.position >= stream.chars.len() {
-            self.streaming = None;
+            push_immediate_response(&mut view, text);
         }
     }
 
@@ -688,14 +634,51 @@ Or just type what you want, e.g. "translate @clip.srt""#
         self.input.set_text(input);
     }
 
-    fn draw(&mut self) -> io::Result<()> {
-        let terminal_area = self.terminal.size()?;
+    /// Commit completed output above the inline viewport. Once inserted, these
+    /// rows belong to the terminal emulator's native scrollback and are no
+    /// longer redrawn by SubBake.
+    fn flush_history(&mut self) -> io::Result<()> {
+        let width = self.terminal.size()?.width.max(1);
+        if self.startup_pending {
+            self.startup_pending = false;
+            let lines = startup_panel_lines(&self.startup_info, width);
+            self.insert_history_lines(lines, width)?;
+        }
+
         let messages = self
             .msg_view
             .lock()
-            .map(|v| v.all().to_vec())
+            .map(|view| view.messages[self.history_cursor.min(view.messages.len())..].to_vec())
             .unwrap_or_default();
-        let scroll = self.scroll_offset;
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.history_cursor = self.history_cursor.saturating_add(messages.len());
+        let lines = messages
+            .iter()
+            .flat_map(message_lines)
+            .collect::<Vec<Line<'static>>>();
+        self.insert_history_lines(lines, width)
+    }
+
+    fn insert_history_lines(&mut self, lines: Vec<Line<'static>>, width: u16) -> io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let height = lines
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(usize::from(width)))
+            .sum::<usize>()
+            .min(usize::from(u16::MAX)) as u16;
+        self.terminal.insert_before(height.max(1), move |buffer| {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(buffer.area, buffer);
+        })
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        let terminal_area = self.terminal.size()?;
         let suggestions = self.suggestions();
         let selected_suggestion = match &self.input_mode {
             InputMode::ChoosingSession(picker) => self
@@ -709,7 +692,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .min(suggestions.len().saturating_sub(1)),
         };
         let processing = self.processing;
-        let animation_tick = self.animation_started_at.elapsed().as_millis() / 80;
         let session_picker = match &self.input_mode {
             InputMode::ChoosingSession(picker) => Some(picker.options.clone()),
             _ => None,
@@ -722,7 +704,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let profile_name_input = self.input.text().to_owned();
         let startup_info = self.startup_info.clone();
         let plan_mode = self.plan_mode;
-        let mut transcript_page_lines = self.transcript_page_lines;
 
         let input_width = terminal_area.width.saturating_sub(4).max(1);
         let max_input_lines = (terminal_area.height.saturating_mul(40) / 100).max(1);
@@ -931,102 +912,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Min(1),
                     Constraint::Length(suggestion_height),
                     Constraint::Length(input_total_height),
                 ])
                 .split(area);
 
-            // -- Output pane --
-            let transcript_area = chunks[0];
-            transcript_page_lines = transcript_area.height.max(1);
-            let mut items =
-                startup_panel_lines(&startup_info, transcript_area.width.saturating_sub(1));
-            items.push(Line::from(""));
-            items.extend(
-                messages
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(index, msg)| {
-                        let is_active_thinking = processing
-                            && msg.style == MsgStyle::Thinking
-                            && !messages[index + 1..]
-                                .iter()
-                                .any(|later| later.style == MsgStyle::Thinking);
-                        let style = match msg.style {
-                            MsgStyle::User => Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                            MsgStyle::Thinking if is_active_thinking => {
-                                let colors = [Color::Yellow, Color::LightYellow, Color::White];
-                                Style::default()
-                                    .fg(colors[(animation_tick as usize / 2) % colors.len()])
-                                    .add_modifier(Modifier::BOLD)
-                            }
-                            MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
-                            MsgStyle::ToolCall => Style::default().fg(Color::Green),
-                            MsgStyle::Observation => Style::default().fg(Color::DarkGray),
-                            MsgStyle::Response => Style::default().fg(Color::White),
-                            MsgStyle::Error => Style::default().fg(Color::Red),
-                            MsgStyle::System => {
-                                Style::default().fg(Color::Blue).add_modifier(Modifier::DIM)
-                            }
-                        };
-                        let display_text = if msg.style == MsgStyle::Thinking {
-                            let marker = if is_active_thinking {
-                                THINKING_FRAMES[animation_tick as usize % THINKING_FRAMES.len()]
-                            } else {
-                                "⎿"
-                            };
-                            format!("{marker} {}", msg.text)
-                        } else {
-                            msg.text.clone()
-                        };
-                        let lines = display_text
-                            .split('\n')
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                        lines
-                            .into_iter()
-                            .map(move |line| Line::from(Span::styled(line, style)))
-                    })
-                    .collect::<Vec<Line<'_>>>(),
-            );
-
-            let visual_line_count = items
-                .iter()
-                .map(|line| {
-                    let width = usize::from(transcript_area.width.max(1));
-                    line.width().max(1).div_ceil(width)
-                })
-                .sum::<usize>();
-
-            let paragraph = Paragraph::new(items)
-                .block(Block::default().borders(Borders::NONE))
-                .wrap(Wrap { trim: false });
-            let max_scroll = visual_line_count
-                .saturating_sub(usize::from(transcript_area.height))
-                .min(usize::from(u16::MAX)) as u16;
-            // `scroll_offset` is the number of visual lines above the newest
-            // output, so zero follows a growing/streaming response.
-            let offset = max_scroll.saturating_sub(scroll.min(max_scroll));
-            let paragraph = paragraph.scroll((offset, 0));
-            frame.render_widget(paragraph, transcript_area);
-            if max_scroll > 0 {
-                let mut scrollbar_state =
-                    ScrollbarState::new(usize::from(max_scroll)).position(usize::from(offset));
-                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .track_symbol(Some("│"))
-                    .track_style(Style::default().fg(Color::Black))
-                    .thumb_symbol("█")
-                    .thumb_style(Style::default().fg(Color::DarkGray));
-                frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
-            }
-
             // -- Slash command suggestions --
-            let suggestion_area = chunks[1];
+            let suggestion_area = chunks[0];
             let suggestion_lines =
                 suggestions
                     .iter()
@@ -1057,7 +949,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
             );
 
             // -- Input bar --
-            let input_area = chunks[2];
+            let input_area = chunks[1];
             let input_entry_area = ratatui::layout::Rect::new(
                 input_area.x,
                 input_area.y,
@@ -1107,10 +999,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 ),
                 Span::styled("  ", Style::default()),
                 Span::styled(startup_info.cwd.clone(), Style::default().fg(Color::Green)),
-                Span::styled(
-                    "  Enter send · Shift+Enter/Ctrl+J newline",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                if processing {
+                    Span::styled("  Working · Esc cancel", Style::default().fg(Color::Yellow))
+                } else {
+                    Span::styled(
+                        "  Enter send · Shift+Enter/Ctrl+J newline",
+                        Style::default().fg(Color::DarkGray),
+                    )
+                },
             ];
             frame.render_widget(
                 Paragraph::new(Line::from(status_spans)).wrap(Wrap { trim: false }),
@@ -1139,7 +1035,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 input_entry_area.y + 1 + input_cursor_y.min(input_line_count.saturating_sub(1)),
             ));
         })?;
-        self.transcript_page_lines = transcript_page_lines;
 
         Ok(())
     }
@@ -1270,7 +1165,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             TuiAction::SubmitText(trimmed)
                         }
                     };
-                    self.scroll_offset = 0;
                     let opens_session_picker =
                         matches!(&action, TuiAction::SubmitText(input) if input == "/sessions");
                     let changes_plan_mode = matches!(&action, TuiAction::TogglePlan)
@@ -1284,12 +1178,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                                 MsgStyle::User,
                                 format!("[{:?}] {}", iso_now(), action.visible_text()),
                             );
-                            view.push(MsgStyle::Thinking, "Deciding next action…".to_owned());
                         }
                     }
                     self.processing = true;
                     self.cancellation_requested = false;
-                    self.animation_started_at = std::time::Instant::now();
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1368,10 +1260,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::PageUp => {
-                    self.scroll_up(self.transcript_page_lines);
+                    // Conversation scrolling belongs to the terminal emulator.
                 }
                 KeyCode::PageDown => {
-                    self.scroll_down(self.transcript_page_lines);
+                    // Conversation scrolling belongs to the terminal emulator.
                 }
                 KeyCode::BackTab => {
                     if self.processing {
@@ -1380,7 +1272,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     let action = TuiAction::TogglePlan;
                     self.processing = true;
                     self.cancellation_requested = false;
-                    self.animation_started_at = std::time::Instant::now();
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1419,36 +1310,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 }
                 _ => {}
             },
-            Event::Resize(_, _) => {
-                self.scroll_offset = 0;
-            }
-            Event::Mouse(mouse) => {
-                let picker_or_form = matches!(
-                    self.input_mode,
-                    InputMode::ChoosingSession(_)
-                        | InputMode::ChoosingProfile(_)
-                        | InputMode::CreatingProfile
-                );
-                if !picker_or_form {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => self.scroll_up(self.transcript_page_lines),
-                        MouseEventKind::ScrollDown => self.scroll_down(self.transcript_page_lines),
-                        _ => {}
-                    }
-                }
-            }
+            Event::Resize(_, _) => {}
             _ => {}
         }
 
         Ok(())
-    }
-
-    fn scroll_up(&mut self, lines: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(lines);
-    }
-
-    fn scroll_down(&mut self, lines: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
 }
 
@@ -1464,7 +1330,35 @@ fn terminal_width(value: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(value)).unwrap_or(u16::MAX)
 }
 
-fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'_>> {
+fn message_lines(message: &Msg) -> Vec<Line<'static>> {
+    let style = match message.style {
+        MsgStyle::User => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        MsgStyle::Thinking => Style::default().fg(Color::DarkGray),
+        MsgStyle::ToolCall => Style::default().fg(Color::Green),
+        MsgStyle::Observation => Style::default().fg(Color::DarkGray),
+        MsgStyle::Response => Style::default().fg(Color::White),
+        MsgStyle::Error => Style::default().fg(Color::Red),
+        MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
+    };
+    let prefix = if message.style == MsgStyle::Thinking {
+        "⎿ "
+    } else {
+        ""
+    };
+    message
+        .text
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 { prefix } else { "" };
+            Line::from(Span::styled(format!("{prefix}{line}"), style))
+        })
+        .collect()
+}
+
+fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(4));
     let inner_width = width.saturating_sub(2);
     let value_style = Style::default().fg(Color::Cyan);
@@ -1627,19 +1521,6 @@ fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyModeChoice> 
             .map(|session| EmptyModeChoice::Submit(TuiAction::SelectSession(session.id.clone()))),
         _ => None,
     }
-}
-
-fn begin_stream(view: &mut MsgView, text: String) -> Option<StreamingResponse> {
-    if text.is_empty() {
-        return None;
-    }
-    view.push(MsgStyle::Response, "➔ ".to_owned());
-    Some(StreamingResponse {
-        chars: text.chars().collect(),
-        position: 0,
-        message_index: view.messages.len() - 1,
-        next_at: std::time::Instant::now(),
-    })
 }
 
 fn push_immediate_response(view: &mut MsgView, text: String) {
@@ -1913,10 +1794,6 @@ mod tests {
         push_immediate_response(&mut view, "one.srt\ntwo.srt".to_owned());
         assert_eq!(view.all().len(), 1);
         assert_eq!(view.all()[0].text, "➔ one.srt\ntwo.srt");
-
-        let stream = super::begin_stream(&mut view, "hello".to_owned()).expect("stream");
-        assert_eq!(view.all()[stream.message_index].text, "➔ ");
-        assert_eq!(stream.chars.iter().collect::<String>(), "hello");
     }
 
     #[test]
