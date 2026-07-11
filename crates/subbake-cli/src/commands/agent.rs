@@ -84,10 +84,12 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
     tui.set_has_config_file(config_path.is_some());
     tui.set_cancellation_token(engine.cancellation_token());
     tui.set_input_history(input_history);
-    tui.set_session_replay(session_events);
+    if !open_session_picker {
+        tui.set_session_replay(session_events);
+    }
     tui.set_plan_mode(initial_plan_mode);
     if open_session_picker {
-        tui.open_session_picker(engine.session_choices(20)?);
+        tui.open_session_picker(engine.session_choices(20)?)?;
     }
     let observer = tui.observer();
     engine = engine.with_observer(Box::new(observer));

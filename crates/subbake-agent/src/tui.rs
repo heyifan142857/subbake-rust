@@ -22,6 +22,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -184,23 +185,10 @@ enum EmptyModeChoice {
     CreateProfile,
 }
 
-impl TuiAction {
-    fn visible_text(&self) -> String {
-        match self {
-            Self::SubmitText(text) => text.clone(),
-            Self::ApprovePlan => "approve".to_owned(),
-            Self::RejectPlan => "reject".to_owned(),
-            Self::SelectProfile(name) => format!("/profile {name}"),
-            Self::CreateProfile(name) => format!("create profile {name}"),
-            Self::SelectSession(id) => format!("/sessions {id}"),
-            Self::TogglePlan => "toggle plan mode".to_owned(),
-        }
-    }
-}
-
 struct TerminalSessionGuard {
     active: bool,
     keyboard_enhancement: bool,
+    alternate_screen: bool,
 }
 
 impl TerminalSessionGuard {
@@ -218,7 +206,24 @@ impl TerminalSessionGuard {
         Ok(Self {
             active: true,
             keyboard_enhancement,
+            alternate_screen: false,
         })
+    }
+
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        if !self.alternate_screen {
+            io::stdout().execute(EnterAlternateScreen)?;
+            self.alternate_screen = true;
+        }
+        Ok(())
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        if self.alternate_screen {
+            io::stdout().execute(LeaveAlternateScreen)?;
+            self.alternate_screen = false;
+        }
+        Ok(())
     }
 
     fn restore(&mut self) -> io::Result<()> {
@@ -226,6 +231,7 @@ impl TerminalSessionGuard {
             return Ok(());
         }
         self.active = false;
+        let screen_result = self.leave_alternate_screen();
         let keyboard_result = if self.keyboard_enhancement {
             io::stdout()
                 .execute(PopKeyboardEnhancementFlags)
@@ -234,7 +240,7 @@ impl TerminalSessionGuard {
             Ok(())
         };
         let raw_result = disable_raw_mode();
-        keyboard_result.and(raw_result)
+        screen_result.and(keyboard_result).and(raw_result)
     }
 }
 
@@ -321,6 +327,7 @@ impl EngineObserver for TuiObserver {
 pub struct SubBakeTui {
     terminal_session: TerminalSessionGuard,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    overlay_terminal: Option<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     input: InputEditor,
     input_history: Vec<String>,
@@ -336,6 +343,7 @@ pub struct SubBakeTui {
     plan_mode: bool,
     history_cursor: usize,
     startup_pending: bool,
+    picker_cancel_exits: bool,
 }
 
 impl SubBakeTui {
@@ -351,6 +359,7 @@ impl SubBakeTui {
         Ok(Self {
             terminal_session,
             terminal,
+            overlay_terminal: None,
             // The terminal emulator owns scrollback retention. Keep the source
             // items for this process lifetime so the commit cursor stays stable.
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(usize::MAX))),
@@ -368,6 +377,7 @@ impl SubBakeTui {
             plan_mode: false,
             history_cursor: 0,
             startup_pending: true,
+            picker_cancel_exits: false,
         })
     }
 
@@ -433,10 +443,30 @@ impl SubBakeTui {
     }
 
     /// Show the same resume picker used by the `/sessions` command on startup.
-    pub fn open_session_picker(&mut self, options: Vec<SessionChoice>) {
+    pub fn open_session_picker(&mut self, options: Vec<SessionChoice>) -> io::Result<()> {
+        self.open_fullscreen_overlay()?;
+        self.picker_cancel_exits = true;
         self.input.clear();
         self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
         self.suggestion_index = 0;
+        Ok(())
+    }
+
+    fn open_fullscreen_overlay(&mut self) -> io::Result<()> {
+        if self.overlay_terminal.is_none() {
+            self.terminal_session.enter_alternate_screen()?;
+            let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+            self.overlay_terminal = Some(Terminal::new(backend)?);
+        }
+        Ok(())
+    }
+
+    fn close_fullscreen_overlay(&mut self) -> io::Result<()> {
+        if let Some(mut terminal) = self.overlay_terminal.take() {
+            terminal.clear()?;
+            terminal.show_cursor()?;
+        }
+        self.terminal_session.leave_alternate_screen()
     }
 
     /// Run the event loop. `process_fn` is called with the user's input each
@@ -480,6 +510,7 @@ impl SubBakeTui {
                             self.render_response(message);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
+                            self.open_fullscreen_overlay()?;
                             self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
                             self.suggestion_index = 0;
                             let _ = message;
@@ -498,6 +529,7 @@ impl SubBakeTui {
                             self.startup_info.model = model;
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
+                            self.open_fullscreen_overlay()?;
                             self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
                             self.suggestion_index = 0;
                             // `/sessions` opens a picker; its textual summary would only
@@ -541,6 +573,7 @@ impl SubBakeTui {
 
         drop(request_tx);
         drop(response_rx);
+        let overlay_result = self.close_fullscreen_overlay();
         let clear_result = self.terminal.clear();
         let cursor_result = self.terminal.show_cursor();
         let terminal_result = self.terminal_session.restore();
@@ -549,6 +582,7 @@ impl SubBakeTui {
             .map_err(|_| io::Error::other("agent worker panicked"));
 
         loop_result?;
+        overlay_result?;
         clear_result?;
         cursor_result?;
         terminal_result?;
@@ -613,6 +647,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
     /// rows belong to the terminal emulator's native scrollback and are no
     /// longer redrawn by SubBake.
     fn flush_history(&mut self) -> io::Result<()> {
+        if self.overlay_terminal.is_some() {
+            return Ok(());
+        }
         let width = self.terminal.size()?.width.max(1);
         if self.startup_pending {
             self.startup_pending = false;
@@ -653,7 +690,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        let terminal_area = self.terminal.size()?;
+        let terminal_area = self
+            .overlay_terminal
+            .as_ref()
+            .map_or_else(|| self.terminal.size(), Terminal::size)?;
         let suggestions = self.suggestions();
         let selected_suggestion = match &self.input_mode {
             InputMode::ChoosingSession(picker) => self
@@ -693,7 +733,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let visible_input_lines = self.input.visible_lines(input_width, input_line_count);
         let (input_cursor_x, input_cursor_y) = self.input.cursor_position(input_width);
 
-        self.terminal.draw(|frame| {
+        let draw_ui = |frame: &mut ratatui::Frame<'_>| {
             let area = frame.area();
             if let Some(options) = &session_picker {
                 frame.render_widget(Clear, area);
@@ -1006,7 +1046,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 input_entry_area.x + 2 + input_cursor_x.min(input_width),
                 input_entry_area.y + 1 + input_cursor_y.min(input_line_count.saturating_sub(1)),
             ));
-        })?;
+        };
+        if let Some(terminal) = self.overlay_terminal.as_mut() {
+            terminal.draw(draw_ui)?;
+        } else {
+            self.terminal.draw(draw_ui)?;
+        }
 
         Ok(())
     }
@@ -1042,9 +1087,21 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             }
                         }
                     } else {
+                        let closes_overlay = matches!(
+                            self.input_mode,
+                            InputMode::ChoosingSession(_)
+                                | InputMode::ChoosingProfile(_)
+                                | InputMode::CreatingProfile
+                        );
                         self.input.clear();
                         self.input_mode = InputMode::Editing;
                         self.suggestion_index = 0;
+                        if closes_overlay {
+                            self.close_fullscreen_overlay()?;
+                        }
+                        if self.picker_cancel_exits {
+                            self.running = false;
+                        }
                     }
                 }
                 _ if is_insert_newline_key(key)
@@ -1142,15 +1199,21 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     let changes_plan_mode = matches!(&action, TuiAction::TogglePlan)
                         || matches!(&action, TuiAction::SubmitText(input) if input.trim().starts_with("/plan"));
 
-                    if !opens_session_picker && !changes_plan_mode {
-                        // Paint the submitted message and initial thinking state
-                        // before the potentially slow engine call begins.
-                        if let Ok(mut view) = self.msg_view.lock() {
-                            view.push(
-                                MsgStyle::User,
-                                format!("[{:?}] {}", iso_now(), action.visible_text()),
-                            );
-                        }
+                    if !opens_session_picker
+                        && !changes_plan_mode
+                        && let TuiAction::SubmitText(text) = &action
+                        && let Ok(mut view) = self.msg_view.lock()
+                    {
+                        view.push(MsgStyle::User, format!("[{}] {text}", iso_now()));
+                    }
+                    if matches!(
+                        &action,
+                        TuiAction::SelectProfile(_)
+                            | TuiAction::CreateProfile(_)
+                            | TuiAction::SelectSession(_)
+                    ) {
+                        self.close_fullscreen_overlay()?;
+                        self.picker_cancel_exits = false;
                     }
                     self.processing = true;
                     self.cancellation_requested = false;
@@ -1663,15 +1726,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_profile_action_has_a_stable_visible_form() {
-        let action = TuiAction::SelectProfile("strict".to_owned());
-        assert_eq!(action.visible_text(), "/profile strict");
-    }
-
-    #[test]
     fn profile_creation_is_a_typed_action_and_picker_choice() {
         let action = TuiAction::CreateProfile("review_copy".to_owned());
-        assert_eq!(action.visible_text(), "create profile review_copy");
+        assert_eq!(action, TuiAction::CreateProfile("review_copy".to_owned()));
         let picker = TuiPicker {
             options: vec![ProfileChoice {
                 name: "new profile…".to_owned(),
