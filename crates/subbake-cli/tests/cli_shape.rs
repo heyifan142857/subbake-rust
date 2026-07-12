@@ -13,6 +13,19 @@ fn cli_exposes_redesigned_commands() {
 }
 
 #[test]
+fn help_is_available_without_required_operands() {
+    for args in [
+        vec!["translate", "--help"],
+        vec!["transcribe", "--help"],
+        vec!["runtime", "clean", "--help"],
+        vec!["provider", "check", "--help"],
+    ] {
+        subbake_cli::run(args.into_iter().map(str::to_owned).collect())
+            .expect("help should not execute or require operands");
+    }
+}
+
+#[test]
 fn pipeline_media_input_attempts_transcription() {
     let error = subbake_cli::run(vec!["pipeline".to_owned(), "movie.mp4".to_owned()])
         .expect_err("media pipeline should attempt transcription");
