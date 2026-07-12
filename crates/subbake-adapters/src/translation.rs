@@ -314,7 +314,7 @@ mod tests {
         fs::write(&input_path, "hello\n").expect("write input");
 
         let mut settings = TranslationSettings {
-            target_language: "English".to_owned(),
+            target_language: "en".to_owned(),
             ..TranslationSettings::default()
         };
         settings.review_policy = subbake_core::ReviewPolicy::Off;

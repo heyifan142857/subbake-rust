@@ -179,7 +179,7 @@ impl Default for TranslationSettings {
             auth_header: None,
             auth_prefix: None,
             source_language: "Auto".to_owned(),
-            target_language: "Chinese".to_owned(),
+            target_language: "zh-Hans".to_owned(),
             batch_size: DEFAULT_BATCH_SIZE,
             batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
             translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(settings.provider, "mock");
         assert_eq!(settings.model, "mock-zh");
         assert_eq!(settings.source_language, "Auto");
-        assert_eq!(settings.target_language, "Chinese");
+        assert_eq!(settings.target_language, "zh-Hans");
         assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
         assert_eq!(settings.review_policy, ReviewPolicy::Targeted);
         assert!(settings.resume);

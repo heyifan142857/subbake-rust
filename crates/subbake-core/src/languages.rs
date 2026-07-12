@@ -9,38 +9,37 @@ pub fn normalize_language_name(value: &str, allow_auto: bool) -> String {
         return "Auto".to_owned();
     }
 
-    let normalized = match key.as_str() {
-        "zh" | "zho" | "chi" | "cn" | "chinese" | "中文" | "汉语" | "漢語" => "Chinese",
-        "en" | "eng" | "english" => "English",
-        "ja" | "jp" | "jpn" | "japanese" | "日本語" => "Japanese",
-        "ko" | "kor" | "korean" | "한국어" => "Korean",
-        "fr" | "fra" | "fre" | "french" => "French",
-        "es" | "spa" | "spanish" => "Spanish",
-        "de" | "deu" | "ger" | "german" => "German",
-        _ => return beautify_language_name(value),
+    let tag = match key.as_str() {
+        // Bare Chinese is kept deterministic for translation and cache keys.
+        "zh" | "zho" | "chi" | "cn" | "中文" | "汉语" | "漢語" | "简体" | "简体中文" | "簡體"
+        | "簡體中文" => "zh-Hans",
+        "zh-hans" | "zh-cn" | "zh-sg" => "zh-Hans",
+        "繁体" | "繁体中文" | "繁體" | "繁體中文" => "zh-Hant",
+        "zh-hant" | "zh-tw" | "zh-hk" | "zh-mo" => "zh-Hant",
+        "en" | "eng" => "en",
+        "ja" | "jp" | "jpn" | "日本語" => "ja",
+        "ko" | "kor" | "한국어" => "ko",
+        "fr" | "fra" | "fre" => "fr",
+        "es" | "spa" => "es",
+        "de" | "deu" | "ger" => "de",
+        "pt" | "por" | "português" => "pt",
+        "pt-br" => "pt-BR",
+        "ru" | "rus" => "ru",
+        _ => return canonicalize_unknown(value),
     };
-    normalized.to_owned()
+    tag.to_owned()
 }
 
 pub fn language_short_code(value: &str) -> String {
     let normalized = normalize_language_name(value, true);
-    match normalized.as_str() {
-        "Auto" => "AUTO".to_owned(),
-        "Chinese" => "ZH".to_owned(),
-        "English" => "EN".to_owned(),
-        "Japanese" => "JA".to_owned(),
-        "Korean" => "KO".to_owned(),
-        "French" => "FR".to_owned(),
-        "Spanish" => "ES".to_owned(),
-        "German" => "DE".to_owned(),
-        other => {
-            let slug = slugify(other);
-            if slug.is_empty() {
-                "LANG".to_owned()
-            } else {
-                slug.chars().take(8).collect::<String>().to_uppercase()
-            }
-        }
+    if normalized == "Auto" {
+        return "AUTO".to_owned();
+    }
+    let slug = slugify(&normalized);
+    if slug.is_empty() {
+        "LANG".to_owned()
+    } else {
+        slug.chars().take(8).collect::<String>().to_uppercase()
     }
 }
 
@@ -56,16 +55,34 @@ fn normalize_key(value: &str) -> String {
     value.trim().to_lowercase().replace('_', "-")
 }
 
-fn beautify_language_name(value: &str) -> String {
+fn canonicalize_unknown(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return "Unknown".to_owned();
+        return "und".to_owned();
     }
-    let mut chars = trimmed.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => "Unknown".to_owned(),
+
+    // Preserve free-form language names, but canonicalize tag-looking input.
+    let parts = trimmed.split(['-', '_']).collect::<Vec<_>>();
+    if !parts[0].chars().all(|ch| ch.is_ascii_alphabetic()) || parts[0].len() > 3 {
+        return "und".to_owned();
     }
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| match (index, part.len()) {
+            (0, _) => part.to_ascii_lowercase(),
+            (_, 2) if part.chars().all(|ch| ch.is_ascii_alphabetic()) => part.to_ascii_uppercase(),
+            (_, 4) if part.chars().all(|ch| ch.is_ascii_alphabetic()) => {
+                let mut chars = part.chars();
+                let first = chars
+                    .next()
+                    .map_or_else(String::new, |ch| ch.to_uppercase().collect());
+                format!("{first}{}", chars.as_str().to_ascii_lowercase())
+            }
+            _ => part.to_ascii_lowercase(),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn slugify(value: &str) -> String {
@@ -88,14 +105,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_common_languages() {
-        assert_eq!(normalize_language_name("zh", false), "Chinese");
-        assert_eq!(normalize_language_name("EN", false), "English");
+    fn normalizes_common_languages_to_bcp_47() {
+        assert_eq!(normalize_language_name("zh", false), "zh-Hans");
+        assert_eq!(normalize_language_name("繁體中文", false), "zh-Hant");
+        assert_eq!(normalize_language_name("zh_TW", false), "zh-Hant");
+        assert_eq!(normalize_language_name("jp", false), "ja");
+        assert_eq!(normalize_language_name("EN", false), "en");
+        assert_eq!(normalize_language_name("pt_br", false), "pt-BR");
         assert_eq!(normalize_language_name("auto", true), "Auto");
     }
 
     #[test]
+    fn canonicalizes_unknown_bcp_47_tags() {
+        assert_eq!(normalize_language_name("sr_latn_rs", false), "sr-Latn-RS");
+        assert_eq!(normalize_language_name("Italian", false), "und");
+        assert_eq!(normalize_language_name("English", false), "und");
+        assert_eq!(normalize_language_name("", false), "und");
+    }
+
+    #[test]
     fn builds_pair_slug() {
-        assert_eq!(language_pair_slug("auto", "zh"), "auto-chinese");
+        assert_eq!(language_pair_slug("auto", "zh"), "auto-zh-hans");
+        assert_eq!(language_pair_slug("en", "繁體中文"), "en-zh-hant");
     }
 }

@@ -90,7 +90,7 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
         let settings = TranslationSettings {
-            target_language: "English".to_owned(),
+            target_language: "en".to_owned(),
             review_policy: subbake_core::ReviewPolicy::Off,
             ..TranslationSettings::default()
         };

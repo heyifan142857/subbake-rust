@@ -261,7 +261,7 @@ fn default_model() -> String {
 }
 
 fn default_target_language() -> String {
-    "Chinese".to_owned()
+    "zh-Hans".to_owned()
 }
 
 fn default_source_language() -> String {

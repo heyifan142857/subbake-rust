@@ -144,7 +144,7 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
     let target_language = context["tgt"]
         .as_str()
         .map(|value| normalize_language_name(value, false))
-        .unwrap_or_else(|| "Chinese".to_owned());
+        .unwrap_or_else(|| "zh-Hans".to_owned());
     let tag = language_short_code(&target_language);
 
     let batch_json = extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END")?;

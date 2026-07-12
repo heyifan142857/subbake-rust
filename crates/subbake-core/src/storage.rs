@@ -564,7 +564,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "ce3a0a8d3a15c62f4c32938a26509d93d3e2008d"
+            "0fc059cedead8046c9cee10efda70cfabb65d277"
         );
     }
 
@@ -605,7 +605,7 @@ mod tests {
             None,
             None,
             "Auto",
-            "Chinese",
+            "zh-Hans",
             false,
         );
         assert!(paths.run_dir.to_string_lossy().contains("show-"));
@@ -613,7 +613,7 @@ mod tests {
             paths
                 .translation_memory_path
                 .to_string_lossy()
-                .contains("translation_memory.v2.auto-chinese.standard.json")
+                .contains("translation_memory.v2.auto-zh-hans.standard.json")
         );
     }
 
