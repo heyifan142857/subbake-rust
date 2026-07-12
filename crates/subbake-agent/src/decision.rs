@@ -808,7 +808,15 @@ impl AgentEngine {
                     output_path: None,
                     settings,
                 };
-                let outcome = translate_subtitle_cancellable(request, &self.operation_guard)?;
+                let outcome = if let Some(progress) = self.progress.clone() {
+                    subbake_adapters::translate_subtitle_cancellable_with_progress(
+                        request,
+                        &self.operation_guard,
+                        progress,
+                    )?
+                } else {
+                    translate_subtitle_cancellable(request, &self.operation_guard)?
+                };
                 if outcome.output_path.is_some() {
                     self.record_file_operation(&undo_snapshot)?;
                 }
@@ -917,7 +925,16 @@ impl AgentEngine {
                     output_path: None,
                     settings: TranscriptionSettings::default(),
                 };
-                match transcribe_media_cancellable(request, &self.operation_guard) {
+                let transcribed = if let Some(progress) = self.progress.clone() {
+                    subbake_adapters::transcribe_media_cancellable_with_progress(
+                        request,
+                        &self.operation_guard,
+                        progress,
+                    )
+                } else {
+                    transcribe_media_cancellable(request, &self.operation_guard)
+                };
+                match transcribed {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
                     Ok(outcome) => Ok(format!("Transcribed: {}", outcome.output_path.display())),
                     Err(e) => Ok(format!("Transcription needs setup: {e}")),
@@ -957,7 +974,16 @@ impl AgentEngine {
                     binary_path: None,
                     models_dir: None,
                 };
-                match subbake_adapters::run_whisper_cancellable(request, &self.operation_guard) {
+                let managed = if let Some(progress) = self.progress.clone() {
+                    subbake_adapters::run_whisper_cancellable_with_progress(
+                        request,
+                        &self.operation_guard,
+                        progress,
+                    )
+                } else {
+                    subbake_adapters::run_whisper_cancellable(request, &self.operation_guard)
+                };
+                match managed {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
                     Ok(_) => Ok("whisper: done".to_owned()),
                     Err(e) => Ok(format!("whisper: {e}")),

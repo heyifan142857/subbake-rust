@@ -7,6 +7,7 @@ pub mod languages;
 pub mod memory;
 pub mod pipeline;
 pub mod ports;
+pub mod progress;
 mod recovery;
 mod review;
 pub mod storage;
@@ -23,4 +24,7 @@ pub use entities::{
 pub use error::{CoreError, CoreResult};
 pub use memory::ContextMemory;
 pub use ports::{GenerationRequest, GenerationResponse, ResponseContract};
+pub use progress::{
+    NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
+};
 pub mod cancellation;

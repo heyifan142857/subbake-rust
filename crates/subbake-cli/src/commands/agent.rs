@@ -92,7 +92,9 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         tui.open_session_picker(engine.session_choices(20)?)?;
     }
     let observer = tui.observer();
-    engine = engine.with_observer(Box::new(observer));
+    engine = engine
+        .with_progress(std::sync::Arc::new(observer.clone()))
+        .with_observer(Box::new(observer));
 
     tui.run(move |action, guard, _obs| {
         engine.begin_operation(guard);

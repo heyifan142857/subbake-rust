@@ -6,7 +6,7 @@
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
 use std::path::PathBuf;
-use subbake_core::{CancellationGuard, CancellationToken};
+use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
@@ -128,6 +128,7 @@ pub struct AgentEngine {
     pub observer: Option<Box<dyn EngineObserver>>,
     cancellation: CancellationToken,
     pub(crate) operation_guard: CancellationGuard,
+    pub(crate) progress: Option<SharedProgress>,
 }
 
 impl AgentEngine {
@@ -142,7 +143,13 @@ impl AgentEngine {
             observer: None,
             cancellation: CancellationToken::default(),
             operation_guard: CancellationGuard::never(),
+            progress: None,
         }
+    }
+
+    pub fn with_progress(mut self, progress: SharedProgress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {

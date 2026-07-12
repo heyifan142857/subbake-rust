@@ -25,7 +25,9 @@ pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
 };
 pub use mock::MockBackend;
-pub use pipeline::{PipelineOutcome, PipelineRequest, run_pipeline};
+pub use pipeline::{
+    PipelineOutcome, PipelineRequest, run_pipeline, run_pipeline_cancellable_with_progress,
+};
 pub use providers::{
     ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
     check_provider, default_api_key_env, resolve_env_var,
@@ -39,14 +41,16 @@ pub use settings::{TranslationSettings, TranslationSettingsPatch};
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{
     TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest, TranscriptionSettings,
-    transcribe_media, transcribe_media_cancellable,
+    transcribe_media, transcribe_media_cancellable, transcribe_media_cancellable_with_progress,
 };
 pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
     translate_subtitle, translate_subtitle_batch, translate_subtitle_batch_cancellable,
-    translate_subtitle_cancellable,
+    translate_subtitle_batch_with_progress, translate_subtitle_cancellable,
+    translate_subtitle_cancellable_with_progress,
 };
 pub use whisper::{
     WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,
     default_whisper_binary_path, run_whisper, run_whisper_cancellable,
+    run_whisper_cancellable_with_progress,
 };

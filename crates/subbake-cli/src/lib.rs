@@ -3,6 +3,7 @@ use std::io;
 pub mod args;
 pub mod commands;
 pub mod output;
+mod progress;
 
 pub fn command_names() -> &'static [&'static str] {
     &[

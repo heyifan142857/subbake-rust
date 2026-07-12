@@ -5,7 +5,10 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use subbake_core::CancellationGuard;
+use subbake_core::{
+    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, TaskKind,
+    TaskState,
+};
 use tokio::runtime::Runtime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +63,31 @@ pub fn run_whisper_cancellable(
     request: WhisperRequest,
     cancellation: &CancellationGuard,
 ) -> io::Result<WhisperOutcome> {
+    run_whisper_cancellable_with_progress(request, cancellation, std::sync::Arc::new(NoopProgress))
+}
+
+pub fn run_whisper_cancellable_with_progress(
+    request: WhisperRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> io::Result<WhisperOutcome> {
     cancellation
         .check()
         .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"))?;
-    match request.action {
+    let stage = match request.action {
+        WhisperAction::Install | WhisperAction::Update => "INSTALL",
+        WhisperAction::DownloadModel { .. } => "DOWNLOAD",
+        WhisperAction::Uninstall { .. } => "UNINSTALL",
+        _ => "INSPECT",
+    };
+    progress.emit(ProgressEvent::running(
+        TaskKind::Installation,
+        stage,
+        0,
+        None,
+        ProgressUnit::Steps,
+    ));
+    let outcome: io::Result<WhisperOutcome> = match request.action {
         WhisperAction::Status => Ok(WhisperOutcome::Status(inspect_status(&request))),
         WhisperAction::ListModels => Ok(WhisperOutcome::ModelList(list_models(&request)?)),
         WhisperAction::Install => {
@@ -83,7 +107,18 @@ pub fn run_whisper_cancellable(
             // Re-list models so the caller can see the new file.
             Ok(WhisperOutcome::ModelList(list_models(&request)?))
         }
-    }
+    };
+    let outcome = outcome?;
+    let mut done = ProgressEvent::running(
+        TaskKind::Installation,
+        "COMPLETE",
+        1,
+        Some(1),
+        ProgressUnit::Steps,
+    );
+    done.state = TaskState::Completed;
+    progress.emit(done);
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------

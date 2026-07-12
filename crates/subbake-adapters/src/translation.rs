@@ -8,7 +8,7 @@ use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
 use subbake_core::storage::{build_runtime_paths, input_signature_from_bytes};
-use subbake_core::{CancellationGuard, CoreError, PipelineResult};
+use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, SharedProgress};
 
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
@@ -53,6 +53,18 @@ pub fn translate_subtitle_cancellable(
     request: TranslationRequest,
     cancellation: &CancellationGuard,
 ) -> io::Result<TranslationOutcome> {
+    translate_subtitle_cancellable_with_progress(
+        request,
+        cancellation,
+        std::sync::Arc::new(NoopProgress),
+    )
+}
+
+pub fn translate_subtitle_cancellable_with_progress(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> io::Result<TranslationOutcome> {
     check_cancelled(cancellation)?;
     if !is_supported_subtitle_path(&request.input_path) {
         return Err(io::Error::other(
@@ -95,13 +107,43 @@ pub fn translate_subtitle_cancellable(
     let store = FileRuntimeStore::new(paths);
     store.ensure_layout().map_err(io::Error::other)?;
 
+    let terminal_progress = progress.clone();
     let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options)
         .with_input_signature(input_signature)
-        .with_cancellation(cancellation.clone());
+        .with_cancellation(cancellation.clone())
+        .with_progress(Box::new(progress));
     pipeline = pipeline.with_store(Box::new(store));
-    let run = pipeline.run_document(&document).map_err(core_error)?;
+    let run = match pipeline.run_document(&document) {
+        Ok(run) => run,
+        Err(error) => {
+            let mut event = subbake_core::ProgressEvent::running(
+                subbake_core::TaskKind::Translation,
+                "TRANSLATE",
+                0,
+                None,
+                subbake_core::ProgressUnit::Batches,
+            );
+            event.state = if matches!(error, CoreError::Cancelled) {
+                subbake_core::TaskState::Cancelled
+            } else {
+                subbake_core::TaskState::Failed
+            };
+            event.message = Some(error.to_string());
+            terminal_progress.emit(event);
+            return Err(core_error(error));
+        }
+    };
 
     if request.settings.dry_run {
+        let mut event = subbake_core::ProgressEvent::running(
+            subbake_core::TaskKind::Translation,
+            "DRY_RUN",
+            1,
+            Some(1),
+            subbake_core::ProgressUnit::Steps,
+        );
+        event.state = subbake_core::TaskState::Completed;
+        terminal_progress.emit(event);
         return Ok(TranslationOutcome {
             result: run.result,
             output_path: None,
@@ -122,6 +164,17 @@ pub fn translate_subtitle_cancellable(
 
     let mut result = run.result;
     result.output_path = Some(output_path.clone());
+    let mut event = subbake_core::ProgressEvent::running(
+        subbake_core::TaskKind::Translation,
+        "COMPLETE",
+        result.batches_translated as u64,
+        Some(result.batches_translated as u64),
+        subbake_core::ProgressUnit::Batches,
+    );
+    event.state = subbake_core::TaskState::Completed;
+    event.resumed = result.resumed_translation_batches as u64;
+    event.usage = result.usage;
+    terminal_progress.emit(event);
     Ok(TranslationOutcome {
         result,
         output_path: Some(output_path),
@@ -138,7 +191,16 @@ pub fn translate_subtitle_batch_cancellable(
     request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
 ) -> io::Result<BatchTranslationOutcome> {
+    translate_subtitle_batch_with_progress(request, cancellation, std::sync::Arc::new(NoopProgress))
+}
+
+pub fn translate_subtitle_batch_with_progress(
+    request: BatchTranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> io::Result<BatchTranslationOutcome> {
     let files = discover_subtitle_files(&request.root, request.recursive)?;
+    let total_files = files.len();
     let mut processed = 0usize;
     let mut skipped = Vec::new();
     let mut outputs = Vec::new();
@@ -155,19 +217,37 @@ pub fn translate_subtitle_batch_cancellable(
             continue;
         }
 
-        let outcome = translate_subtitle_cancellable(
+        progress.emit(subbake_core::ProgressEvent::running(
+            subbake_core::TaskKind::BatchTranslation,
+            "FILES",
+            processed as u64,
+            Some(total_files as u64),
+            subbake_core::ProgressUnit::Files,
+        ));
+        let outcome = translate_subtitle_cancellable_with_progress(
             TranslationRequest {
                 input_path,
                 output_path: None,
                 settings: request.settings.clone(),
             },
             cancellation,
+            progress.clone(),
         )?;
         if let Some(output_path) = outcome.output_path {
             outputs.push(output_path);
         }
         processed += 1;
     }
+
+    let mut done = subbake_core::ProgressEvent::running(
+        subbake_core::TaskKind::BatchTranslation,
+        "FILES",
+        processed as u64,
+        Some(total_files as u64),
+        subbake_core::ProgressUnit::Files,
+    );
+    done.state = subbake_core::TaskState::Completed;
+    progress.emit(done);
 
     Ok(BatchTranslationOutcome {
         processed,

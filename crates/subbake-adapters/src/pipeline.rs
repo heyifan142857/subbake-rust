@@ -1,10 +1,15 @@
 use std::io;
 use std::path::PathBuf;
+use subbake_core::{CancellationGuard, NoopProgress, SharedProgress};
 
 use crate::fs::is_supported_subtitle_path;
 use crate::settings::TranslationSettings;
-use crate::transcription::{TranscriptionRequest, TranscriptionSettings, transcribe_media};
-use crate::translation::{TranslationOutcome, TranslationRequest, translate_subtitle};
+use crate::transcription::{
+    TranscriptionRequest, TranscriptionSettings, transcribe_media_cancellable_with_progress,
+};
+use crate::translation::{
+    TranslationOutcome, TranslationRequest, translate_subtitle_cancellable_with_progress,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineRequest {
@@ -20,29 +25,53 @@ pub enum PipelineOutcome {
 }
 
 pub fn run_pipeline(request: PipelineRequest) -> io::Result<PipelineOutcome> {
+    run_pipeline_cancellable_with_progress(
+        request,
+        &CancellationGuard::never(),
+        std::sync::Arc::new(NoopProgress),
+    )
+}
+
+pub fn run_pipeline_cancellable_with_progress(
+    request: PipelineRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> io::Result<PipelineOutcome> {
     if is_supported_subtitle_path(&request.input_path) {
-        let outcome = translate_subtitle(TranslationRequest {
-            input_path: request.input_path,
-            output_path: request.output_path,
-            settings: request.settings,
-        })?;
+        let outcome = translate_subtitle_cancellable_with_progress(
+            TranslationRequest {
+                input_path: request.input_path,
+                output_path: request.output_path,
+                settings: request.settings,
+            },
+            cancellation,
+            progress,
+        )?;
         return Ok(PipelineOutcome::Subtitle(outcome));
     }
 
     // Media input: transcribe first, then translate the result.
-    let transcription_out = transcribe_media(TranscriptionRequest {
-        media_path: request.input_path.clone(),
-        output_path: None,
-        settings: request.transcription_settings,
-    })?;
+    let transcription_out = transcribe_media_cancellable_with_progress(
+        TranscriptionRequest {
+            media_path: request.input_path.clone(),
+            output_path: None,
+            settings: request.transcription_settings,
+        },
+        cancellation,
+        progress.clone(),
+    )?;
     let transcribed_path = transcription_out.output_path;
 
     // Build TranslationRequest — use the transcription output as input.
-    let translation_out = translate_subtitle(TranslationRequest {
-        input_path: transcribed_path,
-        output_path: request.output_path,
-        settings: request.settings,
-    })?;
+    let translation_out = translate_subtitle_cancellable_with_progress(
+        TranslationRequest {
+            input_path: transcribed_path,
+            output_path: request.output_path,
+            settings: request.settings,
+        },
+        cancellation,
+        progress,
+    )?;
 
     Ok(PipelineOutcome::Subtitle(translation_out))
 }

@@ -35,6 +35,7 @@ use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::input_editor::InputEditor;
 use crate::session::iso_now;
 use subbake_core::{CancellationGuard, CancellationToken};
+use subbake_core::{ProgressEvent, ProgressSink, TaskState};
 
 // ---------------------------------------------------------------------------
 // Message types for the scrollback buffer
@@ -279,13 +280,23 @@ impl MsgView {
 }
 
 /// Wraps a `MsgView` so the agent engine can push into it via the observer trait.
+#[derive(Clone)]
 pub struct TuiObserver {
     pub view: std::sync::Arc<std::sync::Mutex<MsgView>>,
+    progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
+    last_tool: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl TuiObserver {
-    pub fn new(view: std::sync::Arc<std::sync::Mutex<MsgView>>) -> Self {
-        Self { view }
+    fn new(
+        view: std::sync::Arc<std::sync::Mutex<MsgView>>,
+        progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
+    ) -> Self {
+        Self {
+            view,
+            progress,
+            last_tool: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 }
 
@@ -295,6 +306,9 @@ impl EngineObserver for TuiObserver {
     }
 
     fn on_tool_call(&mut self, name: &str, arguments: &serde_json::Value) {
+        if let Ok(mut last) = self.last_tool.lock() {
+            *last = Some(name.to_owned());
+        }
         if let Ok(mut v) = self.view.lock() {
             let args = serde_json::to_string(arguments).unwrap_or_default();
             v.push(MsgStyle::ToolCall, format!("⚡ {name} {args}"));
@@ -302,8 +316,20 @@ impl EngineObserver for TuiObserver {
     }
 
     fn on_observation(&mut self, text: &str) {
+        if self
+            .last_tool
+            .lock()
+            .ok()
+            .and_then(|v| v.clone())
+            .is_some_and(|name| matches!(name.as_str(), "read_file" | "read_file_preview"))
+        {
+            return;
+        }
         if let Ok(mut v) = self.view.lock() {
-            v.push(MsgStyle::Observation, format!("◀ {text}"));
+            v.push(
+                MsgStyle::Observation,
+                format!("◀ {}", text.lines().next().unwrap_or(text)),
+            );
         }
     }
 
@@ -320,6 +346,17 @@ impl EngineObserver for TuiObserver {
     }
 }
 
+impl ProgressSink for TuiObserver {
+    fn emit(&self, event: ProgressEvent) {
+        if let Ok(mut progress) = self.progress.lock() {
+            let started = progress
+                .as_ref()
+                .map_or_else(std::time::Instant::now, |(_, at)| *at);
+            *progress = Some((event, started));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TUI App
 // ---------------------------------------------------------------------------
@@ -329,6 +366,7 @@ pub struct SubBakeTui {
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     overlay_terminal: Option<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
+    progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
     input: InputEditor,
     input_history: Vec<String>,
     input_mode: InputMode,
@@ -363,6 +401,7 @@ impl SubBakeTui {
             // The terminal emulator owns scrollback retention. Keep the source
             // items for this process lifetime so the commit cursor stays stable.
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(usize::MAX))),
+            progress: std::sync::Arc::new(std::sync::Mutex::new(None)),
             input: InputEditor::default(),
             input_history: Vec::new(),
             input_mode: InputMode::Editing,
@@ -396,11 +435,36 @@ impl SubBakeTui {
     }
 
     pub fn observer(&self) -> TuiObserver {
-        TuiObserver::new(self.msg_view.clone())
+        TuiObserver::new(self.msg_view.clone(), self.progress.clone())
     }
 
     pub fn set_cancellation_token(&mut self, token: CancellationToken) {
         self.cancellation = Some(token);
+    }
+
+    fn commit_progress_summary(&mut self) {
+        let completed = self.progress.lock().ok().and_then(|value| value.clone());
+        let Some((event, started)) = completed else {
+            return;
+        };
+        if !matches!(
+            event.state,
+            TaskState::Completed | TaskState::Cancelled | TaskState::Failed
+        ) {
+            return;
+        }
+        let marker = match event.state {
+            TaskState::Completed => "✓",
+            TaskState::Cancelled => "■",
+            TaskState::Failed => "✖",
+            _ => return,
+        };
+        if let Ok(mut view) = self.msg_view.lock() {
+            view.push(
+                MsgStyle::System,
+                format!("{marker} {}", format_progress(&event, started.elapsed())),
+            );
+        }
     }
 
     pub fn set_input_history(&mut self, history: Vec<String>) {
@@ -496,6 +560,7 @@ impl SubBakeTui {
         let loop_result = (|| -> io::Result<()> {
             while self.running {
                 if let Ok(result) = response_rx.try_recv() {
+                    self.commit_progress_summary();
                     self.processing = false;
                     self.cancellation_requested = false;
                     match result {
@@ -703,6 +768,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .min(suggestions.len().saturating_sub(1)),
         };
         let processing = self.processing;
+        let progress = self.progress.lock().ok().and_then(|value| value.clone());
+        let ambient_spinner = spinner_frame(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
         let session_picker = match &self.input_mode {
             InputMode::ChoosingSession(picker) => Some(picker.options.clone()),
             _ => None,
@@ -720,10 +791,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let max_input_lines = (terminal_area.height.saturating_mul(40) / 100).max(1);
         let input_line_count = self.input.desired_height(input_width).min(max_input_lines);
         let input_total_height = input_line_count.saturating_add(3);
+        let progress_height = u16::from(processing && self.pending_plan_toggle.is_none()) * 2;
         let suggestion_height = (suggestions.len() as u16).min(
             terminal_area
                 .height
                 .saturating_sub(input_total_height)
+                .saturating_sub(progress_height)
                 .saturating_sub(1),
         );
         let visible_input_lines = self.input.visible_lines(input_width, input_line_count);
@@ -924,6 +997,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(suggestion_height),
+                    Constraint::Length(progress_height),
                     Constraint::Length(input_total_height),
                 ])
                 .split(area);
@@ -959,8 +1033,31 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 suggestion_area,
             );
 
+            let progress_area = chunks[1];
+            if progress_height > 0 {
+                let progress_text = progress
+                    .as_ref()
+                    .map(|(event, started)| format_progress(event, started.elapsed()))
+                    .unwrap_or_else(|| format!("{ambient_spinner} Working"));
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("⚡ {progress_text}"),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "  Esc cancel",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    progress_area,
+                );
+            }
+
             // -- Input bar --
-            let input_area = chunks[1];
+            let input_area = chunks[2];
             let input_entry_area = ratatui::layout::Rect::new(
                 input_area.x,
                 input_area.y,
@@ -1010,11 +1107,6 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 ),
                 Span::styled("  ", Style::default()),
                 Span::styled(startup_info.cwd.clone(), Style::default().fg(Color::Green)),
-                if processing && self.pending_plan_toggle.is_none() {
-                    Span::styled("  Working · Esc cancel", Style::default().fg(Color::Yellow))
-                } else {
-                    Span::raw("")
-                },
             ];
             frame.render_widget(
                 Paragraph::new(Line::from(status_spans)).wrap(Wrap { trim: false }),
@@ -1075,6 +1167,12 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     if self.processing {
                         if !self.cancellation_requested {
                             self.cancellation_requested = true;
+                            if let Ok(mut progress) = self.progress.lock()
+                                && let Some((event, _)) = progress.as_mut()
+                            {
+                                event.state = TaskState::Cancelling;
+                                event.stage = "CANCELLING".to_owned();
+                            }
                             if let Some(token) = &self.cancellation {
                                 token.cancel();
                             }
@@ -1211,6 +1309,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         self.close_fullscreen_overlay()?;
                         self.picker_cancel_exits = false;
                     }
+                    if let Ok(mut progress) = self.progress.lock() {
+                        *progress = None;
+                    }
                     self.processing = true;
                     self.cancellation_requested = false;
                     let guard = self
@@ -1344,6 +1445,57 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
         Ok(())
     }
+}
+
+fn format_progress(event: &ProgressEvent, elapsed: std::time::Duration) -> String {
+    let state = match event.state {
+        TaskState::Cancelling => "Cancelling",
+        TaskState::Resuming => "Resuming",
+        _ => event.stage.as_str(),
+    };
+    let counts = event
+        .total
+        .map(|total| {
+            let width = 10u64;
+            let filled = (event.current.min(total) * width)
+                .checked_div(total)
+                .unwrap_or(width);
+            format!(
+                "[{}{}] {}/{}",
+                "█".repeat(filled as usize),
+                "─".repeat((width - filled) as usize),
+                event.current,
+                total
+            )
+        })
+        .unwrap_or_else(|| format!("{} {}", spinner_frame(elapsed), event.current));
+    let resumed = if event.resumed > 0 {
+        format!(" · resumed {}", event.resumed)
+    } else {
+        String::new()
+    };
+    let eta = event
+        .total
+        .and_then(|total| {
+            let completed = event.current.saturating_sub(event.resumed);
+            (completed >= 2 && event.current < total).then(|| {
+                let seconds = elapsed.as_secs_f64() / completed as f64
+                    * total.saturating_sub(event.current) as f64;
+                format!(" · ETA {:.0}s", seconds)
+            })
+        })
+        .unwrap_or_default();
+    format!(
+        "{state} {counts} · {:.1}s{eta} · {}/{} tok{resumed}",
+        elapsed.as_secs_f32(),
+        event.usage.input_tokens,
+        event.usage.output_tokens
+    )
+}
+
+fn spinner_frame(elapsed: std::time::Duration) -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(elapsed.as_millis() as usize / 80) % FRAMES.len()]
 }
 
 const INPUT_HINTS: &[&str] = &[
@@ -1852,5 +2004,39 @@ mod tests {
             empty_mode_choice(&InputMode::AwaitingPlanDecision, 2),
             Some(EmptyModeChoice::RevisePlan)
         );
+    }
+
+    #[test]
+    fn file_preview_observation_is_not_added_to_visible_history() {
+        use crate::engine::EngineObserver;
+        let view = std::sync::Arc::new(std::sync::Mutex::new(super::MsgView::new(10)));
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut observer = super::TuiObserver::new(view.clone(), progress);
+        observer.on_tool_call(
+            "read_file_preview",
+            &serde_json::json!({"path":"sample.srt"}),
+        );
+        observer.on_observation("subtitle body");
+        let messages = view.lock().expect("view");
+        assert_eq!(messages.all().len(), 1);
+        assert!(!messages.all()[0].text.contains("subtitle body"));
+    }
+
+    #[test]
+    fn progress_line_reports_resume_tokens_and_counts() {
+        let mut event = subbake_core::ProgressEvent::running(
+            subbake_core::TaskKind::Translation,
+            "TRANSLATE",
+            2,
+            Some(4),
+            subbake_core::ProgressUnit::Batches,
+        );
+        event.resumed = 1;
+        event.usage.input_tokens = 20;
+        event.usage.output_tokens = 10;
+        let line = super::format_progress(&event, std::time::Duration::from_secs(3));
+        assert!(line.contains("2/4"));
+        assert!(line.contains("20/10 tok"));
+        assert!(line.contains("resumed 1"));
     }
 }

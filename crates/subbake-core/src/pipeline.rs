@@ -14,6 +14,7 @@ use crate::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink,
     LlmBackend, RuntimeStore,
 };
+use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
     backend_payload_json, build_agent_repair_messages, combine_glossary, combine_summaries,
     parse_translation_payload, retry_correction_message, split_index,
@@ -41,6 +42,7 @@ pub struct SubtitlePipeline<B, D> {
     cache_hits: usize,
     agent_repairs: Vec<AgentRepairRecord>,
     cancellation: CancellationGuard,
+    progress: Option<Box<dyn ProgressSink>>,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -63,6 +65,36 @@ where
             cache_hits: 0,
             agent_repairs: Vec::new(),
             cancellation: CancellationGuard::never(),
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(mut self, progress: Box<dyn ProgressSink>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    fn report(
+        &self,
+        stage: &str,
+        state: TaskState,
+        current: usize,
+        total: Option<usize>,
+        resumed: usize,
+        usage: Usage,
+    ) {
+        if let Some(sink) = &self.progress {
+            sink.emit(ProgressEvent {
+                task: TaskKind::Translation,
+                stage: stage.to_owned(),
+                state,
+                current: current as u64,
+                total: total.map(|v| v as u64),
+                unit: ProgressUnit::Batches,
+                resumed: resumed as u64,
+                usage,
+                message: None,
+            });
         }
     }
 
@@ -143,6 +175,18 @@ where
         }
 
         let resume = self.load_resume_snapshot(&batches)?;
+        self.report(
+            "TRANSLATE",
+            if resume.translation_batches_completed > 0 {
+                TaskState::Resuming
+            } else {
+                TaskState::Running
+            },
+            resume.translation_batches_completed,
+            Some(batches.len()),
+            resume.translation_batches_completed,
+            Usage::default(),
+        );
         let mut translated_segments = resume.translated_segments;
         translated_segments.reserve(
             document
@@ -160,6 +204,14 @@ where
             .skip(resume.translation_batches_completed)
         {
             self.cancellation.check()?;
+            self.report(
+                "TRANSLATE",
+                TaskState::Running,
+                batch_index,
+                Some(batches.len()),
+                resume.translation_batches_completed,
+                usage,
+            );
             // TM lookup: split batch into TM-matched (by segment text) and pending.
             let (tm_hits, pending): (HashMap<String, String>, Vec<SubtitleSegment>) = {
                 let mut hits = HashMap::new();
@@ -230,6 +282,14 @@ where
                 false,
                 usage,
             )?;
+            self.report(
+                "TRANSLATE",
+                TaskState::Running,
+                batch_index + 1,
+                Some(batches.len()),
+                resume.translation_batches_completed,
+                usage,
+            );
         }
 
         validate_full_alignment(&document.segments, &translated_segments)?;
@@ -273,6 +333,14 @@ where
                 review_plan.iter().enumerate().skip(resumed_review_batches)
             {
                 self.cancellation.check()?;
+                self.report(
+                    "FINAL_REVIEW",
+                    TaskState::Running,
+                    review_index,
+                    Some(review_plan.len()),
+                    resumed_review_batches,
+                    usage,
+                );
                 let review_position = review_index + 1;
                 let reviewed = self.review_batch(review_position, review_batch)?;
                 usage.add(reviewed.usage);
@@ -290,12 +358,28 @@ where
                     ..review_batch.start_offset + reviewed_segments.len()]
                     .clone_from_slice(&reviewed_segments);
                 self.save_run_state(batches.len(), review_position, true, usage)?;
+                self.report(
+                    "FINAL_REVIEW",
+                    TaskState::Running,
+                    review_position,
+                    Some(review_plan.len()),
+                    resumed_review_batches,
+                    usage,
+                );
             }
             validate_full_alignment(&document.segments, &output_segments)?;
             self.dashboard.mark_done("FINAL_REVIEW");
         }
         self.cancellation.check()?;
         self.save_run_state(batches.len(), review_plan.len(), true, usage)?;
+        self.report(
+            "WRITE_OUTPUT",
+            TaskState::Running,
+            batches.len(),
+            Some(batches.len()),
+            resume.translation_batches_completed,
+            usage,
+        );
 
         Ok(PipelineRun {
             result: PipelineResult {

@@ -10,7 +10,10 @@ use std::sync::OnceLock;
 use reqwest::multipart;
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
-use subbake_core::{CancellationGuard, SubtitleDocument};
+use subbake_core::{
+    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, SubtitleDocument,
+    TaskKind, TaskState,
+};
 use tokio::runtime::Runtime;
 
 use crate::fs::{read_document, render_and_write_document};
@@ -357,7 +360,26 @@ pub fn transcribe_media_cancellable(
     request: TranscriptionRequest,
     cancellation: &CancellationGuard,
 ) -> io::Result<TranscriptionOutcome> {
+    transcribe_media_cancellable_with_progress(
+        request,
+        cancellation,
+        std::sync::Arc::new(NoopProgress),
+    )
+}
+
+pub fn transcribe_media_cancellable_with_progress(
+    request: TranscriptionRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> io::Result<TranscriptionOutcome> {
     check_cancelled(cancellation)?;
+    progress.emit(ProgressEvent::running(
+        TaskKind::Transcription,
+        "PREPARE_AUDIO",
+        0,
+        None,
+        ProgressUnit::Steps,
+    ));
     let output_path = request.output_path.unwrap_or_else(|| {
         default_output_path(&request.media_path, request.settings.output_format)
     });
@@ -365,10 +387,26 @@ pub fn transcribe_media_cancellable(
     if let Some(ref sidecar_path) = request.settings.sidecar_path {
         check_cancelled(cancellation)?;
         render_sidecar(sidecar_path, &output_path, request.settings.output_format)?;
+        let mut done = ProgressEvent::running(
+            TaskKind::Transcription,
+            "COMPLETE",
+            1,
+            Some(1),
+            ProgressUnit::Steps,
+        );
+        done.state = TaskState::Completed;
+        progress.emit(done);
         return Ok(TranscriptionOutcome { output_path });
     }
 
     let audio_path = ensure_audio(&request.media_path, cancellation)?;
+    progress.emit(ProgressEvent::running(
+        TaskKind::Transcription,
+        "TRANSCRIBE",
+        0,
+        None,
+        ProgressUnit::Steps,
+    ));
     let fmt = request.settings.output_format;
 
     let doc = match request.settings.provider.as_str() {
@@ -428,6 +466,15 @@ pub fn transcribe_media_cancellable(
     check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
     render_and_write_document(&doc, &doc.segments, &output_path, &opts)?;
+    let mut done = ProgressEvent::running(
+        TaskKind::Transcription,
+        "COMPLETE",
+        1,
+        Some(1),
+        ProgressUnit::Steps,
+    );
+    done.state = TaskState::Completed;
+    progress.emit(done);
     Ok(TranscriptionOutcome { output_path })
 }
 
