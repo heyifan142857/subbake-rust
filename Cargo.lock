@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "subbake-adapters"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "reqwest",
  "serde",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "subbake-agent"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "subbake-cli"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "serde_json",
  "subbake-adapters",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "subbake-core"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "serde",
  "serde_json",

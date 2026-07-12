@@ -8,11 +8,11 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha"
 edition = "2024"
 license = "MIT"
 authors = ["azote <231880175@smail.nju.edu.cn>"]
-repository = "https://github.com/heyifan142857/SubBake"
+repository = "https://github.com/heyifan142857/subbake-rust"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
