@@ -317,7 +317,7 @@ mod tests {
             target_language: "English".to_owned(),
             ..TranslationSettings::default()
         };
-        settings.final_review = false;
+        settings.review_policy = subbake_core::ReviewPolicy::Off;
         let outcome = translate_subtitle(TranslationRequest {
             input_path: input_path.clone(),
             output_path: None,

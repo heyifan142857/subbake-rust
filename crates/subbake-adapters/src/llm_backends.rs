@@ -44,6 +44,7 @@ where
 
 /// All protocol implementations share transport, auth validation and response
 /// normalization. Public aliases make the registry's four adapters explicit.
+#[derive(Clone)]
 pub struct ProtocolAdapter {
     config: BackendConfig,
     format: ApiFormat,
@@ -226,6 +227,9 @@ impl ProtocolAdapter {
     }
 }
 impl LlmBackend for ProtocolAdapter {
+    fn supports_parallel_generation(&self) -> bool {
+        true
+    }
     fn provider_name(&self) -> &str {
         &self.config.display_name
     }
@@ -256,6 +260,46 @@ impl LlmBackend for ProtocolAdapter {
         c: &CancellationGuard,
     ) -> CoreResult<GenerationResponse> {
         runtime().block_on(self.run(&request.messages, c))
+    }
+    fn generate_many_cancellable(
+        &mut self,
+        requests: Vec<GenerationRequest>,
+        max_concurrency: usize,
+        cancellation: &CancellationGuard,
+    ) -> Vec<CoreResult<GenerationResponse>> {
+        let adapter = self.clone();
+        let cancellation = cancellation.clone();
+        runtime().block_on(async move {
+            let semaphore =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1)));
+            let mut set = tokio::task::JoinSet::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                let adapter = adapter.clone();
+                let cancellation = cancellation.clone();
+                let semaphore = semaphore.clone();
+                set.spawn(async move {
+                    let permit = semaphore.acquire_owned().await.map_err(|error| {
+                        CoreError::Backend(format!("concurrency limiter closed: {error}"))
+                    })?;
+                    let result = adapter.run(&request.messages, &cancellation).await;
+                    drop(permit);
+                    Ok::<_, CoreError>((index, result))
+                });
+            }
+            let mut ordered = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(item)) => ordered.push(item),
+                    Ok(Err(error)) => ordered.push((usize::MAX, Err(error))),
+                    Err(error) => ordered.push((
+                        usize::MAX,
+                        Err(CoreError::Backend(format!("provider task failed: {error}"))),
+                    )),
+                }
+            }
+            ordered.sort_by_key(|(index, _)| *index);
+            ordered.into_iter().map(|(_, result)| result).collect()
+        })
     }
 }
 pub fn default_timeout_seconds() -> f64 {

@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use subbake_core::entities::{DEFAULT_BATCH_SIZE, PipelineOptions};
+use subbake_core::entities::{
+    DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET, DEFAULT_REVIEW_CONCURRENCY,
+    DEFAULT_TRANSLATION_CONCURRENCY, PipelineOptions, ReviewPolicy,
+};
 
 use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
 
@@ -19,9 +22,13 @@ pub struct TranslationSettings {
     pub source_language: String,
     pub target_language: String,
     pub batch_size: usize,
+    pub batch_token_budget: usize,
+    pub translation_concurrency: usize,
+    pub review_concurrency: usize,
     pub bilingual: bool,
     pub fast_mode: bool,
-    pub final_review: bool,
+    pub review_policy: ReviewPolicy,
+    pub terminology_preflight: bool,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -74,14 +81,29 @@ impl TranslationSettingsPatch {
         if let Some(value) = other.batch_size {
             self.batch_size = Some(value);
         }
+        if let Some(value) = other.batch_token_budget {
+            self.batch_token_budget = Some(value);
+        }
+        if let Some(value) = other.translation_concurrency {
+            self.translation_concurrency = Some(value);
+        }
+        if let Some(value) = other.review_concurrency {
+            self.review_concurrency = Some(value);
+        }
         if let Some(value) = other.bilingual {
             self.bilingual = Some(value);
         }
         if let Some(value) = other.fast_mode {
             self.fast_mode = Some(value);
         }
+        if let Some(value) = other.review_policy {
+            self.review_policy = Some(value);
+        }
         if let Some(value) = other.final_review {
             self.final_review = Some(value);
+        }
+        if let Some(value) = other.terminology_preflight {
+            self.terminology_preflight = Some(value);
         }
         if let Some(value) = other.dry_run {
             self.dry_run = Some(value);
@@ -125,9 +147,14 @@ pub struct TranslationSettingsPatch {
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     pub batch_size: Option<usize>,
+    pub batch_token_budget: Option<usize>,
+    pub translation_concurrency: Option<usize>,
+    pub review_concurrency: Option<usize>,
     pub bilingual: Option<bool>,
     pub fast_mode: Option<bool>,
     pub final_review: Option<bool>,
+    pub review_policy: Option<ReviewPolicy>,
+    pub terminology_preflight: Option<bool>,
     pub dry_run: Option<bool>,
     pub resume: Option<bool>,
     pub use_cache: Option<bool>,
@@ -154,9 +181,13 @@ impl Default for TranslationSettings {
             source_language: "Auto".to_owned(),
             target_language: "Chinese".to_owned(),
             batch_size: DEFAULT_BATCH_SIZE,
+            batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
+            translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
+            review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
             bilingual: false,
             fast_mode: false,
-            final_review: true,
+            review_policy: ReviewPolicy::Targeted,
+            terminology_preflight: true,
             dry_run: false,
             resume: true,
             use_cache: true,
@@ -215,6 +246,15 @@ impl TranslationSettings {
         if let Some(value) = patch.batch_size {
             self.batch_size = value;
         }
+        if let Some(value) = patch.batch_token_budget {
+            self.batch_token_budget = value;
+        }
+        if let Some(value) = patch.translation_concurrency {
+            self.translation_concurrency = value;
+        }
+        if let Some(value) = patch.review_concurrency {
+            self.review_concurrency = value;
+        }
         if let Some(value) = patch.bilingual {
             self.bilingual = value;
         }
@@ -222,7 +262,17 @@ impl TranslationSettings {
             self.fast_mode = value;
         }
         if let Some(value) = patch.final_review {
-            self.final_review = value;
+            self.review_policy = if value {
+                ReviewPolicy::Targeted
+            } else {
+                ReviewPolicy::Off
+            };
+        }
+        if let Some(value) = patch.review_policy {
+            self.review_policy = value;
+        }
+        if let Some(value) = patch.terminology_preflight {
+            self.terminology_preflight = value;
         }
         if let Some(value) = patch.dry_run {
             self.dry_run = value;
@@ -284,9 +334,13 @@ impl TranslationSettings {
         options.source_language = self.source_language.clone();
         options.target_language = self.target_language.clone();
         options.batch_size = self.batch_size;
+        options.batch_token_budget = self.batch_token_budget;
+        options.translation_concurrency = self.translation_concurrency;
+        options.review_concurrency = self.review_concurrency;
         options.bilingual = self.bilingual;
         options.fast_mode = self.fast_mode;
-        options.final_review = self.final_review;
+        options.review_policy = self.review_policy;
+        options.terminology_preflight = self.terminology_preflight;
         options.dry_run = self.dry_run;
         options.resume = self.resume;
         options.use_cache = self.use_cache;
@@ -340,7 +394,7 @@ mod tests {
         assert_eq!(settings.source_language, "Auto");
         assert_eq!(settings.target_language, "Chinese");
         assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
-        assert!(settings.final_review);
+        assert_eq!(settings.review_policy, ReviewPolicy::Targeted);
         assert!(settings.resume);
         assert!(settings.use_cache);
         assert_eq!(settings.retries, 2);
@@ -380,7 +434,7 @@ mod tests {
 
         assert_eq!(settings.provider, "openai");
         assert_eq!(settings.batch_size, 12);
-        assert!(!settings.final_review);
+        assert_eq!(settings.review_policy, ReviewPolicy::Off);
     }
 
     #[test]

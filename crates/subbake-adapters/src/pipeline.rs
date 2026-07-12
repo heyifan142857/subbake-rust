@@ -91,7 +91,7 @@ mod tests {
         fs::write(&input_path, "hello\n").expect("write input");
         let settings = TranslationSettings {
             target_language: "English".to_owned(),
-            final_review: false,
+            review_policy: subbake_core::ReviewPolicy::Off,
             ..TranslationSettings::default()
         };
 

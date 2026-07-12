@@ -2,7 +2,38 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_BATCH_SIZE: usize = 30;
+pub const DEFAULT_BATCH_SIZE: usize = 80;
+pub const DEFAULT_BATCH_TOKEN_BUDGET: usize = 1_800;
+pub const DEFAULT_TRANSLATION_CONCURRENCY: usize = 3;
+pub const DEFAULT_REVIEW_CONCURRENCY: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPolicy {
+    Off,
+    #[default]
+    Targeted,
+    Full,
+}
+
+impl ReviewPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "none" => Ok(Self::Off),
+            "targeted" | "true" => Ok(Self::Targeted),
+            "full" => Ok(Self::Full),
+            _ => Err("review policy must be one of: off, targeted, full".to_owned()),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Targeted => "targeted",
+            Self::Full => "full",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSegment {
@@ -145,12 +176,16 @@ pub struct PipelineOptions {
     pub provider: String,
     pub model: String,
     pub batch_size: usize,
+    pub batch_token_budget: usize,
+    pub translation_concurrency: usize,
+    pub review_concurrency: usize,
     pub fast_mode: bool,
     pub bilingual: bool,
     pub target_language: String,
     pub source_language: String,
     pub retries: usize,
-    pub final_review: bool,
+    pub review_policy: ReviewPolicy,
+    pub terminology_preflight: bool,
     pub timeout_seconds: f64,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -175,12 +210,16 @@ impl PipelineOptions {
             provider: default_provider(),
             model: default_model(),
             batch_size: DEFAULT_BATCH_SIZE,
+            batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
+            translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
+            review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
             fast_mode: false,
             bilingual: false,
             target_language: default_target_language(),
             source_language: default_source_language(),
             retries: default_retries(),
-            final_review: true,
+            review_policy: ReviewPolicy::Targeted,
+            terminology_preflight: true,
             timeout_seconds: default_timeout_seconds(),
             api_key: None,
             base_url: None,

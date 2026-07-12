@@ -29,7 +29,25 @@ pub enum ProgressUnit {
     Steps,
     Files,
     Batches,
+    Lines,
     Bytes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranslationProgress {
+    pub segments_completed: u64,
+    pub segments_total: u64,
+    pub batches_committed: u64,
+    pub batches_total: u64,
+    pub requests_in_flight: u64,
+    pub requests_buffered: u64,
+    pub requests_retrying: u64,
+    pub cache_hits: u64,
+    pub translation_memory_hits: u64,
+    pub terminology_candidates: u64,
+    pub terminology_conflicts: u64,
+    pub terminology_patched: u64,
+    pub window_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +61,7 @@ pub struct ProgressEvent {
     pub resumed: u64,
     pub usage: Usage,
     pub message: Option<String>,
+    pub translation: Option<TranslationProgress>,
 }
 
 impl ProgressEvent {
@@ -63,6 +82,7 @@ impl ProgressEvent {
             resumed: 0,
             usage: Usage::default(),
             message: None,
+            translation: None,
         }
     }
 }

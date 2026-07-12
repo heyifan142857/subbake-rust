@@ -36,6 +36,27 @@ pub(crate) fn build_review_plan(
     plan
 }
 
+pub(crate) fn build_full_review_plan(
+    batches: &[Vec<SubtitleSegment>],
+    translated_segments: &[SubtitleSegment],
+) -> Vec<ReviewBatchPlan> {
+    let mut offset = 0;
+    batches
+        .iter()
+        .map(|source| {
+            let end = offset + source.len();
+            let plan = ReviewBatchPlan {
+                start_offset: offset,
+                source: source.clone(),
+                translated: translated_segments[offset..end].to_vec(),
+                reasons: vec!["full review".to_owned()],
+            };
+            offset = end;
+            plan
+        })
+        .collect()
+}
+
 pub(crate) fn build_review_messages(
     options: &PipelineOptions,
     source: &[SubtitleSegment],
@@ -90,15 +111,18 @@ pub(crate) fn build_review_messages(
          Do not remove, reorder, merge, or renumber entries.\n\
          Return exactly one output object for each input line id, in the same order as expected_ids.\n\
          Prefer minimal edits; leave good lines untouched.\n\
-         Return JSON only with keys \"lines\" and \"review_notes\".\n\
+         Return JSON only as {{\"changes\":[{{\"id\":\"<id>\",\"translation\":\"<replacement>\"}}]}}.\n\
+         Return an empty changes array when every translation is already good.\n\
          REVIEW_JSON_START{payload_json}REVIEW_JSON_END"
     );
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
 pub(crate) fn parse_review_payload(payload: &serde_json::Value) -> CoreResult<ReviewResult> {
-    let lines = payload["lines"]
-        .as_array()
+    let lines = payload
+        .get("changes")
+        .or_else(|| payload.get("lines"))
+        .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             CoreError::InvalidTranslation("review response missing lines array".to_owned())
         })?

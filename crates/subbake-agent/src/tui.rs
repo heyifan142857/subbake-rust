@@ -1485,8 +1485,22 @@ fn format_progress(event: &ProgressEvent, elapsed: std::time::Duration) -> Strin
             })
         })
         .unwrap_or_default();
+    let activity = event
+        .translation
+        .as_ref()
+        .map_or_else(String::new, |detail| {
+            format!(
+                " · {}/{} batches · active {} · buffered {} · retry {} · TM {}",
+                detail.batches_committed,
+                detail.batches_total,
+                detail.requests_in_flight,
+                detail.requests_buffered,
+                detail.requests_retrying,
+                detail.translation_memory_hits,
+            )
+        });
     format!(
-        "{state} {counts} · {:.1}s{eta} · {}/{} tok{resumed}",
+        "{state} {counts}{activity} · {:.1}s{eta} · {}/{} tok{resumed}",
         elapsed.as_secs_f32(),
         event.usage.input_tokens,
         event.usage.output_tokens

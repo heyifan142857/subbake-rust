@@ -7,8 +7,8 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 5;
-pub const RENDER_FINGERPRINT_VERSION: u64 = 2;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 6;
+pub const RENDER_FINGERPRINT_VERSION: u64 = 3;
 pub const CACHE_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +294,14 @@ pub fn build_translation_fingerprint(
             "batch_size".to_owned(),
             JsonValue::Number(options.batch_size.to_string()),
         ),
+        (
+            "batch_token_budget".to_owned(),
+            JsonValue::Number(options.batch_token_budget.to_string()),
+        ),
+        (
+            "terminology_preflight".to_owned(),
+            JsonValue::Bool(options.terminology_preflight),
+        ),
         ("fast_mode".to_owned(), JsonValue::Bool(options.fast_mode)),
         (
             "source_language".to_owned(),
@@ -314,8 +322,8 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
         ),
         ("bilingual".to_owned(), JsonValue::Bool(options.bilingual)),
         (
-            "final_review".to_owned(),
-            JsonValue::Bool(options.final_review),
+            "review_policy".to_owned(),
+            JsonValue::String(format!("{:?}", options.review_policy).to_lowercase()),
         ),
         (
             "output_format".to_owned(),
@@ -556,7 +564,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "102a9fddbf1093211e0fc41f79bf0f4044393a67"
+            "ce3a0a8d3a15c62f4c32938a26509d93d3e2008d"
         );
     }
 

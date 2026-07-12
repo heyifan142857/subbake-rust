@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, FailureLog, GlossaryEntry,
-    PipelineOptions, PipelineResult, SplitRetryLog, SubtitleDocument, SubtitleSegment,
-    TranslationLine, Usage,
+    PipelineOptions, PipelineResult, ReviewPolicy, SplitRetryLog, SubtitleDocument,
+    SubtitleSegment, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
@@ -20,8 +20,8 @@ use crate::recovery::{
     parse_translation_payload, retry_correction_message, split_index,
 };
 use crate::review::{
-    ReviewBatchPlan, build_review_messages, build_review_plan, parse_review_payload,
-    restore_review_progress,
+    ReviewBatchPlan, build_full_review_plan, build_review_messages, build_review_plan,
+    parse_review_payload, restore_review_progress,
 };
 use crate::storage::{
     InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash, build_request_hash_v2,
@@ -94,8 +94,44 @@ where
                 resumed: resumed as u64,
                 usage,
                 message: None,
+                translation: None,
             });
         }
+    }
+
+    fn report_translation_window(
+        &self,
+        batches: &[Vec<SubtitleSegment>],
+        committed: usize,
+        in_flight: usize,
+        resumed: usize,
+        usage: Usage,
+    ) {
+        let Some(sink) = &self.progress else { return };
+        let completed_segments = batches.iter().take(committed).map(Vec::len).sum::<usize>();
+        let total_segments = batches.iter().map(Vec::len).sum::<usize>();
+        let mut event = ProgressEvent::running(
+            TaskKind::Translation,
+            "TRANSLATE",
+            completed_segments as u64,
+            Some(total_segments as u64),
+            ProgressUnit::Lines,
+        );
+        event.resumed = batches.iter().take(resumed).map(Vec::len).sum::<usize>() as u64;
+        event.usage = usage;
+        event.translation = Some(crate::progress::TranslationProgress {
+            segments_completed: completed_segments as u64,
+            segments_total: total_segments as u64,
+            batches_committed: committed as u64,
+            batches_total: batches.len() as u64,
+            requests_in_flight: in_flight as u64,
+            cache_hits: self.cache_hits as u64,
+            translation_memory_hits: self.translation_memory_hits as u64,
+            window_index: committed.div_ceil(self.options.translation_concurrency.max(1)) as u64
+                + 1,
+            ..crate::progress::TranslationProgress::default()
+        });
+        sink.emit(event);
     }
 
     pub fn with_cancellation(mut self, cancellation: CancellationGuard) -> Self {
@@ -129,7 +165,11 @@ where
             self.memory.load_glossary(&entries);
         }
 
-        let batches = chunk_segments(&document.segments, self.options.batch_size);
+        let batches = chunk_segments_by_budget(
+            &document.segments,
+            self.options.batch_size,
+            self.options.batch_token_budget,
+        );
         let planned_batches = build_batch_plan(&batches);
         let state_path = self
             .store
@@ -198,95 +238,129 @@ where
         if usage != Usage::default() {
             self.dashboard.add_usage(usage);
         }
-        for (batch_index, batch) in batches
-            .iter()
-            .enumerate()
-            .skip(resume.translation_batches_completed)
-        {
+        let mut next_batch = resume.translation_batches_completed;
+        while next_batch < batches.len() {
             self.cancellation.check()?;
-            self.report(
-                "TRANSLATE",
-                TaskState::Running,
-                batch_index,
-                Some(batches.len()),
-                resume.translation_batches_completed,
-                usage,
-            );
-            // TM lookup: split batch into TM-matched (by segment text) and pending.
-            let (tm_hits, pending): (HashMap<String, String>, Vec<SubtitleSegment>) = {
+            let concurrency = if self.backend.supports_parallel_generation() {
+                self.options.translation_concurrency.max(1)
+            } else {
+                1
+            };
+            let window_end = (next_batch + concurrency).min(batches.len());
+            let mut prepared = Vec::new();
+            for (batch_index, batch) in batches.iter().enumerate().take(window_end).skip(next_batch)
+            {
                 let mut hits = HashMap::new();
-                let mut rest = Vec::new();
-                for seg in batch.iter() {
-                    let key = translation_memory_key(&seg.text);
+                let mut pending = Vec::new();
+                for segment in batch {
+                    let key = translation_memory_key(&segment.text);
                     if !key.is_empty()
                         && self.options.use_cache
                         && let Some(text) = self.translation_memory.get(&key)
                     {
-                        hits.insert(seg.id.clone(), text.clone());
+                        hits.insert(segment.id.clone(), text.clone());
                     } else {
-                        rest.push(seg.clone());
+                        pending.push(segment.clone());
                     }
                 }
-                (hits, rest)
-            };
-
-            let new_lines: Vec<TranslationLine> = if pending.is_empty() {
-                // All matched — short-circuit, no LLM call.
-                Vec::new()
-            } else {
-                let br = self.translate_batch(batch_index + 1, &pending)?;
-                validate_translation_batch(&pending, &br.lines)?;
-                usage.add(br.usage);
-                self.dashboard.add_usage(br.usage);
-                self.memory.update(&br.summary, &br.glossary_updates);
-                br.lines
-            };
-
-            let merged: Vec<TranslationLine> = merge_translation_lines(batch, &tm_hits, &new_lines);
-            let translated_batch = apply_lines(batch, &merged);
-            self.translation_memory_hits += tm_hits.len();
-            if self.options.use_cache {
-                update_translation_memory(&mut self.translation_memory, batch, &translated_batch);
+                prepared.push((batch_index, hits, pending));
             }
-
-            // Persist glossary, TM, batch segments after each batch.
-            if let Some(ref store) = self.store {
-                self.cancellation.check()?;
-                let glossary_entries: Vec<(String, String)> = self
-                    .memory
-                    .glossary
-                    .iter()
-                    .map(|(source, target)| (source.clone(), target.clone()))
-                    .collect();
-                store.save_glossary(&glossary_entries)?;
-                store.save_batch_segments(
-                    BatchShardKind::Translated,
-                    batch_index + 1,
-                    &translated_batch,
-                )?;
-                if self.options.use_cache {
-                    let tm_entries: Vec<(String, String)> = self
-                        .translation_memory
-                        .iter()
-                        .map(|(key, text)| (key.clone(), text.clone()))
-                        .collect();
-                    store.save_translation_memory(&tm_entries)?;
-                }
-            }
-
-            translated_segments.extend(translated_batch);
-            self.cancellation.check()?;
-            self.save_run_state(
-                batch_index + 1,
-                resume.review_batches_completed,
-                false,
-                usage,
-            )?;
             self.report(
                 "TRANSLATE",
                 TaskState::Running,
-                batch_index + 1,
+                next_batch,
                 Some(batches.len()),
+                resume.translation_batches_completed,
+                usage,
+            );
+            let pending = prepared
+                .iter()
+                .filter(|(_, _, batch)| !batch.is_empty())
+                .map(|(index, _, batch)| (*index + 1, batch.clone()))
+                .collect::<Vec<_>>();
+            self.report_translation_window(
+                &batches,
+                next_batch,
+                pending.len(),
+                resume.translation_batches_completed,
+                usage,
+            );
+            let mut generated = self.translate_window(&pending)?;
+            validate_window_terminology(&prepared, &generated, &self.memory)?;
+            for (batch_index, tm_hits, pending_batch) in prepared {
+                let batch = &batches[batch_index];
+                let new_lines = if pending_batch.is_empty() {
+                    Vec::new()
+                } else {
+                    let br = generated.remove(&(batch_index + 1)).ok_or_else(|| {
+                        CoreError::Data(format!(
+                            "translation window omitted batch {}",
+                            batch_index + 1
+                        ))
+                    })?;
+                    usage.add(br.usage);
+                    self.dashboard.add_usage(br.usage);
+                    self.memory.update(&br.summary, &br.glossary_updates);
+                    br.lines
+                };
+                let merged = merge_translation_lines(batch, &tm_hits, &new_lines);
+                let translated_batch = apply_lines(batch, &merged);
+                self.translation_memory_hits += tm_hits.len();
+                if self.options.use_cache {
+                    update_translation_memory(
+                        &mut self.translation_memory,
+                        batch,
+                        &translated_batch,
+                    );
+                }
+
+                // Persist glossary, TM, batch segments after each batch.
+                if let Some(ref store) = self.store {
+                    self.cancellation.check()?;
+                    let glossary_entries: Vec<(String, String)> = self
+                        .memory
+                        .glossary
+                        .iter()
+                        .map(|(source, target)| (source.clone(), target.clone()))
+                        .collect();
+                    store.save_glossary(&glossary_entries)?;
+                    store.save_batch_segments(
+                        BatchShardKind::Translated,
+                        batch_index + 1,
+                        &translated_batch,
+                    )?;
+                    if self.options.use_cache {
+                        let tm_entries: Vec<(String, String)> = self
+                            .translation_memory
+                            .iter()
+                            .map(|(key, text)| (key.clone(), text.clone()))
+                            .collect();
+                        store.save_translation_memory(&tm_entries)?;
+                    }
+                }
+
+                translated_segments.extend(translated_batch);
+                self.cancellation.check()?;
+                self.save_run_state(
+                    batch_index + 1,
+                    resume.review_batches_completed,
+                    false,
+                    usage,
+                )?;
+                self.report(
+                    "TRANSLATE",
+                    TaskState::Running,
+                    batch_index + 1,
+                    Some(batches.len()),
+                    resume.translation_batches_completed,
+                    usage,
+                );
+            }
+            next_batch = window_end;
+            self.report_translation_window(
+                &batches,
+                next_batch,
+                0,
                 resume.translation_batches_completed,
                 usage,
             );
@@ -297,13 +371,16 @@ where
         self.save_run_state(batches.len(), resume.review_batches_completed, true, usage)?;
         self.dashboard.mark_done("TRANSLATE");
 
-        let review_plan = if self.options.final_review
-            && !self.options.fast_mode
-            && !translated_segments.is_empty()
-        {
-            build_review_plan(&batches, &translated_segments, &self.memory)
-        } else {
+        let review_plan = if self.options.fast_mode || translated_segments.is_empty() {
             Vec::new()
+        } else {
+            match self.options.review_policy {
+                ReviewPolicy::Off => Vec::new(),
+                ReviewPolicy::Targeted => {
+                    build_review_plan(&batches, &translated_segments, &self.memory)
+                }
+                ReviewPolicy::Full => build_full_review_plan(&batches, &translated_segments),
+            }
         };
         self.dashboard
             .set_total_steps(3 + batches.len() + review_plan.len());
@@ -329,43 +406,66 @@ where
                 &mut output_segments,
             )?;
             self.dashboard.mark_running("FINAL_REVIEW");
-            for (review_index, review_batch) in
-                review_plan.iter().enumerate().skip(resumed_review_batches)
-            {
+            let mut next_review = resumed_review_batches;
+            while next_review < review_plan.len() {
                 self.cancellation.check()?;
+                let concurrency = if self.backend.supports_parallel_generation() {
+                    self.options.review_concurrency.max(1)
+                } else {
+                    1
+                };
+                let window_end = (next_review + concurrency).min(review_plan.len());
                 self.report(
                     "FINAL_REVIEW",
                     TaskState::Running,
-                    review_index,
+                    next_review,
                     Some(review_plan.len()),
                     resumed_review_batches,
                     usage,
                 );
-                let review_position = review_index + 1;
-                let reviewed = self.review_batch(review_position, review_batch)?;
-                usage.add(reviewed.usage);
-                self.dashboard.add_usage(reviewed.usage);
-                let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
-                if let Some(ref store) = self.store {
-                    self.cancellation.check()?;
-                    store.save_batch_segments(
-                        BatchShardKind::Reviewed,
+                let pending = review_plan
+                    .iter()
+                    .enumerate()
+                    .take(window_end)
+                    .skip(next_review)
+                    .map(|(index, batch)| (index + 1, batch.clone()))
+                    .collect::<Vec<_>>();
+                let mut reviewed_window = self.review_window(&pending)?;
+                for (review_index, review_batch) in review_plan
+                    .iter()
+                    .enumerate()
+                    .take(window_end)
+                    .skip(next_review)
+                {
+                    let review_position = review_index + 1;
+                    let reviewed = reviewed_window.remove(&review_position).ok_or_else(|| {
+                        CoreError::Data(format!("review window omitted batch {review_position}"))
+                    })?;
+                    usage.add(reviewed.usage);
+                    self.dashboard.add_usage(reviewed.usage);
+                    let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
+                    if let Some(ref store) = self.store {
+                        self.cancellation.check()?;
+                        store.save_batch_segments(
+                            BatchShardKind::Reviewed,
+                            review_position,
+                            &reviewed_segments,
+                        )?;
+                    }
+                    output_segments[review_batch.start_offset
+                        ..review_batch.start_offset + reviewed_segments.len()]
+                        .clone_from_slice(&reviewed_segments);
+                    self.save_run_state(batches.len(), review_position, true, usage)?;
+                    self.report(
+                        "FINAL_REVIEW",
+                        TaskState::Running,
                         review_position,
-                        &reviewed_segments,
-                    )?;
+                        Some(review_plan.len()),
+                        resumed_review_batches,
+                        usage,
+                    );
                 }
-                output_segments[review_batch.start_offset
-                    ..review_batch.start_offset + reviewed_segments.len()]
-                    .clone_from_slice(&reviewed_segments);
-                self.save_run_state(batches.len(), review_position, true, usage)?;
-                self.report(
-                    "FINAL_REVIEW",
-                    TaskState::Running,
-                    review_position,
-                    Some(review_plan.len()),
-                    resumed_review_batches,
-                    usage,
-                );
+                next_review = window_end;
             }
             validate_full_alignment(&document.segments, &output_segments)?;
             self.dashboard.mark_done("FINAL_REVIEW");
@@ -407,6 +507,106 @@ where
         batch: &[SubtitleSegment],
     ) -> CoreResult<BatchWithUsage> {
         self.translate_batch_impl(batch_index, batch, true)
+    }
+
+    fn translate_window(
+        &mut self,
+        batches: &[(usize, Vec<SubtitleSegment>)],
+    ) -> CoreResult<HashMap<usize, BatchWithUsage>> {
+        use crate::ports::{GenerationRequest, ResponseContract};
+
+        if !self.backend.supports_parallel_generation() {
+            let mut results = HashMap::new();
+            for (batch_index, batch) in batches {
+                results.insert(*batch_index, self.translate_batch(*batch_index, batch)?);
+            }
+            return Ok(results);
+        }
+
+        let mut results = HashMap::new();
+        let mut pending = Vec::new();
+        for (batch_index, batch) in batches {
+            let messages =
+                build_translation_messages(&self.options, *batch_index, batch, &self.memory);
+            let hash = request_hash(&self.options, CacheStage::Translate, &messages);
+            let cached = if self.options.use_cache {
+                self.store
+                    .as_ref()
+                    .map(|store| store.load_cached_response(CacheStage::Translate, &hash))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            if let Some(response) = cached {
+                let BackendPayload::Translation(payload) = response.payload else {
+                    return Err(CoreError::Data(
+                        "translation cache returned a review payload".to_owned(),
+                    ));
+                };
+                validate_translation_batch(batch, &payload.lines)?;
+                self.cache_hits += 1;
+                results.insert(
+                    *batch_index,
+                    BatchWithUsage {
+                        lines: payload.lines,
+                        summary: payload.summary,
+                        glossary_updates: payload.glossary_updates,
+                        usage: Usage::default(),
+                    },
+                );
+            } else {
+                pending.push((*batch_index, batch.clone(), hash, messages));
+            }
+        }
+        let requests = pending
+            .iter()
+            .map(|(_, _, _, messages)| GenerationRequest {
+                messages: messages.clone(),
+                response_contract: ResponseContract::JsonObject,
+            })
+            .collect();
+        let responses = self.backend.generate_many_cancellable(
+            requests,
+            self.options.translation_concurrency,
+            &self.cancellation,
+        );
+        for ((batch_index, batch, hash, _), response) in pending.into_iter().zip(responses) {
+            match response.and_then(|response| {
+                let payload = parse_translation_payload(&response.json)?;
+                validate_translation_batch(&batch, &payload.lines)?;
+                Ok((payload, response.usage))
+            }) {
+                Ok((payload, response_usage)) => {
+                    let backend_result = BackendJsonResult {
+                        payload: BackendPayload::Translation(payload.clone()),
+                        usage: response_usage,
+                    };
+                    if self.options.use_cache
+                        && let Some(store) = self.store.as_ref()
+                    {
+                        store.save_cached_response(
+                            CacheStage::Translate,
+                            &hash,
+                            &backend_result,
+                        )?;
+                    }
+                    results.insert(
+                        batch_index,
+                        BatchWithUsage {
+                            lines: payload.lines,
+                            summary: payload.summary,
+                            glossary_updates: payload.glossary_updates,
+                            usage: response_usage,
+                        },
+                    );
+                }
+                Err(_) => {
+                    results.insert(batch_index, self.translate_batch(batch_index, &batch)?);
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn translate_batch_impl(
@@ -632,6 +832,105 @@ where
         ))
     }
 
+    fn review_window(
+        &mut self,
+        batches: &[(usize, ReviewBatchPlan)],
+    ) -> CoreResult<HashMap<usize, ReviewWithUsage>> {
+        use crate::ports::{GenerationRequest, ResponseContract};
+        if !self.backend.supports_parallel_generation() {
+            let mut output = HashMap::new();
+            for (index, batch) in batches {
+                output.insert(*index, self.review_batch(*index, batch)?);
+            }
+            return Ok(output);
+        }
+        let mut output = HashMap::new();
+        let mut pending = Vec::new();
+        for (index, batch) in batches {
+            let messages = build_review_messages(
+                &self.options,
+                &batch.source,
+                &batch.translated,
+                &batch.reasons,
+                &self.memory,
+            );
+            let hash = request_hash(&self.options, CacheStage::Review, &messages);
+            let cached = if self.options.use_cache {
+                self.store
+                    .as_ref()
+                    .map(|store| store.load_cached_response(CacheStage::Review, &hash))
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            if let Some(response) = cached {
+                let BackendPayload::Review(result) = response.payload else {
+                    return Err(CoreError::Data(
+                        "review cache returned a translation payload".to_owned(),
+                    ));
+                };
+                validate_translation_batch(&batch.source, &result.lines)?;
+                self.cache_hits += 1;
+                output.insert(
+                    *index,
+                    ReviewWithUsage {
+                        lines: result.lines,
+                        usage: Usage::default(),
+                    },
+                );
+            } else {
+                pending.push((*index, batch.clone(), hash, messages));
+            }
+        }
+        let requests = pending
+            .iter()
+            .map(|(_, _, _, messages)| GenerationRequest {
+                messages: messages.clone(),
+                response_contract: ResponseContract::JsonObject,
+            })
+            .collect();
+        let responses = self.backend.generate_many_cancellable(
+            requests,
+            self.options.review_concurrency,
+            &self.cancellation,
+        );
+        for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
+            match response.and_then(|response| {
+                let mut result = parse_review_payload(&response.json)?;
+                result.lines = merge_review_patch(&batch.translated, &result.lines)?;
+                validate_translation_batch(&batch.source, &result.lines)?;
+                Ok((result, response.usage))
+            }) {
+                Ok((result, response_usage)) => {
+                    if self.options.use_cache
+                        && let Some(store) = self.store.as_ref()
+                    {
+                        store.save_cached_response(
+                            CacheStage::Review,
+                            &hash,
+                            &BackendJsonResult {
+                                payload: BackendPayload::Review(result.clone()),
+                                usage: response_usage,
+                            },
+                        )?;
+                    }
+                    output.insert(
+                        index,
+                        ReviewWithUsage {
+                            lines: result.lines,
+                            usage: response_usage,
+                        },
+                    );
+                }
+                Err(_) => {
+                    output.insert(index, self.review_batch(index, &batch)?);
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn review_once(
         &mut self,
         batch: &ReviewBatchPlan,
@@ -658,8 +957,10 @@ where
                 let (payload, usage) = self
                     .backend
                     .generate_raw_json_cancellable(messages, &self.cancellation)?;
+                let mut review = parse_review_payload(&payload)?;
+                review.lines = merge_review_patch(&batch.translated, &review.lines)?;
                 BackendJsonResult {
-                    payload: BackendPayload::Review(parse_review_payload(&payload)?),
+                    payload: BackendPayload::Review(review),
                     usage,
                 }
             }
@@ -1220,6 +1521,128 @@ fn chunk_segments(segments: &[SubtitleSegment], batch_size: usize) -> Vec<Vec<Su
         .chunks(batch_size)
         .map(<[SubtitleSegment]>::to_vec)
         .collect()
+}
+
+fn chunk_segments_by_budget(
+    segments: &[SubtitleSegment],
+    max_batch_size: usize,
+    token_budget: usize,
+) -> Vec<Vec<SubtitleSegment>> {
+    if token_budget == 0 {
+        return chunk_segments(segments, max_batch_size);
+    }
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut tokens = 0usize;
+    for segment in segments {
+        let estimate = estimated_text_tokens(&segment.text).saturating_add(8);
+        if !current.is_empty()
+            && (current.len() >= max_batch_size || tokens.saturating_add(estimate) > token_budget)
+        {
+            batches.push(std::mem::take(&mut current));
+            tokens = 0;
+        }
+        current.push(segment.clone());
+        tokens = tokens.saturating_add(estimate);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn estimated_text_tokens(text: &str) -> usize {
+    let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |(ascii, other), ch| {
+        if ch.is_ascii() {
+            (ascii + 1, other)
+        } else {
+            (ascii, other + 1)
+        }
+    });
+    ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
+fn merge_review_patch(
+    translated: &[SubtitleSegment],
+    changes: &[TranslationLine],
+) -> CoreResult<Vec<TranslationLine>> {
+    let mut replacements = HashMap::new();
+    for change in changes {
+        if change.translation.trim().is_empty()
+            || replacements
+                .insert(&change.id, &change.translation)
+                .is_some()
+        {
+            return Err(CoreError::InvalidTranslation(format!(
+                "review patch contains an empty or duplicate change for `{}`",
+                change.id
+            )));
+        }
+    }
+    if replacements
+        .keys()
+        .any(|id| !translated.iter().any(|segment| segment.id == ***id))
+    {
+        return Err(CoreError::InvalidTranslation(
+            "review patch contains an unknown id".to_owned(),
+        ));
+    }
+    Ok(translated
+        .iter()
+        .map(|segment| TranslationLine {
+            id: segment.id.clone(),
+            translation: replacements.get(&segment.id).map_or_else(
+                || segment.text.clone(),
+                |translation| (*translation).clone(),
+            ),
+        })
+        .collect())
+}
+
+fn validate_window_terminology(
+    prepared: &[(usize, HashMap<String, String>, Vec<SubtitleSegment>)],
+    generated: &HashMap<usize, BatchWithUsage>,
+    memory: &ContextMemory,
+) -> CoreResult<()> {
+    let mut canonical = memory.glossary.clone();
+    for result in generated.values() {
+        for entry in &result.glossary_updates {
+            if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
+                continue;
+            }
+            if let Some(existing) = canonical.get(&entry.source)
+                && !existing.eq_ignore_ascii_case(&entry.target)
+            {
+                return Err(CoreError::InvalidTranslation(format!(
+                    "terminology conflict for `{}`: `{existing}` versus `{}`",
+                    entry.source, entry.target
+                )));
+            }
+            canonical
+                .entry(entry.source.clone())
+                .or_insert_with(|| entry.target.clone());
+        }
+    }
+    for (batch_index, _, source) in prepared {
+        let Some(result) = generated.get(&(*batch_index + 1)) else {
+            continue;
+        };
+        for (segment, line) in source.iter().zip(&result.lines) {
+            let source_lower = segment.text.to_lowercase();
+            let translation_lower = line.translation.to_lowercase();
+            for (term, target) in &canonical {
+                if source_lower.contains(&term.to_lowercase())
+                    && !translation_lower.contains(&target.to_lowercase())
+                {
+                    return Err(CoreError::InvalidTranslation(format!(
+                        "line {} does not use required glossary translation `{term}` -> `{target}`",
+                        segment.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_batch_plan(batches: &[Vec<SubtitleSegment>]) -> Vec<BatchPlanEntry> {
@@ -1912,7 +2335,7 @@ mod tests {
     fn pipeline_retries_transient_backend_failure() {
         let document = document("retry.txt", &["hello"]);
         let mut options = PipelineOptions::new("retry.txt".into());
-        options.final_review = false;
+        options.review_policy = ReviewPolicy::Off;
         options.retries = 1;
         let calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -1935,7 +2358,7 @@ mod tests {
         let document = document("split.txt", &["one", "two", "three", "four"]);
         let mut options = PipelineOptions::new("split.txt".into());
         options.batch_size = 8;
-        options.final_review = false;
+        options.review_policy = ReviewPolicy::Off;
         options.retries = 0;
         options.agent = false;
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
@@ -1964,7 +2387,7 @@ mod tests {
     fn agent_repair_continues_pipeline_and_records_log() {
         let document = document("agent.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent.txt".into());
-        options.final_review = false;
+        options.review_policy = ReviewPolicy::Off;
         options.retries = 0;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -2007,7 +2430,7 @@ mod tests {
     fn agent_repair_cache_bypasses_second_repair_call() {
         let document = document("agent-cache.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-cache.txt".into());
-        options.final_review = false;
+        options.review_policy = ReviewPolicy::Off;
         options.retries = 0;
         options.resume = false;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
@@ -2082,7 +2505,7 @@ mod tests {
     fn failed_agent_repair_persists_failure_and_attempts() {
         let document = document("agent-fail.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-fail.txt".into());
-        options.final_review = false;
+        options.review_policy = ReviewPolicy::Off;
         options.retries = 0;
         options.agent_repair_attempts = 2;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
@@ -2143,6 +2566,28 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].source[0].id, "2");
         assert_eq!(plan[0].reasons, vec!["names and terms"]);
+    }
+
+    #[test]
+    fn token_budget_batches_short_and_long_segments_deterministically() {
+        let segments = document("budget.txt", &["one", "two", &"x".repeat(80)]).segments;
+        let batches = chunk_segments_by_budget(&segments, 80, 20);
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn review_patch_preserves_unchanged_translations() {
+        let translated = document("patch.txt", &["甲", "乙"]).segments;
+        let merged = merge_review_patch(
+            &translated,
+            &[TranslationLine {
+                id: "2".to_owned(),
+                translation: "丙".to_owned(),
+            }],
+        )
+        .expect("valid patch");
+        assert_eq!(merged[0].translation, "甲");
+        assert_eq!(merged[1].translation, "丙");
     }
 
     #[test]

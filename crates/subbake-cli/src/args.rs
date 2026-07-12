@@ -532,11 +532,21 @@ fn parse_translation_setting_option(
         "--source-lang" => settings.source_language = required_value(args, index, option)?,
         "--target-lang" => settings.target_language = required_value(args, index, option)?,
         "--batch-size" => settings.batch_size = parse_batch_size(args, index)?,
+        "--batch-token-budget" => settings.batch_token_budget = parse_batch_size(args, index)?,
+        "--translation-concurrency" => {
+            settings.translation_concurrency = parse_batch_size(args, index)?
+        }
+        "--review-concurrency" => settings.review_concurrency = parse_batch_size(args, index)?,
         "--runtime-dir" => settings.runtime_dir = Some(required_path(args, index, option)?),
         "--glossary" => settings.glossary_path = Some(required_path(args, index, option)?),
         "--bilingual" => settings.bilingual = true,
         "--fast" => settings.fast_mode = true,
-        "--no-review" => settings.final_review = false,
+        "--no-review" => settings.review_policy = subbake_core::ReviewPolicy::Off,
+        "--review" => {
+            settings.review_policy =
+                subbake_core::ReviewPolicy::parse(&required_value(args, index, option)?)
+                    .map_err(io::Error::other)?
+        }
         "--dry-run" => settings.dry_run = true,
         "--resume" => settings.resume = true,
         "--no-resume" => settings.resume = false,
@@ -616,6 +626,29 @@ mod tests {
         assert_eq!(parsed.settings.retries, 0);
         assert!(!parsed.settings.agent);
         assert_eq!(parsed.settings.agent_repair_attempts, 3);
+    }
+
+    #[test]
+    fn parse_translate_accepts_review_and_concurrency_options() {
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--review".to_owned(),
+            "full".to_owned(),
+            "--translation-concurrency".to_owned(),
+            "3".to_owned(),
+            "--review-concurrency".to_owned(),
+            "2".to_owned(),
+            "--batch-token-budget".to_owned(),
+            "1800".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("translation options");
+        assert_eq!(
+            parsed.settings.review_policy,
+            subbake_core::ReviewPolicy::Full
+        );
+        assert_eq!(parsed.settings.translation_concurrency, 3);
+        assert_eq!(parsed.settings.review_concurrency, 2);
+        assert_eq!(parsed.settings.batch_token_budget, 1_800);
     }
 
     #[test]
@@ -737,7 +770,10 @@ mod tests {
         assert_eq!(parsed.input_path, PathBuf::from("movie.srt"));
         assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
         assert!(parsed.json);
-        assert!(!parsed.settings.final_review);
+        assert_eq!(
+            parsed.settings.review_policy,
+            subbake_core::ReviewPolicy::Off
+        );
         assert_eq!(parsed.transcription_settings.provider, "whisper_cpp");
         assert_eq!(parsed.transcription_settings.model.as_deref(), Some("base"));
         assert_eq!(

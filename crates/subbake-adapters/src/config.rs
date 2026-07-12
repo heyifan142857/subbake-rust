@@ -101,9 +101,16 @@ fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPa
     string_setting!("source_language", settings.source_language);
     string_setting!("target_language", settings.target_language);
     usize_setting!("batch_size", settings.batch_size);
+    usize_setting!("batch_token_budget", settings.batch_token_budget);
+    usize_setting!("translation_concurrency", settings.translation_concurrency);
+    usize_setting!("review_concurrency", settings.review_concurrency);
     bool_setting!("bilingual", settings.bilingual);
     bool_setting!("fast_mode", settings.fast_mode);
     bool_setting!("final_review", settings.final_review);
+    if let Some(value) = settings.review_policy {
+        string_setting!("review_policy", Some(value.as_str().to_owned()));
+    }
+    bool_setting!("terminology_preflight", settings.terminology_preflight);
     bool_setting!("dry_run", settings.dry_run);
     bool_setting!("resume", settings.resume);
     bool_setting!("use_cache", settings.use_cache);
@@ -336,9 +343,16 @@ fn apply_key_value(
         "source_language" | "source_lang" => patch.source_language = Some(value.into_string(key)?),
         "target_language" | "target_lang" => patch.target_language = Some(value.into_string(key)?),
         "batch_size" => patch.batch_size = Some(value.into_usize(key)?),
+        "batch_token_budget" => patch.batch_token_budget = Some(value.into_usize(key)?),
+        "translation_concurrency" => patch.translation_concurrency = Some(value.into_usize(key)?),
+        "review_concurrency" => patch.review_concurrency = Some(value.into_usize(key)?),
         "bilingual" => patch.bilingual = Some(value.into_bool(key)?),
         "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
-        "final_review" | "review" => patch.final_review = Some(value.into_bool(key)?),
+        "final_review" => patch.final_review = Some(value.into_bool(key)?),
+        "review" | "review_policy" => {
+            patch.review_policy = Some(subbake_core::ReviewPolicy::parse(&value.into_string(key)?)?)
+        }
+        "terminology_preflight" => patch.terminology_preflight = Some(value.into_bool(key)?),
         "dry_run" => patch.dry_run = Some(value.into_bool(key)?),
         "resume" => patch.resume = Some(value.into_bool(key)?),
         "cache" | "use_cache" => patch.use_cache = Some(value.into_bool(key)?),

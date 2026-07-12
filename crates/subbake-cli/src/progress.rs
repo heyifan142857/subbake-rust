@@ -42,8 +42,23 @@ impl ProgressSink for CliProgress {
         } else {
             String::new()
         };
+        let activity = event
+            .translation
+            .as_ref()
+            .map_or_else(String::new, |detail| {
+                format!(
+                    " · {}/{} batches · active {} · buffered {} · retry {} · TM {} · cache {}",
+                    detail.batches_committed,
+                    detail.batches_total,
+                    detail.requests_in_flight,
+                    detail.requests_buffered,
+                    detail.requests_retrying,
+                    detail.translation_memory_hits,
+                    detail.cache_hits,
+                )
+            });
         let line = format!(
-            "{} {count} · {:.1}s · {}/{} tok{resumed}",
+            "{} {count}{activity} · {:.1}s · {}/{} tok{resumed}",
             event.stage,
             self.started.elapsed().as_secs_f32(),
             event.usage.input_tokens,

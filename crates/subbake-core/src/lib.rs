@@ -18,7 +18,7 @@ pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, BatchTranslationResult, FailureLog,
-    GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, ReviewResult, SplitRetryLog,
+    GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, ReviewPolicy, SplitRetryLog,
     SubtitleDocument, SubtitleSegment, TranslationLine, Usage,
 };
 pub use error::{CoreError, CoreResult};
@@ -26,5 +26,6 @@ pub use memory::ContextMemory;
 pub use ports::{GenerationRequest, GenerationResponse, ResponseContract};
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
+    TranslationProgress,
 };
 pub mod cancellation;

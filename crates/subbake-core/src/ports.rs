@@ -82,6 +82,9 @@ impl CacheStage {
 }
 
 pub trait LlmBackend: Send {
+    fn supports_parallel_generation(&self) -> bool {
+        false
+    }
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;
@@ -128,6 +131,33 @@ pub trait LlmBackend: Send {
         Ok(GenerationResponse { json, usage })
     }
 
+    fn generate_many_cancellable(
+        &mut self,
+        requests: Vec<GenerationRequest>,
+        _max_concurrency: usize,
+        cancellation: &CancellationGuard,
+    ) -> Vec<CoreResult<GenerationResponse>> {
+        requests
+            .into_iter()
+            .map(|request| {
+                let result = self.generate_json_cancellable(&request.messages, cancellation)?;
+                let json = match result.payload {
+                    BackendPayload::Translation(payload) => serde_json::to_value(payload),
+                    BackendPayload::Review(payload) => serde_json::to_value(payload),
+                }
+                .map_err(|error| {
+                    crate::error::CoreError::Data(format!(
+                        "backend payload serialization failed: {error}"
+                    ))
+                })?;
+                Ok(GenerationResponse {
+                    json,
+                    usage: result.usage,
+                })
+            })
+            .collect()
+    }
+
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
         Ok((
             true,
@@ -140,6 +170,9 @@ impl<T> LlmBackend for Box<T>
 where
     T: LlmBackend + ?Sized,
 {
+    fn supports_parallel_generation(&self) -> bool {
+        (**self).supports_parallel_generation()
+    }
     fn provider_name(&self) -> &str {
         (**self).provider_name()
     }
