@@ -1,91 +1,122 @@
-use serde_json::{Value as JsonValue, json};
+use std::io;
 
-pub(super) fn translation_action_requested(input: &str) -> bool {
-    let normalized = input.trim().to_lowercase();
-    if normalized.contains("如何翻译")
-        || normalized.contains("怎么翻译")
-        || normalized.starts_with("how ")
-    {
-        return false;
-    }
-    normalized.starts_with("translate")
-        || normalized.contains("please translate")
-        || normalized.contains("帮我翻译")
-        || normalized.contains("请翻译")
-        || normalized.contains("翻译一下")
-        || normalized.starts_with("翻译")
+use serde_json::Value as JsonValue;
+
+use crate::tools::ToolScope;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Route {
+    Respond(String),
+    AskUser(String),
+    Act {
+        scope: ToolScope,
+        request: String,
+        inspect_project: bool,
+    },
 }
 
-pub(super) fn translation_target_omitted(input: &str) -> bool {
-    let normalized = input.trim().to_lowercase();
-    matches!(
-        normalized.as_str(),
-        "translate" | "please translate" | "帮我翻译" | "请翻译" | "翻译一下" | "翻译"
-    )
+pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route> {
+    let action = value
+        .get("route")
+        .or_else(|| value.get("action"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| io::Error::other("semantic route is missing `route`"))?;
+    let text = value
+        .get("text")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match action {
+        "respond" => Ok(Route::Respond(text)),
+        "ask_user" => Ok(Route::AskUser(text)),
+        "act" => {
+            let scope = parse_scope(
+                value
+                    .get("intent")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| io::Error::other("action route is missing `intent`"))?,
+            )?;
+            let request = value
+                .get("restated_request")
+                .and_then(JsonValue::as_str)
+                .filter(|request| !request.trim().is_empty())
+                .unwrap_or(original)
+                .to_owned();
+            Ok(Route::Act {
+                scope,
+                request,
+                inspect_project: value
+                    .get("inspect_project")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        // Compatibility for structured decision backends: normalize their
+        // proposed tool into an intent, then enforce the same allowlist.
+        "tool_call" | "final_tool_call" => {
+            let tool = value
+                .get("tool_name")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| io::Error::other("tool route is missing `tool_name`"))?;
+            Ok(Route::Act {
+                scope: scope_for_tool(tool)?,
+                request: original.to_owned(),
+                inspect_project: false,
+            })
+        }
+        "plan" => {
+            let tool = value
+                .get("tool_calls")
+                .and_then(JsonValue::as_array)
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.get("tool_name"))
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| io::Error::other("plan route has no tool calls"))?;
+            Ok(Route::Act {
+                scope: scope_for_tool(tool)?,
+                request: original.to_owned(),
+                inspect_project: false,
+            })
+        }
+        other => Err(io::Error::other(format!(
+            "unsupported semantic route `{other}`"
+        ))),
+    }
 }
 
-pub(super) fn preferred_discovery(input: &str) -> Option<(&'static str, JsonValue)> {
-    if translation_action_requested(input) {
-        return Some(("candidate_subtitles", json!({"path": ".", "query": input})));
-    }
-    let normalized = input.trim().to_lowercase();
-    if normalized.starts_with("how ") || normalized.contains("如何") || normalized.contains("怎么")
-    {
-        return None;
-    }
-    if normalized.starts_with("transcribe")
-        || normalized.contains("帮我转录")
-        || normalized.contains("请转录")
-        || normalized.starts_with("转录")
-    {
-        return Some(("search_files", json!({"path": ".", "pattern": ""})));
-    }
-    if normalized.starts_with("edit")
-        || normalized.contains("帮我修改")
-        || normalized.contains("帮我编辑")
-        || normalized.contains("请修改")
-        || normalized.starts_with("修改")
-        || normalized.starts_with("编辑")
-    {
-        return Some(("recent_translations", json!({})));
-    }
-    if normalized.starts_with("diagnose")
-        || normalized.starts_with("debug")
-        || normalized.contains("帮我诊断")
-        || normalized.starts_with("诊断")
-    {
-        return Some(("search_files", json!({"path": ".", "pattern": ""})));
-    }
-    if [
-        "delete ",
-        "rename ",
-        "replace ",
-        "append ",
-        "删除",
-        "重命名",
-        "替换",
-        "追加",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix))
-    {
-        return Some(("search_files", json!({"path": ".", "pattern": ""})));
-    }
-    None
+pub(super) fn scope_for_tool(tool: &str) -> io::Result<ToolScope> {
+    let scope = match tool {
+        "list_files" | "search_files" | "read_file_preview" | "read_file" => ToolScope::Browse,
+        "candidate_subtitles" | "translate_file" | "translate_series" => ToolScope::Translate,
+        "transcribe_audio" => ToolScope::Transcribe,
+        "recent_translations" | "edit_subtitle" => ToolScope::Edit,
+        "diagnose_path" | "diagnose_text" => ToolScope::Diagnose,
+        "create_file" => ToolScope::FileCreate,
+        "append_file" => ToolScope::FileAppend,
+        "replace_in_file" => ToolScope::FileReplace,
+        "rename_path" => ToolScope::FileRename,
+        "delete_file" => ToolScope::FileDelete,
+        "list_profiles" | "switch_profile" => ToolScope::Profile,
+        "manage_whisper" => ToolScope::Whisper,
+        other => return Err(io::Error::other(format!("unknown routed tool `{other}`"))),
+    };
+    Ok(scope)
 }
 
-pub(super) fn bilingual_requested(input: &str) -> bool {
-    let normalized = input.to_lowercase();
-    normalized.contains("bilingual") || normalized.contains("双语") || normalized.contains("中英")
-}
-
-pub(super) fn localize(input: &str, english: &str, chinese: &str) -> String {
-    if input
-        .chars()
-        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
-    {
-        chinese.to_owned()
-    } else {
-        english.to_owned()
+fn parse_scope(value: &str) -> io::Result<ToolScope> {
+    match value {
+        "browse" => Ok(ToolScope::Browse),
+        "translate" => Ok(ToolScope::Translate),
+        "transcribe" => Ok(ToolScope::Transcribe),
+        "edit" => Ok(ToolScope::Edit),
+        "diagnose" => Ok(ToolScope::Diagnose),
+        "file_create" => Ok(ToolScope::FileCreate),
+        "file_append" => Ok(ToolScope::FileAppend),
+        "file_replace" => Ok(ToolScope::FileReplace),
+        "file_rename" => Ok(ToolScope::FileRename),
+        "file_delete" => Ok(ToolScope::FileDelete),
+        "profile" => Ok(ToolScope::Profile),
+        "whisper" => Ok(ToolScope::Whisper),
+        other => Err(io::Error::other(format!("unsupported intent `{other}`"))),
     }
 }

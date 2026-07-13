@@ -484,82 +484,51 @@ pub fn tool_specs_for_categories<'a>(
     result
 }
 
-/// Rank and filter tools for an agent decision prompt.
-///
-/// Discovery tools stay visible because they are the safe way to resolve
-/// ambiguous paths. Domain tools are selected from keywords in the request.
-pub fn ranked_tool_specs(input: &str) -> Vec<&'static ToolSpec> {
-    let input = input.to_lowercase();
-    let mut categories = Vec::new();
-    for (kind, keywords) in [
-        (
-            ToolKind::Translate,
-            &["translate", "subtitle", "bilingual", "翻译", "字幕"][..],
-        ),
-        (
-            ToolKind::Transcribe,
-            &[
-                "transcribe",
-                "audio",
-                "video",
-                "media",
-                "转录",
-                "音频",
-                "视频",
-            ][..],
-        ),
-        (ToolKind::Edit, &["edit", "rewrite", "修改", "编辑"][..]),
-        (
-            ToolKind::Diagnose,
-            &[
-                "diagnose", "failure", "error", "debug", "诊断", "失败", "错误",
-            ][..],
-        ),
-        (
-            ToolKind::FileOp,
-            &[
-                "create",
-                "append",
-                "replace",
-                "rename",
-                "delete",
-                "创建",
-                "追加",
-                "替换",
-                "重命名",
-                "删除",
-            ][..],
-        ),
-        (ToolKind::Profile, &["profile", "配置", "预设"][..]),
-        (
-            ToolKind::ManageWhisper,
-            &["whisper", "model", "install", "模型", "安装"][..],
-        ),
-    ] {
-        if keywords.iter().any(|keyword| input.contains(keyword)) {
-            categories.push(kind);
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolScope {
+    Browse,
+    Translate,
+    Transcribe,
+    Edit,
+    Diagnose,
+    FileCreate,
+    FileAppend,
+    FileReplace,
+    FileRename,
+    FileDelete,
+    Profile,
+    Whisper,
+}
 
-    if categories.is_empty() {
-        return ALL_TOOL_SPECS.iter().collect();
-    }
-    categories.push(ToolKind::Browse);
-    let mut specs = ALL_TOOL_SPECS
+pub(crate) fn tool_specs_for_scope(scope: ToolScope) -> Vec<&'static ToolSpec> {
+    let names: &[&str] = match scope {
+        ToolScope::Browse => &[
+            "list_files",
+            "search_files",
+            "read_file_preview",
+            "read_file",
+        ],
+        ToolScope::Translate => &["candidate_subtitles", "translate_file", "translate_series"],
+        ToolScope::Transcribe => &["search_files", "transcribe_audio"],
+        ToolScope::Edit => &["recent_translations", "read_file_preview", "edit_subtitle"],
+        ToolScope::Diagnose => &[
+            "search_files",
+            "read_file_preview",
+            "diagnose_path",
+            "diagnose_text",
+        ],
+        ToolScope::FileCreate => &["list_files", "create_file"],
+        ToolScope::FileAppend => &["search_files", "read_file", "append_file"],
+        ToolScope::FileReplace => &["search_files", "read_file", "replace_in_file"],
+        ToolScope::FileRename => &["search_files", "rename_path"],
+        ToolScope::FileDelete => &["search_files", "delete_file"],
+        ToolScope::Profile => &["list_profiles", "switch_profile"],
+        ToolScope::Whisper => &["manage_whisper"],
+    };
+    names
         .iter()
-        .filter(|spec| categories.contains(&spec.category))
-        .collect::<Vec<_>>();
-    specs.sort_by_key(|spec| {
-        (
-            if spec.category == ToolKind::Browse {
-                1
-            } else {
-                0
-            },
-            spec.name,
-        )
-    });
-    specs
+        .filter_map(|name| find_tool_spec(name))
+        .collect()
 }
 
 pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(), String> {
@@ -601,14 +570,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ranking_keeps_translation_and_discovery_tools() {
-        let names = ranked_tool_specs("翻译 @episode.srt")
+    fn translation_scope_keeps_only_translation_and_discovery_tools() {
+        let names = tool_specs_for_scope(ToolScope::Translate)
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"translate_file"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(!names.contains(&"manage_whisper"));
+    }
+
+    #[test]
+    fn file_mutation_scopes_expose_only_the_requested_mutation() {
+        let names = tool_specs_for_scope(ToolScope::FileDelete)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"delete_file"));
+        assert!(!names.contains(&"rename_path"));
+        assert!(!names.contains(&"create_file"));
     }
 
     #[test]
