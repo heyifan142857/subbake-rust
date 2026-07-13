@@ -11,7 +11,7 @@ use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
 use crate::session::AgentSessionStore;
-use crate::tools::{ALL_TOOL_SPECS, APPROVAL_REQUIRED_TOOL_NAMES, DISCOVERY_TOOL_NAMES, ToolKind};
+use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
 
 // ---------------------------------------------------------------------------
 // Observer trait — enables streaming output
@@ -62,7 +62,7 @@ pub struct ProfileChoice {
     pub create: bool,
 }
 
-/// Observer that prints everything to stdout (mirrors Python `trace._AgentLoopTrace`).
+/// Observer that prints every engine lifecycle event to stdout.
 pub struct StreamingObserver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,12 +827,12 @@ impl AgentEngine {
 
     /// Whether a tool requires explicit approval (plan mode or approval tool).
     pub fn tool_requires_approval(&self, tool_name: &str) -> bool {
-        APPROVAL_REQUIRED_TOOL_NAMES.contains(&tool_name)
+        find_tool_spec(tool_name).is_some_and(|spec| spec.requires_approval)
     }
 
     /// Whether a tool is a non-mutating discovery tool.
     pub fn is_discovery_tool(&self, tool_name: &str) -> bool {
-        DISCOVERY_TOOL_NAMES.contains(&tool_name)
+        find_tool_spec(tool_name).is_some_and(|spec| spec.discovery)
     }
 
     /// List tool specs filtered by category for the LLM context.

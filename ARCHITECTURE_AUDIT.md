@@ -48,11 +48,13 @@ Remediation: extract cohesive stage services and typed state reducers while reta
 
 Progress: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; deterministic agent intent/discovery classification is isolated from the decision loop; and TUI progress rendering is separated from terminal ownership and event routing. The remaining translation/review stages, tool execution branches, and interaction reducer still need extraction before this item is complete.
 
-### 6. Agent tools have multiple parallel registries
+### 6. Agent tools have multiple parallel registries — Completed
 
 Tool metadata, argument schemas, discovery membership, approval membership, and executor dispatch are maintained separately. Although tests cover current entries, adding or changing a tool requires synchronized edits across several lists and match expressions.
 
 Remediation: make one registered tool definition own its schema, policy, category, and executor. Derive prompt/native schemas and filtered views from that registry.
+
+Completed: every tool now has one registered definition owning its argument schema, category, mutation/discovery/approval policy, and typed executor identity. Prompt and native schemas, validation, filtered views, policy checks, and execution dispatch all resolve through that registry; duplicate-name/executor regression tests protect the invariant.
 
 ### 7. TUI interaction state is not structurally mutually exclusive
 
@@ -74,11 +76,13 @@ Remediation: separate backend, translation-domain, runtime-storage, and CLI-outp
 
 Remediation: keep provider construction and secrets in adapters, pass only non-secret backend identity required for caching into core, and render structured diagnostics at CLI/TUI edges.
 
-### 10. Python-authoritative comments are stale
+### 10. Python-authoritative comments are stale — Completed
 
 Several comments describe Rust registries and session structures as mirrors of Python. One comment claims there are 19 tools while the current registry contains 20. These comments conflict with the repository's independent Rust architecture and can misdirect future changes.
 
 Remediation: describe current Rust contracts and mention Python only where a persisted compatibility shape is intentionally supported.
+
+Completed: the stale Python-authoritative tool-registry comments and incorrect fixed tool count were replaced with descriptions of the current Rust registry contract.
 
 ## Recommended Order
 

@@ -2003,7 +2003,7 @@ fn apply_lines(source: &[SubtitleSegment], lines: &[TranslationLine]) -> Vec<Sub
 }
 
 /// Normalise a subtitle text for translation-memory lookup.
-/// Mirrors Python `pipeline.py::_translation_memory_key`:
+/// Builds the stable translation-memory key used by compatible runtime data:
 ///   lower-case → collapse whitespace → attach punctuation.
 pub fn translation_memory_key(text: &str) -> String {
     let lower = text.trim().to_lowercase();

@@ -1017,9 +1017,19 @@ impl AgentEngine {
             arguments: args.clone(),
         })?;
 
-        match name {
+        let executor = crate::tools::find_tool_spec(name)
+            .map(|spec| spec.executor)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown agent tool `{name}`"),
+                )
+            })?;
+
+        use crate::tools::ToolExecutor;
+        match executor {
             // -- Browse (FileGuard) --
-            "list_files" => {
+            ToolExecutor::ListFiles => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let files = self.guard.list_files(PathBuf::from(dir).as_path())?;
                 Ok(files
@@ -1028,17 +1038,17 @@ impl AgentEngine {
                     .collect::<Vec<_>>()
                     .join("\n"))
             }
-            "search_files" => {
+            ToolExecutor::SearchFiles => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
                 let files = self.guard.search_files(PathBuf::from(dir).as_path(), pat)?;
                 Ok(format_file_list(&files))
             }
-            "read_file" => {
+            ToolExecutor::ReadFile => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 self.guard.read_file(PathBuf::from(path).as_path())
             }
-            "read_file_preview" => {
+            ToolExecutor::ReadFilePreview => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let content = self.guard.read_file(PathBuf::from(path).as_path())?;
                 let preview: String = content.chars().take(2000).collect();
@@ -1048,14 +1058,14 @@ impl AgentEngine {
                     preview
                 })
             }
-            "candidate_subtitles" => {
+            ToolExecutor::CandidateSubtitles => {
                 let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
                 let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let files = self.guard.search_files(PathBuf::from(dir).as_path(), "")?;
                 let ranked = rank_subtitle_candidates(files, query, &self.project_root);
                 Ok(format_file_list(&ranked))
             }
-            "recent_translations" => {
+            ToolExecutor::RecentTranslations => {
                 let session = self.session.as_ref();
                 let events = session
                     .map(|s| &s.events)
@@ -1083,14 +1093,14 @@ impl AgentEngine {
             }
 
             // -- File operations (FileGuard) --
-            "create_file" => {
+            ToolExecutor::CreateFile => {
                 let path = req_arg(args, "path")?;
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let r = self.guard.create_file(&path, content)?;
                 self.record_file_operation(&r)?;
                 Ok(format!("Created {}", r.path.display()))
             }
-            "append_file" => {
+            ToolExecutor::AppendFile => {
                 let path = req_arg(args, "path")?;
                 let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let r = self.guard.append_file(&path, content)?;
@@ -1104,7 +1114,7 @@ impl AgentEngine {
                         .unwrap_or_default()
                 ))
             }
-            "replace_in_file" => {
+            ToolExecutor::ReplaceInFile => {
                 let path = req_arg(args, "path")?;
                 let old = args.get("old").and_then(|v| v.as_str()).unwrap_or("");
                 let new = args.get("new").and_then(|v| v.as_str()).unwrap_or("");
@@ -1119,7 +1129,7 @@ impl AgentEngine {
                         .unwrap_or_default()
                 ))
             }
-            "rename_path" => {
+            ToolExecutor::RenamePath => {
                 let from = req_arg(args, "from")?;
                 let to = req_arg(args, "to")?;
                 let r = self.guard.rename_path(&from, &to)?;
@@ -1133,7 +1143,7 @@ impl AgentEngine {
                         .unwrap_or_default()
                 ))
             }
-            "delete_file" => {
+            ToolExecutor::DeleteFile => {
                 let path = req_arg(args, "path")?;
                 let r = self.guard.delete_file(&path)?;
                 self.record_file_operation(&r)?;
@@ -1148,7 +1158,7 @@ impl AgentEngine {
             }
 
             // -- Translate --
-            "translate_file" => {
+            ToolExecutor::TranslateFile => {
                 let path = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&path)?;
                 let mut settings = self.active_translation_settings()?;
@@ -1180,7 +1190,7 @@ impl AgentEngine {
                     .map(|p| format!("Translated: {}", p.display()))
                     .unwrap_or_default())
             }
-            "translate_series" => {
+            ToolExecutor::TranslateSeries => {
                 let dir = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&dir)?;
                 let recursive = args
@@ -1246,7 +1256,7 @@ impl AgentEngine {
             }
 
             // -- Edit: targeted rewrite of a generated subtitle file --
-            "edit_subtitle" => {
+            ToolExecutor::EditSubtitle => {
                 let path = req_arg(args, "path")?;
                 let instruction = req_string_arg(args, "instruction")?;
                 let target_path = self.guard.resolve_path(&path)?;
@@ -1272,7 +1282,7 @@ impl AgentEngine {
             }
 
             // -- Transcribe --
-            "transcribe_audio" => {
+            ToolExecutor::TranscribeAudio => {
                 let path = req_arg(args, "path")?;
                 let input = self.guard.resolve_path(&path)?;
                 let request = TranscriptionRequest {
@@ -1297,7 +1307,7 @@ impl AgentEngine {
             }
 
             // -- Whisper management --
-            "manage_whisper" => {
+            ToolExecutor::ManageWhisper => {
                 let action_str = args
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -1346,7 +1356,7 @@ impl AgentEngine {
             }
 
             // -- Diagnose: structured failure summary from file/run dir/text --
-            "diagnose_path" => {
+            ToolExecutor::DiagnosePath => {
                 let path = req_arg(args, "path")?;
                 let full = self.guard.resolve_path(&path)?;
                 let reports = if full.is_file() {
@@ -1364,7 +1374,7 @@ impl AgentEngine {
                         .join("\n\n---\n\n"))
                 }
             }
-            "diagnose_text" => {
+            ToolExecutor::DiagnoseText => {
                 let text = req_string_arg(args, "text")?;
                 Ok(format_diagnostic_report(&diagnose_failure_text(
                     &text,
@@ -1373,7 +1383,7 @@ impl AgentEngine {
             }
 
             // -- Profile: read and switch active session profile --
-            "list_profiles" => {
+            ToolExecutor::ListProfiles => {
                 let Some((_, config)) = self.load_project_config()? else {
                     return Ok("No subbake config found in project root.".to_owned());
                 };
@@ -1392,7 +1402,7 @@ impl AgentEngine {
                     Ok(format_profile_list(&profiles, active.as_deref()))
                 }
             }
-            "switch_profile" => {
+            ToolExecutor::SwitchProfile => {
                 let name = req_string_arg(args, "name")?;
                 let Some((config_path, config)) = self.load_project_config()? else {
                     return Ok(
@@ -1422,11 +1432,6 @@ impl AgentEngine {
                     settings.provider, settings.model
                 ))
             }
-
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown agent tool `{name}`"),
-            )),
         }
     }
 

@@ -1,6 +1,6 @@
 // Agent session — event log (the source of truth for undo, replay, and resume).
 //
-// Mirrors Python `agent/session.py` (`SESSION_VERSION=1`). The session JSON
+// Version 1 of the persisted agent-session JSON contract. The session JSON
 // lives at `<project_root>/.subbake/agent/sessions/<id>.json`.
 
 use std::path::PathBuf;

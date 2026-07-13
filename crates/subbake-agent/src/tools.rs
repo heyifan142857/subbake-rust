@@ -1,6 +1,5 @@
-// Tool trait + ToolKind registry — core abstraction for agent-callable
-// operations. Mirrors Python `agent/tool_registry.py` (19 tools organised into
-// categories, with mutating/discovery/approval distinctions).
+// Central registry for agent-callable operations. Each entry owns the tool's
+// schema, policy, category, and executor identity.
 
 /// High-level category used for filtering which tools the LLM can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +21,34 @@ pub struct ToolSpec {
     pub category: ToolKind,
     pub mutating: bool,
     pub requires_approval: bool,
+    pub discovery: bool,
     pub description: &'static str,
+    pub arguments: &'static [ToolArgSpec],
+    pub(crate) executor: ToolExecutor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolExecutor {
+    TranslateFile,
+    TranslateSeries,
+    EditSubtitle,
+    TranscribeAudio,
+    ManageWhisper,
+    DiagnosePath,
+    DiagnoseText,
+    ListFiles,
+    SearchFiles,
+    RecentTranslations,
+    CandidateSubtitles,
+    ReadFilePreview,
+    ReadFile,
+    CreateFile,
+    AppendFile,
+    ReplaceInFile,
+    RenamePath,
+    DeleteFile,
+    SwitchProfile,
+    ListProfiles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +82,8 @@ pub struct ToolArgSpec {
 }
 
 impl ToolSpec {
-    pub fn arguments(&self) -> Vec<ToolArgSpec> {
-        tool_arguments(self.name)
+    pub fn arguments(&self) -> &'static [ToolArgSpec] {
+        self.arguments
     }
 
     pub fn prompt_line(&self) -> String {
@@ -139,256 +165,311 @@ const fn arg(
     }
 }
 
-pub fn tool_arguments(name: &str) -> Vec<ToolArgSpec> {
-    use ToolArgKind::{Boolean, String};
-    match name {
-        "translate_file" => vec![
-            arg("path", String, true, "subtitle file path"),
-            arg(
-                "bilingual",
-                Boolean,
-                false,
-                "override bilingual output for this call",
-            ),
-        ],
-        "translate_series" => vec![
-            arg(
-                "path",
-                String,
-                true,
-                "directory path; use . for the current directory",
-            ),
-            arg("recursive", Boolean, false, "include nested directories"),
-            arg("overwrite", Boolean, false, "replace existing outputs"),
-            arg(
-                "bilingual",
-                Boolean,
-                false,
-                "override bilingual output for this call",
-            ),
-        ],
-        "edit_subtitle" => vec![
-            arg("path", String, true, "generated subtitle path"),
-            arg("instruction", String, true, "requested edit"),
-            arg(
-                "allow_non_generated",
-                Boolean,
-                false,
-                "allow editing a source file",
-            ),
-        ],
-        "transcribe_audio" | "read_file" | "read_file_preview" | "delete_file"
-        | "diagnose_path" => vec![arg("path", String, true, "project-local path")],
-        "list_files" => vec![arg("path", String, false, "directory path; defaults to .")],
-        "search_files" => vec![
-            arg("path", String, false, "directory path; defaults to ."),
-            arg("pattern", String, false, "filename search pattern"),
-        ],
-        "candidate_subtitles" => vec![
-            arg("path", String, false, "directory path; defaults to ."),
-            arg("query", String, false, "text used to rank candidates"),
-        ],
-        "create_file" | "append_file" => vec![
-            arg("path", String, true, "project-local path"),
-            arg("content", String, false, "file content"),
-        ],
-        "replace_in_file" => vec![
-            arg("path", String, true, "project-local path"),
-            arg("old", String, false, "text to replace"),
-            arg("new", String, false, "replacement text"),
-        ],
-        "rename_path" => vec![
-            arg("from", String, true, "existing path"),
-            arg("to", String, true, "new path"),
-        ],
-        "diagnose_text" => vec![arg("text", String, true, "diagnostic text")],
-        "switch_profile" => vec![arg("name", String, true, "profile name")],
-        "manage_whisper" => vec![
-            arg(
-                "action",
-                String,
-                false,
-                "status, install, update, uninstall, list-models, or download",
-            ),
-            arg(
-                "keep_models",
-                Boolean,
-                false,
-                "keep models when uninstalling",
-            ),
-            arg("model", String, false, "model name to download"),
-        ],
-        "recent_translations" | "list_profiles" => vec![],
-        _ => vec![],
-    }
+const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, true, "subtitle file path"),
+    arg(
+        "bilingual",
+        BooleanArg,
+        false,
+        "override bilingual output for this call",
+    ),
+];
+const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
+    arg(
+        "path",
+        StringArg,
+        true,
+        "directory path; use . for the current directory",
+    ),
+    arg("recursive", BooleanArg, false, "include nested directories"),
+    arg("overwrite", BooleanArg, false, "replace existing outputs"),
+    arg(
+        "bilingual",
+        BooleanArg,
+        false,
+        "override bilingual output for this call",
+    ),
+];
+const EDIT_SUBTITLE_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, true, "generated subtitle path"),
+    arg("instruction", StringArg, true, "requested edit"),
+    arg(
+        "allow_non_generated",
+        BooleanArg,
+        false,
+        "allow editing a source file",
+    ),
+];
+const PATH_ARGS: &[ToolArgSpec] = &[arg("path", StringArg, true, "project-local path")];
+const LIST_FILES_ARGS: &[ToolArgSpec] = &[arg(
+    "path",
+    StringArg,
+    false,
+    "directory path; defaults to .",
+)];
+const SEARCH_FILES_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, false, "directory path; defaults to ."),
+    arg("pattern", StringArg, false, "filename search pattern"),
+];
+const CANDIDATE_SUBTITLES_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, false, "directory path; defaults to ."),
+    arg("query", StringArg, false, "text used to rank candidates"),
+];
+const WRITE_FILE_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, true, "project-local path"),
+    arg("content", StringArg, false, "file content"),
+];
+const REPLACE_IN_FILE_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, true, "project-local path"),
+    arg("old", StringArg, false, "text to replace"),
+    arg("new", StringArg, false, "replacement text"),
+];
+const RENAME_PATH_ARGS: &[ToolArgSpec] = &[
+    arg("from", StringArg, true, "existing path"),
+    arg("to", StringArg, true, "new path"),
+];
+const DIAGNOSE_TEXT_ARGS: &[ToolArgSpec] = &[arg("text", StringArg, true, "diagnostic text")];
+const SWITCH_PROFILE_ARGS: &[ToolArgSpec] = &[arg("name", StringArg, true, "profile name")];
+const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
+    arg(
+        "action",
+        StringArg,
+        false,
+        "status, install, update, uninstall, list-models, or download",
+    ),
+    arg(
+        "keep_models",
+        BooleanArg,
+        false,
+        "keep models when uninstalling",
+    ),
+    arg("model", StringArg, false, "model name to download"),
+];
+
+use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
+
+macro_rules! tool {
+    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $description:literal, $arguments:expr, $executor:ident) => {
+        ToolSpec {
+            name: $name,
+            category: ToolKind::$category,
+            mutating: $mutating,
+            requires_approval: $approval,
+            discovery: $discovery,
+            description: $description,
+            arguments: $arguments,
+            executor: ToolExecutor::$executor,
+        }
+    };
 }
 
-/// The 19 tools from the Python agent, grouped by category.
+/// All tools exposed by the Rust agent, grouped by category.
 pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
-    // -- translate --
-    ToolSpec {
-        name: "translate_file",
-        category: ToolKind::Translate,
-        mutating: true,
-        requires_approval: false,
-        description: "Translate a subtitle file.",
-    },
-    ToolSpec {
-        name: "translate_series",
-        category: ToolKind::Translate,
-        mutating: true,
-        requires_approval: false,
-        description: "Translate a series of subtitle files in a directory.",
-    },
-    // -- edit --
-    ToolSpec {
-        name: "edit_subtitle",
-        category: ToolKind::Edit,
-        mutating: true,
-        requires_approval: false,
-        description: "Edit an already translated subtitle file.",
-    },
-    // -- transcribe --
-    ToolSpec {
-        name: "transcribe_audio",
-        category: ToolKind::Transcribe,
-        mutating: true,
-        requires_approval: false,
-        description: "Transcribe a media file to subtitles.",
-    },
-    // -- manage_whisper --
-    ToolSpec {
-        name: "manage_whisper",
-        category: ToolKind::ManageWhisper,
-        mutating: true,
-        requires_approval: true,
-        description: "Install, update, or uninstall whisper.cpp.",
-    },
-    // -- diagnose --
-    ToolSpec {
-        name: "diagnose_path",
-        category: ToolKind::Diagnose,
-        mutating: false,
-        requires_approval: false,
-        description: "Diagnose a translation failure from a run directory.",
-    },
-    ToolSpec {
-        name: "diagnose_text",
-        category: ToolKind::Diagnose,
-        mutating: false,
-        requires_approval: false,
-        description: "Diagnose a translation failure from text input.",
-    },
-    // -- browse (non-mutating, always available) --
-    ToolSpec {
-        name: "list_files",
-        category: ToolKind::Browse,
-        mutating: false,
-        requires_approval: false,
-        description: "List files and directories.",
-    },
-    ToolSpec {
-        name: "search_files",
-        category: ToolKind::Browse,
-        mutating: false,
-        requires_approval: false,
-        description: "Search files by name glob.",
-    },
-    ToolSpec {
-        name: "recent_translations",
-        category: ToolKind::Browse,
-        mutating: false,
-        requires_approval: false,
-        description: "List recent translation outputs from the session.",
-    },
-    ToolSpec {
-        name: "candidate_subtitles",
-        category: ToolKind::Browse,
-        mutating: false,
-        requires_approval: false,
-        description: "Find subtitle files that look relevant.",
-    },
-    ToolSpec {
-        name: "read_file_preview",
-        category: ToolKind::Browse,
-        mutating: false,
-        requires_approval: false,
-        description: "Read a short preview of a file.",
-    },
-    // -- file_operation --
-    ToolSpec {
-        name: "read_file",
-        category: ToolKind::FileOp,
-        mutating: false,
-        requires_approval: false,
-        description: "Read the full content of a file.",
-    },
-    ToolSpec {
-        name: "create_file",
-        category: ToolKind::FileOp,
-        mutating: true,
-        requires_approval: false,
-        description: "Create a new file.",
-    },
-    ToolSpec {
-        name: "append_file",
-        category: ToolKind::FileOp,
-        mutating: true,
-        requires_approval: false,
-        description: "Append content to a file.",
-    },
-    ToolSpec {
-        name: "replace_in_file",
-        category: ToolKind::FileOp,
-        mutating: true,
-        requires_approval: false,
-        description: "Replace text in a file.",
-    },
-    ToolSpec {
-        name: "rename_path",
-        category: ToolKind::FileOp,
-        mutating: true,
-        requires_approval: false,
-        description: "Rename or move a file or directory.",
-    },
-    ToolSpec {
-        name: "delete_file",
-        category: ToolKind::FileOp,
-        mutating: true,
-        requires_approval: false,
-        description: "Delete a file or directory.",
-    },
-    // -- profile --
-    ToolSpec {
-        name: "switch_profile",
-        category: ToolKind::Profile,
-        mutating: false,
-        requires_approval: false,
-        description: "Switch the active profile.",
-    },
-    ToolSpec {
-        name: "list_profiles",
-        category: ToolKind::Profile,
-        mutating: false,
-        requires_approval: false,
-        description: "List all available profiles.",
-    },
+    tool!(
+        "translate_file",
+        Translate,
+        true,
+        false,
+        false,
+        "Translate a subtitle file.",
+        TRANSLATE_FILE_ARGS,
+        TranslateFile
+    ),
+    tool!(
+        "translate_series",
+        Translate,
+        true,
+        false,
+        false,
+        "Translate a series of subtitle files in a directory.",
+        TRANSLATE_SERIES_ARGS,
+        TranslateSeries
+    ),
+    tool!(
+        "edit_subtitle",
+        Edit,
+        true,
+        false,
+        false,
+        "Edit an already translated subtitle file.",
+        EDIT_SUBTITLE_ARGS,
+        EditSubtitle
+    ),
+    tool!(
+        "transcribe_audio",
+        Transcribe,
+        true,
+        false,
+        false,
+        "Transcribe a media file to subtitles.",
+        PATH_ARGS,
+        TranscribeAudio
+    ),
+    tool!(
+        "manage_whisper",
+        ManageWhisper,
+        true,
+        true,
+        false,
+        "Install, update, or uninstall whisper.cpp.",
+        MANAGE_WHISPER_ARGS,
+        ManageWhisper
+    ),
+    tool!(
+        "diagnose_path",
+        Diagnose,
+        false,
+        false,
+        true,
+        "Diagnose a translation failure from a run directory.",
+        PATH_ARGS,
+        DiagnosePath
+    ),
+    tool!(
+        "diagnose_text",
+        Diagnose,
+        false,
+        false,
+        true,
+        "Diagnose a translation failure from text input.",
+        DIAGNOSE_TEXT_ARGS,
+        DiagnoseText
+    ),
+    tool!(
+        "list_files",
+        Browse,
+        false,
+        false,
+        true,
+        "List files and directories.",
+        LIST_FILES_ARGS,
+        ListFiles
+    ),
+    tool!(
+        "search_files",
+        Browse,
+        false,
+        false,
+        true,
+        "Search files by name glob.",
+        SEARCH_FILES_ARGS,
+        SearchFiles
+    ),
+    tool!(
+        "recent_translations",
+        Browse,
+        false,
+        false,
+        true,
+        "List recent translation outputs from the session.",
+        &[],
+        RecentTranslations
+    ),
+    tool!(
+        "candidate_subtitles",
+        Browse,
+        false,
+        false,
+        true,
+        "Find subtitle files that look relevant.",
+        CANDIDATE_SUBTITLES_ARGS,
+        CandidateSubtitles
+    ),
+    tool!(
+        "read_file_preview",
+        Browse,
+        false,
+        false,
+        true,
+        "Read a short preview of a file.",
+        PATH_ARGS,
+        ReadFilePreview
+    ),
+    tool!(
+        "read_file",
+        FileOp,
+        false,
+        false,
+        true,
+        "Read the full content of a file.",
+        PATH_ARGS,
+        ReadFile
+    ),
+    tool!(
+        "create_file",
+        FileOp,
+        true,
+        false,
+        false,
+        "Create a new file.",
+        WRITE_FILE_ARGS,
+        CreateFile
+    ),
+    tool!(
+        "append_file",
+        FileOp,
+        true,
+        false,
+        false,
+        "Append content to a file.",
+        WRITE_FILE_ARGS,
+        AppendFile
+    ),
+    tool!(
+        "replace_in_file",
+        FileOp,
+        true,
+        false,
+        false,
+        "Replace text in a file.",
+        REPLACE_IN_FILE_ARGS,
+        ReplaceInFile
+    ),
+    tool!(
+        "rename_path",
+        FileOp,
+        true,
+        false,
+        false,
+        "Rename or move a file or directory.",
+        RENAME_PATH_ARGS,
+        RenamePath
+    ),
+    tool!(
+        "delete_file",
+        FileOp,
+        true,
+        false,
+        false,
+        "Delete a file or directory.",
+        PATH_ARGS,
+        DeleteFile
+    ),
+    tool!(
+        "switch_profile",
+        Profile,
+        false,
+        false,
+        false,
+        "Switch the active profile.",
+        SWITCH_PROFILE_ARGS,
+        SwitchProfile
+    ),
+    tool!(
+        "list_profiles",
+        Profile,
+        false,
+        false,
+        false,
+        "List all available profiles.",
+        &[],
+        ListProfiles
+    ),
 ];
 
-/// Non-mutating discovery tools that can run without approval even in plan mode.
-pub const DISCOVERY_TOOL_NAMES: &[&str] = &[
-    "list_files",
-    "search_files",
-    "recent_translations",
-    "candidate_subtitles",
-    "read_file_preview",
-    "read_file",
-    "diagnose_path",
-    "diagnose_text",
-];
-
-/// Tools that always require confirmation (equivalent to APPROVAL_REQUIRED mode).
-pub const APPROVAL_REQUIRED_TOOL_NAMES: &[&str] = &["manage_whisper"];
+pub fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
+    ALL_TOOL_SPECS.iter().find(|spec| spec.name == name)
+}
 
 /// Filter tool specs by a list of category names.
 pub fn tool_specs_for_categories<'a>(
@@ -591,5 +672,24 @@ mod tests {
             serde_json::json!(["path"])
         );
         assert_eq!(definition.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn registry_has_unique_names_and_executors() {
+        for (index, spec) in ALL_TOOL_SPECS.iter().enumerate() {
+            assert_eq!(find_tool_spec(spec.name), Some(spec));
+            for other in &ALL_TOOL_SPECS[index + 1..] {
+                assert_ne!(spec.name, other.name, "duplicate tool name");
+                assert_ne!(spec.executor, other.executor, "duplicate tool executor");
+            }
+        }
+    }
+
+    #[test]
+    fn registry_owns_discovery_and_approval_policy() {
+        assert!(find_tool_spec("read_file").is_some_and(|spec| spec.discovery));
+        assert!(find_tool_spec("manage_whisper").is_some_and(|spec| spec.requires_approval));
+        assert!(find_tool_spec("translate_file").is_some_and(|spec| spec.mutating));
+        assert!(find_tool_spec("missing").is_none());
     }
 }
