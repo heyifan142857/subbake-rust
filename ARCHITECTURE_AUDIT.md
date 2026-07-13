@@ -4,17 +4,21 @@ This audit records the architecture and maintainability issues identified after 
 
 ## Priority 1
 
-### 1. `subbake-core` performs filesystem and process-environment reads
+### 1. `subbake-core` performs filesystem and process-environment reads — Completed
 
 `subbake-core::storage::build_runtime_paths` canonicalizes input paths and reads the process current directory while calculating a run key. This conflicts with the requirement that core remain side-effect-free and makes a domain calculation depend on ambient filesystem state.
 
 Remediation: resolve a stable input path in `subbake-adapters`, pass it explicitly into core, and keep hashing and path-layout construction pure. Preserve the existing run-key algorithm and storage locations.
 
-### 2. Resuming a session can overwrite its pinned configuration path
+Completed in commit `f829e12`: stable path resolution now occurs in `subbake-adapters`, while core receives the resolved path explicitly and performs only deterministic runtime layout calculation.
+
+### 2. Resuming a session can overwrite its pinned configuration path — Completed
 
 The CLI discovers configuration again when starting the TUI and immediately writes that path into the loaded session. A resumed session can therefore use a different configuration, profile list, or backend from the one it originally pinned.
 
 Remediation: prefer the stored session path on resume and only perform discovery for sessions without a pinned path. Backend construction, profile listing, and model reporting must use that same path.
+
+Completed: resumed sessions now retain their pinned configuration path, unpinned sessions alone use discovery, session switching rebuilds the backend from the selected session's configuration, and internal profile/model resolution no longer falls back when a pinned path is present.
 
 ### 3. Translation CLI paths silently ignore configuration errors
 
@@ -77,4 +81,3 @@ Remediation: describe current Rust contracts and mention Python only where a per
 3. Consolidate the agent tool registry.
 4. Replace parallel progress/state sources and split oversized orchestrators.
 5. Normalize configuration ownership and remove remaining boundary leaks.
-

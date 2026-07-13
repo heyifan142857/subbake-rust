@@ -472,6 +472,12 @@ impl AgentEngine {
         self.session_store.load(id).map(|session| session.profile)
     }
 
+    pub fn session_config(&self, id: &str) -> std::io::Result<(Option<String>, Option<String>)> {
+        self.session_store
+            .load(id)
+            .map(|session| (session.profile, session.config_path))
+    }
+
     pub fn select_session(&mut self, id: &str) -> std::io::Result<String> {
         self.resume_session(Some(id))?;
         let result = self.session_summary()?;

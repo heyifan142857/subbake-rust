@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
     TranslationSettings, build_backend, discover_config_path, load_and_resolve,
@@ -53,8 +53,10 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 
 fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io::Result<()> {
     let project_root = engine.project_root.clone();
-    let config_path = discover_config_path();
-    engine.set_config_path(config_path.as_deref())?;
+    let (mut config_path, needs_config_pin) = session_config_path(&engine);
+    if needs_config_pin {
+        engine.set_config_path(config_path.as_deref())?;
+    }
     let initial_profile = engine
         .session
         .as_ref()
@@ -127,11 +129,14 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             None
         };
         let candidate_session_backend = if let Some(id) = requested_session {
-            let profile = engine.session_profile(id)?;
-            Some(build_agent_decision_backend(
-                config_path.as_deref(),
-                profile.as_deref(),
-            )?)
+            let (profile, stored_config_path) = engine.session_config(id)?;
+            let needs_config_pin = stored_config_path.is_none();
+            let candidate_config_path = stored_config_path
+                .map(PathBuf::from)
+                .or_else(discover_config_path);
+            let candidate_backend =
+                build_agent_decision_backend(candidate_config_path.as_deref(), profile.as_deref())?;
+            Some((candidate_backend, candidate_config_path, needs_config_pin))
         } else {
             None
         };
@@ -178,8 +183,13 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         if let Some(candidate) = candidate_backend {
             backend = candidate;
         }
-        if let Some(candidate) = candidate_session_backend {
-            engine.set_config_path(config_path.as_deref())?;
+        if let Some((candidate, candidate_config_path, needs_config_pin)) =
+            candidate_session_backend
+        {
+            config_path = candidate_config_path;
+            if needs_config_pin {
+                engine.set_config_path(config_path.as_deref())?;
+            }
             backend = candidate;
         }
 
@@ -274,6 +284,16 @@ fn prepare_profile_backend(
     build_agent_decision_backend(config_path, Some(profile)).map(Some)
 }
 
+fn session_config_path(engine: &AgentEngine) -> (Option<PathBuf>, bool) {
+    let stored = engine
+        .session
+        .as_ref()
+        .and_then(|session| session.config_path.as_deref())
+        .map(PathBuf::from);
+    let needs_config_pin = stored.is_none();
+    (stored.or_else(discover_config_path), needs_config_pin)
+}
+
 fn build_agent_decision_backend(
     config_path: Option<&Path>,
     profile: Option<&str>,
@@ -326,7 +346,7 @@ fn display_config_path(path: &Path) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_agent_decision_backend, prepare_profile_backend};
+    use super::{build_agent_decision_backend, prepare_profile_backend, session_config_path};
     use subbake_agent::AgentEngine;
 
     #[test]
@@ -375,6 +395,24 @@ mod tests {
             None,
             "backend preparation must not commit the requested profile"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_session_keeps_its_pinned_config_path() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-pinned-config-{nonce}"));
+        let pinned = root.join("original.toml");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine.set_config_path(Some(&pinned)).expect("pin config");
+
+        assert_eq!(session_config_path(&engine), (Some(pinned), false));
         let _ = std::fs::remove_dir_all(root);
     }
 }

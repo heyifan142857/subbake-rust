@@ -1446,14 +1446,19 @@ impl AgentEngine {
     }
 
     pub(crate) fn load_project_config(&self) -> io::Result<Option<(PathBuf, ConfigFile)>> {
+        if let Some(path) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.config_path.as_deref().map(PathBuf::from))
+        {
+            return ConfigFile::load(&path).map(|config| Some((path, config)));
+        }
+
         let candidates = [
-            self.session
-                .as_ref()
-                .and_then(|session| session.config_path.as_deref().map(PathBuf::from)),
-            Some(self.project_root.join("subbake.toml")),
-            Some(self.project_root.join(".subbake.toml")),
+            self.project_root.join("subbake.toml"),
+            self.project_root.join(".subbake.toml"),
         ];
-        for path in candidates.into_iter().flatten() {
+        for path in candidates {
             if path.exists() {
                 return ConfigFile::load(&path).map(|config| Some((path, config)));
             }
