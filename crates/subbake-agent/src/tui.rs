@@ -35,7 +35,7 @@ use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::input_editor::InputEditor;
 use crate::session::iso_now;
 use crate::tui_state::{
-    APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionPhase, SessionPicker, TuiPicker,
+    APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionState, SessionPicker, TuiPicker,
     VerticalNavigation, empty_mode_choice, history_down, history_up, vertical_navigation,
 };
 use subbake_core::{CancellationGuard, CancellationToken};
@@ -326,10 +326,9 @@ pub struct SubBakeTui {
     progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
     input: InputEditor,
     input_history: Vec<String>,
-    input_mode: InputMode,
     running: bool,
     suggestion_index: usize,
-    interaction_phase: InteractionPhase,
+    interaction_state: InteractionState,
     cancellation: Option<CancellationToken>,
     input_hint: &'static str,
     startup_info: StartupInfo,
@@ -359,10 +358,9 @@ impl SubBakeTui {
             progress: std::sync::Arc::new(std::sync::Mutex::new(None)),
             input: InputEditor::default(),
             input_history: Vec::new(),
-            input_mode: InputMode::Editing,
             running: true,
             suggestion_index: 0,
-            interaction_phase: InteractionPhase::Idle,
+            interaction_state: InteractionState::default(),
             cancellation: None,
             input_hint: session_input_hint(),
             startup_info: StartupInfo::default(),
@@ -421,7 +419,7 @@ impl SubBakeTui {
 
     pub fn set_input_history(&mut self, history: Vec<String>) {
         self.input_history = history;
-        self.input_mode = InputMode::Editing;
+        self.interaction_state.set_input_mode(InputMode::Editing);
     }
 
     pub fn set_session_replay(&mut self, events: Vec<crate::session::AgentEvent>) {
@@ -433,17 +431,29 @@ impl SubBakeTui {
                 );
             }
             for event in events {
-                let (style, text) = match event.kind.as_str() {
-                    "user" => (
+                let (style, text) = match event.tag() {
+                    crate::session::EventTag::User => (
                         MsgStyle::User,
                         format!("[{}] {}", event.created_at, event.text),
                     ),
-                    "assistant" | "ask_user" => (MsgStyle::Response, format!("➔ {}", event.text)),
-                    "tool_call" => (MsgStyle::ToolCall, format!("⚡ {}", event.text)),
-                    "file_operation" => (MsgStyle::Observation, format!("◀ {}", event.text)),
-                    "plan" => (MsgStyle::System, format!("Plan: {}", event.text)),
-                    "error" => (MsgStyle::Error, format!("✖ {}", event.text)),
-                    "cancelled" => (MsgStyle::System, "Cancelled.".to_owned()),
+                    crate::session::EventTag::Assistant | crate::session::EventTag::AskUser => {
+                        (MsgStyle::Response, format!("➔ {}", event.text))
+                    }
+                    crate::session::EventTag::ToolCall => {
+                        (MsgStyle::ToolCall, format!("⚡ {}", event.text))
+                    }
+                    crate::session::EventTag::FileOperation => {
+                        (MsgStyle::Observation, format!("◀ {}", event.text))
+                    }
+                    crate::session::EventTag::Plan => {
+                        (MsgStyle::System, format!("Plan: {}", event.text))
+                    }
+                    crate::session::EventTag::Error => {
+                        (MsgStyle::Error, format!("✖ {}", event.text))
+                    }
+                    crate::session::EventTag::Cancelled => {
+                        (MsgStyle::System, "Cancelled.".to_owned())
+                    }
                     _ => continue,
                 };
                 if view.messages.len() >= view.max {
@@ -462,10 +472,11 @@ impl SubBakeTui {
     pub fn open_session_picker(&mut self, options: Vec<SessionChoice>) -> io::Result<()> {
         self.open_fullscreen_overlay()?;
         self.input.clear();
-        self.input_mode = InputMode::ChoosingSession(SessionPicker {
-            options,
-            cancel_exits: true,
-        });
+        self.interaction_state
+            .set_input_mode(InputMode::ChoosingSession(SessionPicker {
+                options,
+                cancel_exits: true,
+            }));
         self.suggestion_index = 0;
         Ok(())
     }
@@ -515,21 +526,23 @@ impl SubBakeTui {
             while self.running {
                 if let Ok(result) = response_rx.try_recv() {
                     self.commit_progress_summary();
-                    let plan_mode_rollback = self.interaction_phase.finish();
+                    let plan_mode_rollback = self.interaction_state.finish();
                     match result {
                         Ok(TuiInteraction::Message { message }) => {
-                            self.input_mode = InputMode::Editing;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
                             self.suggestion_index = 0;
                             self.render_response(message);
                         }
                         Ok(TuiInteraction::PlanApproval { message }) => {
-                            self.input_mode = InputMode::AwaitingPlanDecision;
+                            self.interaction_state
+                                .set_input_mode(InputMode::AwaitingPlanDecision);
                             self.suggestion_index = 0;
                             self.render_response(message);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
                             self.open_fullscreen_overlay()?;
-                            self.input_mode = InputMode::ChoosingProfile(TuiPicker { options });
+                            self.interaction_state
+                                .set_input_mode(InputMode::ChoosingProfile(TuiPicker { options }));
                             self.suggestion_index = 0;
                             let _ = message;
                         }
@@ -540,7 +553,7 @@ impl SubBakeTui {
                             model,
                         }) => {
                             self.input_history = input_history;
-                            self.input_mode = InputMode::Editing;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
                             self.suggestion_index = 0;
                             self.set_session_replay(events);
                             self.plan_mode = plan_mode;
@@ -548,10 +561,11 @@ impl SubBakeTui {
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
                             self.open_fullscreen_overlay()?;
-                            self.input_mode = InputMode::ChoosingSession(SessionPicker {
-                                options,
-                                cancel_exits: false,
-                            });
+                            self.interaction_state
+                                .set_input_mode(InputMode::ChoosingSession(SessionPicker {
+                                    options,
+                                    cancel_exits: false,
+                                }));
                             self.suggestion_index = 0;
                             // `/sessions` opens a picker; its textual summary would only
                             // duplicate the rows already visible in that picker.
@@ -559,12 +573,12 @@ impl SubBakeTui {
                         }
                         Ok(TuiInteraction::PlanModeChanged { enabled }) => {
                             self.plan_mode = enabled;
-                            self.input_mode = InputMode::Editing;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
                             self.suggestion_index = 0;
                         }
                         Ok(TuiInteraction::ModelChanged { model, message }) => {
                             self.startup_info.model = model;
-                            self.input_mode = InputMode::Editing;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
                             self.suggestion_index = 0;
                             self.render_response(message);
                         }
@@ -572,10 +586,10 @@ impl SubBakeTui {
                             if let Some(previous) = plan_mode_rollback {
                                 self.plan_mode = previous;
                             }
-                            self.input_mode = InputMode::Editing;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
                             if let Ok(mut view) = self.msg_view.lock() {
                                 if error.kind() == io::ErrorKind::Interrupted {
-                                    self.input_mode = InputMode::Editing;
+                                    self.interaction_state.set_input_mode(InputMode::Editing);
                                     view.push(MsgStyle::System, "Cancelled.".to_owned());
                                 } else {
                                     view.push(MsgStyle::Error, format!("Error: {error}"));
@@ -642,24 +656,28 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn suggestions(&self) -> Vec<(String, String)> {
-        suggestions_for(self.input.text(), &self.input_mode)
+        suggestions_for(self.input.text(), self.interaction_state.input_mode())
     }
 
     fn navigate_history_up(&mut self) {
-        let Some((mode, input)) =
-            history_up(&self.input_history, self.input.text(), &self.input_mode)
-        else {
+        let Some((mode, input)) = history_up(
+            &self.input_history,
+            self.input.text(),
+            self.interaction_state.input_mode(),
+        ) else {
             return;
         };
-        self.input_mode = mode;
+        self.interaction_state.set_input_mode(mode);
         self.input.set_text(input);
     }
 
     fn navigate_history_down(&mut self) {
-        let Some((mode, input)) = history_down(&self.input_history, &self.input_mode) else {
+        let Some((mode, input)) =
+            history_down(&self.input_history, self.interaction_state.input_mode())
+        else {
             return;
         };
-        self.input_mode = mode;
+        self.interaction_state.set_input_mode(mode);
         self.input.set_text(input);
     }
 
@@ -711,7 +729,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
             .as_ref()
             .map_or_else(|| self.terminal.size(), Terminal::size)?;
         let suggestions = self.suggestions();
-        let selected_suggestion = match &self.input_mode {
+        let selected_suggestion = match self.interaction_state.input_mode() {
             InputMode::ChoosingSession(picker) => self
                 .suggestion_index
                 .min(picker.options.len().saturating_sub(1)),
@@ -722,22 +740,25 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .suggestion_index
                 .min(suggestions.len().saturating_sub(1)),
         };
-        let processing = self.interaction_phase.is_processing();
+        let processing = self.interaction_state.is_processing();
         let progress = self.progress.lock().ok().and_then(|value| value.clone());
         let ambient_spinner = spinner_frame(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default(),
         );
-        let session_picker = match &self.input_mode {
+        let session_picker = match self.interaction_state.input_mode() {
             InputMode::ChoosingSession(picker) => Some(picker.options.clone()),
             _ => None,
         };
-        let profile_picker = match &self.input_mode {
+        let profile_picker = match self.interaction_state.input_mode() {
             InputMode::ChoosingProfile(picker) => Some(picker.options.clone()),
             _ => None,
         };
-        let creating_profile = matches!(self.input_mode, InputMode::CreatingProfile);
+        let creating_profile = matches!(
+            self.interaction_state.input_mode(),
+            InputMode::CreatingProfile
+        );
         let profile_name_input = self.input.text().to_owned();
         let startup_info = self.startup_info.clone();
         let plan_mode = self.plan_mode;
@@ -747,8 +768,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let input_line_count = self.input.desired_height(input_width).min(max_input_lines);
         let input_total_height = input_line_count.saturating_add(3);
         let toggling_plan_mode = matches!(
-            self.interaction_phase,
-            InteractionPhase::Processing {
+            self.interaction_state,
+            InteractionState::Processing {
                 plan_mode_rollback: Some(_),
                 ..
             }
@@ -1033,7 +1054,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 1,
             );
             let input_lines = if self.input.is_empty()
-                && matches!(self.input_mode, InputMode::Editing)
+                && matches!(self.interaction_state.input_mode(), InputMode::Editing)
                 && !processing
             {
                 vec![Line::from(vec![
@@ -1126,8 +1147,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.running = false;
                 }
                 KeyCode::Esc => {
-                    if self.interaction_phase.is_processing() {
-                        if self.interaction_phase.request_cancellation() {
+                    if self.interaction_state.is_processing() {
+                        if self.interaction_state.request_cancellation() {
                             if let Ok(mut progress) = self.progress.lock()
                                 && let Some((event, _)) = progress.as_mut()
                             {
@@ -1143,20 +1164,20 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         }
                     } else {
                         let cancel_exits = matches!(
-                            &self.input_mode,
+                            self.interaction_state.input_mode(),
                             InputMode::ChoosingSession(SessionPicker {
                                 cancel_exits: true,
                                 ..
                             })
                         );
                         let closes_overlay = matches!(
-                            self.input_mode,
+                            self.interaction_state.input_mode(),
                             InputMode::ChoosingSession(_)
                                 | InputMode::ChoosingProfile(_)
                                 | InputMode::CreatingProfile
                         );
                         self.input.clear();
-                        self.input_mode = InputMode::Editing;
+                        self.interaction_state.set_input_mode(InputMode::Editing);
                         self.suggestion_index = 0;
                         if closes_overlay {
                             self.close_fullscreen_overlay()?;
@@ -1167,27 +1188,34 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 _ if is_insert_newline_key(key)
-                    && !matches!(self.input_mode, InputMode::CreatingProfile) =>
+                    && !matches!(
+                        self.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) =>
                 {
                     self.input.insert_newline();
-                    self.input_mode = InputMode::Editing;
+                    self.interaction_state.set_input_mode(InputMode::Editing);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Enter => {
-                    if self.interaction_phase.is_processing() {
+                    if self.interaction_state.is_processing() {
                         return Ok(());
                     }
                     let suggestions = self.suggestions();
                     let selected_action = if self.input.is_empty() {
-                        match empty_mode_choice(&self.input_mode, self.suggestion_index) {
+                        match empty_mode_choice(
+                            self.interaction_state.input_mode(),
+                            self.suggestion_index,
+                        ) {
                             Some(EmptyModeChoice::Submit(action)) => Some(action),
                             Some(EmptyModeChoice::RevisePlan) => {
-                                self.input_mode = InputMode::Editing;
+                                self.interaction_state.set_input_mode(InputMode::Editing);
                                 self.suggestion_index = 0;
                                 return Ok(());
                             }
                             Some(EmptyModeChoice::CreateProfile) => {
-                                self.input_mode = InputMode::CreatingProfile;
+                                self.interaction_state
+                                    .set_input_mode(InputMode::CreatingProfile);
                                 self.suggestion_index = 0;
                                 if let Ok(mut view) = self.msg_view.lock() {
                                     view.push(
@@ -1227,9 +1255,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             return Ok(());
                         }
 
-                        let creating_profile =
-                            matches!(self.input_mode, InputMode::CreatingProfile);
-                        self.input_mode = InputMode::Editing;
+                        let creating_profile = matches!(
+                            self.interaction_state.input_mode(),
+                            InputMode::CreatingProfile
+                        );
+                        self.interaction_state.set_input_mode(InputMode::Editing);
                         if self
                             .input_history
                             .last()
@@ -1279,7 +1309,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     if let Ok(mut progress) = self.progress.lock() {
                         *progress = None;
                     }
-                    self.interaction_phase.begin_processing(None);
+                    self.interaction_state.begin_processing(None);
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1290,26 +1320,37 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     })?;
                 }
                 KeyCode::Char(ch) => {
-                    if matches!(self.input_mode, InputMode::CreatingProfile)
-                        && !is_profile_name_character(ch)
+                    if matches!(
+                        self.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) && !is_profile_name_character(ch)
                     {
                         return Ok(());
                     }
-                    if !matches!(self.input_mode, InputMode::CreatingProfile) {
-                        self.input_mode = InputMode::Editing;
+                    if !matches!(
+                        self.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) {
+                        self.interaction_state.set_input_mode(InputMode::Editing);
                     }
                     self.input.insert_char(ch);
                     self.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
-                    if !matches!(self.input_mode, InputMode::CreatingProfile) {
-                        self.input_mode = InputMode::Editing;
+                    if !matches!(
+                        self.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) {
+                        self.interaction_state.set_input_mode(InputMode::Editing);
                     }
                     self.input.backspace();
                     self.suggestion_index = 0;
                 }
                 KeyCode::Up => {
-                    match vertical_navigation(&self.input_mode, self.suggestions().len()) {
+                    match vertical_navigation(
+                        self.interaction_state.input_mode(),
+                        self.suggestions().len(),
+                    ) {
                         VerticalNavigation::Selection(count) => {
                             self.suggestion_index =
                                 previous_suggestion(self.suggestion_index, count);
@@ -1324,7 +1365,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::Down => {
-                    match vertical_navigation(&self.input_mode, self.suggestions().len()) {
+                    match vertical_navigation(
+                        self.interaction_state.input_mode(),
+                        self.suggestions().len(),
+                    ) {
                         VerticalNavigation::Selection(count) => {
                             self.suggestion_index = (self.suggestion_index + 1) % count;
                         }
@@ -1338,7 +1382,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::Left | KeyCode::Right => {
-                    let option_count = match &self.input_mode {
+                    let option_count = match self.interaction_state.input_mode() {
                         InputMode::ChoosingSession(picker) => picker.options.len(),
                         InputMode::ChoosingProfile(picker) => picker.options.len(),
                         _ => 0,
@@ -1349,7 +1393,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         } else {
                             (self.suggestion_index + 1) % option_count
                         };
-                    } else if !self.interaction_phase.is_processing() {
+                    } else if !self.interaction_state.is_processing() {
                         if key.code == KeyCode::Left {
                             self.input.move_left();
                         } else {
@@ -1358,13 +1402,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::BackTab => {
-                    if self.interaction_phase.is_processing() {
+                    if self.interaction_state.is_processing() {
                         return Ok(());
                     }
                     let previous = self.plan_mode;
                     self.plan_mode = !previous;
                     let action = TuiAction::TogglePlan;
-                    self.interaction_phase.begin_processing(Some(previous));
+                    self.interaction_state.begin_processing(Some(previous));
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1608,15 +1652,16 @@ mod tests {
 
     use crate::engine::ProfileChoice;
     use crate::tui_state::{
-        ApprovalChoice, ProfilePickerChoice, approval_choice, profile_picker_choice,
+        ApprovalChoice, InteractionState, ProfilePickerChoice, approval_choice,
+        profile_picker_choice,
     };
 
     use super::{
-        EmptyModeChoice, InputMode, InteractionPhase, Msg, MsgStyle, TuiAction, TuiPicker,
-        VerticalNavigation, empty_mode_choice, history_down, history_lines_height, history_up,
-        is_insert_newline_key, is_profile_name_character, message_lines, picker_viewport,
-        previous_suggestion, push_immediate_response, slash_suggestions, suggestions_for,
-        terminal_width, vertical_navigation,
+        EmptyModeChoice, InputMode, Msg, MsgStyle, TuiAction, TuiPicker, VerticalNavigation,
+        empty_mode_choice, history_down, history_lines_height, history_up, is_insert_newline_key,
+        is_profile_name_character, message_lines, picker_viewport, previous_suggestion,
+        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
+        vertical_navigation,
     };
 
     #[test]
@@ -1729,8 +1774,8 @@ mod tests {
     }
 
     #[test]
-    fn interaction_phase_tracks_cancellation_as_a_typed_transition() {
-        let mut phase = InteractionPhase::Idle;
+    fn interaction_state_tracks_cancellation_as_a_typed_transition() {
+        let mut phase = InteractionState::default();
         assert!(!phase.request_cancellation());
 
         phase.begin_processing(None);
@@ -1738,16 +1783,16 @@ mod tests {
         assert!(phase.request_cancellation());
         assert!(!phase.request_cancellation());
         assert_eq!(phase.finish(), None);
-        assert_eq!(phase, InteractionPhase::Idle);
+        assert!(matches!(phase, InteractionState::Idle { .. }));
     }
 
     #[test]
-    fn interaction_phase_returns_plan_mode_rollback_only_when_finishing() {
-        let mut phase = InteractionPhase::Idle;
+    fn interaction_state_returns_plan_mode_rollback_only_when_finishing() {
+        let mut phase = InteractionState::default();
         phase.begin_processing(Some(false));
 
         assert_eq!(phase.finish(), Some(false));
-        assert_eq!(phase, InteractionPhase::Idle);
+        assert!(matches!(phase, InteractionState::Idle { .. }));
         assert_eq!(phase.finish(), None);
     }
 

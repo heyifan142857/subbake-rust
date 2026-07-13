@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{
-    DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET, DEFAULT_REVIEW_CONCURRENCY,
-    DEFAULT_TRANSLATION_CONCURRENCY, PipelineOptions, ReviewPolicy,
+    DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET, DEFAULT_MODEL,
+    DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY, DEFAULT_SOURCE_LANGUAGE,
+    DEFAULT_TARGET_LANGUAGE, DEFAULT_TRANSLATION_CONCURRENCY, PipelineOptions, ReviewPolicy,
 };
 
 use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
@@ -189,8 +190,8 @@ impl Default for TranslationSettings {
                 bilingual: false,
             },
             backend: BackendSettings {
-                provider: "mock".to_owned(),
-                model: "mock-zh".to_owned(),
+                provider: DEFAULT_PROVIDER.to_owned(),
+                model: DEFAULT_MODEL.to_owned(),
                 api_key: None,
                 base_url: None,
                 api_format: None,
@@ -200,8 +201,8 @@ impl Default for TranslationSettings {
                 auth_prefix: None,
             },
             translation: TranslationDomainSettings {
-                source_language: "Auto".to_owned(),
-                target_language: "zh-Hans".to_owned(),
+                source_language: DEFAULT_SOURCE_LANGUAGE.to_owned(),
+                target_language: DEFAULT_TARGET_LANGUAGE.to_owned(),
                 batch_size: DEFAULT_BATCH_SIZE,
                 batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
                 translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
@@ -212,9 +213,9 @@ impl Default for TranslationSettings {
                 dry_run: false,
                 resume: true,
                 use_cache: true,
-                retries: 2,
+                retries: DEFAULT_RETRIES,
                 agent: true,
-                agent_repair_attempts: 2,
+                agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
             },
             runtime: RuntimeSettings {
                 runtime_dir: None,

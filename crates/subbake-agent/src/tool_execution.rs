@@ -15,6 +15,7 @@ use subbake_core::{CancellationGuard, SharedProgress};
 use crate::discovery::rank_subtitle_candidates;
 use crate::guard::{FileGuard, FileOpResult};
 use crate::session::AgentEvent;
+use crate::session::EventTag;
 use crate::tools::ToolExecutor;
 
 pub(crate) struct LocalToolOutcome {
@@ -172,17 +173,11 @@ pub(crate) fn execute_adapter_tool(
             match transcribed {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Ok(outcome) => format!("Transcribed: {}", outcome.output_path.display()),
-                Err(error) => format!("Transcription needs setup: {error}"),
+                Err(error) => return Err(error),
             }
         }
         ToolExecutor::ManageWhisper => {
-            let action = match whisper_action(args) {
-                Ok(action) => action,
-                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-                    return Ok(Some(error.to_string()));
-                }
-                Err(error) => return Err(error),
-            };
+            let action = whisper_action(args)?;
             let request = WhisperRequest {
                 action,
                 binary_path: None,
@@ -200,7 +195,7 @@ pub(crate) fn execute_adapter_tool(
             match managed {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Ok(_) => "whisper: done".to_owned(),
-                Err(error) => format!("whisper: {error}"),
+                Err(error) => return Err(error),
             }
         }
         ToolExecutor::DiagnosePath => {
@@ -503,7 +498,7 @@ fn recent_translation_paths(events: &[AgentEvent]) -> String {
         .rev()
         .take(20)
         .filter(|event| {
-            event.kind == "file_operation"
+            event.tag() == EventTag::FileOperation
                 && !event
                     .data
                     .get("undone")
@@ -597,6 +592,22 @@ mod tests {
         .expect("execute")
         .expect("adapter outcome");
         assert!(outcome.contains("Provider rate limit was hit."));
+    }
+
+    #[test]
+    fn invalid_whisper_action_is_an_error_not_success_text() {
+        let root = temp_root();
+        let guard = FileGuard::new(root.clone());
+        let error = execute_adapter_tool(
+            ToolExecutor::ManageWhisper,
+            &json!({"action": "not-a-command"}),
+            &guard,
+            &CancellationGuard::never(),
+            None,
+        )
+        .expect_err("invalid whisper action must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root() -> PathBuf {

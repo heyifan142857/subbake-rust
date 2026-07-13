@@ -24,6 +24,7 @@ use crate::discovery::summarize_observation;
 use crate::engine::AgentEngine;
 use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
 use crate::guard::{FileOpAction, FileOpResult};
+use crate::session::EventTag;
 use crate::tool_execution::{
     execute_adapter_tool, execute_local_tool, execute_session_tool, execute_translation_tool,
 };
@@ -135,8 +136,17 @@ struct LoopState {
 }
 
 /// The LLM's structured decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionAction {
+    Respond,
+    ToolCall,
+    Plan,
+    AskUser,
+    NativeToolCalls,
+}
+
 struct Decision {
-    action: String, // "respond" | "tool_call" | "plan" | "ask_user"
+    action: DecisionAction,
     text: String,
     tool_name: Option<String>,
     arguments: Option<JsonValue>,
@@ -152,7 +162,7 @@ struct NativeTurn {
 
 fn invalid_decision_response(error: &io::Error) -> Decision {
     Decision {
-        action: "ask_user".into(),
+        action: DecisionAction::AskUser,
         text: format!(
             "I couldn't execute the proposed action because its arguments were invalid: {error}"
         ),
@@ -454,16 +464,16 @@ impl AgentEngine {
                 return self.finish_response(outputs.join("\n"), false, true);
             }
 
-            match decision.action.as_str() {
-                "respond" => {
+            match decision.action {
+                DecisionAction::Respond => {
                     return self.finish_response(decision.text, false, true);
                 }
 
-                "ask_user" => {
+                DecisionAction::AskUser => {
                     return self.finish_response(decision.text, true, true);
                 }
 
-                "tool_call" => {
+                DecisionAction::ToolCall => {
                     let tool_name = decision.tool_name.as_deref().unwrap_or("unknown");
                     let args = decision.arguments.unwrap_or(json!({}));
 
@@ -519,7 +529,7 @@ impl AgentEngine {
                     return self.finish_response(result_text, false, true);
                 }
 
-                "plan" => {
+                DecisionAction::Plan => {
                     if decision
                         .tool_calls
                         .iter()
@@ -553,9 +563,13 @@ impl AgentEngine {
                     return self.finish_response(response, false, true);
                 }
 
-                other => {
-                    let msg = format!("I'm not sure how to proceed (action={other}).");
-                    return self.finish_response(msg, true, true);
+                DecisionAction::NativeToolCalls => {
+                    return self.finish_response(
+                        "The model returned native tool calls without continuation state. Please try again."
+                            .to_owned(),
+                        true,
+                        true,
+                    );
                 }
             }
         }
@@ -698,10 +712,10 @@ impl AgentEngine {
             .events
             .iter()
             .rev()
-            .skip_while(|event| event.kind == "user")
-            .filter_map(|event| match event.kind.as_str() {
-                "user" => Some(format!("User: {}", truncate_text(&event.text, 240))),
-                "assistant" | "ask_user" => {
+            .skip_while(|event| event.tag() == EventTag::User)
+            .filter_map(|event| match event.tag() {
+                EventTag::User => Some(format!("User: {}", truncate_text(&event.text, 240))),
+                EventTag::Assistant | EventTag::AskUser => {
                     Some(format!("Assistant: {}", truncate_text(&event.text, 240)))
                 }
                 _ => None,
@@ -761,7 +775,7 @@ impl AgentEngine {
                 Ok(response) => {
                     if !response.tool_calls.is_empty() {
                         return Ok(Decision {
-                            action: "native_tool_calls".to_owned(),
+                            action: DecisionAction::NativeToolCalls,
                             text: response.text.unwrap_or_default(),
                             tool_name: None,
                             arguments: None,
@@ -771,7 +785,7 @@ impl AgentEngine {
                         });
                     }
                     return Ok(Decision {
-                        action: "respond".to_owned(),
+                        action: DecisionAction::Respond,
                         text: response.text.unwrap_or_default(),
                         tool_name: None,
                         arguments: None,
@@ -792,7 +806,7 @@ impl AgentEngine {
                         observer.on_error(&error.to_string());
                     }
                     return Ok(Decision {
-                        action: "respond".to_owned(),
+                        action: DecisionAction::Respond,
                         text: format!("Error: {error}"),
                         tool_name: None,
                         arguments: None,
@@ -848,7 +862,7 @@ impl AgentEngine {
                             "operation cancelled",
                         )),
                         Err(error) => Ok(Decision {
-                            action: "ask_user".into(),
+                            action: DecisionAction::AskUser,
                             text: format!(
                                 "The proposed action was invalid ({first_error}), and the repair attempt failed: {error}"
                             ),
@@ -872,7 +886,7 @@ impl AgentEngine {
                     obs.on_error(&e.to_string());
                 }
                 Ok(Decision {
-                    action: "respond".into(),
+                    action: DecisionAction::Respond,
                     text: format!("Error: {e}"),
                     tool_name: None,
                     arguments: None,
@@ -981,15 +995,16 @@ impl AgentEngine {
             .and_then(JsonValue::as_str)
             .ok_or_else(|| io::Error::other("agent decision is missing `action`"))?;
         let action = match raw_action {
-            "final_tool_call" => "tool_call",
-            "respond" | "tool_call" | "plan" | "ask_user" => raw_action,
+            "final_tool_call" | "tool_call" => DecisionAction::ToolCall,
+            "respond" => DecisionAction::Respond,
+            "plan" => DecisionAction::Plan,
+            "ask_user" => DecisionAction::AskUser,
             other => {
                 return Err(io::Error::other(format!(
                     "unsupported agent action `{other}`"
                 )));
             }
-        }
-        .to_owned();
+        };
         let text = object
             .get("text")
             .and_then(JsonValue::as_str)
@@ -998,7 +1013,7 @@ impl AgentEngine {
         let mut tool_name = None;
         let mut arguments = None;
         let mut tool_calls = Vec::new();
-        if action == "tool_call" {
+        if action == DecisionAction::ToolCall {
             let name = object
                 .get("tool_name")
                 .and_then(JsonValue::as_str)
@@ -1010,7 +1025,7 @@ impl AgentEngine {
             validate_tool_call(name, &args).map_err(io::Error::other)?;
             tool_name = Some(name.to_owned());
             arguments = Some(args);
-        } else if action == "plan" {
+        } else if action == DecisionAction::Plan {
             let calls = object
                 .get("tool_calls")
                 .and_then(JsonValue::as_array)
@@ -1052,7 +1067,9 @@ impl AgentEngine {
     // ------------------------------------------------------------------
 
     fn is_in_plan_mode(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.mode == "plan")
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.mode == crate::session::SessionMode::Plan)
     }
 
     // ------------------------------------------------------------------

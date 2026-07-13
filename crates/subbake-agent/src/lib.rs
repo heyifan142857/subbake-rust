@@ -22,66 +22,14 @@ pub use tui::{
     Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,
 };
 
-// ---------------------------------------------------------------------------
-// Compatibility API — used by the CLI while the interactive engine is built.
-// These will be replaced when the full agent loop lands in stage 5.
-// ---------------------------------------------------------------------------
-
-use std::fmt;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionKind {
+    Start,
+    Resume,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentAction {
-    pub kind: String,
+    pub kind: AgentActionKind,
     pub session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRequest {
-    pub action: AgentAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentOutcome {
-    pub message: String,
-}
-
-impl fmt::Display for AgentOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-pub fn run_agent(request: AgentRequest) -> AgentOutcome {
-    let message = match request.action.kind.as_str() {
-        "start" => format!(
-            "SubBake agent session {} started.",
-            request.action.session_id.as_deref().unwrap_or("(new)")
-        ),
-        "resume" => format!(
-            "SubBake agent session resume requested for `{}`.",
-            request.action.session_id.as_deref().unwrap_or("latest")
-        ),
-        _ => "SubBake agent command received.".to_owned(),
-    };
-    AgentOutcome { message }
-}
-
-pub fn start_agent() -> String {
-    run_agent(AgentRequest {
-        action: AgentAction {
-            kind: "start".to_owned(),
-            session_id: None,
-        },
-    })
-    .message
-}
-
-pub fn resume_agent(session_id: Option<&str>) -> String {
-    run_agent(AgentRequest {
-        action: AgentAction {
-            kind: "resume".to_owned(),
-            session_id: session_id.map(str::to_owned),
-        },
-    })
-    .message
 }

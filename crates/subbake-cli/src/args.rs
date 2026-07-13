@@ -6,7 +6,8 @@ use subbake_adapters::{
     TranslationSettings, TranslationSettingsPatch, WhisperAction, discover_config_path,
     load_and_resolve,
 };
-use subbake_agent::AgentAction;
+use subbake_agent::{AgentAction, AgentActionKind};
+use subbake_core::entities::{DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 #[derive(Debug, Clone)]
 pub struct AgentArgs {
@@ -87,7 +88,7 @@ pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
     }
 
     let action = AgentAction {
-        kind: "start".to_owned(),
+        kind: AgentActionKind::Start,
         session_id: None,
     };
 
@@ -100,7 +101,7 @@ pub fn parse_resume_args(args: &[String]) -> io::Result<AgentArgs> {
     }
     Ok(AgentArgs {
         action: AgentAction {
-            kind: "resume".to_owned(),
+            kind: AgentActionKind::Resume,
             session_id: args.first().cloned(),
         },
     })
@@ -357,8 +358,8 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
         return Err(io::Error::other("provider requires `check`"));
     }
 
-    let mut provider = "mock".to_owned();
-    let mut model = "mock-zh".to_owned();
+    let mut provider = DEFAULT_PROVIDER.to_owned();
+    let mut model = DEFAULT_MODEL.to_owned();
     let mut api_key = None;
     let mut base_url = None;
     let mut api_format = None;
@@ -690,7 +691,7 @@ mod tests {
         assert_eq!(
             parsed.action,
             AgentAction {
-                kind: "resume".to_owned(),
+                kind: AgentActionKind::Resume,
                 session_id: Some("abc".to_owned()),
             }
         );

@@ -10,7 +10,7 @@ use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
-use crate::session::AgentSessionStore;
+use crate::session::{AgentSessionStore, EventTag, SessionMode};
 use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
 
 // ---------------------------------------------------------------------------
@@ -121,11 +121,11 @@ impl EngineObserver for StreamingObserver {
 
 /// The headless agent engine.
 pub struct AgentEngine {
-    pub project_root: PathBuf,
-    pub session_store: AgentSessionStore,
-    pub guard: FileGuard,
-    pub session: Option<crate::session::AgentSession>,
-    pub observer: Option<Box<dyn EngineObserver>>,
+    pub(crate) project_root: PathBuf,
+    pub(crate) session_store: AgentSessionStore,
+    pub(crate) guard: FileGuard,
+    pub(crate) session: Option<crate::session::AgentSession>,
+    pub(crate) observer: Option<Box<dyn EngineObserver>>,
     cancellation: CancellationToken,
     pub(crate) operation_guard: CancellationGuard,
     pub(crate) progress: Option<SharedProgress>,
@@ -150,6 +150,28 @@ impl AgentEngine {
     pub fn with_progress(mut self, progress: SharedProgress) -> Self {
         self.progress = Some(progress);
         self
+    }
+
+    pub fn project_root(&self) -> &std::path::Path {
+        &self.project_root
+    }
+
+    pub fn active_profile(&self) -> Option<&str> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.profile.as_deref())
+    }
+
+    pub fn active_config_path(&self) -> Option<&str> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.config_path.as_deref())
+    }
+
+    pub fn is_plan_mode(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.mode == SessionMode::Plan)
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -268,13 +290,12 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = "plan".to_owned();
+        session.mode = SessionMode::Plan;
         session.pending_plan = Some(PendingPlan {
             message: message.to_owned(),
             tool_calls,
             created_at: crate::session::iso_now(),
         });
-        self.session_store.save(session)?;
         self.record(EventKind::Plan {
             message: message.to_owned(),
             tool_calls: event_calls,
@@ -319,7 +340,7 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = "chat".to_owned();
+        session.mode = SessionMode::Chat;
         session.pending_plan = None;
         self.record(EventKind::Approve)?;
 
@@ -338,7 +359,7 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = "chat".to_owned();
+        session.mode = SessionMode::Chat;
         session.pending_plan = None;
         self.record(EventKind::Reject)?;
         Ok("Rejected pending plan.".to_owned())
@@ -369,7 +390,7 @@ impl AgentEngine {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no active session"))?
             .mode
-            != "plan";
+            != SessionMode::Plan;
         self.set_plan_mode(enabled)
     }
 
@@ -379,12 +400,12 @@ impl AgentEngine {
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
         if !enabled {
-            session.mode = "chat".to_owned();
+            session.mode = SessionMode::Chat;
             session.pending_plan = None;
             self.session_store.save(session)?;
             Ok("Plan mode off.".to_owned())
         } else {
-            session.mode = "plan".to_owned();
+            session.mode = SessionMode::Plan;
             self.session_store.save(session)?;
             Ok("Plan mode on. Mutating tools will wait for your approval.".to_owned())
         }
@@ -447,7 +468,9 @@ impl AgentEngine {
                     let title = session
                         .events
                         .iter()
-                        .find(|event| event.kind == "user" && !event.text.trim().is_empty())
+                        .find(|event| {
+                            event.tag() == EventTag::User && !event.text.trim().is_empty()
+                        })
                         .map(|event| truncate_session_title(&event.text, 48))
                         .unwrap_or_else(|| "New session".to_owned());
                     let cwd = std::path::Path::new(&session.cwd)
@@ -496,11 +519,11 @@ impl AgentEngine {
         let lines = session.events[start..]
             .iter()
             .filter_map(|event| {
-                let label = match event.kind.as_str() {
-                    "user" => "You",
-                    "assistant" | "ask_user" => "Agent",
-                    "tool_call" => "Tool",
-                    "error" => "Error",
+                let label = match event.tag() {
+                    EventTag::User => "You",
+                    EventTag::Assistant | EventTag::AskUser => "Agent",
+                    EventTag::ToolCall => "Tool",
+                    EventTag::Error => "Error",
                     _ => return None,
                 };
                 Some(format!("{label}: {}", event.text))
@@ -610,16 +633,16 @@ impl AgentEngine {
             .events
             .iter()
             .rev()
-            .skip_while(|event| event.kind == "user")
+            .skip_while(|event| event.tag() == EventTag::User)
             .filter_map(|event| {
-                let label = match event.kind.as_str() {
-                    "user" => "User",
-                    "assistant" => "Assistant",
-                    "ask_user" => "Assistant question",
-                    "tool_call" => "Tool",
-                    "file_operation" => "File operation",
-                    "plan" => "Plan",
-                    "error" => "Error",
+                let label = match event.tag() {
+                    EventTag::User => "User",
+                    EventTag::Assistant => "Assistant",
+                    EventTag::AskUser => "Assistant question",
+                    EventTag::ToolCall => "Tool",
+                    EventTag::FileOperation => "File operation",
+                    EventTag::Plan => "Plan",
+                    EventTag::Error => "Error",
                     _ => return None,
                 };
                 let text = if event.text.trim().is_empty() {
@@ -642,7 +665,7 @@ impl AgentEngine {
                 session
                     .events
                     .iter()
-                    .filter(|event| event.kind == "user" && !event.text.trim().is_empty())
+                    .filter(|event| event.tag() == EventTag::User && !event.text.trim().is_empty())
                     .map(|event| event.text.clone())
                     .fold(Vec::<String>::new(), |mut history, input| {
                         if history.last() != Some(&input) {
@@ -722,7 +745,7 @@ impl AgentEngine {
             .iter()
             .rev()
             .find(|event| {
-                event.kind == "file_operation"
+                event.tag() == EventTag::FileOperation
                     && !event
                         .data
                         .get("undone")
@@ -743,7 +766,7 @@ impl AgentEngine {
             events
                 .iter()
                 .filter(|e| {
-                    e.kind == "file_operation"
+                    e.tag() == EventTag::FileOperation
                         && e.data.get("group_id").and_then(|v| v.as_str()) == Some(gid.as_str())
                         && !e
                             .data
@@ -800,7 +823,7 @@ impl AgentEngine {
             // Mark as undone.
             if let Some(session) = self.session.as_mut() {
                 for se in session.events.iter_mut().rev() {
-                    if se.created_at == event.created_at && se.kind == "file_operation" {
+                    if se.created_at == event.created_at && se.tag() == EventTag::FileOperation {
                         if let Some(obj) = se.data.as_object_mut() {
                             obj.insert("undone".to_owned(), serde_json::Value::Bool(true));
                         }

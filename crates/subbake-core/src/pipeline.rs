@@ -630,7 +630,10 @@ where
                     store.save_glossary(&entries)?;
                 }
             }
-            Err(_) => stats.degraded = true,
+            Err(error) => {
+                stats.degraded = true;
+                stats.degraded_reason = Some(error.to_string());
+            }
         }
         stats.duration_ms = duration_ms(started);
         self.dashboard.add_usage(stats.usage);
@@ -650,7 +653,7 @@ where
         batch_index: usize,
         batch: &[SubtitleSegment],
     ) -> CoreResult<BatchWithUsage> {
-        self.translate_batch_impl(batch_index, batch, true)
+        self.translate_batch_impl(batch_index, batch, true, None)
     }
 
     fn translate_window(
@@ -714,7 +717,14 @@ where
             requests,
             self.options.translation_concurrency,
             &self.cancellation,
-        );
+        )?;
+        if responses.len() != pending.len() {
+            return Err(CoreError::Backend(format!(
+                "backend returned {} responses for {} translation requests",
+                responses.len(),
+                pending.len()
+            )));
+        }
         for ((batch_index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.and_then(|response| {
                 let payload = parse_translation_payload(&response.json)?;
@@ -745,8 +755,11 @@ where
                         },
                     );
                 }
-                Err(_) => {
-                    results.insert(batch_index, self.translate_batch(batch_index, &batch)?);
+                Err(error) => {
+                    results.insert(
+                        batch_index,
+                        self.translate_batch_impl(batch_index, &batch, true, Some(error))?,
+                    );
                 }
             }
         }
@@ -758,8 +771,9 @@ where
         batch_index: usize,
         batch: &[SubtitleSegment],
         record_failure: bool,
+        initial_error: Option<CoreError>,
     ) -> CoreResult<BatchWithUsage> {
-        let mut last_error = None;
+        let mut last_error = initial_error;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
@@ -772,9 +786,6 @@ where
             match self.translate_once(batch, &messages, &request_hash) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
-                    if matches!(error, CoreError::Cancelled) {
-                        return Err(error);
-                    }
                     if matches!(error, CoreError::Cancelled) {
                         return Err(error);
                     }
@@ -910,8 +921,8 @@ where
         batch: &[SubtitleSegment],
         split: usize,
     ) -> CoreResult<BatchWithUsage> {
-        let left = self.translate_batch_impl(batch_index, &batch[..split], false)?;
-        let right = self.translate_batch_impl(batch_index, &batch[split..], false)?;
+        let left = self.translate_batch_impl(batch_index, &batch[..split], false, None)?;
+        let right = self.translate_batch_impl(batch_index, &batch[split..], false, None)?;
         let mut usage = left.usage;
         usage.add(right.usage);
         Ok(BatchWithUsage {
@@ -927,7 +938,25 @@ where
         batch_index: usize,
         batch: &ReviewBatchPlan,
     ) -> CoreResult<ReviewWithUsage> {
-        let mut last_error = None;
+        self.review_batch_impl(batch_index, batch, None)
+    }
+
+    fn review_batch_after_error(
+        &mut self,
+        batch_index: usize,
+        batch: &ReviewBatchPlan,
+        error: CoreError,
+    ) -> CoreResult<ReviewWithUsage> {
+        self.review_batch_impl(batch_index, batch, Some(error))
+    }
+
+    fn review_batch_impl(
+        &mut self,
+        batch_index: usize,
+        batch: &ReviewBatchPlan,
+        initial_error: Option<CoreError>,
+    ) -> CoreResult<ReviewWithUsage> {
+        let mut last_error = initial_error;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
@@ -1040,7 +1069,14 @@ where
             requests,
             self.options.review_concurrency,
             &self.cancellation,
-        );
+        )?;
+        if responses.len() != pending.len() {
+            return Err(CoreError::Backend(format!(
+                "backend returned {} responses for {} review requests",
+                responses.len(),
+                pending.len()
+            )));
+        }
         for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.and_then(|response| {
                 let mut result = parse_review_payload(&response.json)?;
@@ -1070,8 +1106,8 @@ where
                         },
                     );
                 }
-                Err(_) => {
-                    output.insert(index, self.review_batch(index, &batch)?);
+                Err(error) => {
+                    output.insert(index, self.review_batch_after_error(index, &batch, error)?);
                 }
             }
         }
@@ -1265,7 +1301,7 @@ where
         let mut repair_error = initial_error.clone();
         let mut attempts = Vec::new();
         let mut total_usage = Usage::default();
-        let mut log_path = PathBuf::new();
+        let mut log_path = None;
         for attempt in 1..=self.options.agent_repair_attempts {
             self.cancellation.check()?;
             let messages = build_agent_repair_messages(
@@ -1402,12 +1438,11 @@ where
             .transpose()
     }
 
-    fn save_agent_log(&self, log: AgentLog) -> CoreResult<PathBuf> {
+    fn save_agent_log(&self, log: AgentLog) -> CoreResult<Option<PathBuf>> {
         self.store
             .as_ref()
             .map(|store| store.save_agent_log(&log))
             .transpose()
-            .map(|path| path.unwrap_or_default())
     }
 
     fn load_resume_snapshot(
@@ -1653,7 +1688,7 @@ struct RepairOutcome {
     payload: Option<BackendPayload>,
     usage: Usage,
     attempts: Vec<AttemptLog>,
-    log_path: PathBuf,
+    log_path: Option<PathBuf>,
     error: Option<String>,
 }
 
@@ -1771,11 +1806,8 @@ fn failure_error(
             "\nAgent repair failed after {} attempt(s).",
             repair.attempts.len()
         ));
-        if !repair.log_path.as_os_str().is_empty() {
-            message.push_str(&format!(
-                "\nAgent log saved to:\n{}",
-                repair.log_path.display()
-            ));
+        if let Some(log_path) = &repair.log_path {
+            message.push_str(&format!("\nAgent log saved to:\n{}", log_path.display()));
         }
         if let Some(error) = &repair.error {
             message.push_str(&format!("\nLast agent error: {error}"));
@@ -2058,6 +2090,35 @@ mod tests {
                     total_tokens: 2,
                 },
             })
+        }
+    }
+
+    struct ShortParallelBackend;
+
+    impl LlmBackend for ShortParallelBackend {
+        fn supports_parallel_generation(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "short-parallel"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            EchoBackend.generate_json(messages)
+        }
+
+        fn generate_many_cancellable(
+            &mut self,
+            _requests: Vec<crate::ports::GenerationRequest>,
+            _max_concurrency: usize,
+            _cancellation: &CancellationGuard,
+        ) -> CoreResult<Vec<CoreResult<crate::ports::GenerationResponse>>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2470,6 +2531,23 @@ mod tests {
     }
 
     #[test]
+    fn parallel_backend_response_count_must_match_request_count() {
+        let mut options = PipelineOptions::new("clip.txt".into());
+        options.translation_concurrency = 2;
+        options.batch_size = 1;
+        let mut pipeline = SubtitlePipeline::new(ShortParallelBackend, NoopDashboard, options);
+
+        let error = pipeline
+            .run_document(&document("clip.txt", &["one", "two"]))
+            .expect_err("short batch responses must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("responses for 2 translation requests")
+        );
+    }
+
+    #[test]
     fn pipeline_translates_document_batches() {
         let document = SubtitleDocument {
             path: "clip.txt".into(),
@@ -2790,6 +2868,27 @@ mod tests {
         let data = captured.lock().expect("capture lock");
         assert!(data.agent_logs.last().expect("agent log").success);
         assert!(data.failure_logs.is_empty());
+    }
+
+    #[test]
+    fn agent_repair_reports_missing_log_path_without_a_runtime_store() {
+        let document = document("agent-no-store.txt", &["Alpha."]);
+        let mut options = PipelineOptions::new("agent-no-store.txt".into());
+        options.review_policy = ReviewPolicy::Off;
+        options.retries = 0;
+        let mut pipeline = SubtitlePipeline::new(
+            AgentRepairBackend {
+                regular_calls: Arc::new(AtomicUsize::new(0)),
+                repair_calls: Arc::new(AtomicUsize::new(0)),
+                repair_succeeds: true,
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("agent repairs");
+        assert_eq!(run.result.agent_repairs.len(), 1);
+        assert_eq!(run.result.agent_repairs[0].log_path, None);
     }
 
     #[test]

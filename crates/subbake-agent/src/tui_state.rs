@@ -28,22 +28,50 @@ pub(crate) enum InputMode {
     AwaitingPlanDecision,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InteractionPhase {
-    Idle,
+pub(crate) enum InteractionState {
+    Idle {
+        input_mode: InputMode,
+    },
     Processing {
+        // Processing always renders an editing input; pickers and forms are
+        // therefore structurally unavailable while a worker is active.
+        input_mode: InputMode,
         plan_mode_rollback: Option<bool>,
         cancellation_requested: bool,
     },
 }
 
-impl InteractionPhase {
-    pub fn is_processing(self) -> bool {
+impl Default for InteractionState {
+    fn default() -> Self {
+        Self::Idle {
+            input_mode: InputMode::Editing,
+        }
+    }
+}
+
+impl InteractionState {
+    pub fn input_mode(&self) -> &InputMode {
+        match self {
+            Self::Idle { input_mode } | Self::Processing { input_mode, .. } => input_mode,
+        }
+    }
+
+    pub fn set_input_mode(&mut self, mode: InputMode) {
+        match self {
+            Self::Idle { input_mode } => *input_mode = mode,
+            Self::Processing { .. } => {
+                debug_assert!(false, "input modes cannot change while processing");
+            }
+        }
+    }
+
+    pub fn is_processing(&self) -> bool {
         matches!(self, Self::Processing { .. })
     }
 
     pub fn begin_processing(&mut self, plan_mode_rollback: Option<bool>) {
         *self = Self::Processing {
+            input_mode: InputMode::Editing,
             plan_mode_rollback,
             cancellation_requested: false,
         };
@@ -65,13 +93,13 @@ impl InteractionPhase {
     }
 
     pub fn finish(&mut self) -> Option<bool> {
-        let rollback = match *self {
-            Self::Idle => None,
+        let rollback = match self {
+            Self::Idle { .. } => None,
             Self::Processing {
                 plan_mode_rollback, ..
-            } => plan_mode_rollback,
+            } => *plan_mode_rollback,
         };
-        *self = Self::Idle;
+        *self = Self::default();
         rollback
     }
 }
@@ -208,11 +236,11 @@ mod tests {
 
     #[test]
     fn processing_transitions_are_reduced_without_tui_state() {
-        let mut phase = InteractionPhase::Idle;
+        let mut phase = InteractionState::default();
         phase.begin_processing(Some(false));
         assert!(phase.request_cancellation());
         assert!(!phase.request_cancellation());
         assert_eq!(phase.finish(), Some(false));
-        assert_eq!(phase, InteractionPhase::Idle);
+        assert!(matches!(phase, InteractionState::Idle { .. }));
     }
 }

@@ -5,7 +5,6 @@ use subbake_adapters::{
     BatchTranslationOutcome, PipelineOutcome, ProviderCheckOutcome, RuntimeOutcome,
     TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
 };
-use subbake_agent::AgentOutcome;
 use subbake_core::entities::PipelineResult;
 
 pub fn print_translation_outcome(
@@ -19,10 +18,6 @@ pub fn print_translation_outcome(
 
 pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
     print!("{}", batch_text(outcome));
-}
-
-pub fn print_agent_outcome(outcome: &AgentOutcome) {
-    println!("{}", outcome.message);
 }
 
 pub fn print_pipeline_outcome(
@@ -115,6 +110,9 @@ fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
                 ""
             }
         ));
+        if let Some(reason) = &result.terminology.degraded_reason {
+            output.push_str(&format!("Terminology preflight fallback: {reason}\n"));
+        }
     }
     if result.review.batches > 0 {
         let rate = if result.review.reviewed_lines == 0 {

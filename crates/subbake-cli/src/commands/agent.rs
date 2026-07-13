@@ -6,31 +6,22 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentEngine, AgentRequest, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
+    AgentActionKind, AgentEngine, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
     TuiAction, TuiInteraction,
 };
 
 use crate::args::AgentArgs;
-use crate::output::print_agent_outcome;
 
 pub fn run(args: AgentArgs) -> io::Result<()> {
     // No-args / resume → start TUI.
-    match args.action.kind.as_str() {
-        "start" | "" => start_interactive(),
-        "resume" => {
+    match args.action.kind {
+        AgentActionKind::Start => start_interactive(),
+        AgentActionKind::Resume => {
             if let Some(sid) = &args.action.session_id {
                 start_interactive_resume(Some(sid))
             } else {
                 start_interactive_resume(None)
             }
-        }
-        _other => {
-            // Legacy stub path (backwards compat).
-            let outcome = subbake_agent::run_agent(AgentRequest {
-                action: args.action,
-            });
-            print_agent_outcome(&outcome);
-            Ok(())
         }
     }
 }
@@ -52,15 +43,12 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
 }
 
 fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io::Result<()> {
-    let project_root = engine.project_root.clone();
+    let project_root = engine.project_root().to_path_buf();
     let (mut config_path, needs_config_pin) = session_config_path(&engine);
     if needs_config_pin {
         engine.set_config_path(config_path.as_deref())?;
     }
-    let initial_profile = engine
-        .session
-        .as_ref()
-        .and_then(|session| session.profile.clone());
+    let initial_profile = engine.active_profile().map(str::to_owned);
     let mut backend =
         build_agent_decision_backend(config_path.as_deref(), initial_profile.as_deref())?;
     let startup_settings = resolved_settings(config_path.as_deref(), initial_profile.as_deref())?;
@@ -68,10 +56,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
     // Create the TUI with an observer attached to the engine.
     let input_history = engine.input_history();
     let session_events = engine.session_events();
-    let initial_plan_mode = engine
-        .session
-        .as_ref()
-        .is_some_and(|session| session.mode == "plan");
+    let initial_plan_mode = engine.is_plan_mode();
     let mut tui = SubBakeTui::new()?;
     tui.set_startup_info(StartupInfo {
         provider: startup_settings.backend.provider,
@@ -198,10 +183,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             || submitted_text.is_some_and(|input| input.trim().starts_with("/plan"));
         if changed_session {
             engine.set_config_path(config_path.as_deref())?;
-            let profile = engine
-                .session
-                .as_ref()
-                .and_then(|session| session.profile.as_deref());
+            let profile = engine.active_profile();
             backend = build_agent_decision_backend(config_path.as_deref(), profile)?;
         }
 
@@ -220,38 +202,26 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             .filter(|options| !options.is_empty());
 
         if requested_session.is_some() || changed_session {
-            let profile = engine
-                .session
-                .as_ref()
-                .and_then(|session| session.profile.as_deref());
+            let profile = engine.active_profile();
             let model = resolved_settings(config_path.as_deref(), profile)?
                 .backend
                 .model;
             Ok(TuiInteraction::SessionChanged {
                 input_history: engine.input_history(),
                 events: engine.session_events(),
-                plan_mode: engine
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.mode == "plan"),
+                plan_mode: engine.is_plan_mode(),
                 model,
             })
         } else if changed_plan_mode {
             Ok(TuiInteraction::PlanModeChanged {
-                enabled: engine
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.mode == "plan"),
+                enabled: engine.is_plan_mode(),
             })
         } else if matches!(
             action,
             TuiAction::SelectProfile(_) | TuiAction::CreateProfile(_)
         ) || requested_profile.is_some()
         {
-            let profile = engine
-                .session
-                .as_ref()
-                .and_then(|session| session.profile.as_deref());
+            let profile = engine.active_profile();
             let settings = resolved_settings(config_path.as_deref(), profile)?;
             Ok(TuiInteraction::ModelChanged {
                 model: settings.backend.model,
@@ -287,11 +257,7 @@ fn prepare_profile_backend(
 }
 
 fn session_config_path(engine: &AgentEngine) -> (Option<PathBuf>, bool) {
-    let stored = engine
-        .session
-        .as_ref()
-        .and_then(|session| session.config_path.as_deref())
-        .map(PathBuf::from);
+    let stored = engine.active_config_path().map(PathBuf::from);
     let needs_config_pin = stored.is_none();
     (stored.or_else(discover_config_path), needs_config_pin)
 }
@@ -393,7 +359,7 @@ mod tests {
             .err()
             .expect("invalid backend must fail before switching");
         assert_eq!(
-            engine.session.as_ref().expect("session").profile,
+            engine.active_profile(),
             None,
             "backend preparation must not commit the requested profile"
         );

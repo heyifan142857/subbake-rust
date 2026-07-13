@@ -245,8 +245,8 @@ pub trait LlmBackend: Send {
         requests: Vec<GenerationRequest>,
         _max_concurrency: usize,
         cancellation: &CancellationGuard,
-    ) -> Vec<CoreResult<GenerationResponse>> {
-        requests
+    ) -> CoreResult<Vec<CoreResult<GenerationResponse>>> {
+        Ok(requests
             .into_iter()
             .map(|request| {
                 let result = self.generate_json_cancellable(&request.messages, cancellation)?;
@@ -265,7 +265,7 @@ pub trait LlmBackend: Send {
                     usage: result.usage,
                 })
             })
-            .collect()
+            .collect())
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -339,6 +339,15 @@ where
         cancellation: &CancellationGuard,
     ) -> CoreResult<GenerationResponse> {
         (**self).generate_cancellable(request, cancellation)
+    }
+
+    fn generate_many_cancellable(
+        &mut self,
+        requests: Vec<GenerationRequest>,
+        max_concurrency: usize,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<Vec<CoreResult<GenerationResponse>>> {
+        (**self).generate_many_cancellable(requests, max_concurrency, cancellation)
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {

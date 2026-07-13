@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Client, RequestBuilder};
@@ -18,10 +18,6 @@ use tokio::runtime::Runtime;
 use crate::providers::{ApiFormat, BackendConfig};
 const TIMEOUT: f64 = 120.0;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-fn runtime() -> &'static Runtime {
-    static R: OnceLock<Runtime> = OnceLock::new();
-    R.get_or_init(|| Runtime::new().expect("tokio runtime"))
-}
 fn client(timeout: f64) -> CoreResult<Client> {
     Client::builder()
         .timeout(Duration::from_secs_f64(timeout.max(1.0)))
@@ -52,6 +48,7 @@ pub struct ProtocolAdapter {
     format: ApiFormat,
     key: String,
     client: Client,
+    runtime: Arc<Runtime>,
     native_tool_support: NativeToolSupport,
 }
 
@@ -90,6 +87,11 @@ pub fn build_protocol_backend(
         format,
         key,
         client: client(timeout)?,
+        runtime: Arc::new(
+            Runtime::new().map_err(|error| {
+                CoreError::Backend(format!("tokio runtime build failed: {error}"))
+            })?,
+        ),
         native_tool_support: NativeToolSupport::Unknown,
     }))
 }
@@ -928,7 +930,7 @@ impl LlmBackend for ProtocolAdapter {
         m: &[ChatMessage],
         c: &CancellationGuard,
     ) -> CoreResult<(Value, Usage)> {
-        let r = runtime().block_on(self.run(m, c))?;
+        let r = self.runtime.block_on(self.run(m, c))?;
         Ok((r.json, r.usage))
     }
     fn generate_with_tools_cancellable(
@@ -939,7 +941,9 @@ impl LlmBackend for ProtocolAdapter {
         if self.native_tool_support == NativeToolSupport::Unsupported {
             return Err(CoreError::UnsupportedCapability("native tools".to_owned()));
         }
-        let result = runtime().block_on(self.run_native(request, cancellation));
+        let result = self
+            .runtime
+            .block_on(self.run_native(request, cancellation));
         match &result {
             Ok(_) => self.native_tool_support = NativeToolSupport::Supported,
             Err(CoreError::UnsupportedCapability(_)) => {
@@ -954,17 +958,17 @@ impl LlmBackend for ProtocolAdapter {
         request: GenerationRequest,
         c: &CancellationGuard,
     ) -> CoreResult<GenerationResponse> {
-        runtime().block_on(self.run(&request.messages, c))
+        self.runtime.block_on(self.run(&request.messages, c))
     }
     fn generate_many_cancellable(
         &mut self,
         requests: Vec<GenerationRequest>,
         max_concurrency: usize,
         cancellation: &CancellationGuard,
-    ) -> Vec<CoreResult<GenerationResponse>> {
+    ) -> CoreResult<Vec<CoreResult<GenerationResponse>>> {
         let adapter = self.clone();
         let cancellation = cancellation.clone();
-        runtime().block_on(async move {
+        self.runtime.block_on(async move {
             let semaphore =
                 std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1)));
             let mut set = tokio::task::JoinSet::new();
@@ -985,15 +989,14 @@ impl LlmBackend for ProtocolAdapter {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(Ok(item)) => ordered.push(item),
-                    Ok(Err(error)) => ordered.push((usize::MAX, Err(error))),
-                    Err(error) => ordered.push((
-                        usize::MAX,
-                        Err(CoreError::Backend(format!("provider task failed: {error}"))),
-                    )),
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(CoreError::Backend(format!("provider task failed: {error}")));
+                    }
                 }
             }
             ordered.sort_by_key(|(index, _)| *index);
-            ordered.into_iter().map(|(_, result)| result).collect()
+            Ok(ordered.into_iter().map(|(_, result)| result).collect())
         })
     }
 }

@@ -6,6 +6,12 @@ pub const DEFAULT_BATCH_SIZE: usize = 80;
 pub const DEFAULT_BATCH_TOKEN_BUDGET: usize = 1_800;
 pub const DEFAULT_TRANSLATION_CONCURRENCY: usize = 3;
 pub const DEFAULT_REVIEW_CONCURRENCY: usize = 3;
+pub const DEFAULT_PROVIDER: &str = "mock";
+pub const DEFAULT_MODEL: &str = "mock-zh";
+pub const DEFAULT_TARGET_LANGUAGE: &str = "zh-Hans";
+pub const DEFAULT_SOURCE_LANGUAGE: &str = "Auto";
+pub const DEFAULT_RETRIES: usize = 2;
+pub const DEFAULT_AGENT_REPAIR_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +86,8 @@ pub struct TerminologyStats {
     pub conflicts_omitted: usize,
     pub cache_hits: usize,
     pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
     pub usage: Usage,
     pub duration_ms: u64,
 }
@@ -165,7 +173,8 @@ pub struct AgentRepairRecord {
     pub batch_index: usize,
     pub attempts: usize,
     pub success: bool,
-    pub log_path: PathBuf,
+    /// Present only when a runtime store is configured for the pipeline.
+    pub log_path: Option<PathBuf>,
     pub error: String,
 }
 
@@ -262,7 +271,7 @@ impl PipelineOptions {
             bilingual: false,
             target_language: default_target_language(),
             source_language: default_source_language(),
-            retries: default_retries(),
+            retries: DEFAULT_RETRIES,
             review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
             timeout_seconds: default_timeout_seconds(),
@@ -271,7 +280,7 @@ impl PipelineOptions {
             resume: true,
             use_cache: true,
             agent: true,
-            agent_repair_attempts: default_agent_repair_attempts(),
+            agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
             runtime_dir: None,
             glossary_path: None,
         }
@@ -298,29 +307,21 @@ pub struct PipelineResult {
 }
 
 fn default_provider() -> String {
-    "mock".to_owned()
+    DEFAULT_PROVIDER.to_owned()
 }
 
 fn default_model() -> String {
-    "mock-zh".to_owned()
+    DEFAULT_MODEL.to_owned()
 }
 
 fn default_target_language() -> String {
-    "zh-Hans".to_owned()
+    DEFAULT_TARGET_LANGUAGE.to_owned()
 }
 
 fn default_source_language() -> String {
-    "Auto".to_owned()
-}
-
-fn default_retries() -> usize {
-    2
+    DEFAULT_SOURCE_LANGUAGE.to_owned()
 }
 
 fn default_timeout_seconds() -> f64 {
     120.0
-}
-
-fn default_agent_repair_attempts() -> usize {
-    2
 }

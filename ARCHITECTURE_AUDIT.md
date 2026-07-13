@@ -1,99 +1,64 @@
-# SubBake Architecture Audit
+# 未完成的架构整改项
 
-This audit records the architecture and maintainability issues identified after repeated revisions. The workspace dependency direction is currently correct and the full formatting, Clippy, and test suite passed before remediation began. The main risks are weakened boundaries, duplicated sources of truth, and oversized orchestration modules.
+本文档只记录仍未完成的整改项；已完成的历史审计结论已移除，避免把
+旧状态误当作当前架构保证。
 
-## Priority 1
+## 1. 拆分仍然过大的编排模块
 
-### 1. `subbake-core` performs filesystem and process-environment reads — Completed
+`subbake-adapters/src/llm_backends.rs`、
+`subbake-agent/src/decision.rs`、`subbake-agent/src/engine.rs` 与
+`subbake-agent/src/tui.rs` 仍分别承担多项职责。虽然部分 reducer、工具执行器
+和协议转换已经抽出，但主要编排文件依然过长，修改一项流程时容易影响无关逻辑。
 
-`subbake-core::storage::build_runtime_paths` canonicalizes input paths and reads the process current directory while calculating a run key. This conflicts with the requirement that core remain side-effect-free and makes a domain calculation depend on ambient filesystem state.
+后续应按稳定边界继续拆分，而不是仅移动代码：
 
-Remediation: resolve a stable input path in `subbake-adapters`, pass it explicitly into core, and keep hashing and path-layout construction pure. Preserve the existing run-key algorithm and storage locations.
+- 将各 LLM 协议的请求/响应转换、原生工具调用和 HTTP 重试拆到独立模块；
+- 将 Agent 决策、计划执行、配置切换和对话呈现分为独立协作者；
+- 将 TUI 的键盘路由、渲染、worker 生命周期和 picker/form 进一步解耦。
 
-Completed in commit `f829e12`: stable path resolution now occurs in `subbake-adapters`, while core receives the resolved path explicitly and performs only deterministic runtime layout calculation.
+验收：每个提取后的模块只拥有一种主要职责，公共类型位于所属 crate 的明确边界，
+原编排入口只负责组装和顺序控制。
 
-### 2. Resuming a session can overwrite its pinned configuration path — Completed
+## 2. LLM 调用接口尚未完全统一
 
-The CLI discovers configuration again when starting the TUI and immediately writes that path into the loaded session. A resumed session can therefore use a different configuration, profile list, or backend from the one it originally pinned.
+`LlmBackend` 已补强并发调用的外层错误契约，且协议适配器不再依赖全局、会 panic
+的 runtime；但普通生成、流式生成和原生工具调用仍存在多层兼容入口。
 
-Remediation: prefer the stored session path on resume and only perform discovery for sessions without a pinned path. Backend construction, profile listing, and model reporting must use that same path.
+后续应定义单一的请求执行边界，明确：取消、超时、重试、工具调用 continuation 与
+批量并发的错误语义；兼容协议只在 adapters 内转换，core 不感知协议差异。
 
-Completed: resumed sessions now retain their pinned configuration path, unpinned sessions alone use discovery, session switching rebuilds the backend from the selected session's configuration, and internal profile/model resolution no longer falls back when a pinned path is present.
+验收：新增协议或调用模式不需要复制取消/错误映射逻辑；所有并发调用都能表达
+“整个请求失败”与“单个项目失败”的区别。
 
-### 3. Translation CLI paths silently ignore configuration errors — Completed
+## 3. 错误模型仍有字符串化和边界泄漏
 
-The `translate` and `batch` argument parsers accept only the successful `Some` result from configuration loading. Parse errors and I/O failures are discarded and execution falls back to defaults, potentially selecting the mock backend without explaining why.
+目前部分 agent/adapter 路径仍会过早将错误转为展示文本或 `io::Error`。这会损失
+可供 CLI、TUI 与重试策略判断的类别信息。
 
-Remediation: propagate configuration errors with path context. Fall back to defaults only when configuration is genuinely absent.
+后续应补齐 crate 边界的结构化错误类型和转换规则：core 保持领域错误，adapters
+保留外部错误上下文，CLI/TUI 仅在最终展示层格式化。持久化的兼容数据需继续维持
+已有 shape，若要改变必须版本化或提供兼容读取。
 
-Completed: translation, pipeline, and batch argument resolution now propagate configuration read and parse failures with the offending path, while a genuinely missing configuration file still uses defaults.
+验收：取消、配置、认证、限流、输入校验和外部 I/O 可被调用方可靠区分；终端文案
+不再作为控制流依据。
 
-### 4. `RuntimeStore` permits false persistence success — Completed
+## 4. 配置模型的最终收敛尚未完成
 
-Several persistence methods have defaults that return success without writing anything. The default failure-log and agent-log implementations return plausible paths without creating files. New implementations can accidentally omit required persistence while the pipeline reports success.
+默认值已集中到 core，旧 `final_review` 已在配置边界规范化；但配置文件兼容层、CLI
+覆盖、profile 更新和运行时展示仍跨多个模块维护字段映射。
 
-Remediation: make required writes mandatory trait methods. Keep defaults only for explicitly optional capabilities, with names and contracts that make no-op behavior clear.
+后续应以一个明确的兼容解码层读取扁平配置，再转换为 backend、translation、storage
+和 output 等拥有者的类型；profile 写入也应复用同一映射。
 
-Completed: every `RuntimeStore` write operation is now a required trait method, including review reports, run state, response caches, failure logs, and agent logs. Read defaults retain their explicit empty/not-found semantics without claiming that data was persisted.
+验收：新增配置项只在其拥有者及一个兼容映射处出现；优先级不依赖赋值顺序，并有
+defaults/profile/CLI 三层覆盖测试。
 
-## Priority 2
+## 5. 交互式终端的真实 PTY 验证待补
 
-### 5. Core pipeline, agent decision logic, and TUI are oversized orchestrators — Completed
+单元测试覆盖了新的 `InteractionState` 转换，二进制也可在伪终端启动；但当前自动化
+执行环境不会响应终端 DSR 光标位置查询，因此无法完成一次正常的全交互退出验证。
 
-- `subbake-core/src/pipeline.rs` combines batching, terminology, translation, review, retries, splitting, caching, resume, translation memory, logging, and progress.
-- `subbake-agent/src/decision.rs` combines the decision loop, quick paths, tool execution, profile handling, diagnostics, translation/transcription orchestration, and presentation text.
-- `subbake-agent/src/tui.rs` combines terminal ownership, interaction state, key routing, rendering, pickers, and worker communication.
+后续应在支持 DSR 的真实 PTY 中手工或自动验证：启动/退出的 raw-mode 与 alternate
+screen 清理、Shift+Tab、picker/form、处理中的 Esc 取消、以及 worker 退出后的状态恢复。
 
-Remediation: extract cohesive stage services and typed state reducers while retaining a small orchestration entry point. Split by responsibility rather than file length alone.
-
-Completed: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; translation progress, resume restoration, window selection, translation-memory lookup, and ordered result assembly belong to a typed core `TranslationStage`; review planning, resume restoration, window selection, result application, and change/statistics calculation belong to a typed core `ReviewStage`; deterministic agent intent/discovery classification is isolated from the decision loop; project-local, adapter-backed, translation/edit, and session/profile tools execute through cohesive typed executors while the engine retains routing and atomic state commits; and TUI progress rendering plus interaction phase, picker, approval, and history reducers are separated from terminal ownership and event routing.
-
-### 6. Agent tools have multiple parallel registries — Completed
-
-Tool metadata, argument schemas, discovery membership, approval membership, and executor dispatch are maintained separately. Although tests cover current entries, adding or changing a tool requires synchronized edits across several lists and match expressions.
-
-Remediation: make one registered tool definition own its schema, policy, category, and executor. Derive prompt/native schemas and filtered views from that registry.
-
-Completed: every tool now has one registered definition owning its argument schema, category, mutation/discovery/approval policy, and typed executor identity. Prompt and native schemas, validation, filtered views, policy checks, and execution dispatch all resolve through that registry; duplicate-name/executor regression tests protect the invariant.
-
-### 7. TUI interaction state is not structurally mutually exclusive — Completed
-
-`InputMode` is combined with independent flags for processing, plan mode, pending toggles, cancellation, startup, and picker exit behavior. Invalid combinations are representable and correctness relies on event ordering.
-
-Remediation: introduce a top-level interaction-state enum whose variants carry only the data valid for that phase, then route keys and worker responses through typed transitions.
-
-Completed: operation lifecycle is now represented by a typed `InteractionPhase` reducer. Cancellation requests and plan-mode rollback data exist only in the processing variant, repeated or idle cancellation is rejected by the transition API, and worker completion atomically returns the TUI to idle. Startup-only picker cancellation behavior now belongs to the session picker instead of an independent flag.
-
-### 8. Translation configuration is repeated mechanically — Completed
-
-The same fields are enumerated in patch merging, patch application, configuration parsing/writing, CLI parsing, defaults, and conversion into pipeline options. Compatibility fields such as `final_review` also rely on assignment order for precedence.
-
-Remediation: separate backend, translation-domain, runtime-storage, and CLI-output settings. Convert compatibility aliases once at the configuration boundary and centralize overlay semantics.
-
-Completed: the legacy `final_review` boolean is converted to the canonical typed `ReviewPolicy` while parsing configuration, so it no longer survives as parallel patch state or relies on assignment order. Resolved settings are now structurally separated into backend construction, translation-domain behavior, runtime storage, and output policy; CLI overrides, adapter services, agent reporting, and pipeline conversion consume the owning group explicitly while configuration overlays retain the compatible flat file shape.
-
-## Boundary and Legacy Issues
-
-### 9. Core contains provider secrets and human presentation — Completed
-
-`PipelineOptions` carries `api_key` and `base_url` even though the core pipeline does not use them. Diagnostic formatting also emits English headings and CLI-style lists from core.
-
-Remediation: keep provider construction and secrets in adapters, pass only non-secret backend identity required for caching into core, and render structured diagnostics at CLI/TUI edges.
-
-Completed: `PipelineOptions` now carries only the non-secret provider identity needed by the pipeline and cache, while API credentials and endpoint configuration remain in adapters. Core diagnostics return only structured reports; human-readable headings and list rendering now live at the adapter/agent edge.
-
-### 10. Python-authoritative comments are stale — Completed
-
-Several comments describe Rust registries and session structures as mirrors of Python. One comment claims there are 19 tools while the current registry contains 20. These comments conflict with the repository's independent Rust architecture and can misdirect future changes.
-
-Remediation: describe current Rust contracts and mention Python only where a persisted compatibility shape is intentionally supported.
-
-Completed: the stale Python-authoritative tool-registry comments and incorrect fixed tool count were replaced with descriptions of the current Rust registry contract.
-
-## Recommended Order
-
-1. Remove core filesystem/environment reads without changing runtime storage identity.
-2. Correct configuration pinning and configuration error propagation.
-3. Consolidate the agent tool registry.
-4. Replace parallel progress/state sources and split oversized orchestrators.
-5. Normalize configuration ownership and remove remaining boundary leaks.
+验收：上述流程正常退出且终端状态恢复，无悬挂 worker 或残留 alternate screen。

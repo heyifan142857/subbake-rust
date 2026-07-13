@@ -11,6 +11,67 @@ use crate::event::PendingPlan;
 
 pub const SESSION_VERSION: u64 = 1;
 
+/// Stable discriminants for the v1 wire-format event kinds. `Unknown` keeps
+/// older or future events readable without allowing ad-hoc comparisons in
+/// runtime logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTag {
+    User,
+    Assistant,
+    AskUser,
+    ToolCall,
+    FinalToolCall,
+    FileOperation,
+    Plan,
+    Approve,
+    Reject,
+    Undo,
+    Profile,
+    Error,
+    Cancelled,
+    Unknown,
+}
+
+impl EventTag {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "ask_user" => Self::AskUser,
+            "tool_call" => Self::ToolCall,
+            "final_tool_call" => Self::FinalToolCall,
+            "file_operation" => Self::FileOperation,
+            "plan" => Self::Plan,
+            "approve" => Self::Approve,
+            "reject" => Self::Reject,
+            "undo" => Self::Undo,
+            "profile" => Self::Profile,
+            "error" => Self::Error,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The persisted session mode. Serde keeps the v1 JSON representation as the
+/// existing lowercase string while preventing invalid in-memory modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    #[default]
+    Chat,
+    Plan,
+}
+
+impl std::fmt::Display for SessionMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Chat => "chat",
+            Self::Plan => "plan",
+        })
+    }
+}
+
 /// A single event recorded in a session. The `kind` field discriminates the
 /// event type; `data` carries type-specific payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +80,12 @@ pub struct AgentEvent {
     pub text: String,
     pub data: serde_json::Value,
     pub created_at: String,
+}
+
+impl AgentEvent {
+    pub fn tag(&self) -> EventTag {
+        EventTag::parse(&self.kind)
+    }
 }
 
 /// An interactive agent session.
@@ -31,7 +98,7 @@ pub struct AgentSession {
     pub cwd: String,
     pub profile: Option<String>,
     pub config_path: Option<String>,
-    pub mode: String, // "chat" | "plan"
+    pub mode: SessionMode,
     pub pending_plan: Option<PendingPlan>,
     pub events: Vec<AgentEvent>,
 }
@@ -49,7 +116,7 @@ impl AgentSession {
                 .unwrap_or_default(),
             profile: None,
             config_path: None,
-            mode: "chat".to_owned(),
+            mode: SessionMode::Chat,
             pending_plan: None,
             events: Vec::new(),
         }
@@ -134,18 +201,24 @@ impl AgentSessionStore {
         let mut sessions = Vec::new();
         for entry in std::fs::read_dir(&self.root)
             .map_err(|e| std::io::Error::other(format!("list sessions: {e}")))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         {
-            let path = entry.path();
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_owned();
-            if let Ok(session) = self.load(&id) {
-                sessions.push(session);
+            let entry = entry.map_err(|error| {
+                std::io::Error::other(format!("read session directory entry: {error}"))
+            })?;
+            if !entry.path().extension().is_some_and(|ext| ext == "json") {
+                continue;
             }
+            let path = entry.path();
+            let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "session filename is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+            let session = self.load(id).map_err(|error| {
+                std::io::Error::other(format!("load session `{}`: {error}", path.display()))
+            })?;
+            sessions.push(session);
         }
         sessions.sort_by(|a, b| {
             b.updated_at
@@ -213,13 +286,25 @@ mod tests {
         let session = store.create().expect("create session");
         assert_eq!(session.version, SESSION_VERSION);
         assert!(!session.id.is_empty());
-        assert_eq!(session.mode, "chat");
+        assert_eq!(session.mode, SessionMode::Chat);
         assert!(session.events.is_empty());
 
         assert!(!store.path_for(&session.id).exists());
         assert!(store.list(20).expect("list sessions").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_mode_keeps_the_v1_string_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(SessionMode::Plan).expect("serialize mode"),
+            serde_json::json!("plan")
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read v1 mode"),
+            SessionMode::Chat
+        );
     }
 
     #[test]
@@ -263,6 +348,23 @@ mod tests {
         assert_eq!(sessions[0].id, s1.id);
         assert_eq!(sessions[1].id, s2.id);
         assert_eq!(latest.id, s1.id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_reports_corrupt_sessions_instead_of_hiding_them() {
+        let dir = std::env::temp_dir().join(format!("subbake-agent-corrupt-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+        let session_dir = dir.join(".subbake/agent/sessions");
+        std::fs::create_dir_all(&session_dir).expect("create session directory");
+        std::fs::write(session_dir.join("broken.json"), "{not json")
+            .expect("write corrupt session");
+
+        let error = store
+            .list(20)
+            .expect_err("corrupt session must be reported");
+        assert!(error.to_string().contains("broken.json"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
