@@ -23,6 +23,7 @@ pub use editing::{
 };
 pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
+    stable_runtime_input_path,
 };
 pub use mock::MockBackend;
 pub use pipeline::{

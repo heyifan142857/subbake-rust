@@ -177,8 +177,13 @@ impl From<u64> for JsonValue {
     }
 }
 
+/// Build the runtime layout from explicit path inputs.
+///
+/// `stable_input_path` is the filesystem-resolved identity used for the run
+/// key. Resolving it belongs to an adapter so this function remains pure.
 pub fn build_runtime_paths(
     input_path: &Path,
+    stable_input_path: &Path,
     runtime_dir: Option<&Path>,
     glossary_path: Option<&Path>,
     source_language: &str,
@@ -197,7 +202,6 @@ pub fn build_runtime_paths(
             .and_then(|value| value.to_str())
             .unwrap_or("input"),
     );
-    let stable_input_path = stable_path_for_hash(input_path);
     let input_key = &stable_hash(&JsonValue::Object(vec![(
         "path".to_owned(),
         JsonValue::String(stable_input_path.to_string_lossy().to_string()),
@@ -225,18 +229,6 @@ pub fn build_runtime_paths(
         agent_logs_dir: run_dir.join("agent_logs"),
         review_report_path: run_dir.join("review_report.json"),
     }
-}
-
-fn stable_path_for_hash(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
-        }
-    })
 }
 
 pub fn input_signature_from_bytes(bytes: &[u8], mtime_ns: Option<u128>) -> InputSignature {
@@ -604,6 +596,7 @@ mod tests {
     fn runtime_paths_match_expected_shape() {
         let paths = build_runtime_paths(
             Path::new("/tmp/show.srt"),
+            Path::new("/tmp/show.srt"),
             None,
             None,
             "Auto",
@@ -617,6 +610,32 @@ mod tests {
                 .to_string_lossy()
                 .contains("translation_memory.v2.auto-zh-hans.standard.json")
         );
+    }
+
+    #[test]
+    fn runtime_run_key_uses_the_explicit_stable_input_path() {
+        let first = build_runtime_paths(
+            Path::new("show.srt"),
+            Path::new("/library/one/show.srt"),
+            None,
+            None,
+            "Auto",
+            "zh-Hans",
+            false,
+        );
+        let second = build_runtime_paths(
+            Path::new("show.srt"),
+            Path::new("/library/two/show.srt"),
+            None,
+            None,
+            "Auto",
+            "zh-Hans",
+            false,
+        );
+
+        assert_ne!(first.run_dir, second.run_dir);
+        assert_eq!(first.root_dir, Path::new(".subbake"));
+        assert_eq!(second.root_dir, Path::new(".subbake"));
     }
 
     #[test]

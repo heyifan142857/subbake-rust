@@ -12,6 +12,7 @@ use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, S
 
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
+    stable_runtime_input_path,
 };
 use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
@@ -96,8 +97,10 @@ pub fn translate_subtitle_cancellable_with_progress(
     let backend = build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
 
     // Wire runtime store for glossary/TM persistence.
+    let stable_input_path = stable_runtime_input_path(&request.input_path)?;
     let paths = build_runtime_paths(
         &request.input_path,
+        &stable_input_path,
         request.settings.runtime_dir(),
         request.settings.glossary_path(),
         &request.settings.source_language,

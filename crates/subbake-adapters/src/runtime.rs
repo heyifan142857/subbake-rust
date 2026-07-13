@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use subbake_core::storage::{RuntimePaths, build_runtime_paths};
 
+use crate::fs::stable_runtime_input_path;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeRequest {
     pub action: RuntimeAction,
@@ -41,7 +43,7 @@ pub struct RuntimeCleanOutcome {
 }
 
 pub fn run_runtime(request: RuntimeRequest) -> io::Result<RuntimeOutcome> {
-    let paths = runtime_paths(&request);
+    let paths = runtime_paths(&request)?;
     match request.action {
         RuntimeAction::Inspect => Ok(RuntimeOutcome::Inspection(Box::new(RuntimeInspection {
             paths,
@@ -56,15 +58,17 @@ pub fn run_runtime(request: RuntimeRequest) -> io::Result<RuntimeOutcome> {
     }
 }
 
-fn runtime_paths(request: &RuntimeRequest) -> RuntimePaths {
-    build_runtime_paths(
+fn runtime_paths(request: &RuntimeRequest) -> io::Result<RuntimePaths> {
+    let stable_input_path = stable_runtime_input_path(&request.target_path)?;
+    Ok(build_runtime_paths(
         &request.target_path,
+        &stable_input_path,
         request.runtime_dir.as_deref(),
         None,
         "Auto",
         "Chinese",
         false,
-    )
+    ))
 }
 
 fn clean_runtime(

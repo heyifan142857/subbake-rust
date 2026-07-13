@@ -2664,6 +2664,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("clip.txt"),
+                std::path::Path::new("/workspace/clip.txt"),
                 None,
                 None,
                 "Auto",
@@ -2715,6 +2716,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("resume.txt"),
+                std::path::Path::new("/workspace/resume.txt"),
                 None,
                 None,
                 "Auto",
@@ -2798,6 +2800,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("cache.txt"),
+                std::path::Path::new("/workspace/cache.txt"),
                 None,
                 None,
                 "Auto",
@@ -2902,6 +2905,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("agent.txt"),
+                std::path::Path::new("/workspace/agent.txt"),
                 None,
                 None,
                 "Auto",
@@ -2946,6 +2950,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("agent-cache.txt"),
+                std::path::Path::new("/workspace/agent-cache.txt"),
                 None,
                 None,
                 "Auto",
@@ -3022,6 +3027,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("agent-fail.txt"),
+                std::path::Path::new("/workspace/agent-fail.txt"),
                 None,
                 None,
                 "Auto",
@@ -3240,6 +3246,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("review-resume.txt"),
+                std::path::Path::new("/workspace/review-resume.txt"),
                 None,
                 None,
                 "Auto",
@@ -3314,6 +3321,7 @@ mod tests {
         let store = CapturedStore {
             paths: build_runtime_paths(
                 std::path::Path::new("review-cache.txt"),
+                std::path::Path::new("/workspace/review-cache.txt"),
                 None,
                 None,
                 "Auto",

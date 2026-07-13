@@ -399,6 +399,7 @@ mod tests {
         let root = temp_root("glossary");
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
+            &root.join("clip.srt"),
             Some(&root),
             None,
             "Auto",
@@ -420,6 +421,7 @@ mod tests {
     fn round_trips_glossary_via_save_and_load() {
         let root = temp_root("glossary-rt");
         let paths = build_runtime_paths(
+            &root.join("clip.srt"),
             &root.join("clip.srt"),
             Some(&root),
             None,
@@ -445,6 +447,7 @@ mod tests {
         let root = temp_root("glossary-empty");
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
+            &root.join("clip.srt"),
             Some(&root),
             None,
             "Auto",
@@ -461,6 +464,7 @@ mod tests {
     fn saves_batch_segments_to_padded_shard_path() {
         let root = temp_root("batch");
         let paths = build_runtime_paths(
+            &root.join("clip.srt"),
             &root.join("clip.srt"),
             Some(&root),
             None,
@@ -493,6 +497,7 @@ mod tests {
     fn loads_batch_segments_in_order() {
         let root = temp_root("batch-load");
         let paths = build_runtime_paths(
+            &root.join("clip.srt"),
             &root.join("clip.srt"),
             Some(&root),
             None,
@@ -538,6 +543,7 @@ mod tests {
         let root = temp_root("run-state");
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
+            &root.join("clip.txt"),
             Some(&root),
             None,
             "Auto",
@@ -581,6 +587,7 @@ mod tests {
     fn round_trips_python_compatible_request_cache_shape() {
         let root = temp_root("request-cache");
         let paths = build_runtime_paths(
+            &root.join("clip.txt"),
             &root.join("clip.txt"),
             Some(&root),
             None,
@@ -633,6 +640,7 @@ mod tests {
         let root = temp_root("review-cache");
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
+            &root.join("clip.txt"),
             Some(&root),
             None,
             "Auto",
@@ -678,6 +686,7 @@ mod tests {
     fn round_trips_terminology_cache_and_writes_review_report() {
         let root = temp_root("terminology-cache");
         let paths = build_runtime_paths(
+            &root.join("clip.srt"),
             &root.join("clip.srt"),
             Some(&root),
             None,
@@ -743,6 +752,7 @@ mod tests {
     fn writes_python_compatible_failure_and_agent_logs() {
         let root = temp_root("recovery-logs");
         let paths = build_runtime_paths(
+            &root.join("clip.txt"),
             &root.join("clip.txt"),
             Some(&root),
             None,
