@@ -56,11 +56,13 @@ Remediation: make one registered tool definition own its schema, policy, categor
 
 Completed: every tool now has one registered definition owning its argument schema, category, mutation/discovery/approval policy, and typed executor identity. Prompt and native schemas, validation, filtered views, policy checks, and execution dispatch all resolve through that registry; duplicate-name/executor regression tests protect the invariant.
 
-### 7. TUI interaction state is not structurally mutually exclusive
+### 7. TUI interaction state is not structurally mutually exclusive — Completed
 
 `InputMode` is combined with independent flags for processing, plan mode, pending toggles, cancellation, startup, and picker exit behavior. Invalid combinations are representable and correctness relies on event ordering.
 
 Remediation: introduce a top-level interaction-state enum whose variants carry only the data valid for that phase, then route keys and worker responses through typed transitions.
+
+Completed: operation lifecycle is now represented by a typed `InteractionPhase` reducer. Cancellation requests and plan-mode rollback data exist only in the processing variant, repeated or idle cancellation is rejected by the transition API, and worker completion atomically returns the TUI to idle. Startup-only picker cancellation behavior now belongs to the session picker instead of an independent flag.
 
 ### 8. Translation configuration is repeated mechanically
 

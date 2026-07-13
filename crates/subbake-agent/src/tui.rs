@@ -112,6 +112,7 @@ struct TuiPicker {
 
 struct SessionPicker {
     pub options: Vec<SessionChoice>,
+    pub cancel_exits: bool,
 }
 
 pub enum TuiInteraction {
@@ -151,6 +152,54 @@ enum InputMode {
     CreatingProfile,
     ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionPhase {
+    Idle,
+    Processing {
+        plan_mode_rollback: Option<bool>,
+        cancellation_requested: bool,
+    },
+}
+
+impl InteractionPhase {
+    fn is_processing(self) -> bool {
+        matches!(self, Self::Processing { .. })
+    }
+
+    fn begin_processing(&mut self, plan_mode_rollback: Option<bool>) {
+        *self = Self::Processing {
+            plan_mode_rollback,
+            cancellation_requested: false,
+        };
+    }
+
+    fn request_cancellation(&mut self) -> bool {
+        let Self::Processing {
+            cancellation_requested,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if *cancellation_requested {
+            return false;
+        }
+        *cancellation_requested = true;
+        true
+    }
+
+    fn finish(&mut self) -> Option<bool> {
+        let rollback = match *self {
+            Self::Idle => None,
+            Self::Processing {
+                plan_mode_rollback, ..
+            } => plan_mode_rollback,
+        };
+        *self = Self::Idle;
+        rollback
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,16 +425,13 @@ pub struct SubBakeTui {
     input_mode: InputMode,
     running: bool,
     suggestion_index: usize,
-    processing: bool,
-    pending_plan_toggle: Option<bool>,
+    interaction_phase: InteractionPhase,
     cancellation: Option<CancellationToken>,
-    cancellation_requested: bool,
     input_hint: &'static str,
     startup_info: StartupInfo,
     plan_mode: bool,
     history_cursor: usize,
     startup_pending: bool,
-    picker_cancel_exits: bool,
 }
 
 impl SubBakeTui {
@@ -411,16 +457,13 @@ impl SubBakeTui {
             input_mode: InputMode::Editing,
             running: true,
             suggestion_index: 0,
-            processing: false,
-            pending_plan_toggle: None,
+            interaction_phase: InteractionPhase::Idle,
             cancellation: None,
-            cancellation_requested: false,
             input_hint: session_input_hint(),
             startup_info: StartupInfo::default(),
             plan_mode: false,
             history_cursor: 0,
             startup_pending: true,
-            picker_cancel_exits: false,
         })
     }
 
@@ -513,9 +556,11 @@ impl SubBakeTui {
     /// Show the same resume picker used by the `/sessions` command on startup.
     pub fn open_session_picker(&mut self, options: Vec<SessionChoice>) -> io::Result<()> {
         self.open_fullscreen_overlay()?;
-        self.picker_cancel_exits = true;
         self.input.clear();
-        self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
+        self.input_mode = InputMode::ChoosingSession(SessionPicker {
+            options,
+            cancel_exits: true,
+        });
         self.suggestion_index = 0;
         Ok(())
     }
@@ -565,8 +610,7 @@ impl SubBakeTui {
             while self.running {
                 if let Ok(result) = response_rx.try_recv() {
                     self.commit_progress_summary();
-                    self.processing = false;
-                    self.cancellation_requested = false;
+                    let plan_mode_rollback = self.interaction_phase.finish();
                     match result {
                         Ok(TuiInteraction::Message { message }) => {
                             self.input_mode = InputMode::Editing;
@@ -599,7 +643,10 @@ impl SubBakeTui {
                         }
                         Ok(TuiInteraction::SessionPicker { message, options }) => {
                             self.open_fullscreen_overlay()?;
-                            self.input_mode = InputMode::ChoosingSession(SessionPicker { options });
+                            self.input_mode = InputMode::ChoosingSession(SessionPicker {
+                                options,
+                                cancel_exits: false,
+                            });
                             self.suggestion_index = 0;
                             // `/sessions` opens a picker; its textual summary would only
                             // duplicate the rows already visible in that picker.
@@ -607,7 +654,6 @@ impl SubBakeTui {
                         }
                         Ok(TuiInteraction::PlanModeChanged { enabled }) => {
                             self.plan_mode = enabled;
-                            self.pending_plan_toggle = None;
                             self.input_mode = InputMode::Editing;
                             self.suggestion_index = 0;
                         }
@@ -618,7 +664,7 @@ impl SubBakeTui {
                             self.render_response(message);
                         }
                         Err(error) => {
-                            if let Some(previous) = self.pending_plan_toggle.take() {
+                            if let Some(previous) = plan_mode_rollback {
                                 self.plan_mode = previous;
                             }
                             self.input_mode = InputMode::Editing;
@@ -771,7 +817,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                 .suggestion_index
                 .min(suggestions.len().saturating_sub(1)),
         };
-        let processing = self.processing;
+        let processing = self.interaction_phase.is_processing();
         let progress = self.progress.lock().ok().and_then(|value| value.clone());
         let ambient_spinner = spinner_frame(
             std::time::SystemTime::now()
@@ -795,7 +841,14 @@ Or just type what you want, e.g. "translate @clip.srt""#
         let max_input_lines = (terminal_area.height.saturating_mul(40) / 100).max(1);
         let input_line_count = self.input.desired_height(input_width).min(max_input_lines);
         let input_total_height = input_line_count.saturating_add(3);
-        let progress_height = u16::from(processing && self.pending_plan_toggle.is_none()) * 2;
+        let toggling_plan_mode = matches!(
+            self.interaction_phase,
+            InteractionPhase::Processing {
+                plan_mode_rollback: Some(_),
+                ..
+            }
+        );
+        let progress_height = u16::from(processing && !toggling_plan_mode) * 2;
         let suggestion_height = (suggestions.len() as u16).min(
             terminal_area
                 .height
@@ -1168,9 +1221,8 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.running = false;
                 }
                 KeyCode::Esc => {
-                    if self.processing {
-                        if !self.cancellation_requested {
-                            self.cancellation_requested = true;
+                    if self.interaction_phase.is_processing() {
+                        if self.interaction_phase.request_cancellation() {
                             if let Ok(mut progress) = self.progress.lock()
                                 && let Some((event, _)) = progress.as_mut()
                             {
@@ -1185,6 +1237,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             }
                         }
                     } else {
+                        let cancel_exits = matches!(
+                            &self.input_mode,
+                            InputMode::ChoosingSession(SessionPicker {
+                                cancel_exits: true,
+                                ..
+                            })
+                        );
                         let closes_overlay = matches!(
                             self.input_mode,
                             InputMode::ChoosingSession(_)
@@ -1197,7 +1256,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         if closes_overlay {
                             self.close_fullscreen_overlay()?;
                         }
-                        if self.picker_cancel_exits {
+                        if cancel_exits {
                             self.running = false;
                         }
                     }
@@ -1210,7 +1269,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     self.suggestion_index = 0;
                 }
                 KeyCode::Enter => {
-                    if self.processing {
+                    if self.interaction_phase.is_processing() {
                         return Ok(());
                     }
                     let suggestions = self.suggestions();
@@ -1311,13 +1370,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                             | TuiAction::SelectSession(_)
                     ) {
                         self.close_fullscreen_overlay()?;
-                        self.picker_cancel_exits = false;
                     }
                     if let Ok(mut progress) = self.progress.lock() {
                         *progress = None;
                     }
-                    self.processing = true;
-                    self.cancellation_requested = false;
+                    self.interaction_phase.begin_processing(None);
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1387,7 +1444,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
                         } else {
                             (self.suggestion_index + 1) % option_count
                         };
-                    } else if !self.processing {
+                    } else if !self.interaction_phase.is_processing() {
                         if key.code == KeyCode::Left {
                             self.input.move_left();
                         } else {
@@ -1396,15 +1453,13 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     }
                 }
                 KeyCode::BackTab => {
-                    if self.processing {
+                    if self.interaction_phase.is_processing() {
                         return Ok(());
                     }
                     let previous = self.plan_mode;
                     self.plan_mode = !previous;
-                    self.pending_plan_toggle = Some(previous);
                     let action = TuiAction::TogglePlan;
-                    self.processing = true;
-                    self.cancellation_requested = false;
+                    self.interaction_phase.begin_processing(Some(previous));
                     let guard = self
                         .cancellation
                         .as_ref()
@@ -1738,12 +1793,12 @@ mod tests {
     use crate::engine::ProfileChoice;
 
     use super::{
-        ApprovalChoice, EmptyModeChoice, InputMode, Msg, MsgStyle, ProfilePickerChoice, TuiAction,
-        TuiPicker, VerticalNavigation, approval_choice, empty_mode_choice, history_down,
-        history_lines_height, history_up, is_insert_newline_key, is_profile_name_character,
-        message_lines, picker_viewport, previous_suggestion, profile_picker_choice,
-        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
-        vertical_navigation,
+        ApprovalChoice, EmptyModeChoice, InputMode, InteractionPhase, Msg, MsgStyle,
+        ProfilePickerChoice, TuiAction, TuiPicker, VerticalNavigation, approval_choice,
+        empty_mode_choice, history_down, history_lines_height, history_up, is_insert_newline_key,
+        is_profile_name_character, message_lines, picker_viewport, previous_suggestion,
+        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
+        terminal_width, vertical_navigation,
     };
 
     #[test]
@@ -1845,6 +1900,29 @@ mod tests {
         assert_eq!(picker_viewport(0, 0, 9), (0, 0));
         assert_eq!(picker_viewport(4, 5, 0), (4, 5));
         assert_eq!(picker_viewport(99, 5, 3), (4, 5));
+    }
+
+    #[test]
+    fn interaction_phase_tracks_cancellation_as_a_typed_transition() {
+        let mut phase = InteractionPhase::Idle;
+        assert!(!phase.request_cancellation());
+
+        phase.begin_processing(None);
+        assert!(phase.is_processing());
+        assert!(phase.request_cancellation());
+        assert!(!phase.request_cancellation());
+        assert_eq!(phase.finish(), None);
+        assert_eq!(phase, InteractionPhase::Idle);
+    }
+
+    #[test]
+    fn interaction_phase_returns_plan_mode_rollback_only_when_finishing() {
+        let mut phase = InteractionPhase::Idle;
+        phase.begin_processing(Some(false));
+
+        assert_eq!(phase.finish(), Some(false));
+        assert_eq!(phase, InteractionPhase::Idle);
+        assert_eq!(phase.finish(), None);
     }
 
     #[test]
