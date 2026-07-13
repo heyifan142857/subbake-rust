@@ -287,7 +287,13 @@ impl FileGuard {
             } else if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|name| name.contains(pattern))
+                .is_some_and(|name| {
+                    if pattern.contains(['*', '?']) {
+                        wildcard_matches(pattern, name)
+                    } else {
+                        name.contains(pattern)
+                    }
+                })
             {
                 results.push(path);
             }
@@ -341,6 +347,31 @@ impl FileGuard {
         std::fs::copy(backup_path, target)?;
         Ok(())
     }
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = value.chars().collect::<Vec<_>>();
+    let mut matches = vec![vec![false; value.len() + 1]; pattern.len() + 1];
+    matches[0][0] = true;
+    for pattern_index in 1..=pattern.len() {
+        if pattern[pattern_index - 1] == '*' {
+            matches[pattern_index][0] = matches[pattern_index - 1][0];
+        }
+        for value_index in 1..=value.len() {
+            matches[pattern_index][value_index] = match pattern[pattern_index - 1] {
+                '*' => {
+                    matches[pattern_index - 1][value_index]
+                        || matches[pattern_index][value_index - 1]
+                }
+                '?' => matches[pattern_index - 1][value_index - 1],
+                literal => {
+                    literal == value[value_index - 1] && matches[pattern_index - 1][value_index - 1]
+                }
+            };
+        }
+    }
+    matches[pattern.len()][value.len()]
 }
 
 fn nanos_since_epoch() -> u128 {
@@ -471,6 +502,34 @@ mod tests {
             .expect_err("should fail");
         assert!(err.to_string().contains("missing.txt"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_files_supports_wildcards_and_keeps_substring_matching() {
+        let (root, guard) = setup();
+        std::fs::create_dir_all(root.join("nested")).expect("create nested directory");
+        std::fs::write(root.join("movie.srt"), "one").expect("write srt");
+        std::fs::write(root.join("nested/notes.txt"), "two").expect("write txt");
+
+        let srt = guard
+            .search_files(Path::new("."), "*.srt")
+            .expect("search wildcard");
+        assert_eq!(srt, vec![root.join("movie.srt")]);
+
+        let text = guard
+            .search_files(Path::new("."), "notes")
+            .expect("search substring");
+        assert_eq!(text, vec![root.join("nested/notes.txt")]);
+
+        let all = guard.search_files(Path::new("."), "").expect("search all");
+        assert_eq!(all.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wildcard_match_supports_single_character_patterns() {
+        assert!(wildcard_matches("episode-??.srt", "episode-01.srt"));
+        assert!(!wildcard_matches("episode-?.srt", "episode-01.srt"));
     }
 
     #[cfg(unix)]

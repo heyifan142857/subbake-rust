@@ -24,7 +24,11 @@ pub use entities::{
 };
 pub use error::{CoreError, CoreResult};
 pub use memory::ContextMemory;
-pub use ports::{GenerationRequest, GenerationResponse, ResponseContract};
+pub use ports::{
+    GenerationRequest, GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport,
+    ResponseContract, ToolChoice, ToolContinuation, ToolDefinition, ToolGenerationInput,
+    ToolGenerationRequest, ToolGenerationResponse,
+};
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
     TranslationProgress,

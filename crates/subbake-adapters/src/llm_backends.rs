@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -9,7 +10,8 @@ use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationL
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::ports::{
     BackendJsonResult, BackendPayload, ChatMessage, GenerationRequest, GenerationResponse,
-    LlmBackend,
+    LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport, ToolChoice, ToolContinuation,
+    ToolDefinition, ToolGenerationInput, ToolGenerationRequest, ToolGenerationResponse,
 };
 use tokio::runtime::Runtime;
 
@@ -50,6 +52,15 @@ pub struct ProtocolAdapter {
     format: ApiFormat,
     key: String,
     client: Client,
+    native_tool_support: NativeToolSupport,
+}
+
+#[derive(Debug)]
+struct ProtocolContinuation {
+    format: ApiFormat,
+    system: Option<String>,
+    history: Vec<Value>,
+    call_ids: HashMap<String, Option<String>>,
 }
 pub type OpenAiChatAdapter = ProtocolAdapter;
 pub type OpenAiResponsesAdapter = ProtocolAdapter;
@@ -79,6 +90,7 @@ pub fn build_protocol_backend(
         format,
         key,
         client: client(timeout)?,
+        native_tool_support: NativeToolSupport::Unknown,
     }))
 }
 impl ProtocolAdapter {
@@ -152,6 +164,98 @@ impl ProtocolAdapter {
             }
         }
     }
+
+    fn native_payload(
+        &self,
+        request: ToolGenerationRequest,
+    ) -> CoreResult<(Value, ProtocolContinuation)> {
+        let tools = request.tools;
+        let choice = request.tool_choice;
+        let mut continuation = match request.input {
+            ToolGenerationInput::Start { messages } => native_start(self.format, &messages),
+            ToolGenerationInput::Continue {
+                continuation,
+                results,
+            } => {
+                let mut continuation =
+                    continuation
+                        .downcast::<ProtocolContinuation>()
+                        .map_err(|_| {
+                            CoreError::Data(
+                                "native tool continuation belongs to a different backend"
+                                    .to_owned(),
+                            )
+                        })?;
+                if continuation.format != self.format {
+                    return Err(CoreError::Data(
+                        "native tool continuation protocol changed".to_owned(),
+                    ));
+                }
+                append_native_results(&mut continuation, &results)?;
+                continuation
+            }
+        };
+        continuation.call_ids.clear();
+        let payload = native_request_body(
+            self.format,
+            &self.config.model,
+            &continuation,
+            &tools,
+            &choice,
+        );
+        Ok((payload, continuation))
+    }
+
+    async fn run_native(
+        &self,
+        request: ToolGenerationRequest,
+        cancel: &CancellationGuard,
+    ) -> CoreResult<ToolGenerationResponse> {
+        let (payload, mut continuation) = self.native_payload(request)?;
+        let url = self.endpoint();
+        let response = await_http(
+            self.authenticated(self.client.post(url).json(&payload))
+                .send(),
+            cancel,
+            "provider request failed",
+        )
+        .await?;
+        let status = response.status();
+        let text = await_http(response.text(), cancel, "provider response read failed").await?;
+        if !status.is_success() {
+            if native_tools_unsupported(status.as_u16(), &text) {
+                return Err(CoreError::UnsupportedCapability(format!(
+                    "native tools: {text}"
+                )));
+            }
+            return Err(CoreError::Backend(format!(
+                "{} rejected request ({status}): {text}",
+                self.config.display_name
+            )));
+        }
+        let body: Value = serde_json::from_str(&text).map_err(|error| {
+            CoreError::Backend(format!(
+                "{} response decode failed: {error}",
+                self.config.display_name
+            ))
+        })?;
+        let (response_text, tool_calls) =
+            parse_native_response(self.format, &body, &mut continuation)?;
+        let usage = usage(
+            self.format,
+            &body,
+            response_text.as_deref().unwrap_or(""),
+            &payload,
+        );
+        let continuation = (!tool_calls.is_empty()).then(|| ToolContinuation::new(continuation));
+        Ok(ToolGenerationResponse {
+            text: response_text,
+            tool_calls,
+            continuation,
+            usage,
+        })
+    }
+
     async fn run(
         &self,
         messages: &[ChatMessage],
@@ -226,6 +330,448 @@ impl ProtocolAdapter {
         })
     }
 }
+
+fn native_start(format: ApiFormat, messages: &[ChatMessage]) -> ProtocolContinuation {
+    let (system, history) = match format {
+        ApiFormat::OpenaiChat => (
+            None,
+            messages.iter().map(openai_message).collect::<Vec<_>>(),
+        ),
+        ApiFormat::OpenaiResponses => (
+            None,
+            messages
+                .iter()
+                .map(|message| {
+                    json!({"role":message.role,"content":[{"type":"input_text","text":message.content}]})
+                })
+                .collect(),
+        ),
+        ApiFormat::AnthropicMessages => (
+            Some(
+                messages
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            messages
+                .iter()
+                .filter(|message| message.role != "system")
+                .map(|message| {
+                    json!({"role":message.role,"content":[{"type":"text","text":message.content}]})
+                })
+                .collect(),
+        ),
+        ApiFormat::GeminiGenerateContent => (
+            Some(
+                messages
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            messages
+                .iter()
+                .filter(|message| message.role != "system")
+                .map(|message| {
+                    json!({"role":if message.role == "assistant" {"model"} else {"user"},"parts":[{"text":message.content}]})
+                })
+                .collect(),
+        ),
+    };
+    ProtocolContinuation {
+        format,
+        system,
+        history,
+        call_ids: HashMap::new(),
+    }
+}
+
+fn append_native_results(
+    continuation: &mut ProtocolContinuation,
+    results: &[ModelToolResult],
+) -> CoreResult<()> {
+    for result in results {
+        if !continuation.call_ids.contains_key(&result.id) {
+            return Err(CoreError::Data(format!(
+                "native tool result references unknown call `{}`",
+                result.id
+            )));
+        }
+    }
+    match continuation.format {
+        ApiFormat::OpenaiChat => {
+            for result in results {
+                let wire_id = continuation
+                    .call_ids
+                    .get(&result.id)
+                    .and_then(|value| value.as_deref())
+                    .unwrap_or(&result.id);
+                continuation.history.push(json!({
+                    "role":"tool",
+                    "tool_call_id":wire_id,
+                    "content":result.output,
+                }));
+            }
+        }
+        ApiFormat::OpenaiResponses => {
+            for result in results {
+                let wire_id = continuation
+                    .call_ids
+                    .get(&result.id)
+                    .and_then(|value| value.as_deref())
+                    .unwrap_or(&result.id);
+                continuation.history.push(json!({
+                    "type":"function_call_output",
+                    "call_id":wire_id,
+                    "output":result.output,
+                }));
+            }
+        }
+        ApiFormat::AnthropicMessages => {
+            let content = results
+                .iter()
+                .map(|result| {
+                    let wire_id = continuation
+                        .call_ids
+                        .get(&result.id)
+                        .and_then(|value| value.as_deref())
+                        .unwrap_or(&result.id);
+                    json!({
+                        "type":"tool_result",
+                        "tool_use_id":wire_id,
+                        "content":result.output,
+                        "is_error":result.is_error,
+                    })
+                })
+                .collect::<Vec<_>>();
+            continuation
+                .history
+                .push(json!({"role":"user","content":content}));
+        }
+        ApiFormat::GeminiGenerateContent => {
+            let parts = results
+                .iter()
+                .map(|result| {
+                    let wire_id = continuation
+                        .call_ids
+                        .get(&result.id)
+                        .and_then(|value| value.as_deref());
+                    let response = if result.is_error {
+                        json!({"error":result.output})
+                    } else {
+                        json!({"result":result.output})
+                    };
+                    let mut function_response = json!({
+                        "name":result.name,
+                        "response":response,
+                    });
+                    if let Some(id) = wire_id {
+                        function_response["id"] = Value::String(id.to_owned());
+                    }
+                    json!({"functionResponse":function_response})
+                })
+                .collect::<Vec<_>>();
+            continuation
+                .history
+                .push(json!({"role":"user","parts":parts}));
+        }
+    }
+    Ok(())
+}
+
+fn native_request_body(
+    format: ApiFormat,
+    model: &str,
+    continuation: &ProtocolContinuation,
+    tools: &[ToolDefinition],
+    choice: &ToolChoice,
+) -> Value {
+    match format {
+        ApiFormat::OpenaiChat => json!({
+            "model":model,
+            "messages":continuation.history,
+            "tools":tools.iter().map(openai_chat_tool).collect::<Vec<_>>(),
+            "tool_choice":openai_chat_tool_choice(choice),
+            "parallel_tool_calls":false,
+        }),
+        ApiFormat::OpenaiResponses => json!({
+            "model":model,
+            "input":continuation.history,
+            "tools":tools.iter().map(openai_responses_tool).collect::<Vec<_>>(),
+            "tool_choice":openai_responses_tool_choice(choice),
+            "parallel_tool_calls":false,
+        }),
+        ApiFormat::AnthropicMessages => json!({
+            "model":model,
+            "max_tokens":4096,
+            "system":continuation.system.as_deref().unwrap_or(""),
+            "messages":continuation.history,
+            "tools":tools.iter().map(anthropic_tool).collect::<Vec<_>>(),
+            "tool_choice":anthropic_tool_choice(choice),
+        }),
+        ApiFormat::GeminiGenerateContent => json!({
+            "systemInstruction":{"parts":[{"text":continuation.system.as_deref().unwrap_or("")}]},
+            "contents":continuation.history,
+            "tools":[{"functionDeclarations":tools.iter().map(gemini_tool).collect::<Vec<_>>()}],
+            "toolConfig":{"functionCallingConfig":gemini_tool_choice(choice)},
+        }),
+    }
+}
+
+fn openai_chat_tool(tool: &ToolDefinition) -> Value {
+    json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})
+}
+
+fn openai_responses_tool(tool: &ToolDefinition) -> Value {
+    json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.input_schema})
+}
+
+fn anthropic_tool(tool: &ToolDefinition) -> Value {
+    json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})
+}
+
+fn gemini_tool(tool: &ToolDefinition) -> Value {
+    json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})
+}
+
+fn openai_chat_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Specific(name) => json!({"type":"function","function":{"name":name}}),
+        ToolChoice::None => json!("none"),
+    }
+}
+
+fn openai_responses_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Specific(name) => json!({"type":"function","name":name}),
+        ToolChoice::None => json!("none"),
+    }
+}
+
+fn anthropic_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!({"type":"auto"}),
+        ToolChoice::Required => json!({"type":"any"}),
+        ToolChoice::Specific(name) => json!({"type":"tool","name":name}),
+        ToolChoice::None => json!({"type":"none"}),
+    }
+}
+
+fn gemini_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!({"mode":"AUTO"}),
+        ToolChoice::Required => json!({"mode":"ANY"}),
+        ToolChoice::Specific(name) => json!({"mode":"ANY","allowedFunctionNames":[name]}),
+        ToolChoice::None => json!({"mode":"NONE"}),
+    }
+}
+
+fn parse_native_response(
+    format: ApiFormat,
+    body: &Value,
+    continuation: &mut ProtocolContinuation,
+) -> CoreResult<(Option<String>, Vec<ModelToolCall>)> {
+    let mut calls = Vec::new();
+    let text = match format {
+        ApiFormat::OpenaiChat => {
+            let message = body["choices"][0]["message"].clone();
+            for (index, call) in message["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let id = call["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("openai_chat_call_{index}"));
+                continuation.call_ids.insert(id.clone(), Some(id.clone()));
+                calls.push(ModelToolCall {
+                    id,
+                    name: required_wire_string(call, &["function", "name"])?.to_owned(),
+                    arguments: parse_wire_arguments(&call["function"]["arguments"])?,
+                });
+            }
+            continuation.history.push(message.clone());
+            message["content"].as_str().map(str::to_owned)
+        }
+        ApiFormat::OpenaiResponses => {
+            let output = body["output"].as_array().ok_or_else(|| {
+                CoreError::Backend("OpenAI Responses output is missing".to_owned())
+            })?;
+            for (index, item) in output.iter().enumerate() {
+                continuation.history.push(item.clone());
+                if item["type"].as_str() != Some("function_call") {
+                    continue;
+                }
+                let wire_id = item["call_id"].as_str().ok_or_else(|| {
+                    CoreError::Backend("function call is missing call_id".to_owned())
+                })?;
+                let id = wire_id.to_owned();
+                continuation
+                    .call_ids
+                    .insert(id.clone(), Some(wire_id.to_owned()));
+                calls.push(ModelToolCall {
+                    id,
+                    name: item["name"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            CoreError::Backend(format!(
+                                "function call {} is missing name",
+                                index + 1
+                            ))
+                        })?
+                        .to_owned(),
+                    arguments: parse_wire_arguments(&item["arguments"])?,
+                });
+            }
+            responses_text(body)
+        }
+        ApiFormat::AnthropicMessages => {
+            let content = body["content"].as_array().ok_or_else(|| {
+                CoreError::Backend("Anthropic response content is missing".to_owned())
+            })?;
+            let mut texts = Vec::new();
+            for (index, block) in content.iter().enumerate() {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(value) = block["text"].as_str() {
+                            texts.push(value.to_owned());
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block["id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                CoreError::Backend(format!("tool use {} is missing id", index + 1))
+                            })?
+                            .to_owned();
+                        continuation.call_ids.insert(id.clone(), Some(id.clone()));
+                        calls.push(ModelToolCall {
+                            id,
+                            name: block["name"]
+                                .as_str()
+                                .ok_or_else(|| {
+                                    CoreError::Backend(format!(
+                                        "tool use {} is missing name",
+                                        index + 1
+                                    ))
+                                })?
+                                .to_owned(),
+                            arguments: block["input"].clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            continuation
+                .history
+                .push(json!({"role":"assistant","content":content}));
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        ApiFormat::GeminiGenerateContent => {
+            let content = body["candidates"][0]["content"].clone();
+            let parts = content["parts"].as_array().ok_or_else(|| {
+                CoreError::Backend("Gemini response parts are missing".to_owned())
+            })?;
+            let mut texts = Vec::new();
+            for (index, part) in parts.iter().enumerate() {
+                if let Some(value) = part["text"].as_str() {
+                    texts.push(value.to_owned());
+                }
+                let Some(function_call) = part.get("functionCall") else {
+                    continue;
+                };
+                let wire_id = function_call["id"].as_str().map(str::to_owned);
+                let id = wire_id
+                    .clone()
+                    .unwrap_or_else(|| format!("gemini_call_{index}"));
+                continuation.call_ids.insert(id.clone(), wire_id);
+                calls.push(ModelToolCall {
+                    id,
+                    name: function_call["name"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            CoreError::Backend(format!(
+                                "function call {} is missing name",
+                                index + 1
+                            ))
+                        })?
+                        .to_owned(),
+                    arguments: function_call["args"].clone(),
+                });
+            }
+            continuation.history.push(content);
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+    };
+    Ok((text.filter(|value| !value.is_empty()), calls))
+}
+
+fn required_wire_string<'a>(value: &'a Value, path: &[&str]) -> CoreResult<&'a str> {
+    let mut current = value;
+    for part in path {
+        current = &current[*part];
+    }
+    current.as_str().ok_or_else(|| {
+        CoreError::Backend(format!("native tool call is missing {}", path.join(".")))
+    })
+}
+
+fn parse_wire_arguments(value: &Value) -> CoreResult<Value> {
+    if let Some(text) = value.as_str() {
+        serde_json::from_str(text)
+            .map_err(|error| CoreError::Backend(format!("invalid native tool arguments: {error}")))
+    } else {
+        Ok(value.clone())
+    }
+}
+
+fn responses_text(body: &Value) -> Option<String> {
+    body["output_text"].as_str().map(str::to_owned).or_else(|| {
+        let parts = body["output"]
+            .as_array()?
+            .iter()
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter_map(|content| content["text"].as_str())
+            .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    })
+}
+
+fn native_tools_unsupported(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 404 | 422) {
+        return false;
+    }
+    let body = body.to_lowercase();
+    let mentions_tools = [
+        "tools",
+        "tool_choice",
+        "function_declarations",
+        "function calling",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    let rejects_feature = [
+        "unsupported",
+        "unknown field",
+        "unknown parameter",
+        "unrecognized",
+        "not supported",
+        "not allowed",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    mentions_tools && rejects_feature
+}
+
 impl LlmBackend for ProtocolAdapter {
     fn supports_terminology_preflight(&self) -> bool {
         true
@@ -233,6 +779,9 @@ impl LlmBackend for ProtocolAdapter {
 
     fn supports_parallel_generation(&self) -> bool {
         true
+    }
+    fn native_tool_support(&self) -> NativeToolSupport {
+        self.native_tool_support
     }
     fn provider_name(&self) -> &str {
         &self.config.display_name
@@ -257,6 +806,24 @@ impl LlmBackend for ProtocolAdapter {
     ) -> CoreResult<(Value, Usage)> {
         let r = runtime().block_on(self.run(m, c))?;
         Ok((r.json, r.usage))
+    }
+    fn generate_with_tools_cancellable(
+        &mut self,
+        request: ToolGenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<ToolGenerationResponse> {
+        if self.native_tool_support == NativeToolSupport::Unsupported {
+            return Err(CoreError::UnsupportedCapability("native tools".to_owned()));
+        }
+        let result = runtime().block_on(self.run_native(request, cancellation));
+        match &result {
+            Ok(_) => self.native_tool_support = NativeToolSupport::Supported,
+            Err(CoreError::UnsupportedCapability(_)) => {
+                self.native_tool_support = NativeToolSupport::Unsupported;
+            }
+            Err(_) => {}
+        }
+        result
     }
     fn generate_cancellable(
         &mut self,
@@ -432,8 +999,20 @@ fn estimate(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use subbake_core::ports::{ModelToolResult, ToolChoice, ToolDefinition};
 
-    use super::parse_translation_payload;
+    use super::{
+        ApiFormat, append_native_results, native_request_body, native_start,
+        native_tools_unsupported, parse_native_response, parse_translation_payload,
+    };
+
+    fn tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "list_files".to_owned(),
+            description: "List files".to_owned(),
+            input_schema: json!({"type":"object","properties":{}}),
+        }
+    }
 
     #[test]
     fn translation_payload_accepts_migration_field_aliases() {
@@ -460,6 +1039,168 @@ mod tests {
             error
                 .to_string()
                 .contains("missing string field `translation`")
+        );
+    }
+
+    #[test]
+    fn openai_chat_native_turn_round_trips_tool_results() {
+        let mut continuation = native_start(
+            ApiFormat::OpenaiChat,
+            &[subbake_core::ports::ChatMessage::user("list")],
+        );
+        let (_, calls) = parse_native_response(
+            ApiFormat::OpenaiChat,
+            &json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"list_files","arguments":"{\"path\":\".\"}"}}]}}]}),
+            &mut continuation,
+        )
+        .expect("parse native response");
+        assert_eq!(calls[0].arguments["path"], ".");
+        append_native_results(
+            &mut continuation,
+            &[ModelToolResult {
+                id: "call_1".to_owned(),
+                name: "list_files".to_owned(),
+                output: "clip.srt".to_owned(),
+                is_error: false,
+            }],
+        )
+        .expect("append result");
+        let body = native_request_body(
+            ApiFormat::OpenaiChat,
+            "model",
+            &continuation,
+            &[tool()],
+            &ToolChoice::Auto,
+        );
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_native_turn_preserves_output_items() {
+        let mut continuation = native_start(ApiFormat::OpenaiResponses, &[]);
+        let (_, calls) = parse_native_response(
+            ApiFormat::OpenaiResponses,
+            &json!({"output":[
+                {"type":"reasoning","id":"reason_1","summary":[]},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"list_files","arguments":"{}"}
+            ]}),
+            &mut continuation,
+        )
+        .expect("parse native response");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(continuation.history[0]["type"], "reasoning");
+        assert_eq!(continuation.history[1]["id"], "fc_1");
+    }
+
+    #[test]
+    fn anthropic_native_turn_places_error_result_first() {
+        let mut continuation = native_start(ApiFormat::AnthropicMessages, &[]);
+        parse_native_response(
+            ApiFormat::AnthropicMessages,
+            &json!({"content":[{"type":"tool_use","id":"toolu_1","name":"list_files","input":{}}]}),
+            &mut continuation,
+        )
+        .expect("parse native response");
+        append_native_results(
+            &mut continuation,
+            &[ModelToolResult {
+                id: "toolu_1".to_owned(),
+                name: "list_files".to_owned(),
+                output: "denied".to_owned(),
+                is_error: true,
+            }],
+        )
+        .expect("append result");
+        let last = continuation.history.last().expect("result message");
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn gemini_native_turn_preserves_content_and_maps_missing_id() {
+        let mut continuation = native_start(ApiFormat::GeminiGenerateContent, &[]);
+        let (_, calls) = parse_native_response(
+            ApiFormat::GeminiGenerateContent,
+            &json!({"candidates":[{"content":{"role":"model","parts":[
+                {"thoughtSignature":"opaque"},
+                {"functionCall":{"name":"list_files","args":{}}}
+            ]}}]}),
+            &mut continuation,
+        )
+        .expect("parse native response");
+        assert_eq!(calls[0].id, "gemini_call_1");
+        assert_eq!(
+            continuation.history[0]["parts"][0]["thoughtSignature"],
+            "opaque"
+        );
+        append_native_results(
+            &mut continuation,
+            &[ModelToolResult {
+                id: calls[0].id.clone(),
+                name: calls[0].name.clone(),
+                output: "ok".to_owned(),
+                is_error: false,
+            }],
+        )
+        .expect("append result");
+        assert!(continuation.history[1]["parts"][0]["functionResponse"]["id"].is_null());
+    }
+
+    #[test]
+    fn native_fallback_classifier_is_narrow() {
+        assert!(native_tools_unsupported(400, "unknown parameter: tools"));
+        assert!(!native_tools_unsupported(401, "tools unauthorized"));
+        assert!(!native_tools_unsupported(400, "invalid api key"));
+        assert!(!native_tools_unsupported(500, "tools unsupported"));
+    }
+
+    #[test]
+    fn every_protocol_maps_the_shared_tool_schema_and_forced_choice() {
+        let chat = native_request_body(
+            ApiFormat::OpenaiChat,
+            "model",
+            &native_start(ApiFormat::OpenaiChat, &[]),
+            &[tool()],
+            &ToolChoice::Specific("list_files".to_owned()),
+        );
+        assert_eq!(chat["tools"][0]["function"]["name"], "list_files");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "list_files");
+
+        let responses = native_request_body(
+            ApiFormat::OpenaiResponses,
+            "model",
+            &native_start(ApiFormat::OpenaiResponses, &[]),
+            &[tool()],
+            &ToolChoice::Specific("list_files".to_owned()),
+        );
+        assert_eq!(responses["tools"][0]["name"], "list_files");
+        assert_eq!(responses["tool_choice"]["name"], "list_files");
+
+        let anthropic = native_request_body(
+            ApiFormat::AnthropicMessages,
+            "model",
+            &native_start(ApiFormat::AnthropicMessages, &[]),
+            &[tool()],
+            &ToolChoice::Specific("list_files".to_owned()),
+        );
+        assert_eq!(anthropic["tools"][0]["name"], "list_files");
+        assert_eq!(anthropic["tool_choice"]["type"], "tool");
+
+        let gemini = native_request_body(
+            ApiFormat::GeminiGenerateContent,
+            "model",
+            &native_start(ApiFormat::GeminiGenerateContent, &[]),
+            &[tool()],
+            &ToolChoice::Specific("list_files".to_owned()),
+        );
+        assert_eq!(
+            gemini["tools"][0]["functionDeclarations"][0]["name"],
+            "list_files"
+        );
+        assert_eq!(
+            gemini["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+            "list_files"
         );
     }
 }

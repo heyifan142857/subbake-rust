@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::{any::Any, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,92 @@ pub enum ResponseContract {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationResponse {
     pub json: serde_json::Value,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolSupport {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    Specific(String),
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelToolResult {
+    pub id: String,
+    pub name: String,
+    pub output: String,
+    pub is_error: bool,
+}
+
+/// Provider-owned, in-memory state required to continue a native tool turn.
+/// The domain layer intentionally cannot inspect or persist its contents.
+pub struct ToolContinuation(Box<dyn Any + Send>);
+
+impl ToolContinuation {
+    pub fn new<T: Any + Send>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    pub fn downcast<T: Any + Send>(self) -> Result<T, Self> {
+        match self.0.downcast::<T>() {
+            Ok(value) => Ok(*value),
+            Err(value) => Err(Self(value)),
+        }
+    }
+}
+
+impl fmt::Debug for ToolContinuation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolContinuation(..)")
+    }
+}
+
+#[derive(Debug)]
+pub enum ToolGenerationInput {
+    Start {
+        messages: Vec<ChatMessage>,
+    },
+    Continue {
+        continuation: ToolContinuation,
+        results: Vec<ModelToolResult>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ToolGenerationRequest {
+    pub input: ToolGenerationInput,
+    pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
+}
+
+#[derive(Debug)]
+pub struct ToolGenerationResponse {
+    pub text: Option<String>,
+    pub tool_calls: Vec<ModelToolCall>,
+    pub continuation: Option<ToolContinuation>,
     pub usage: Usage,
 }
 
@@ -93,6 +180,9 @@ pub trait LlmBackend: Send {
     fn supports_parallel_generation(&self) -> bool {
         false
     }
+    fn native_tool_support(&self) -> NativeToolSupport {
+        NativeToolSupport::Unsupported
+    }
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
     fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult>;
@@ -120,6 +210,17 @@ pub trait LlmBackend: Send {
     ) -> CoreResult<(serde_json::Value, Usage)> {
         cancellation.check()?;
         self.generate_raw_json(messages)
+    }
+
+    fn generate_with_tools_cancellable(
+        &mut self,
+        _request: ToolGenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<ToolGenerationResponse> {
+        cancellation.check()?;
+        Err(crate::error::CoreError::UnsupportedCapability(
+            "native tools".to_owned(),
+        ))
     }
 
     /// The protocol-neutral generation API.  The legacy raw methods remain as
@@ -186,6 +287,9 @@ where
     fn supports_parallel_generation(&self) -> bool {
         (**self).supports_parallel_generation()
     }
+    fn native_tool_support(&self) -> NativeToolSupport {
+        (**self).native_tool_support()
+    }
     fn provider_name(&self) -> &str {
         (**self).provider_name()
     }
@@ -217,6 +321,13 @@ where
         cancellation: &CancellationGuard,
     ) -> CoreResult<(serde_json::Value, Usage)> {
         (**self).generate_raw_json_cancellable(messages, cancellation)
+    }
+    fn generate_with_tools_cancellable(
+        &mut self,
+        request: ToolGenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> CoreResult<ToolGenerationResponse> {
+        (**self).generate_with_tools_cancellable(request, cancellation)
     }
 
     fn generate(&mut self, request: GenerationRequest) -> CoreResult<GenerationResponse> {
@@ -324,5 +435,25 @@ pub trait RuntimeStore {
             .paths()
             .agent_logs_dir
             .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::ToolContinuation;
+
+    #[test]
+    fn continuation_is_opaque_but_returns_to_its_provider() {
+        let continuation = ToolContinuation::new(vec!["wire state".to_owned()]);
+        let state = continuation
+            .downcast::<Vec<String>>()
+            .expect("provider continuation type");
+        assert_eq!(state, vec!["wire state"]);
+    }
+
+    #[test]
+    fn continuation_rejects_a_different_provider_type() {
+        let continuation = ToolContinuation::new(42usize);
+        assert!(continuation.downcast::<String>().is_err());
     }
 }

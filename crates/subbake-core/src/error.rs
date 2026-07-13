@@ -9,6 +9,7 @@ pub enum CoreError {
     UnsupportedFormat(String),
     MalformedSubtitle(String),
     InvalidTranslation(String),
+    UnsupportedCapability(String),
     Backend(String),
     Data(String),
 }
@@ -25,6 +26,9 @@ impl Display for CoreError {
             }
             CoreError::InvalidTranslation(value) => {
                 write!(formatter, "invalid translation result: {value}")
+            }
+            CoreError::UnsupportedCapability(value) => {
+                write!(formatter, "unsupported backend capability: {value}")
             }
             CoreError::Backend(value) => write!(formatter, "backend error: {value}"),
             CoreError::Data(value) => write!(formatter, "data error: {value}"),

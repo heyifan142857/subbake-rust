@@ -88,6 +88,41 @@ impl ToolSpec {
             )
         }
     }
+
+    pub fn native_definition(&self) -> subbake_core::ports::ToolDefinition {
+        let arguments = self.arguments();
+        let properties = arguments
+            .iter()
+            .map(|argument| {
+                let kind = match argument.kind {
+                    ToolArgKind::String => "string",
+                    ToolArgKind::Boolean => "boolean",
+                };
+                (
+                    argument.name.to_owned(),
+                    serde_json::json!({
+                        "type": kind,
+                        "description": argument.description,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let required = arguments
+            .iter()
+            .filter(|argument| argument.required)
+            .map(|argument| argument.name)
+            .collect::<Vec<_>>();
+        subbake_core::ports::ToolDefinition {
+            name: self.name.to_owned(),
+            description: self.description.to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": false,
+            }),
+        }
+    }
 }
 
 const fn arg(
@@ -534,5 +569,27 @@ mod tests {
         let line = spec.prompt_line();
         assert!(line.contains("path: string required"));
         assert!(line.contains("bilingual: boolean optional"));
+    }
+
+    #[test]
+    fn native_schema_uses_the_same_arguments_as_local_validation() {
+        let spec = ALL_TOOL_SPECS
+            .iter()
+            .find(|spec| spec.name == "translate_file")
+            .expect("translation tool");
+        let definition = spec.native_definition();
+        assert_eq!(
+            definition.input_schema["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["bilingual"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            definition.input_schema["required"],
+            serde_json::json!(["path"])
+        );
+        assert_eq!(definition.input_schema["additionalProperties"], false);
     }
 }
