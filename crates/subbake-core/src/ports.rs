@@ -374,9 +374,7 @@ pub trait RuntimeStore {
         Ok(Vec::new())
     }
 
-    fn save_review_report(&self, _report: &ReviewReport) -> CoreResult<()> {
-        Ok(())
-    }
+    fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()>;
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
     fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
@@ -398,9 +396,7 @@ pub trait RuntimeStore {
         Ok(Vec::new())
     }
 
-    fn save_run_state(&self, _state: &RunState) -> CoreResult<()> {
-        Ok(())
-    }
+    fn save_run_state(&self, state: &RunState) -> CoreResult<()>;
 
     fn load_run_state(&self) -> CoreResult<Option<RunState>> {
         Ok(None)
@@ -408,12 +404,10 @@ pub trait RuntimeStore {
 
     fn save_cached_response(
         &self,
-        _stage: CacheStage,
-        _request_hash: &str,
-        _response: &BackendJsonResult,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
+        stage: CacheStage,
+        request_hash: &str,
+        response: &BackendJsonResult,
+    ) -> CoreResult<()>;
 
     fn load_cached_response(
         &self,
@@ -423,19 +417,9 @@ pub trait RuntimeStore {
         Ok(None)
     }
 
-    fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
-        Ok(self
-            .paths()
-            .failures_dir
-            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
-    }
+    fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf>;
 
-    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
-        Ok(self
-            .paths()
-            .agent_logs_dir
-            .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
-    }
+    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf>;
 }
 
 #[cfg(test)]

@@ -3394,6 +3394,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct CapturedStoreData {
         saved_translation_memory: Vec<(String, String)>,
+        review_reports: Vec<ReviewReport>,
         saved_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_review_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_state: Option<RunState>,
@@ -3425,6 +3426,15 @@ mod tests {
             let mut data = self.data.lock().expect("capture lock");
             data.saved_translation_memory = entries.to_vec();
             data.saved_translation_memory.sort();
+            Ok(())
+        }
+
+        fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()> {
+            self.data
+                .lock()
+                .expect("capture lock")
+                .review_reports
+                .push(report.clone());
             Ok(())
         }
 

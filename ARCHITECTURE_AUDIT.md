@@ -28,11 +28,13 @@ Remediation: propagate configuration errors with path context. Fall back to defa
 
 Completed: translation, pipeline, and batch argument resolution now propagate configuration read and parse failures with the offending path, while a genuinely missing configuration file still uses defaults.
 
-### 4. `RuntimeStore` permits false persistence success
+### 4. `RuntimeStore` permits false persistence success — Completed
 
 Several persistence methods have defaults that return success without writing anything. The default failure-log and agent-log implementations return plausible paths without creating files. New implementations can accidentally omit required persistence while the pipeline reports success.
 
 Remediation: make required writes mandatory trait methods. Keep defaults only for explicitly optional capabilities, with names and contracts that make no-op behavior clear.
+
+Completed: every `RuntimeStore` write operation is now a required trait method, including review reports, run state, response caches, failure logs, and agent logs. Read defaults retain their explicit empty/not-found semantics without claiming that data was persisted.
 
 ## Priority 2
 
