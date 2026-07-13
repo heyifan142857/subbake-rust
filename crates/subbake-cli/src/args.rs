@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use subbake_adapters::{
     ApiFormat, BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings,
-    TranslationSettings, WhisperAction, discover_config_path, load_and_resolve,
+    TranslationSettings, TranslationSettingsPatch, WhisperAction, discover_config_path,
+    load_and_resolve,
 };
 use subbake_agent::AgentAction;
 
@@ -132,7 +133,7 @@ fn parse_file_translation_args(
     });
 
     // Load config + resolve profile as the baseline.
-    if let Ok(Some(patch)) = load_and_resolve(&cfg_file, explicit_profile.as_deref()) {
+    if let Some(patch) = load_config_patch(&cfg_file, explicit_profile.as_deref())? {
         parsed.settings.apply_patch(patch);
     }
     if cfg_file.exists() {
@@ -229,7 +230,7 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
     let cfg_file = explicit_config.clone().unwrap_or_else(|| {
         discover_config_path().unwrap_or_else(|| PathBuf::from(".subbake.toml"))
     });
-    if let Ok(Some(patch)) = load_and_resolve(&cfg_file, explicit_profile.as_deref()) {
+    if let Some(patch) = load_config_patch(&cfg_file, explicit_profile.as_deref())? {
         parsed.translate.settings.apply_patch(patch);
     }
     if cfg_file.exists() {
@@ -258,6 +259,18 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
     }
 
     Ok(parsed)
+}
+
+fn load_config_patch(
+    path: &std::path::Path,
+    profile: Option<&str>,
+) -> io::Result<Option<TranslationSettingsPatch>> {
+    load_and_resolve(path, profile).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to load config `{}`: {error}", path.display()),
+        )
+    })
 }
 
 pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
@@ -677,6 +690,63 @@ mod tests {
 
         assert!(parsed.recursive);
         assert!(parsed.translate.settings.bilingual);
+    }
+
+    #[test]
+    fn parse_translate_reports_config_errors_with_path() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-translate-invalid.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[defaults]\nbatch_size = nope\n").expect("write config");
+        let args = vec![
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+
+        let error = parse_translate_args(&args).expect_err("invalid config should fail");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.to_string().contains("failed to load config"));
+    }
+
+    #[test]
+    fn parse_batch_reports_config_errors_with_path() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-batch-invalid.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[defaults]\nunknown_setting = true\n").expect("write config");
+        let args = vec![
+            "season".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+
+        let error = parse_batch_args(&args).expect_err("invalid config should fail");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.to_string().contains("failed to load config"));
+    }
+
+    #[test]
+    fn missing_config_uses_translation_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("subbake-test-{}-missing.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let args = vec![
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+
+        let parsed = parse_translate_args(&args).expect("missing config should use defaults");
+
+        assert_eq!(parsed.settings, TranslationSettings::default());
+        assert_eq!(parsed.config_path, None);
     }
 
     #[test]

@@ -20,11 +20,13 @@ Remediation: prefer the stored session path on resume and only perform discovery
 
 Completed: resumed sessions now retain their pinned configuration path, unpinned sessions alone use discovery, session switching rebuilds the backend from the selected session's configuration, and internal profile/model resolution no longer falls back when a pinned path is present.
 
-### 3. Translation CLI paths silently ignore configuration errors
+### 3. Translation CLI paths silently ignore configuration errors — Completed
 
 The `translate` and `batch` argument parsers accept only the successful `Some` result from configuration loading. Parse errors and I/O failures are discarded and execution falls back to defaults, potentially selecting the mock backend without explaining why.
 
 Remediation: propagate configuration errors with path context. Fall back to defaults only when configuration is genuinely absent.
+
+Completed: translation, pipeline, and batch argument resolution now propagate configuration read and parse failures with the offending path, while a genuinely missing configuration file still uses defaults.
 
 ### 4. `RuntimeStore` permits false persistence success
 

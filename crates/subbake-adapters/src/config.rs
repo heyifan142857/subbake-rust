@@ -163,10 +163,11 @@ pub fn load_and_resolve(
     path: &Path,
     profile: Option<&str>,
 ) -> io::Result<Option<TranslationSettingsPatch>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let config = ConfigFile::load(path)?;
+    let config = match ConfigFile::load(path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let resolved = config.resolve(profile);
     if resolved == TranslationSettingsPatch::default() {
         // All fields are None → nothing to apply.
