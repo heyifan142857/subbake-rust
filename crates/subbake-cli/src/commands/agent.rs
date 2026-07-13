@@ -7,7 +7,7 @@ use subbake_adapters::{
 use subbake_agent::event::EventKind;
 use subbake_agent::{
     AgentActionKind, AgentEngine, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
-    TuiAction, TuiInteraction,
+    TuiAction, TuiInteraction, is_known_slash_command,
 };
 
 use crate::args::AgentArgs;
@@ -128,7 +128,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
 
         let operation_result = (|| -> io::Result<String> {
             Ok(match &action {
-                TuiAction::SubmitText(input) if input.trim().starts_with('/') => {
+                TuiAction::SubmitText(input) if is_known_slash_command(input) => {
                     if !input.trim().starts_with("/plan") {
                         engine.record(EventKind::User {
                             text: input.clone(),

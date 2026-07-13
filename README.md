@@ -49,6 +49,7 @@ source_language = "English"
 target_language = "Simplified Chinese"
 translation_concurrency = 4
 review_concurrency = 2
+bilingual = true
 ```
 
 ```bash

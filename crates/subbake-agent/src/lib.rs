@@ -13,6 +13,7 @@ mod tui_state;
 pub use decision::EchoDecisionBackend;
 pub use engine::{
     AgentEngine, EngineObserver, PlanDecision, ProfileChoice, SessionChoice, StreamingObserver,
+    is_known_slash_command,
 };
 pub use guard::FileGuard;
 pub use session::*;

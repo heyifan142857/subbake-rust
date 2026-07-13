@@ -71,6 +71,39 @@ pub enum PlanDecision {
     Reject,
 }
 
+/// Returns whether `input` is a complete built-in slash command.
+///
+/// Inputs that merely start with `/` are ordinary chat text. This keeps
+/// absolute paths and pasted shell-style instructions from being rejected as
+/// unknown commands.
+pub fn is_known_slash_command(input: &str) -> bool {
+    let command = input.trim();
+    matches!(
+        command,
+        "/help"
+            | "/h"
+            | "/plan"
+            | "/plan on"
+            | "/plan off"
+            | "/approve"
+            | "/reject"
+            | "/undo"
+            | "/sessions"
+            | "/clear"
+            | "/model"
+            | "/profile"
+            | "/history"
+            | "/exit"
+            | "/quit"
+    ) || command
+        .strip_prefix("/profile ")
+        .is_some_and(|name| !name.trim().is_empty())
+        || command
+            .strip_prefix("/sessions ")
+            .is_some_and(|id| !id.trim().is_empty())
+        || command.starts_with("/history ")
+}
+
 impl Default for StreamingObserver {
     fn default() -> Self {
         Self
@@ -941,7 +974,18 @@ fn truncate_summary(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod error_persistence_tests {
-    use super::AgentEngine;
+    use super::{AgentEngine, is_known_slash_command};
+
+    #[test]
+    fn only_registered_slash_commands_take_the_command_path() {
+        assert!(is_known_slash_command("/plan on"));
+        assert!(is_known_slash_command("/profile subtitles"));
+        assert!(is_known_slash_command("/history 50"));
+        assert!(!is_known_slash_command(
+            "/home/azote/Downloads/Braveheart.fixed.translated.srt改为中英双语"
+        ));
+        assert!(!is_known_slash_command("/plan 改为中英双语"));
+    }
 
     #[test]
     fn interactive_errors_are_persisted_in_the_active_session() {

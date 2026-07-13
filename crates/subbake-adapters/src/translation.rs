@@ -334,6 +334,48 @@ mod tests {
     }
 
     #[test]
+    fn cached_translation_can_be_rerendered_as_bilingual_output() {
+        let root = temp_root("bilingual-cache-rerender");
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("clip.txt");
+        fs::write(&input_path, "hello\n").expect("write input");
+
+        let mut translated_settings = TranslationSettings::default();
+        translated_settings.translation.target_language = "en".to_owned();
+        translated_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        let translated = translate_subtitle(TranslationRequest {
+            input_path: input_path.clone(),
+            output_path: None,
+            settings: translated_settings,
+        })
+        .expect("translate source subtitle");
+
+        let mut bilingual_settings = TranslationSettings::default();
+        bilingual_settings.translation.target_language = "en".to_owned();
+        bilingual_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        bilingual_settings.output.bilingual = true;
+        let bilingual = translate_subtitle(TranslationRequest {
+            input_path,
+            output_path: None,
+            settings: bilingual_settings,
+        })
+        .expect("render bilingual subtitle from cache");
+        let bilingual_path = bilingual.output_path.expect("bilingual output path");
+        let bilingual_text = fs::read_to_string(&bilingual_path).expect("read bilingual output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            translated
+                .output_path
+                .expect("translated output path")
+                .ends_with("clip.translated.txt")
+        );
+        assert!(bilingual_path.ends_with("clip.bilingual.txt"));
+        assert_eq!(bilingual.result.resumed_translation_batches, 1);
+        assert_eq!(bilingual_text, "hello\n[MOCK-EN] hello\n");
+    }
+
+    #[test]
     fn dry_run_does_not_write_output() {
         let root = temp_root("dry-run");
         fs::create_dir_all(&root).expect("create temp root");

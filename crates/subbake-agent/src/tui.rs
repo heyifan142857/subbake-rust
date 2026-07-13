@@ -1289,7 +1289,11 @@ Or just type what you want, e.g. "translate @clip.srt""#
                     let opens_session_picker =
                         matches!(&action, TuiAction::SubmitText(input) if input == "/sessions");
                     let changes_plan_mode = matches!(&action, TuiAction::TogglePlan)
-                        || matches!(&action, TuiAction::SubmitText(input) if input.trim().starts_with("/plan"));
+                        || matches!(
+                            &action,
+                            TuiAction::SubmitText(input)
+                                if matches!(input.trim(), "/plan" | "/plan on" | "/plan off")
+                        );
 
                     if !opens_session_picker
                         && !changes_plan_mode
