@@ -63,27 +63,6 @@ pub fn diagnose_failure_value(
     report
 }
 
-pub fn format_diagnostic_report(report: &DiagnosticReport) -> String {
-    let mut lines = vec![
-        format!("Source: {}", report.source),
-        format!("Diagnosis: {}", report.diagnosis),
-    ];
-    if !report.details.is_empty() {
-        lines.push("Details:".to_owned());
-        lines.extend(report.details.iter().map(|detail| format!("- {detail}")));
-    }
-    if !report.suggestions.is_empty() {
-        lines.push("Suggestions:".to_owned());
-        lines.extend(
-            report
-                .suggestions
-                .iter()
-                .map(|suggestion| format!("- {suggestion}")),
-        );
-    }
-    lines.join("\n")
-}
-
 #[derive(Debug, Default)]
 struct ErrorMetadata {
     status_code: Option<u64>,

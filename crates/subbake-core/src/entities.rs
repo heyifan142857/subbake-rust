@@ -234,8 +234,6 @@ pub struct PipelineOptions {
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
     pub timeout_seconds: f64,
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
     /// Non-secret identity of the configured API route, used to isolate v2
     /// cache entries across protocols and relay endpoints.
     pub provider_fingerprint: Option<String>,
@@ -268,8 +266,6 @@ impl PipelineOptions {
             review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
             timeout_seconds: default_timeout_seconds(),
-            api_key: None,
-            base_url: None,
             provider_fingerprint: None,
             dry_run: false,
             resume: true,

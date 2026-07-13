@@ -16,10 +16,10 @@ use subbake_adapters::{
     ConfigFile, SubtitleEditRequest, TranscriptionRequest, TranscriptionSettings,
     TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest,
     append_profile_snapshot, default_output_path, diagnose_failure_path, edit_subtitle_cancellable,
-    is_supported_subtitle_path, load_diagnostic_reports, transcribe_media_cancellable,
-    translate_subtitle_cancellable,
+    format_diagnostic_report, is_supported_subtitle_path, load_diagnostic_reports,
+    transcribe_media_cancellable, translate_subtitle_cancellable,
 };
-use subbake_core::diagnostics::{diagnose_text as diagnose_failure_text, format_diagnostic_report};
+use subbake_core::diagnostics::diagnose_text as diagnose_failure_text;
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
 use subbake_core::error::CoreResult;
 use subbake_core::ports::{

@@ -74,11 +74,13 @@ Progress: the legacy `final_review` boolean is now converted to the canonical ty
 
 ## Boundary and Legacy Issues
 
-### 9. Core contains provider secrets and human presentation
+### 9. Core contains provider secrets and human presentation — Completed
 
 `PipelineOptions` carries `api_key` and `base_url` even though the core pipeline does not use them. Diagnostic formatting also emits English headings and CLI-style lists from core.
 
 Remediation: keep provider construction and secrets in adapters, pass only non-secret backend identity required for caching into core, and render structured diagnostics at CLI/TUI edges.
+
+Completed: `PipelineOptions` now carries only the non-secret provider identity needed by the pipeline and cache, while API credentials and endpoint configuration remain in adapters. Core diagnostics return only structured reports; human-readable headings and list rendering now live at the adapter/agent edge.
 
 ### 10. Python-authoritative comments are stale — Completed
 

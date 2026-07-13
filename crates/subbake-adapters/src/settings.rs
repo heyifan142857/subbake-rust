@@ -317,8 +317,6 @@ impl TranslationSettings {
         options.output_format = self.output_format.clone();
         options.provider = self.provider.clone();
         options.model = self.model.clone();
-        options.api_key = self.backend_config().api_key;
-        options.base_url = self.base_url.clone();
         options.provider_fingerprint = self.provider_fingerprint();
         options.source_language = self.source_language.clone();
         options.target_language = self.target_language.clone();
