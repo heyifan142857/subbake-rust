@@ -581,7 +581,7 @@ fn parse_native_response(
     let mut calls = Vec::new();
     let text = match format {
         ApiFormat::OpenaiChat => {
-            let message = body["choices"][0]["message"].clone();
+            let mut message = body["choices"][0]["message"].clone();
             for (index, call) in message["tool_calls"]
                 .as_array()
                 .into_iter()
@@ -599,8 +599,37 @@ fn parse_native_response(
                     arguments: parse_wire_arguments(&call["function"]["arguments"])?,
                 });
             }
+            let mut text = message["content"].as_str().map(str::to_owned);
+            if calls.is_empty()
+                && let Some(content) = text.as_deref()
+                && let Some(dsml_calls) = parse_dsml_tool_calls(content)?
+            {
+                for call in &dsml_calls {
+                    continuation
+                        .call_ids
+                        .insert(call.id.clone(), Some(call.id.clone()));
+                }
+                calls = dsml_calls;
+                text = None;
+                message["content"] = Value::Null;
+                message["tool_calls"] = Value::Array(
+                    calls
+                        .iter()
+                        .map(|call| {
+                            json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect(),
+                );
+            }
             continuation.history.push(message.clone());
-            message["content"].as_str().map(str::to_owned)
+            text
         }
         ApiFormat::OpenaiResponses => {
             let output = body["output"].as_array().ok_or_else(|| {
@@ -713,6 +742,101 @@ fn parse_native_response(
         }
     };
     Ok((text.filter(|value| !value.is_empty()), calls))
+}
+
+fn parse_dsml_tool_calls(content: &str) -> CoreResult<Option<Vec<ModelToolCall>>> {
+    const PREFIXES: [&str; 2] = ["｜｜DSML｜｜", "||DSML||"];
+    let Some(prefix) = PREFIXES
+        .iter()
+        .find(|prefix| content.contains(&format!("<{prefix}tool_calls>")))
+    else {
+        return Ok(None);
+    };
+    let invoke_open = format!("<{prefix}invoke ");
+    let invoke_close = format!("</{prefix}invoke>");
+    let parameter_open = format!("<{prefix}parameter ");
+    let parameter_close = format!("</{prefix}parameter>");
+    let mut remainder = content;
+    let mut calls = Vec::new();
+    while let Some(start) = remainder.find(&invoke_open) {
+        remainder = &remainder[start + invoke_open.len()..];
+        let header_end = remainder.find('>').ok_or_else(|| {
+            CoreError::Backend("DSML tool invocation has an unterminated header".to_owned())
+        })?;
+        let name = dsml_attribute(&remainder[..header_end], "name")
+            .ok_or_else(|| CoreError::Backend("DSML tool invocation is missing name".to_owned()))?;
+        remainder = &remainder[header_end + 1..];
+        let body_end = remainder.find(&invoke_close).ok_or_else(|| {
+            CoreError::Backend(format!("DSML tool invocation `{name}` is unterminated"))
+        })?;
+        let body = &remainder[..body_end];
+        let mut parameters = serde_json::Map::new();
+        let mut parameter_remainder = body;
+        while let Some(parameter_start) = parameter_remainder.find(&parameter_open) {
+            parameter_remainder = &parameter_remainder[parameter_start + parameter_open.len()..];
+            let parameter_header_end = parameter_remainder.find('>').ok_or_else(|| {
+                CoreError::Backend(format!(
+                    "DSML parameter for `{name}` has an unterminated header"
+                ))
+            })?;
+            let header = &parameter_remainder[..parameter_header_end];
+            let parameter_name = dsml_attribute(header, "name").ok_or_else(|| {
+                CoreError::Backend(format!("DSML parameter for `{name}` is missing name"))
+            })?;
+            let is_string = dsml_attribute(header, "string").as_deref() == Some("true");
+            parameter_remainder = &parameter_remainder[parameter_header_end + 1..];
+            let value_end = parameter_remainder.find(&parameter_close).ok_or_else(|| {
+                CoreError::Backend(format!("DSML parameter `{parameter_name}` is unterminated"))
+            })?;
+            let raw_value = decode_dsml_entities(parameter_remainder[..value_end].trim());
+            let value = if is_string {
+                Value::String(raw_value)
+            } else {
+                serde_json::from_str(&raw_value).unwrap_or(Value::String(raw_value))
+            };
+            let parameter_name = if name == "translate_file" && parameter_name == "file_path" {
+                "path".to_owned()
+            } else {
+                parameter_name
+            };
+            parameters.insert(parameter_name, value);
+            parameter_remainder = &parameter_remainder[value_end + parameter_close.len()..];
+        }
+        let index = calls.len() + 1;
+        calls.push(ModelToolCall {
+            id: format!("dsml_call_{index}"),
+            name,
+            arguments: Value::Object(parameters),
+        });
+        remainder = &remainder[body_end + invoke_close.len()..];
+    }
+    if calls.is_empty() {
+        return Err(CoreError::Backend(
+            "DSML tool_calls block contains no invocation".to_owned(),
+        ));
+    }
+    Ok(Some(calls))
+}
+
+fn dsml_attribute(header: &str, name: &str) -> Option<String> {
+    let marker = format!(r#"{name}="#);
+    let value = header.split_once(&marker)?.1.trim_start();
+    let quote = value.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let value = &value[quote.len_utf8()..];
+    let end = value.find(quote)?;
+    Some(decode_dsml_entities(&value[..end]))
+}
+
+fn decode_dsml_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn required_wire_string<'a>(value: &'a Value, path: &[&str]) -> CoreResult<&'a str> {
@@ -1074,6 +1198,49 @@ mod tests {
         );
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn openai_chat_parses_deepseek_dsml_tool_calls() {
+        let mut continuation = native_start(ApiFormat::OpenaiChat, &[]);
+        let content = concat!(
+            "<｜｜DSML｜｜tool_calls>\n",
+            "<｜｜DSML｜｜invoke name=\"translate_file\">\n",
+            "<｜｜DSML｜｜parameter name=\"file_path\" string=\"true\">/tmp/a&amp;b.srt</｜｜DSML｜｜parameter>\n",
+            "<｜｜DSML｜｜parameter name=\"bilingual\" string=\"false\">false</｜｜DSML｜｜parameter>\n",
+            "</｜｜DSML｜｜invoke>\n",
+            "</｜｜DSML｜｜tool_calls>"
+        );
+        let (text, calls) = parse_native_response(
+            ApiFormat::OpenaiChat,
+            &json!({"choices":[{"message":{"role":"assistant","content":content}}]}),
+            &mut continuation,
+        )
+        .expect("parse DSML response");
+
+        assert_eq!(text, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "translate_file");
+        assert_eq!(calls[0].arguments["path"], "/tmp/a&b.srt");
+        assert_eq!(calls[0].arguments["bilingual"], false);
+        assert_eq!(continuation.history[0]["content"], json!(null));
+        assert_eq!(
+            continuation.history[0]["tool_calls"][0]["function"]["name"],
+            "translate_file"
+        );
+    }
+
+    #[test]
+    fn malformed_dsml_is_reported_instead_of_rendered() {
+        let mut continuation = native_start(ApiFormat::OpenaiChat, &[]);
+        let error = parse_native_response(
+            ApiFormat::OpenaiChat,
+            &json!({"choices":[{"message":{"role":"assistant","content":"<｜｜DSML｜｜tool_calls></｜｜DSML｜｜tool_calls>"}}]}),
+            &mut continuation,
+        )
+        .expect_err("empty DSML should fail");
+
+        assert!(error.to_string().contains("contains no invocation"));
     }
 
     #[test]

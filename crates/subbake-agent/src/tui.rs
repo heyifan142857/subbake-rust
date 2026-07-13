@@ -342,10 +342,11 @@ impl SubBakeTui {
     pub fn new() -> io::Result<Self> {
         let terminal_session = TerminalSessionGuard::enter()?;
         let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+        let terminal_rows = crossterm::terminal::size()?.1;
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(12),
+                viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
             },
         )?;
         Ok(Self {
@@ -1410,6 +1411,10 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 }
 
+fn inline_viewport_height(terminal_rows: u16) -> u16 {
+    terminal_rows.saturating_sub(1).clamp(1, 12)
+}
+
 const INPUT_HINTS: &[&str] = &[
     "Type a message or /help for commands",
     "Ask SubBake to translate, transcribe, or inspect a file",
@@ -1613,6 +1618,14 @@ mod tests {
         previous_suggestion, push_immediate_response, slash_suggestions, suggestions_for,
         terminal_width, vertical_navigation,
     };
+
+    #[test]
+    fn inline_viewport_leaves_room_for_native_scrollback() {
+        assert_eq!(super::inline_viewport_height(40), 12);
+        assert_eq!(super::inline_viewport_height(12), 11);
+        assert_eq!(super::inline_viewport_height(2), 1);
+        assert_eq!(super::inline_viewport_height(1), 1);
+    }
 
     #[test]
     fn terminal_width_uses_display_columns_for_unicode_input() {
