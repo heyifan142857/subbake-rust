@@ -5,9 +5,8 @@ use std::time::Instant;
 use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, FailureLog, GlossaryEntry, PipelineOptions,
-    PipelineResult, ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog,
-    SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, TerminologyStats,
-    TranslationLine, Usage,
+    PipelineResult, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
+    SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
@@ -21,10 +20,7 @@ use crate::recovery::{
     backend_payload_json, build_agent_repair_messages, combine_glossary, combine_summaries,
     parse_translation_payload, retry_correction_message, split_index,
 };
-use crate::review::{
-    ReviewBatchPlan, build_full_review_plan, build_review_messages, build_review_plan,
-    parse_review_payload, restore_review_progress,
-};
+use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
 use crate::storage::{
     InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash, build_request_hash_v2,
     build_translation_fingerprint,
@@ -32,8 +28,10 @@ use crate::storage::{
 use crate::validation::{validate_full_alignment, validate_translation_batch};
 
 mod planning;
+mod review_stage;
 
 use planning::BatchPlanner;
+use review_stage::ReviewStage;
 
 pub struct SubtitlePipeline<B, D> {
     backend: B,
@@ -386,111 +384,67 @@ where
         self.save_run_state(batches.len(), resume.review_batches_completed, true, usage)?;
         self.dashboard.mark_done("TRANSLATE");
 
-        let review_plan = if self.options.fast_mode || translated_segments.is_empty() {
-            Vec::new()
-        } else {
-            match self.options.review_policy {
-                ReviewPolicy::Off => Vec::new(),
-                ReviewPolicy::Targeted => build_review_plan(
-                    &batches,
-                    &translated_segments,
-                    &self.memory,
-                    &self.options.source_language,
-                    &self.options.target_language,
-                ),
-                ReviewPolicy::Full => build_full_review_plan(&batches, &translated_segments),
-            }
-        };
+        let mut review_stage = ReviewStage::new(
+            &self.options,
+            &batches,
+            &translated_segments,
+            &self.memory,
+            resume.review_batches_completed,
+            &resume.reviewed_segments,
+            self.cache_hits,
+        )?;
         self.dashboard
-            .set_total_steps(3 + batches.len() + review_plan.len());
-        let review_started = Instant::now();
-        let review_cache_hits_before = self.cache_hits;
-        let mut review_usage = Usage::default();
-
-        let resumed_review_batches = if review_plan.is_empty() {
-            0
-        } else {
-            if resume.review_batches_completed > review_plan.len() {
-                return Err(CoreError::Data(format!(
-                    "resume state has {} reviewed batches, but the current review plan has only {}",
-                    resume.review_batches_completed,
-                    review_plan.len()
-                )));
-            }
-            resume.review_batches_completed
-        };
-        let mut output_segments = translated_segments.clone();
-        if !review_plan.is_empty() {
-            restore_review_progress(
-                &review_plan,
-                resumed_review_batches,
-                &resume.reviewed_segments,
-                &mut output_segments,
-            )?;
+            .set_total_steps(3 + batches.len() + review_stage.len());
+        let resumed_review_batches = review_stage.resumed();
+        if !review_stage.is_empty() {
             self.dashboard.mark_running("FINAL_REVIEW");
             let mut next_review = resumed_review_batches;
-            while next_review < review_plan.len() {
+            while next_review < review_stage.len() {
                 self.cancellation.check()?;
                 let concurrency = if self.backend.supports_parallel_generation() {
                     self.options.review_concurrency.max(1)
                 } else {
                     1
                 };
-                let window_end = (next_review + concurrency).min(review_plan.len());
                 self.report(
                     "FINAL_REVIEW",
                     TaskState::Running,
                     next_review,
-                    Some(review_plan.len()),
+                    Some(review_stage.len()),
                     resumed_review_batches,
                     usage,
                 );
-                let pending = review_plan
-                    .iter()
-                    .enumerate()
-                    .take(window_end)
-                    .skip(next_review)
-                    .map(|(index, batch)| (index + 1, batch.clone()))
-                    .collect::<Vec<_>>();
+                let pending = review_stage.window(next_review, concurrency);
                 let mut reviewed_window = self.review_window(&pending)?;
-                for (review_index, review_batch) in review_plan
-                    .iter()
-                    .enumerate()
-                    .take(window_end)
-                    .skip(next_review)
-                {
-                    let review_position = review_index + 1;
-                    let reviewed = reviewed_window.remove(&review_position).ok_or_else(|| {
+                for (review_position, _) in &pending {
+                    let reviewed = reviewed_window.remove(review_position).ok_or_else(|| {
                         CoreError::Data(format!("review window omitted batch {review_position}"))
                     })?;
                     usage.add(reviewed.usage);
-                    review_usage.add(reviewed.usage);
                     self.dashboard.add_usage(reviewed.usage);
-                    let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
+                    let reviewed_segments =
+                        review_stage.apply(*review_position, &reviewed.lines, reviewed.usage)?;
                     if let Some(ref store) = self.store {
                         self.cancellation.check()?;
                         store.save_batch_segments(
                             BatchShardKind::Reviewed,
-                            review_position,
+                            *review_position,
                             &reviewed_segments,
                         )?;
                     }
-                    output_segments[review_batch.start_offset
-                        ..review_batch.start_offset + reviewed_segments.len()]
-                        .clone_from_slice(&reviewed_segments);
-                    self.save_run_state(batches.len(), review_position, true, usage)?;
+                    self.save_run_state(batches.len(), *review_position, true, usage)?;
                     self.report(
                         "FINAL_REVIEW",
                         TaskState::Running,
-                        review_position,
-                        Some(review_plan.len()),
+                        *review_position,
+                        Some(review_stage.len()),
                         resumed_review_batches,
                         usage,
                     );
                 }
-                next_review = window_end;
+                next_review += pending.len();
             }
-            validate_full_alignment(&document.segments, &output_segments)?;
+            validate_full_alignment(&document.segments, review_stage.output())?;
             self.dashboard.mark_done("FINAL_REVIEW");
         } else {
             self.report(
@@ -502,53 +456,18 @@ where
                 Usage::default(),
             );
         }
-        let changes = review_plan
-            .iter()
-            .flat_map(|batch| {
-                let reviewed = &output_segments
-                    [batch.start_offset..batch.start_offset + batch.translated.len()];
-                batch
-                    .translated
-                    .iter()
-                    .zip(reviewed)
-                    .filter(|(before, after)| before.text != after.text)
-                    .map(|(before, after)| ReviewChange {
-                        batch: batch.batch_index,
-                        id: before.id.clone(),
-                        reasons: batch
-                            .candidate_reasons
-                            .get(&before.id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        before: before.text.clone(),
-                        after: after.text.clone(),
-                    })
-            })
-            .collect::<Vec<_>>();
-        let review = ReviewStats {
-            candidate_lines: review_plan
-                .iter()
-                .map(|batch| batch.candidate_reasons.len())
-                .sum(),
-            reviewed_lines: review_plan
-                .iter()
-                .map(|batch| batch.candidate_reasons.len())
-                .sum(),
-            changed_lines: changes.len(),
-            batches: review_plan.len(),
-            cache_hits: self.cache_hits.saturating_sub(review_cache_hits_before),
-            usage: review_usage,
-            duration_ms: duration_ms(review_started),
-        };
+        let review_batches = review_stage.len();
+        let review_outcome = review_stage.finish(self.cache_hits);
+        let review = review_outcome.stats;
         if let Some(store) = self.store.as_ref() {
             store.save_review_report(&ReviewReport {
                 terminology: terminology.clone(),
                 review: review.clone(),
-                changes,
+                changes: review_outcome.changes,
             })?;
         }
         self.cancellation.check()?;
-        self.save_run_state(batches.len(), review_plan.len(), true, usage)?;
+        self.save_run_state(batches.len(), review_batches, true, usage)?;
         self.report(
             "WRITE_OUTPUT",
             TaskState::Running,
@@ -562,7 +481,7 @@ where
             result: PipelineResult {
                 output_path: self.options.output_path.clone(),
                 batches_translated: batches.len(),
-                review_batches: review_plan.len(),
+                review_batches,
                 usage,
                 dry_run: false,
                 planned_batches,
@@ -576,7 +495,7 @@ where
                 terminology,
                 review,
             },
-            translated_segments: output_segments,
+            translated_segments: review_outcome.output,
         })
     }
 
@@ -2088,6 +2007,7 @@ mod tests {
 
     use crate::entities::{BatchTranslationResult, GlossaryEntry};
     use crate::ports::{BackendJsonResult, NoopDashboard};
+    use crate::review::build_review_plan;
     use crate::storage::{RunState, RuntimePaths, build_runtime_paths, input_signature_from_bytes};
 
     use super::*;

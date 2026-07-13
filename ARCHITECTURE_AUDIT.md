@@ -46,7 +46,7 @@ Completed: every `RuntimeStore` write operation is now a required trait method, 
 
 Remediation: extract cohesive stage services and typed state reducers while retaining a small orchestration entry point. Split by responsibility rather than file length alone.
 
-Progress: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; deterministic agent intent/discovery classification is isolated from the decision loop; and TUI progress rendering is separated from terminal ownership and event routing. The remaining translation/review stages, tool execution branches, and interaction reducer still need extraction before this item is complete.
+Progress: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; review planning, resume restoration, window selection, result application, and change/statistics calculation belong to a typed core `ReviewStage`; deterministic agent intent/discovery classification is isolated from the decision loop; and TUI progress rendering is separated from terminal ownership and event routing. The remaining translation stage, tool execution branches, and interaction reducer still need extraction before this item is complete.
 
 ### 6. Agent tools have multiple parallel registries — Completed
 
