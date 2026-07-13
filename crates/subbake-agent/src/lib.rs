@@ -5,8 +5,10 @@ pub mod event;
 pub mod guard;
 mod input_editor;
 pub mod session;
+mod tool_execution;
 pub mod tools;
 pub mod tui;
+mod tui_state;
 
 pub use decision::EchoDecisionBackend;
 pub use engine::{

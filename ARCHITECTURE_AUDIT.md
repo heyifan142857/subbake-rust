@@ -38,7 +38,7 @@ Completed: every `RuntimeStore` write operation is now a required trait method, 
 
 ## Priority 2
 
-### 5. Core pipeline, agent decision logic, and TUI are oversized orchestrators — In progress
+### 5. Core pipeline, agent decision logic, and TUI are oversized orchestrators — Completed
 
 - `subbake-core/src/pipeline.rs` combines batching, terminology, translation, review, retries, splitting, caching, resume, translation memory, logging, and progress.
 - `subbake-agent/src/decision.rs` combines the decision loop, quick paths, tool execution, profile handling, diagnostics, translation/transcription orchestration, and presentation text.
@@ -46,7 +46,7 @@ Completed: every `RuntimeStore` write operation is now a required trait method, 
 
 Remediation: extract cohesive stage services and typed state reducers while retaining a small orchestration entry point. Split by responsibility rather than file length alone.
 
-Progress: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; translation progress, resume restoration, window selection, translation-memory lookup, and ordered result assembly belong to a typed core `TranslationStage`; review planning, resume restoration, window selection, result application, and change/statistics calculation belong to a typed core `ReviewStage`; deterministic agent intent/discovery classification is isolated from the decision loop; and TUI progress rendering is separated from terminal ownership and event routing. The remaining tool execution branches and interaction reducer still need extraction before this item is complete.
+Completed: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; translation progress, resume restoration, window selection, translation-memory lookup, and ordered result assembly belong to a typed core `TranslationStage`; review planning, resume restoration, window selection, result application, and change/statistics calculation belong to a typed core `ReviewStage`; deterministic agent intent/discovery classification is isolated from the decision loop; project-local, adapter-backed, translation/edit, and session/profile tools execute through cohesive typed executors while the engine retains routing and atomic state commits; and TUI progress rendering plus interaction phase, picker, approval, and history reducers are separated from terminal ownership and event routing.
 
 ### 6. Agent tools have multiple parallel registries — Completed
 

@@ -12,14 +12,7 @@ use std::io;
 use std::path::PathBuf;
 
 use serde_json::{Value as JsonValue, json};
-use subbake_adapters::{
-    ConfigFile, SubtitleEditRequest, TranscriptionRequest, TranscriptionSettings,
-    TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest,
-    append_profile_snapshot, default_output_path, diagnose_failure_path, edit_subtitle_cancellable,
-    format_diagnostic_report, is_supported_subtitle_path, load_diagnostic_reports,
-    transcribe_media_cancellable, translate_subtitle_cancellable,
-};
-use subbake_core::diagnostics::diagnose_text as diagnose_failure_text;
+use subbake_adapters::{ConfigFile, TranslationSettings, append_profile_snapshot};
 use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
 use subbake_core::error::CoreResult;
 use subbake_core::ports::{
@@ -27,10 +20,13 @@ use subbake_core::ports::{
     NativeToolSupport, ToolChoice, ToolContinuation, ToolGenerationInput, ToolGenerationRequest,
 };
 
-use crate::discovery::{rank_subtitle_candidates, summarize_observation};
+use crate::discovery::summarize_observation;
 use crate::engine::AgentEngine;
 use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
 use crate::guard::{FileOpAction, FileOpResult};
+use crate::tool_execution::{
+    execute_adapter_tool, execute_local_tool, execute_session_tool, execute_translation_tool,
+};
 use crate::tools::{ranked_tool_specs, validate_tool_call};
 
 mod intent;
@@ -1026,413 +1022,88 @@ impl AgentEngine {
                 )
             })?;
 
-        use crate::tools::ToolExecutor;
-        match executor {
-            // -- Browse (FileGuard) --
-            ToolExecutor::ListFiles => {
-                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let files = self.guard.list_files(PathBuf::from(dir).as_path())?;
-                Ok(files
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"))
+        if let Some(outcome) = execute_local_tool(executor, args, &self.guard, &self.project_root)?
+        {
+            if let Some(operation) = outcome.file_operation {
+                self.record_file_operation(&operation)?;
             }
-            ToolExecutor::SearchFiles => {
-                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let pat = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-                let files = self.guard.search_files(PathBuf::from(dir).as_path(), pat)?;
-                Ok(format_file_list(&files))
+            return Ok(outcome.text);
+        }
+        if let Some(text) = execute_adapter_tool(
+            executor,
+            args,
+            &self.guard,
+            &self.operation_guard,
+            self.progress.clone(),
+        )? {
+            return Ok(text);
+        }
+        if matches!(
+            executor,
+            crate::tools::ToolExecutor::TranslateFile
+                | crate::tools::ToolExecutor::TranslateSeries
+                | crate::tools::ToolExecutor::EditSubtitle
+        ) {
+            let settings = self.active_translation_settings()?;
+            let outcome = execute_translation_tool(
+                executor,
+                args,
+                &self.guard,
+                &self.operation_guard,
+                self.progress.clone(),
+                settings,
+            )?
+            .ok_or_else(|| io::Error::other("translation tool executor rejected its tool"))?;
+            let group_id = outcome
+                .group_file_operations
+                .then(|| format!("translate-series-{}", crate::session::iso_now()));
+            for operation in &outcome.file_operations {
+                self.record_file_operation_with_group(operation, group_id.clone())?;
             }
-            ToolExecutor::ReadFile => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                self.guard.read_file(PathBuf::from(path).as_path())
-            }
-            ToolExecutor::ReadFilePreview => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let content = self.guard.read_file(PathBuf::from(path).as_path())?;
-                let preview: String = content.chars().take(2000).collect();
-                Ok(if preview.len() < content.len() {
-                    format!("{preview}\n… (truncated)")
-                } else {
-                    preview
-                })
-            }
-            ToolExecutor::CandidateSubtitles => {
-                let dir = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let files = self.guard.search_files(PathBuf::from(dir).as_path(), "")?;
-                let ranked = rank_subtitle_candidates(files, query, &self.project_root);
-                Ok(format_file_list(&ranked))
-            }
-            ToolExecutor::RecentTranslations => {
-                let session = self.session.as_ref();
-                let events = session
-                    .map(|s| &s.events)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                let mut out = Vec::new();
-                for event in events.iter().rev().take(20) {
-                    if event.kind != "file_operation"
-                        || event
-                            .data
-                            .get("undone")
-                            .and_then(JsonValue::as_bool)
-                            .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let path = event.data.get("path").and_then(JsonValue::as_str);
-                    if path.is_some_and(|path| {
-                        path.contains(".translated.") || path.contains(".bilingual.")
-                    }) {
-                        out.push(path.unwrap_or_default().to_owned());
-                    }
-                }
-                Ok(out.join("\n"))
-            }
+            return Ok(outcome.text);
+        }
 
-            // -- File operations (FileGuard) --
-            ToolExecutor::CreateFile => {
-                let path = req_arg(args, "path")?;
-                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let r = self.guard.create_file(&path, content)?;
-                self.record_file_operation(&r)?;
-                Ok(format!("Created {}", r.path.display()))
-            }
-            ToolExecutor::AppendFile => {
-                let path = req_arg(args, "path")?;
-                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let r = self.guard.append_file(&path, content)?;
-                self.record_file_operation(&r)?;
-                Ok(format!(
-                    "Appended {} (backup: {})",
-                    r.path.display(),
-                    r.backup_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ))
-            }
-            ToolExecutor::ReplaceInFile => {
-                let path = req_arg(args, "path")?;
-                let old = args.get("old").and_then(|v| v.as_str()).unwrap_or("");
-                let new = args.get("new").and_then(|v| v.as_str()).unwrap_or("");
-                let r = self.guard.replace_in_file(&path, old, new)?;
-                self.record_file_operation(&r)?;
-                Ok(format!(
-                    "Replaced in {} (backup: {})",
-                    r.path.display(),
-                    r.backup_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ))
-            }
-            ToolExecutor::RenamePath => {
-                let from = req_arg(args, "from")?;
-                let to = req_arg(args, "to")?;
-                let r = self.guard.rename_path(&from, &to)?;
-                self.record_file_operation(&r)?;
-                Ok(format!(
-                    "Renamed {} → {}",
-                    r.path.display(),
-                    r.new_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ))
-            }
-            ToolExecutor::DeleteFile => {
-                let path = req_arg(args, "path")?;
-                let r = self.guard.delete_file(&path)?;
-                self.record_file_operation(&r)?;
-                Ok(format!(
-                    "Deleted {} (backup: {})",
-                    r.path.display(),
-                    r.backup_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ))
-            }
-
-            // -- Translate --
-            ToolExecutor::TranslateFile => {
-                let path = req_arg(args, "path")?;
-                let input = self.guard.resolve_path(&path)?;
-                let mut settings = self.active_translation_settings()?;
-                if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
-                    settings.bilingual = bilingual;
-                }
-                let output_path =
-                    default_output_path(&input, settings.output_format(), settings.bilingual)?;
-                let undo_snapshot = self.guard.snapshot_write(&output_path)?;
-                let request = TranslationRequest {
-                    input_path: input,
-                    output_path: None,
-                    settings,
-                };
-                let outcome = if let Some(progress) = self.progress.clone() {
-                    subbake_adapters::translate_subtitle_cancellable_with_progress(
-                        request,
-                        &self.operation_guard,
-                        progress,
-                    )?
-                } else {
-                    translate_subtitle_cancellable(request, &self.operation_guard)?
-                };
-                if outcome.output_path.is_some() {
-                    self.record_file_operation(&undo_snapshot)?;
-                }
-                Ok(outcome
-                    .output_path
-                    .map(|p| format!("Translated: {}", p.display()))
-                    .unwrap_or_default())
-            }
-            ToolExecutor::TranslateSeries => {
-                let dir = req_arg(args, "path")?;
-                let input = self.guard.resolve_path(&dir)?;
-                let recursive = args
-                    .get("recursive")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let overwrite = args
-                    .get("overwrite")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let mut settings = self.active_translation_settings()?;
-                if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
-                    settings.bilingual = bilingual;
-                }
-                let source_files = if recursive {
-                    self.guard.search_files(&input, "")?
-                } else {
-                    self.guard.list_files(&input)?
-                };
-                let mut undo_snapshots = Vec::new();
-                for source in source_files
-                    .into_iter()
-                    .filter(|path| path.is_file() && is_supported_subtitle_path(path))
-                    .filter(|path| {
-                        !path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .is_some_and(|stem| {
-                                stem.ends_with(".translated") || stem.ends_with(".bilingual")
-                            })
-                    })
-                {
-                    let output =
-                        default_output_path(&source, settings.output_format(), settings.bilingual)?;
-                    if overwrite || !output.exists() {
-                        let snapshot = self.guard.snapshot_write(&output)?;
-                        undo_snapshots.push((output, snapshot));
-                    }
-                }
-                let request = subbake_adapters::BatchTranslationRequest {
-                    root: input,
-                    recursive,
-                    overwrite,
-                    settings,
-                };
-                let outcome = subbake_adapters::translate_subtitle_batch_cancellable(
-                    request,
-                    &self.operation_guard,
-                )?;
-                let group_id = format!("translate-series-{}", crate::session::iso_now());
-                for output in &outcome.outputs {
-                    if let Some((_, snapshot)) =
-                        undo_snapshots.iter().find(|(path, _)| path == output)
-                    {
-                        self.record_file_operation_with_group(snapshot, Some(group_id.clone()))?;
-                    }
-                }
-                Ok(format!(
-                    "Translated {} files, skipped {}.",
-                    outcome.processed,
-                    outcome.skipped.len()
-                ))
-            }
-
-            // -- Edit: targeted rewrite of a generated subtitle file --
-            ToolExecutor::EditSubtitle => {
-                let path = req_arg(args, "path")?;
-                let instruction = req_string_arg(args, "instruction")?;
-                let target_path = self.guard.resolve_path(&path)?;
-                let snapshot = self.guard.snapshot_write(&target_path)?;
-                let outcome = edit_subtitle_cancellable(
-                    SubtitleEditRequest {
-                        target_path: target_path.clone(),
-                        instruction,
-                        settings: self.active_translation_settings()?,
-                        allow_non_generated: args
-                            .get("allow_non_generated")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false),
-                    },
-                    &self.operation_guard,
-                )?;
-                self.record_file_operation(&snapshot)?;
-                let mut lines = vec![format!("Edited: {}", target_path.display())];
-                if !outcome.edit_notes.trim().is_empty() {
-                    lines.push(outcome.edit_notes);
-                }
-                Ok(lines.join("\n"))
-            }
-
-            // -- Transcribe --
-            ToolExecutor::TranscribeAudio => {
-                let path = req_arg(args, "path")?;
-                let input = self.guard.resolve_path(&path)?;
-                let request = TranscriptionRequest {
-                    media_path: input,
-                    output_path: None,
-                    settings: TranscriptionSettings::default(),
-                };
-                let transcribed = if let Some(progress) = self.progress.clone() {
-                    subbake_adapters::transcribe_media_cancellable_with_progress(
-                        request,
-                        &self.operation_guard,
-                        progress,
-                    )
-                } else {
-                    transcribe_media_cancellable(request, &self.operation_guard)
-                };
-                match transcribed {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
-                    Ok(outcome) => Ok(format!("Transcribed: {}", outcome.output_path.display())),
-                    Err(e) => Ok(format!("Transcription needs setup: {e}")),
-                }
-            }
-
-            // -- Whisper management --
-            ToolExecutor::ManageWhisper => {
-                let action_str = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("status");
-                let action = match action_str {
-                    "install" => WhisperAction::Install,
-                    "update" => WhisperAction::Update,
-                    "uninstall" => WhisperAction::Uninstall {
-                        keep_models: args
-                            .get("keep_models")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false),
-                    },
-                    "status" => WhisperAction::Status,
-                    "list-models" | "models" => WhisperAction::ListModels,
-                    "download" | "download_model" => {
-                        let name = args
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("small");
-                        WhisperAction::DownloadModel {
-                            name: name.to_owned(),
-                        }
-                    }
-                    other => return Ok(format!("unknown whisper action `{other}`")),
-                };
-                let request = WhisperRequest {
-                    action,
-                    binary_path: None,
-                    models_dir: None,
-                };
-                let managed = if let Some(progress) = self.progress.clone() {
-                    subbake_adapters::run_whisper_cancellable_with_progress(
-                        request,
-                        &self.operation_guard,
-                        progress,
-                    )
-                } else {
-                    subbake_adapters::run_whisper_cancellable(request, &self.operation_guard)
-                };
-                match managed {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(e),
-                    Ok(_) => Ok("whisper: done".to_owned()),
-                    Err(e) => Ok(format!("whisper: {e}")),
-                }
-            }
-
-            // -- Diagnose: structured failure summary from file/run dir/text --
-            ToolExecutor::DiagnosePath => {
-                let path = req_arg(args, "path")?;
-                let full = self.guard.resolve_path(&path)?;
-                let reports = if full.is_file() {
-                    vec![diagnose_failure_path(&full)?]
-                } else {
-                    load_diagnostic_reports(&full)?
-                };
-                if reports.is_empty() {
-                    Ok("No failure logs found.".to_owned())
-                } else {
-                    Ok(reports
-                        .iter()
-                        .map(format_diagnostic_report)
-                        .collect::<Vec<_>>()
-                        .join("\n\n---\n\n"))
-                }
-            }
-            ToolExecutor::DiagnoseText => {
-                let text = req_string_arg(args, "text")?;
-                Ok(format_diagnostic_report(&diagnose_failure_text(
-                    &text,
-                    "pasted diagnostic text",
-                )))
-            }
-
-            // -- Profile: read and switch active session profile --
-            ToolExecutor::ListProfiles => {
-                let Some((_, config)) = self.load_project_config()? else {
-                    return Ok("No subbake config found in project root.".to_owned());
-                };
-                let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
-                profiles.sort();
-                if profiles.is_empty() {
-                    Ok(
-                        "No profiles defined in subbake.toml. Create [profiles.<name>] sections."
-                            .to_owned(),
-                    )
-                } else {
-                    let active = self
-                        .session
-                        .as_ref()
-                        .and_then(|session| session.profile.clone());
-                    Ok(format_profile_list(&profiles, active.as_deref()))
-                }
-            }
-            ToolExecutor::SwitchProfile => {
-                let name = req_string_arg(args, "name")?;
-                let Some((config_path, config)) = self.load_project_config()? else {
-                    return Ok(
-                        "No subbake config found. Create one with [profiles.<name>] sections."
-                            .to_owned(),
-                    );
-                };
-                if !config.profiles.contains_key(&name) {
-                    let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
-                    profiles.sort();
-                    return Ok(format!(
-                        "Profile `{name}` not found. Available: {}",
-                        profiles.join(", ")
-                    ));
-                }
-                let settings = self.settings_for_profile(&config, Some(&name));
+        if matches!(
+            executor,
+            crate::tools::ToolExecutor::RecentTranslations
+                | crate::tools::ToolExecutor::ListProfiles
+                | crate::tools::ToolExecutor::SwitchProfile
+        ) {
+            let config = if matches!(executor, crate::tools::ToolExecutor::RecentTranslations) {
+                None
+            } else {
+                self.load_project_config()?
+            };
+            let events = self
+                .session
+                .as_ref()
+                .map(|session| session.events.as_slice())
+                .unwrap_or(&[]);
+            let active_profile = self
+                .session
+                .as_ref()
+                .and_then(|session| session.profile.as_deref());
+            let outcome = execute_session_tool(executor, args, events, config, active_profile)?
+                .ok_or_else(|| io::Error::other("session tool executor rejected its tool"))?;
+            if let Some(profile_switch) = outcome.profile_switch {
                 let session = self
                     .session
                     .as_mut()
                     .ok_or_else(|| io::Error::other("no active session"))?;
-                session.profile = Some(name.clone());
-                session.config_path = Some(config_path.to_string_lossy().to_string());
+                session.profile = Some(profile_switch.name.clone());
+                session.config_path =
+                    Some(profile_switch.config_path.to_string_lossy().to_string());
                 self.save()?;
-                self.record_if_active(EventKind::Profile { name: name.clone() })?;
-                Ok(format!(
-                    "Profile switched: {name} ({}/{})",
-                    settings.provider, settings.model
-                ))
+                self.record_if_active(EventKind::Profile {
+                    name: profile_switch.name,
+                })?;
             }
+            return Ok(outcome.text);
         }
+
+        Err(io::Error::other(
+            "tool was not handled by its registered executor",
+        ))
     }
 
     fn record_file_operation(&mut self, result: &FileOpResult) -> io::Result<()> {
@@ -1520,32 +1191,6 @@ fn file_action_label(action: FileOpAction) -> &'static str {
     }
 }
 
-/// Extract a required string argument from the LLM's tool args, or error.
-fn req_arg(args: &JsonValue, key: &str) -> io::Result<PathBuf> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
-}
-
-fn req_string_arg(args: &JsonValue, key: &str) -> io::Result<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
-}
-
-fn format_file_list(files: &[PathBuf]) -> String {
-    if files.is_empty() {
-        return "(no files found)".to_owned();
-    }
-    files
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn truncate_text(text: &str, limit: usize) -> String {
     let value = text.chars().take(limit).collect::<String>();
     if text.chars().count() > limit {
@@ -1553,21 +1198,6 @@ fn truncate_text(text: &str, limit: usize) -> String {
     } else {
         value
     }
-}
-
-fn format_profile_list(profiles: &[String], active: Option<&str>) -> String {
-    let rendered = profiles
-        .iter()
-        .map(|name| {
-            if Some(name.as_str()) == active {
-                format!("{name} (active)")
-            } else {
-                name.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Profiles: {rendered}")
 }
 
 // ---------------------------------------------------------------------------

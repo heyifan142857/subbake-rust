@@ -34,6 +34,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
 use crate::input_editor::InputEditor;
 use crate::session::iso_now;
+use crate::tui_state::{
+    APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionPhase, SessionPicker, TuiPicker,
+    VerticalNavigation, empty_mode_choice, history_down, history_up, vertical_navigation,
+};
 use subbake_core::{CancellationGuard, CancellationToken};
 use subbake_core::{ProgressEvent, ProgressSink, TaskState};
 
@@ -98,23 +102,6 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit SubBake"),
 ];
 
-const APPROVAL_OPTIONS: &[(&str, &str)] = &[
-    ("approve", "execute the pending plan"),
-    ("reject", "discard the pending plan"),
-    (
-        "tell agent what to do",
-        "revise the plan with your instructions",
-    ),
-];
-struct TuiPicker {
-    pub options: Vec<ProfileChoice>,
-}
-
-struct SessionPicker {
-    pub options: Vec<SessionChoice>,
-    pub cancel_exits: bool,
-}
-
 pub enum TuiInteraction {
     Message {
         message: String,
@@ -145,70 +132,6 @@ pub enum TuiInteraction {
     },
 }
 
-enum InputMode {
-    Editing,
-    BrowsingHistory { index: usize, draft: String },
-    ChoosingProfile(TuiPicker),
-    CreatingProfile,
-    ChoosingSession(SessionPicker),
-    AwaitingPlanDecision,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InteractionPhase {
-    Idle,
-    Processing {
-        plan_mode_rollback: Option<bool>,
-        cancellation_requested: bool,
-    },
-}
-
-impl InteractionPhase {
-    fn is_processing(self) -> bool {
-        matches!(self, Self::Processing { .. })
-    }
-
-    fn begin_processing(&mut self, plan_mode_rollback: Option<bool>) {
-        *self = Self::Processing {
-            plan_mode_rollback,
-            cancellation_requested: false,
-        };
-    }
-
-    fn request_cancellation(&mut self) -> bool {
-        let Self::Processing {
-            cancellation_requested,
-            ..
-        } = self
-        else {
-            return false;
-        };
-        if *cancellation_requested {
-            return false;
-        }
-        *cancellation_requested = true;
-        true
-    }
-
-    fn finish(&mut self) -> Option<bool> {
-        let rollback = match *self {
-            Self::Idle => None,
-            Self::Processing {
-                plan_mode_rollback, ..
-            } => plan_mode_rollback,
-        };
-        *self = Self::Idle;
-        rollback
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerticalNavigation {
-    Selection(usize),
-    History,
-    Disabled,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     SubmitText(String),
@@ -218,25 +141,6 @@ pub enum TuiAction {
     CreateProfile(String),
     SelectSession(String),
     TogglePlan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ApprovalChoice {
-    Submit(TuiAction),
-    Revise,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProfilePickerChoice {
-    Select(String),
-    Create,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EmptyModeChoice {
-    Submit(TuiAction),
-    RevisePlan,
-    CreateProfile,
 }
 
 struct TerminalSessionGuard {
@@ -1648,102 +1552,9 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
     }
 }
 
-fn approval_choice(index: usize) -> ApprovalChoice {
-    match index.min(APPROVAL_OPTIONS.len() - 1) {
-        0 => ApprovalChoice::Submit(TuiAction::ApprovePlan),
-        1 => ApprovalChoice::Submit(TuiAction::RejectPlan),
-        _ => ApprovalChoice::Revise,
-    }
-}
-
-fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> VerticalNavigation {
-    match mode {
-        InputMode::ChoosingProfile(picker) if !picker.options.is_empty() => {
-            VerticalNavigation::Selection(picker.options.len())
-        }
-        InputMode::ChoosingSession(picker) if !picker.options.is_empty() => {
-            VerticalNavigation::Selection(picker.options.len())
-        }
-        InputMode::AwaitingPlanDecision if suggestion_count > 0 => {
-            VerticalNavigation::Selection(suggestion_count)
-        }
-        InputMode::Editing if suggestion_count > 0 => {
-            VerticalNavigation::Selection(suggestion_count)
-        }
-        InputMode::Editing | InputMode::BrowsingHistory { .. } => VerticalNavigation::History,
-        InputMode::ChoosingProfile(_)
-        | InputMode::ChoosingSession(_)
-        | InputMode::AwaitingPlanDecision
-        | InputMode::CreatingProfile => VerticalNavigation::Disabled,
-    }
-}
-
-fn profile_picker_choice(picker: &TuiPicker, index: usize) -> Option<ProfilePickerChoice> {
-    let option = picker
-        .options
-        .get(index.min(picker.options.len().saturating_sub(1)))?;
-    if option.create {
-        Some(ProfilePickerChoice::Create)
-    } else {
-        Some(ProfilePickerChoice::Select(option.name.clone()))
-    }
-}
-
-fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyModeChoice> {
-    match mode {
-        InputMode::AwaitingPlanDecision => match approval_choice(index) {
-            ApprovalChoice::Submit(action) => Some(EmptyModeChoice::Submit(action)),
-            ApprovalChoice::Revise => Some(EmptyModeChoice::RevisePlan),
-        },
-        InputMode::ChoosingProfile(picker) => match profile_picker_choice(picker, index)? {
-            ProfilePickerChoice::Select(name) => {
-                Some(EmptyModeChoice::Submit(TuiAction::SelectProfile(name)))
-            }
-            ProfilePickerChoice::Create => Some(EmptyModeChoice::CreateProfile),
-        },
-        InputMode::ChoosingSession(picker) => picker
-            .options
-            .get(index.min(picker.options.len().saturating_sub(1)))
-            .map(|session| EmptyModeChoice::Submit(TuiAction::SelectSession(session.id.clone()))),
-        _ => None,
-    }
-}
-
 fn push_immediate_response(view: &mut MsgView, text: String) {
     if !text.is_empty() {
         view.push(MsgStyle::Response, format!("➔ {text}"));
-    }
-}
-
-fn history_up(history: &[String], input: &str, mode: &InputMode) -> Option<(InputMode, String)> {
-    if history.is_empty() {
-        return None;
-    }
-    let (index, draft) = match mode {
-        InputMode::BrowsingHistory { index, draft } => (index.saturating_sub(1), draft.clone()),
-        _ => (history.len() - 1, input.to_owned()),
-    };
-    Some((
-        InputMode::BrowsingHistory { index, draft },
-        history[index].clone(),
-    ))
-}
-
-fn history_down(history: &[String], mode: &InputMode) -> Option<(InputMode, String)> {
-    let InputMode::BrowsingHistory { index, draft } = mode else {
-        return None;
-    };
-    if index + 1 < history.len() {
-        let next = index + 1;
-        Some((
-            InputMode::BrowsingHistory {
-                index: next,
-                draft: draft.clone(),
-            },
-            history[next].clone(),
-        ))
-    } else {
-        Some((InputMode::Editing, draft.clone()))
     }
 }
 
@@ -1791,13 +1602,15 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::engine::ProfileChoice;
+    use crate::tui_state::{
+        ApprovalChoice, ProfilePickerChoice, approval_choice, profile_picker_choice,
+    };
 
     use super::{
-        ApprovalChoice, EmptyModeChoice, InputMode, InteractionPhase, Msg, MsgStyle,
-        ProfilePickerChoice, TuiAction, TuiPicker, VerticalNavigation, approval_choice,
-        empty_mode_choice, history_down, history_lines_height, history_up, is_insert_newline_key,
-        is_profile_name_character, message_lines, picker_viewport, previous_suggestion,
-        profile_picker_choice, push_immediate_response, slash_suggestions, suggestions_for,
+        EmptyModeChoice, InputMode, InteractionPhase, Msg, MsgStyle, TuiAction, TuiPicker,
+        VerticalNavigation, empty_mode_choice, history_down, history_lines_height, history_up,
+        is_insert_newline_key, is_profile_name_character, message_lines, picker_viewport,
+        previous_suggestion, push_immediate_response, slash_suggestions, suggestions_for,
         terminal_width, vertical_navigation,
     };
 
