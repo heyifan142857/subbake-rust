@@ -29,9 +29,11 @@ use crate::validation::{validate_full_alignment, validate_translation_batch};
 
 mod planning;
 mod review_stage;
+mod translation_stage;
 
 use planning::BatchPlanner;
 use review_stage::ReviewStage;
+use translation_stage::{PreparedBatch, TranslationStage};
 
 pub struct SubtitlePipeline<B, D> {
     backend: B,
@@ -232,13 +234,11 @@ where
             resume.translation_batches_completed,
             Usage::default(),
         );
-        let mut translated_segments = resume.translated_segments;
-        translated_segments.reserve(
-            document
-                .segments
-                .len()
-                .saturating_sub(translated_segments.len()),
-        );
+        let mut translation_stage = TranslationStage::new(
+            batches,
+            resume.translation_batches_completed,
+            resume.translated_segments,
+        )?;
         let mut usage = resume.usage;
         if resume.translation_batches_completed == 0 {
             usage.add(terminology.usage);
@@ -246,49 +246,34 @@ where
         if usage != Usage::default() {
             self.dashboard.add_usage(usage);
         }
-        let mut next_batch = resume.translation_batches_completed;
-        while next_batch < batches.len() {
+        while !translation_stage.is_complete() {
             self.cancellation.check()?;
             let concurrency = if self.backend.supports_parallel_generation() {
                 self.options.translation_concurrency.max(1)
             } else {
                 1
             };
-            let window_end = (next_batch + concurrency).min(batches.len());
-            let mut prepared = Vec::new();
-            for (batch_index, batch) in batches.iter().enumerate().take(window_end).skip(next_batch)
-            {
-                let mut hits = HashMap::new();
-                let mut pending = Vec::new();
-                for segment in batch {
-                    let key = translation_memory_key(&segment.text);
-                    if !key.is_empty()
-                        && self.options.use_cache
-                        && let Some(text) = self.translation_memory.get(&key)
-                    {
-                        hits.insert(segment.id.clone(), text.clone());
-                    } else {
-                        pending.push(segment.clone());
-                    }
-                }
-                prepared.push((batch_index, hits, pending));
-            }
+            let prepared = translation_stage.prepare_window(
+                concurrency,
+                self.options.use_cache,
+                &self.translation_memory,
+            );
             self.report(
                 "TRANSLATE",
                 TaskState::Running,
-                next_batch,
-                Some(batches.len()),
+                translation_stage.next_batch(),
+                Some(translation_stage.len()),
                 resume.translation_batches_completed,
                 usage,
             );
             let pending = prepared
                 .iter()
-                .filter(|(_, _, batch)| !batch.is_empty())
-                .map(|(index, _, batch)| (*index + 1, batch.clone()))
+                .filter(|batch| !batch.pending.is_empty())
+                .map(|batch| (batch.index + 1, batch.pending.clone()))
                 .collect::<Vec<_>>();
             self.report_translation_window(
-                &batches,
-                next_batch,
+                translation_stage.batches(),
+                translation_stage.next_batch(),
                 pending.len(),
                 resume.translation_batches_completed,
                 usage,
@@ -300,30 +285,34 @@ where
                 &self.memory,
                 self.options.review_policy != ReviewPolicy::Off,
             )?;
-            for (batch_index, tm_hits, pending_batch) in prepared {
-                let batch = &batches[batch_index];
-                let new_lines = if pending_batch.is_empty() {
-                    Vec::new()
+            for prepared_batch in prepared {
+                let result = if prepared_batch.pending.is_empty() {
+                    None
                 } else {
-                    let br = generated.remove(&(batch_index + 1)).ok_or_else(|| {
-                        CoreError::Data(format!(
-                            "translation window omitted batch {}",
-                            batch_index + 1
-                        ))
-                    })?;
-                    usage.add(br.usage);
-                    self.dashboard.add_usage(br.usage);
-                    self.memory.update(&br.summary, &br.glossary_updates);
-                    br.lines
+                    Some(
+                        generated
+                            .remove(&(prepared_batch.index + 1))
+                            .ok_or_else(|| {
+                                CoreError::Data(format!(
+                                    "translation window omitted batch {}",
+                                    prepared_batch.index + 1
+                                ))
+                            })?,
+                    )
                 };
-                let merged = merge_translation_lines(batch, &tm_hits, &new_lines);
-                let translated_batch = apply_lines(batch, &merged);
-                self.translation_memory_hits += tm_hits.len();
+                let applied = translation_stage.apply(prepared_batch, result)?;
+                if let Some(result) = applied.result.as_ref() {
+                    usage.add(result.usage);
+                    self.dashboard.add_usage(result.usage);
+                    self.memory
+                        .update(&result.summary, &result.glossary_updates);
+                }
+                self.translation_memory_hits = translation_stage.memory_hits();
                 if self.options.use_cache {
                     update_translation_memory(
                         &mut self.translation_memory,
-                        batch,
-                        &translated_batch,
+                        &applied.source,
+                        &applied.translated,
                     );
                 }
 
@@ -339,8 +328,8 @@ where
                     store.save_glossary(&glossary_entries)?;
                     store.save_batch_segments(
                         BatchShardKind::Translated,
-                        batch_index + 1,
-                        &translated_batch,
+                        applied.index + 1,
+                        &applied.translated,
                     )?;
                     if self.options.use_cache {
                         let tm_entries: Vec<(String, String)> = self
@@ -352,10 +341,9 @@ where
                     }
                 }
 
-                translated_segments.extend(translated_batch);
                 self.cancellation.check()?;
                 self.save_run_state(
-                    batch_index + 1,
+                    applied.index + 1,
                     resume.review_batches_completed,
                     false,
                     usage,
@@ -363,26 +351,33 @@ where
                 self.report(
                     "TRANSLATE",
                     TaskState::Running,
-                    batch_index + 1,
-                    Some(batches.len()),
+                    applied.index + 1,
+                    Some(translation_stage.len()),
                     resume.translation_batches_completed,
                     usage,
                 );
             }
-            next_batch = window_end;
             self.report_translation_window(
-                &batches,
-                next_batch,
+                translation_stage.batches(),
+                translation_stage.next_batch(),
                 0,
                 resume.translation_batches_completed,
                 usage,
             );
         }
 
-        validate_full_alignment(&document.segments, &translated_segments)?;
+        validate_full_alignment(&document.segments, translation_stage.output())?;
         self.cancellation.check()?;
-        self.save_run_state(batches.len(), resume.review_batches_completed, true, usage)?;
+        self.save_run_state(
+            translation_stage.len(),
+            resume.review_batches_completed,
+            true,
+            usage,
+        )?;
         self.dashboard.mark_done("TRANSLATE");
+
+        let batches = translation_stage.batches().to_vec();
+        let translated_segments = translation_stage.finish();
 
         let mut review_stage = ReviewStage::new(
             &self.options,
@@ -1858,7 +1853,7 @@ fn validate_review_candidate_ids(
 }
 
 fn validate_window_terminology(
-    prepared: &[(usize, HashMap<String, String>, Vec<SubtitleSegment>)],
+    prepared: &[PreparedBatch],
     generated: &HashMap<usize, BatchWithUsage>,
     memory: &ContextMemory,
     defer_missing_to_review: bool,
@@ -1882,11 +1877,11 @@ fn validate_window_terminology(
                 .or_insert_with(|| entry.target.clone());
         }
     }
-    for (batch_index, _, source) in prepared {
-        let Some(result) = generated.get(&(*batch_index + 1)) else {
+    for batch in prepared {
+        let Some(result) = generated.get(&(batch.index + 1)) else {
             continue;
         };
-        for (segment, line) in source.iter().zip(&result.lines) {
+        for (segment, line) in batch.pending.iter().zip(&result.lines) {
             let source_lower = segment.text.to_lowercase();
             let translation_lower = line.translation.to_lowercase();
             for (term, target) in &canonical {
