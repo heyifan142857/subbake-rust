@@ -2,7 +2,7 @@
 
 SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写 CLI，也提供交互式终端 Agent。
 
-本项目从作者原有的 Python 项目 [heyifan142857/subbake](https://github.com/heyifan142857/subbake) 迁移而来。它重新设计了部分核心逻辑与命令，利用并发翻译提升处理速度，并在类型安全、资源占用、错误处理和单文件部署方面做了改进。
+本项目从原有的 Python 项目 [heyifan142857/subbake](https://github.com/heyifan142857/subbake) 迁移而来。它重新设计了部分核心逻辑与命令，利用并发翻译提升处理速度，并在类型安全、资源占用、错误处理和单文件部署方面做了改进。
 
 > 当前版本仍处于早期开发阶段，命令和配置格式可能继续调整。
 
