@@ -64,11 +64,13 @@ Remediation: introduce a top-level interaction-state enum whose variants carry o
 
 Completed: operation lifecycle is now represented by a typed `InteractionPhase` reducer. Cancellation requests and plan-mode rollback data exist only in the processing variant, repeated or idle cancellation is rejected by the transition API, and worker completion atomically returns the TUI to idle. Startup-only picker cancellation behavior now belongs to the session picker instead of an independent flag.
 
-### 8. Translation configuration is repeated mechanically
+### 8. Translation configuration is repeated mechanically — In progress
 
 The same fields are enumerated in patch merging, patch application, configuration parsing/writing, CLI parsing, defaults, and conversion into pipeline options. Compatibility fields such as `final_review` also rely on assignment order for precedence.
 
 Remediation: separate backend, translation-domain, runtime-storage, and CLI-output settings. Convert compatibility aliases once at the configuration boundary and centralize overlay semantics.
+
+Progress: the legacy `final_review` boolean is now converted to the canonical typed `ReviewPolicy` while parsing configuration. It no longer survives as parallel patch state or requires special precedence in patch merging and application. Settings ownership still needs separation by concern before this item is complete.
 
 ## Boundary and Legacy Issues
 

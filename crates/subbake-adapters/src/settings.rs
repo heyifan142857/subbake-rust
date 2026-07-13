@@ -99,9 +99,6 @@ impl TranslationSettingsPatch {
         if let Some(value) = other.review_policy {
             self.review_policy = Some(value);
         }
-        if let Some(value) = other.final_review {
-            self.final_review = Some(value);
-        }
         if let Some(value) = other.terminology_preflight {
             self.terminology_preflight = Some(value);
         }
@@ -152,7 +149,6 @@ pub struct TranslationSettingsPatch {
     pub review_concurrency: Option<usize>,
     pub bilingual: Option<bool>,
     pub fast_mode: Option<bool>,
-    pub final_review: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
     pub dry_run: Option<bool>,
@@ -260,13 +256,6 @@ impl TranslationSettings {
         }
         if let Some(value) = patch.fast_mode {
             self.fast_mode = value;
-        }
-        if let Some(value) = patch.final_review {
-            self.review_policy = if value {
-                ReviewPolicy::Targeted
-            } else {
-                ReviewPolicy::Off
-            };
         }
         if let Some(value) = patch.review_policy {
             self.review_policy = value;
@@ -428,7 +417,7 @@ mod tests {
         let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
             provider: Some("openai".to_owned()),
             batch_size: Some(12),
-            final_review: Some(false),
+            review_policy: Some(ReviewPolicy::Off),
             ..TranslationSettingsPatch::default()
         });
 

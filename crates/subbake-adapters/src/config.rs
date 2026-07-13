@@ -106,7 +106,6 @@ fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPa
     usize_setting!("review_concurrency", settings.review_concurrency);
     bool_setting!("bilingual", settings.bilingual);
     bool_setting!("fast_mode", settings.fast_mode);
-    bool_setting!("final_review", settings.final_review);
     if let Some(value) = settings.review_policy {
         string_setting!("review_policy", Some(value.as_str().to_owned()));
     }
@@ -349,7 +348,15 @@ fn apply_key_value(
         "review_concurrency" => patch.review_concurrency = Some(value.into_usize(key)?),
         "bilingual" => patch.bilingual = Some(value.into_bool(key)?),
         "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
-        "final_review" => patch.final_review = Some(value.into_bool(key)?),
+        // Normalize the legacy boolean at the configuration boundary. All
+        // downstream overlay and application code sees one canonical field.
+        "final_review" => {
+            patch.review_policy = Some(if value.into_bool(key)? {
+                subbake_core::ReviewPolicy::Targeted
+            } else {
+                subbake_core::ReviewPolicy::Off
+            });
+        }
         "review" | "review_policy" => {
             patch.review_policy = Some(subbake_core::ReviewPolicy::parse(&value.into_string(key)?)?)
         }
@@ -516,7 +523,7 @@ mod tests {
         assert_eq!(patch.target_language.as_deref(), Some("English"));
         assert_eq!(patch.batch_size, Some(8));
         assert_eq!(patch.bilingual, Some(true));
-        assert_eq!(patch.final_review, Some(false));
+        assert_eq!(patch.review_policy, Some(subbake_core::ReviewPolicy::Off));
         assert_eq!(patch.resume, Some(false));
         assert_eq!(patch.use_cache, Some(false));
         assert_eq!(patch.retries, Some(0));
