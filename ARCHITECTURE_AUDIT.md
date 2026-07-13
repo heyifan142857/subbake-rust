@@ -38,13 +38,15 @@ Completed: every `RuntimeStore` write operation is now a required trait method, 
 
 ## Priority 2
 
-### 5. Core pipeline, agent decision logic, and TUI are oversized orchestrators
+### 5. Core pipeline, agent decision logic, and TUI are oversized orchestrators — In progress
 
 - `subbake-core/src/pipeline.rs` combines batching, terminology, translation, review, retries, splitting, caching, resume, translation memory, logging, and progress.
 - `subbake-agent/src/decision.rs` combines the decision loop, quick paths, tool execution, profile handling, diagnostics, translation/transcription orchestration, and presentation text.
 - `subbake-agent/src/tui.rs` combines terminal ownership, interaction state, key routing, rendering, pickers, and worker communication.
 
 Remediation: extract cohesive stage services and typed state reducers while retaining a small orchestration entry point. Split by responsibility rather than file length alone.
+
+Progress: batch sizing and dry-run descriptions now belong to a typed core `BatchPlanner`; deterministic agent intent/discovery classification is isolated from the decision loop; and TUI progress rendering is separated from terminal ownership and event routing. The remaining translation/review stages, tool execution branches, and interaction reducer still need extraction before this item is complete.
 
 ### 6. Agent tools have multiple parallel registries
 

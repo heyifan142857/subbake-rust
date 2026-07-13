@@ -4,9 +4,9 @@ use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, FailureLog, GlossaryEntry,
-    PipelineOptions, PipelineResult, ReviewChange, ReviewPolicy, ReviewReport, ReviewStats,
-    SplitRetryLog, SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, TerminologyStats,
+    AgentLog, AgentRepairRecord, AttemptLog, FailureLog, GlossaryEntry, PipelineOptions,
+    PipelineResult, ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog,
+    SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, TerminologyStats,
     TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
@@ -30,6 +30,10 @@ use crate::storage::{
     build_translation_fingerprint,
 };
 use crate::validation::{validate_full_alignment, validate_translation_batch};
+
+mod planning;
+
+use planning::BatchPlanner;
 
 pub struct SubtitlePipeline<B, D> {
     backend: B,
@@ -167,12 +171,9 @@ where
             self.memory.load_glossary(&entries);
         }
 
-        let batches = chunk_segments_by_budget(
-            &document.segments,
-            self.options.batch_size,
-            self.options.batch_token_budget,
-        );
-        let planned_batches = build_batch_plan(&batches);
+        let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
+            .split(&document.segments);
+        let planned_batches = BatchPlanner::describe(&batches);
         let state_path = self
             .store
             .as_ref()
@@ -1884,52 +1885,6 @@ fn is_agent_repairable(error: &CoreError) -> bool {
     }
 }
 
-fn chunk_segments(segments: &[SubtitleSegment], batch_size: usize) -> Vec<Vec<SubtitleSegment>> {
-    segments
-        .chunks(batch_size)
-        .map(<[SubtitleSegment]>::to_vec)
-        .collect()
-}
-
-fn chunk_segments_by_budget(
-    segments: &[SubtitleSegment],
-    max_batch_size: usize,
-    token_budget: usize,
-) -> Vec<Vec<SubtitleSegment>> {
-    if token_budget == 0 {
-        return chunk_segments(segments, max_batch_size);
-    }
-    let mut batches = Vec::new();
-    let mut current = Vec::new();
-    let mut tokens = 0usize;
-    for segment in segments {
-        let estimate = estimated_text_tokens(&segment.text).saturating_add(8);
-        if !current.is_empty()
-            && (current.len() >= max_batch_size || tokens.saturating_add(estimate) > token_budget)
-        {
-            batches.push(std::mem::take(&mut current));
-            tokens = 0;
-        }
-        current.push(segment.clone());
-        tokens = tokens.saturating_add(estimate);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    batches
-}
-
-fn estimated_text_tokens(text: &str) -> usize {
-    let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |(ascii, other), ch| {
-        if ch.is_ascii() {
-            (ascii + 1, other)
-        } else {
-            (ascii, other + 1)
-        }
-    });
-    ascii.div_ceil(4).saturating_add(non_ascii)
-}
-
 fn merge_review_patch(
     translated: &[SubtitleSegment],
     changes: &[TranslationLine],
@@ -2029,23 +1984,6 @@ fn validate_window_terminology(
         }
     }
     Ok(())
-}
-
-fn build_batch_plan(batches: &[Vec<SubtitleSegment>]) -> Vec<BatchPlanEntry> {
-    batches
-        .iter()
-        .enumerate()
-        .filter_map(|(index, batch)| {
-            let first = batch.first()?;
-            let last = batch.last()?;
-            Some(BatchPlanEntry {
-                index: index + 1,
-                size: batch.len(),
-                first_id: first.id.clone(),
-                last_id: last.id.clone(),
-            })
-        })
-        .collect()
 }
 
 fn apply_lines(source: &[SubtitleSegment], lines: &[TranslationLine]) -> Vec<SubtitleSegment> {
@@ -3167,7 +3105,7 @@ mod tests {
     #[test]
     fn token_budget_batches_short_and_long_segments_deterministically() {
         let segments = document("budget.txt", &["one", "two", &"x".repeat(80)]).segments;
-        let batches = chunk_segments_by_budget(&segments, 80, 20);
+        let batches = BatchPlanner::new(80, 20).split(&segments);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1]);
     }
 
