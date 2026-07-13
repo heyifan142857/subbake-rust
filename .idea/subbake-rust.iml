@@ -8,6 +8,9 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/subbake-cli/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/subbake-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/subbake-core/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/.subbake" />
+      <excludeFolder url="file://$MODULE_DIR$/crates/subbake-adapters/.subbake" />
+      <excludeFolder url="file://$MODULE_DIR$/crates/subbake-cli/.subbake" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
