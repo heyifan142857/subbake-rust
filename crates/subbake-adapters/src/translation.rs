@@ -87,7 +87,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         None => default_output_path(
             &request.input_path,
             request.settings.output_format(),
-            request.settings.bilingual,
+            request.settings.output.bilingual,
         )?,
     };
 
@@ -103,9 +103,9 @@ pub fn translate_subtitle_cancellable_with_progress(
         &stable_input_path,
         request.settings.runtime_dir(),
         request.settings.glossary_path(),
-        &request.settings.source_language,
-        &request.settings.target_language,
-        request.settings.fast_mode,
+        &request.settings.translation.source_language,
+        &request.settings.translation.target_language,
+        request.settings.translation.fast_mode,
     );
     let store = FileRuntimeStore::new(paths);
     store.ensure_layout().map_err(io::Error::other)?;
@@ -137,7 +137,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         }
     };
 
-    if request.settings.dry_run {
+    if request.settings.translation.dry_run {
         let mut event = subbake_core::ProgressEvent::running(
             subbake_core::TaskKind::Translation,
             "DRY_RUN",
@@ -154,8 +154,8 @@ pub fn translate_subtitle_cancellable_with_progress(
     }
 
     let render_options = RenderOptions::new(
-        request.settings.bilingual,
-        request.settings.output_format.clone(),
+        request.settings.output.bilingual,
+        request.settings.output.format.clone(),
     );
     check_cancelled(cancellation)?;
     render_and_write_document(
@@ -213,9 +213,9 @@ pub fn translate_subtitle_batch_with_progress(
         let output_path = default_output_path(
             &input_path,
             request.settings.output_format(),
-            request.settings.bilingual,
+            request.settings.output.bilingual,
         )?;
-        if output_path.exists() && !request.overwrite && !request.settings.dry_run {
+        if output_path.exists() && !request.overwrite && !request.settings.translation.dry_run {
             skipped.push(input_path);
             continue;
         }
@@ -316,11 +316,9 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
 
-        let mut settings = TranslationSettings {
-            target_language: "en".to_owned(),
-            ..TranslationSettings::default()
-        };
-        settings.review_policy = subbake_core::ReviewPolicy::Off;
+        let mut settings = TranslationSettings::default();
+        settings.translation.target_language = "en".to_owned();
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         let outcome = translate_subtitle(TranslationRequest {
             input_path: input_path.clone(),
             output_path: None,
@@ -342,10 +340,8 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
         let output_path = root.join("custom.txt");
-        let settings = TranslationSettings {
-            dry_run: true,
-            ..TranslationSettings::default()
-        };
+        let mut settings = TranslationSettings::default();
+        settings.translation.dry_run = true;
 
         let outcome = translate_subtitle(TranslationRequest {
             input_path,

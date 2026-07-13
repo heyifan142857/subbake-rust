@@ -38,7 +38,10 @@ pub use runtime::{
     run_runtime,
 };
 pub use runtime_store::FileRuntimeStore;
-pub use settings::{TranslationSettings, TranslationSettingsPatch};
+pub use settings::{
+    BackendSettings, OutputSettings, RuntimeSettings, TranslationDomainSettings,
+    TranslationSettings, TranslationSettingsPatch,
+};
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{
     TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest, TranscriptionSettings,

@@ -9,7 +9,20 @@ use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationSettings {
-    pub output_format: Option<String>,
+    pub output: OutputSettings,
+    pub backend: BackendSettings,
+    pub translation: TranslationDomainSettings,
+    pub runtime: RuntimeSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSettings {
+    pub format: Option<String>,
+    pub bilingual: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendSettings {
     pub provider: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -19,13 +32,16 @@ pub struct TranslationSettings {
     pub api_key_env: Option<String>,
     pub auth_header: Option<String>,
     pub auth_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationDomainSettings {
     pub source_language: String,
     pub target_language: String,
     pub batch_size: usize,
     pub batch_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
-    pub bilingual: bool,
     pub fast_mode: bool,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
@@ -35,6 +51,10 @@ pub struct TranslationSettings {
     pub retries: usize,
     pub agent: bool,
     pub agent_repair_attempts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeSettings {
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -164,34 +184,42 @@ pub struct TranslationSettingsPatch {
 impl Default for TranslationSettings {
     fn default() -> Self {
         Self {
-            output_format: None,
-            provider: "mock".to_owned(),
-            model: "mock-zh".to_owned(),
-            api_key: None,
-            base_url: None,
-            api_format: None,
-            endpoint_url: None,
-            api_key_env: None,
-            auth_header: None,
-            auth_prefix: None,
-            source_language: "Auto".to_owned(),
-            target_language: "zh-Hans".to_owned(),
-            batch_size: DEFAULT_BATCH_SIZE,
-            batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
-            translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
-            review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
-            bilingual: false,
-            fast_mode: false,
-            review_policy: ReviewPolicy::Off,
-            terminology_preflight: true,
-            dry_run: false,
-            resume: true,
-            use_cache: true,
-            retries: 2,
-            agent: true,
-            agent_repair_attempts: 2,
-            runtime_dir: None,
-            glossary_path: None,
+            output: OutputSettings {
+                format: None,
+                bilingual: false,
+            },
+            backend: BackendSettings {
+                provider: "mock".to_owned(),
+                model: "mock-zh".to_owned(),
+                api_key: None,
+                base_url: None,
+                api_format: None,
+                endpoint_url: None,
+                api_key_env: None,
+                auth_header: None,
+                auth_prefix: None,
+            },
+            translation: TranslationDomainSettings {
+                source_language: "Auto".to_owned(),
+                target_language: "zh-Hans".to_owned(),
+                batch_size: DEFAULT_BATCH_SIZE,
+                batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
+                translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
+                review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
+                fast_mode: false,
+                review_policy: ReviewPolicy::Off,
+                terminology_preflight: true,
+                dry_run: false,
+                resume: true,
+                use_cache: true,
+                retries: 2,
+                agent: true,
+                agent_repair_attempts: 2,
+            },
+            runtime: RuntimeSettings {
+                runtime_dir: None,
+                glossary_path: None,
+            },
         }
     }
 }
@@ -204,106 +232,107 @@ impl TranslationSettings {
 
     pub fn apply_patch(&mut self, patch: TranslationSettingsPatch) {
         if let Some(value) = patch.output_format {
-            self.output_format = Some(value);
+            self.output.format = Some(value);
         }
         if let Some(value) = patch.provider {
-            self.provider = value;
+            self.backend.provider = value;
         }
         if let Some(value) = patch.model {
-            self.model = value;
+            self.backend.model = value;
         }
         if let Some(value) = patch.api_key {
-            self.api_key = Some(value);
+            self.backend.api_key = Some(value);
         }
         if let Some(value) = patch.base_url {
-            self.base_url = Some(value);
+            self.backend.base_url = Some(value);
         }
         if let Some(value) = patch.api_format {
-            self.api_format = Some(value);
+            self.backend.api_format = Some(value);
         }
         if let Some(value) = patch.endpoint_url {
-            self.endpoint_url = Some(value);
+            self.backend.endpoint_url = Some(value);
         }
         if let Some(value) = patch.api_key_env {
-            self.api_key_env = Some(value);
+            self.backend.api_key_env = Some(value);
         }
         if let Some(value) = patch.auth_header {
-            self.auth_header = Some(value);
+            self.backend.auth_header = Some(value);
         }
         if let Some(value) = patch.auth_prefix {
-            self.auth_prefix = Some(value);
+            self.backend.auth_prefix = Some(value);
         }
         if let Some(value) = patch.source_language {
-            self.source_language = value;
+            self.translation.source_language = value;
         }
         if let Some(value) = patch.target_language {
-            self.target_language = value;
+            self.translation.target_language = value;
         }
         if let Some(value) = patch.batch_size {
-            self.batch_size = value;
+            self.translation.batch_size = value;
         }
         if let Some(value) = patch.batch_token_budget {
-            self.batch_token_budget = value;
+            self.translation.batch_token_budget = value;
         }
         if let Some(value) = patch.translation_concurrency {
-            self.translation_concurrency = value;
+            self.translation.translation_concurrency = value;
         }
         if let Some(value) = patch.review_concurrency {
-            self.review_concurrency = value;
+            self.translation.review_concurrency = value;
         }
         if let Some(value) = patch.bilingual {
-            self.bilingual = value;
+            self.output.bilingual = value;
         }
         if let Some(value) = patch.fast_mode {
-            self.fast_mode = value;
+            self.translation.fast_mode = value;
         }
         if let Some(value) = patch.review_policy {
-            self.review_policy = value;
+            self.translation.review_policy = value;
         }
         if let Some(value) = patch.terminology_preflight {
-            self.terminology_preflight = value;
+            self.translation.terminology_preflight = value;
         }
         if let Some(value) = patch.dry_run {
-            self.dry_run = value;
+            self.translation.dry_run = value;
         }
         if let Some(value) = patch.resume {
-            self.resume = value;
+            self.translation.resume = value;
         }
         if let Some(value) = patch.use_cache {
-            self.use_cache = value;
+            self.translation.use_cache = value;
         }
         if let Some(value) = patch.retries {
-            self.retries = value;
+            self.translation.retries = value;
         }
         if let Some(value) = patch.agent {
-            self.agent = value;
+            self.translation.agent = value;
         }
         if let Some(value) = patch.agent_repair_attempts {
-            self.agent_repair_attempts = value;
+            self.translation.agent_repair_attempts = value;
         }
         if let Some(value) = patch.runtime_dir {
-            self.runtime_dir = Some(value);
+            self.runtime.runtime_dir = Some(value);
         }
         if let Some(value) = patch.glossary_path {
-            self.glossary_path = Some(value);
+            self.runtime.glossary_path = Some(value);
         }
     }
 
     pub fn backend_config(&self) -> BackendConfig {
         BackendConfig {
-            id: self.provider.clone(),
-            provider: self.provider.clone(),
-            display_name: self.provider.clone(),
+            id: self.backend.provider.clone(),
+            provider: self.backend.provider.clone(),
+            display_name: self.backend.provider.clone(),
             api_format: self
+                .backend
                 .api_format
-                .or_else(|| legacy_api_format(&self.provider)),
-            model: self.model.clone(),
-            api_key: self.api_key.clone(),
-            api_key_env: self.api_key_env.clone(),
-            base_url: self.base_url.clone(),
-            endpoint_url: self.endpoint_url.clone(),
-            auth_header: self.auth_header.clone(),
-            auth_prefix: self.auth_prefix.clone(),
+                .or_else(|| legacy_api_format(&self.backend.provider)),
+            model: self.backend.model.clone(),
+            api_key: self.backend.api_key.clone(),
+            api_key_env: self.backend.api_key_env.clone(),
+            base_url: self.backend.base_url.clone(),
+            endpoint_url: self.backend.endpoint_url.clone(),
+            auth_header: self.backend.auth_header.clone(),
+            auth_prefix: self.backend.auth_prefix.clone(),
         }
     }
 
@@ -314,45 +343,45 @@ impl TranslationSettings {
     ) -> PipelineOptions {
         let mut options = PipelineOptions::new(input_path.into());
         options.output_path = output_path;
-        options.output_format = self.output_format.clone();
-        options.provider = self.provider.clone();
-        options.model = self.model.clone();
+        options.output_format = self.output.format.clone();
+        options.provider = self.backend.provider.clone();
+        options.model = self.backend.model.clone();
         options.provider_fingerprint = self.provider_fingerprint();
-        options.source_language = self.source_language.clone();
-        options.target_language = self.target_language.clone();
-        options.batch_size = self.batch_size;
-        options.batch_token_budget = self.batch_token_budget;
-        options.translation_concurrency = self.translation_concurrency;
-        options.review_concurrency = self.review_concurrency;
-        options.bilingual = self.bilingual;
-        options.fast_mode = self.fast_mode;
-        options.review_policy = self.review_policy;
-        options.terminology_preflight = self.terminology_preflight;
-        options.dry_run = self.dry_run;
-        options.resume = self.resume;
-        options.use_cache = self.use_cache;
-        options.retries = self.retries;
-        options.agent = self.agent;
-        options.agent_repair_attempts = self.agent_repair_attempts;
-        options.runtime_dir = self.runtime_dir.clone();
-        options.glossary_path = self.glossary_path.clone();
+        options.source_language = self.translation.source_language.clone();
+        options.target_language = self.translation.target_language.clone();
+        options.batch_size = self.translation.batch_size;
+        options.batch_token_budget = self.translation.batch_token_budget;
+        options.translation_concurrency = self.translation.translation_concurrency;
+        options.review_concurrency = self.translation.review_concurrency;
+        options.bilingual = self.output.bilingual;
+        options.fast_mode = self.translation.fast_mode;
+        options.review_policy = self.translation.review_policy;
+        options.terminology_preflight = self.translation.terminology_preflight;
+        options.dry_run = self.translation.dry_run;
+        options.resume = self.translation.resume;
+        options.use_cache = self.translation.use_cache;
+        options.retries = self.translation.retries;
+        options.agent = self.translation.agent;
+        options.agent_repair_attempts = self.translation.agent_repair_attempts;
+        options.runtime_dir = self.runtime.runtime_dir.clone();
+        options.glossary_path = self.runtime.glossary_path.clone();
         options
     }
 
     pub fn output_format(&self) -> Option<&str> {
-        self.output_format.as_deref()
+        self.output.format.as_deref()
     }
 
     pub fn runtime_dir(&self) -> Option<&Path> {
-        self.runtime_dir.as_deref()
+        self.runtime.runtime_dir.as_deref()
     }
 
     pub fn glossary_path(&self) -> Option<&Path> {
-        self.glossary_path.as_deref()
+        self.runtime.glossary_path.as_deref()
     }
 
     fn provider_fingerprint(&self) -> Option<String> {
-        if self.provider.eq_ignore_ascii_case("mock") {
+        if self.backend.provider.eq_ignore_ascii_case("mock") {
             return None;
         }
         let config = self.backend_config();
@@ -376,27 +405,25 @@ mod tests {
     fn defaults_match_current_cli_behavior() {
         let settings = TranslationSettings::default();
 
-        assert_eq!(settings.provider, "mock");
-        assert_eq!(settings.model, "mock-zh");
-        assert_eq!(settings.source_language, "Auto");
-        assert_eq!(settings.target_language, "zh-Hans");
-        assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
-        assert_eq!(settings.review_policy, ReviewPolicy::Off);
-        assert!(settings.resume);
-        assert!(settings.use_cache);
-        assert_eq!(settings.retries, 2);
-        assert!(settings.agent);
-        assert_eq!(settings.agent_repair_attempts, 2);
+        assert_eq!(settings.backend.provider, "mock");
+        assert_eq!(settings.backend.model, "mock-zh");
+        assert_eq!(settings.translation.source_language, "Auto");
+        assert_eq!(settings.translation.target_language, "zh-Hans");
+        assert_eq!(settings.translation.batch_size, DEFAULT_BATCH_SIZE);
+        assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
+        assert!(settings.translation.resume);
+        assert!(settings.translation.use_cache);
+        assert_eq!(settings.translation.retries, 2);
+        assert!(settings.translation.agent);
+        assert_eq!(settings.translation.agent_repair_attempts, 2);
     }
 
     #[test]
     fn builds_pipeline_options_from_settings() {
-        let mut settings = TranslationSettings {
-            target_language: "English".to_owned(),
-            bilingual: true,
-            ..TranslationSettings::default()
-        };
-        settings.output_format = Some("txt".to_owned());
+        let mut settings = TranslationSettings::default();
+        settings.translation.target_language = "English".to_owned();
+        settings.output.bilingual = true;
+        settings.output.format = Some("txt".to_owned());
 
         let options = settings.to_pipeline_options("clip.srt", Some("out.txt".into()));
 
@@ -419,20 +446,18 @@ mod tests {
             ..TranslationSettingsPatch::default()
         });
 
-        assert_eq!(settings.provider, "openai");
-        assert_eq!(settings.batch_size, 12);
-        assert_eq!(settings.review_policy, ReviewPolicy::Off);
+        assert_eq!(settings.backend.provider, "openai");
+        assert_eq!(settings.translation.batch_size, 12);
+        assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
     }
 
     #[test]
     fn builds_backend_config_with_api_key_sources() {
-        let settings = TranslationSettings {
-            provider: "openai".to_owned(),
-            model: "gpt".to_owned(),
-            api_key: Some("direct-key".to_owned()),
-            base_url: Some("https://example.test/v1".to_owned()),
-            ..TranslationSettings::default()
-        };
+        let mut settings = TranslationSettings::default();
+        settings.backend.provider = "openai".to_owned();
+        settings.backend.model = "gpt".to_owned();
+        settings.backend.api_key = Some("direct-key".to_owned());
+        settings.backend.base_url = Some("https://example.test/v1".to_owned());
 
         let config = settings.backend_config();
 

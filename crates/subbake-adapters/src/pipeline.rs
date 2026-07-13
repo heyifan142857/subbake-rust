@@ -89,11 +89,9 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
-        let settings = TranslationSettings {
-            target_language: "en".to_owned(),
-            review_policy: subbake_core::ReviewPolicy::Off,
-            ..TranslationSettings::default()
-        };
+        let mut settings = TranslationSettings::default();
+        settings.translation.target_language = "en".to_owned();
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
 
         let outcome = run_pipeline(PipelineRequest {
             input_path,

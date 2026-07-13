@@ -74,13 +74,13 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         .is_some_and(|session| session.mode == "plan");
     let mut tui = SubBakeTui::new()?;
     tui.set_startup_info(StartupInfo {
-        provider: startup_settings.provider,
-        model: startup_settings.model,
+        provider: startup_settings.backend.provider,
+        model: startup_settings.backend.model,
         config: config_path
             .as_deref()
             .map(display_config_path)
             .unwrap_or_else(|| "Not configured".to_owned()),
-        cache_enabled: startup_settings.use_cache,
+        cache_enabled: startup_settings.translation.use_cache,
         cwd: project_root.to_string_lossy().into_owned(),
     });
     tui.set_has_config_file(config_path.is_some());
@@ -224,7 +224,9 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                 .session
                 .as_ref()
                 .and_then(|session| session.profile.as_deref());
-            let model = resolved_settings(config_path.as_deref(), profile)?.model;
+            let model = resolved_settings(config_path.as_deref(), profile)?
+                .backend
+                .model;
             Ok(TuiInteraction::SessionChanged {
                 input_history: engine.input_history(),
                 events: engine.session_events(),
@@ -252,7 +254,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                 .and_then(|session| session.profile.as_deref());
             let settings = resolved_settings(config_path.as_deref(), profile)?;
             Ok(TuiInteraction::ModelChanged {
-                model: settings.model,
+                model: settings.backend.model,
                 message: result,
             })
         } else if let Some(options) = session_options {
@@ -309,7 +311,7 @@ fn build_agent_decision_backend(
         settings.apply_patch(patch);
     }
 
-    if settings.provider == "mock" {
+    if settings.backend.provider == "mock" {
         return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
     }
 

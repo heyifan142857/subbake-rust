@@ -557,7 +557,7 @@ impl AgentEngine {
         let settings = self.active_translation_settings()?;
         Ok(format!(
             "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
-            settings.provider, settings.model
+            settings.backend.provider, settings.backend.model
         ))
     }
 
@@ -586,8 +586,8 @@ impl AgentEngine {
                 let settings = self.settings_for_profile(&config, Some(name));
                 ProfileChoice {
                     name: name.clone(),
-                    provider: settings.provider,
-                    model: settings.model,
+                    provider: settings.backend.provider,
+                    model: settings.backend.model,
                     active: active == Some(name.as_str()),
                     create: false,
                 }

@@ -58,7 +58,7 @@ pub fn edit_subtitle_cancellable(
         &document.segments,
         source_document.as_ref().map(|doc| doc.segments.as_slice()),
         &request.instruction,
-        &request.settings.target_language,
+        &request.settings.translation.target_language,
     )
     .map_err(io::Error::other)?;
 

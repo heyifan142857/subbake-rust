@@ -238,14 +238,14 @@ pub(crate) fn execute_translation_tool(
     mut settings: TranslationSettings,
 ) -> io::Result<Option<TranslationToolOutcome>> {
     if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
-        settings.bilingual = bilingual;
+        settings.output.bilingual = bilingual;
     }
 
     let outcome = match executor {
         ToolExecutor::TranslateFile => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
             let output_path =
-                default_output_path(&input, settings.output_format(), settings.bilingual)?;
+                default_output_path(&input, settings.output_format(), settings.output.bilingual)?;
             let undo_snapshot = guard.snapshot_write(&output_path)?;
             let request = TranslationRequest {
                 input_path: input,
@@ -296,8 +296,11 @@ pub(crate) fn execute_translation_tool(
                 .filter(|path| path.is_file() && is_supported_subtitle_path(path))
                 .filter(|path| !is_generated_subtitle(path))
             {
-                let output =
-                    default_output_path(&source, settings.output_format(), settings.bilingual)?;
+                let output = default_output_path(
+                    &source,
+                    settings.output_format(),
+                    settings.output.bilingual,
+                )?;
                 if overwrite || !output.exists() {
                     undo_snapshots.push((output.clone(), guard.snapshot_write(&output)?));
                 }
@@ -416,7 +419,7 @@ pub(crate) fn execute_session_tool(
             SessionToolOutcome {
                 text: format!(
                     "Profile switched: {name} ({}/{})",
-                    settings.provider, settings.model
+                    settings.backend.provider, settings.backend.model
                 ),
                 profile_switch: Some(ProfileSwitch { name, config_path }),
             }

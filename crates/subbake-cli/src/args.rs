@@ -527,49 +527,66 @@ fn parse_translation_setting_option(
     settings: &mut TranslationSettings,
 ) -> io::Result<bool> {
     match option {
-        "--output-format" => settings.output_format = Some(required_value(args, index, option)?),
-        "--provider" => settings.provider = required_value(args, index, option)?,
-        "--model" => settings.model = required_value(args, index, option)?,
-        "--api-key" => settings.api_key = Some(required_value(args, index, option)?),
-        "--base-url" => settings.base_url = Some(required_value(args, index, option)?),
+        "--output-format" => settings.output.format = Some(required_value(args, index, option)?),
+        "--provider" => settings.backend.provider = required_value(args, index, option)?,
+        "--model" => settings.backend.model = required_value(args, index, option)?,
+        "--api-key" => settings.backend.api_key = Some(required_value(args, index, option)?),
+        "--base-url" => settings.backend.base_url = Some(required_value(args, index, option)?),
         "--api-format" => {
-            settings.api_format = Some(
+            settings.backend.api_format = Some(
                 ApiFormat::parse(&required_value(args, index, option)?)
                     .map_err(io::Error::other)?,
             )
         }
-        "--endpoint-url" => settings.endpoint_url = Some(required_value(args, index, option)?),
-        "--api-key-env" => settings.api_key_env = Some(required_value(args, index, option)?),
-        "--auth-header" => settings.auth_header = Some(required_value(args, index, option)?),
-        "--auth-prefix" => settings.auth_prefix = Some(required_value(args, index, option)?),
-        "--source-lang" => settings.source_language = required_value(args, index, option)?,
-        "--target-lang" => settings.target_language = required_value(args, index, option)?,
-        "--batch-size" => settings.batch_size = parse_batch_size(args, index)?,
-        "--batch-token-budget" => settings.batch_token_budget = parse_batch_size(args, index)?,
-        "--translation-concurrency" => {
-            settings.translation_concurrency = parse_batch_size(args, index)?
+        "--endpoint-url" => {
+            settings.backend.endpoint_url = Some(required_value(args, index, option)?)
         }
-        "--review-concurrency" => settings.review_concurrency = parse_batch_size(args, index)?,
-        "--runtime-dir" => settings.runtime_dir = Some(required_path(args, index, option)?),
-        "--glossary" => settings.glossary_path = Some(required_path(args, index, option)?),
-        "--bilingual" => settings.bilingual = true,
-        "--fast" => settings.fast_mode = true,
-        "--no-review" => settings.review_policy = subbake_core::ReviewPolicy::Off,
+        "--api-key-env" => {
+            settings.backend.api_key_env = Some(required_value(args, index, option)?)
+        }
+        "--auth-header" => {
+            settings.backend.auth_header = Some(required_value(args, index, option)?)
+        }
+        "--auth-prefix" => {
+            settings.backend.auth_prefix = Some(required_value(args, index, option)?)
+        }
+        "--source-lang" => {
+            settings.translation.source_language = required_value(args, index, option)?
+        }
+        "--target-lang" => {
+            settings.translation.target_language = required_value(args, index, option)?
+        }
+        "--batch-size" => settings.translation.batch_size = parse_batch_size(args, index)?,
+        "--batch-token-budget" => {
+            settings.translation.batch_token_budget = parse_batch_size(args, index)?
+        }
+        "--translation-concurrency" => {
+            settings.translation.translation_concurrency = parse_batch_size(args, index)?
+        }
+        "--review-concurrency" => {
+            settings.translation.review_concurrency = parse_batch_size(args, index)?
+        }
+        "--runtime-dir" => settings.runtime.runtime_dir = Some(required_path(args, index, option)?),
+        "--glossary" => settings.runtime.glossary_path = Some(required_path(args, index, option)?),
+        "--bilingual" => settings.output.bilingual = true,
+        "--fast" => settings.translation.fast_mode = true,
+        "--no-review" => settings.translation.review_policy = subbake_core::ReviewPolicy::Off,
         "--review" => {
-            settings.review_policy =
+            settings.translation.review_policy =
                 subbake_core::ReviewPolicy::parse(&required_value(args, index, option)?)
                     .map_err(io::Error::other)?
         }
-        "--dry-run" => settings.dry_run = true,
-        "--resume" => settings.resume = true,
-        "--no-resume" => settings.resume = false,
-        "--cache" => settings.use_cache = true,
-        "--no-cache" => settings.use_cache = false,
-        "--retries" => settings.retries = parse_nonnegative_usize(args, index, option)?,
-        "--agent" => settings.agent = true,
-        "--no-agent" => settings.agent = false,
+        "--dry-run" => settings.translation.dry_run = true,
+        "--resume" => settings.translation.resume = true,
+        "--no-resume" => settings.translation.resume = false,
+        "--cache" => settings.translation.use_cache = true,
+        "--no-cache" => settings.translation.use_cache = false,
+        "--retries" => settings.translation.retries = parse_nonnegative_usize(args, index, option)?,
+        "--agent" => settings.translation.agent = true,
+        "--no-agent" => settings.translation.agent = false,
         "--agent-repair-attempts" => {
-            settings.agent_repair_attempts = parse_nonnegative_usize(args, index, option)?
+            settings.translation.agent_repair_attempts =
+                parse_nonnegative_usize(args, index, option)?
         }
         _ => return Ok(false),
     }
@@ -634,11 +651,11 @@ mod tests {
         ];
         let parsed = parse_translate_args(&args).expect("translate args should parse");
 
-        assert!(!parsed.settings.resume);
-        assert!(!parsed.settings.use_cache);
-        assert_eq!(parsed.settings.retries, 0);
-        assert!(!parsed.settings.agent);
-        assert_eq!(parsed.settings.agent_repair_attempts, 3);
+        assert!(!parsed.settings.translation.resume);
+        assert!(!parsed.settings.translation.use_cache);
+        assert_eq!(parsed.settings.translation.retries, 0);
+        assert!(!parsed.settings.translation.agent);
+        assert_eq!(parsed.settings.translation.agent_repair_attempts, 3);
     }
 
     #[test]
@@ -656,12 +673,12 @@ mod tests {
         ];
         let parsed = parse_translate_args(&args).expect("translation options");
         assert_eq!(
-            parsed.settings.review_policy,
+            parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Full
         );
-        assert_eq!(parsed.settings.translation_concurrency, 3);
-        assert_eq!(parsed.settings.review_concurrency, 2);
-        assert_eq!(parsed.settings.batch_token_budget, 1_800);
+        assert_eq!(parsed.settings.translation.translation_concurrency, 3);
+        assert_eq!(parsed.settings.translation.review_concurrency, 2);
+        assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
     }
 
     #[test]
@@ -689,7 +706,7 @@ mod tests {
         let parsed = parse_batch_args(&args).expect("batch args should parse");
 
         assert!(parsed.recursive);
-        assert!(parsed.translate.settings.bilingual);
+        assert!(parsed.translate.settings.output.bilingual);
     }
 
     #[test]
@@ -781,8 +798,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(parsed.profile.as_deref(), Some("zh"));
-        assert_eq!(parsed.translate.settings.target_language, "Chinese");
-        assert_eq!(parsed.translate.settings.batch_size, 7);
+        assert_eq!(
+            parsed.translate.settings.translation.target_language,
+            "Chinese"
+        );
+        assert_eq!(parsed.translate.settings.translation.batch_size, 7);
     }
 
     #[test]
@@ -814,9 +834,9 @@ mod tests {
         let parsed = parse_translate_args(&args).expect("translate args should parse");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(parsed.settings.target_language, "English");
-        assert_eq!(parsed.settings.batch_size, 9);
-        assert!(parsed.settings.bilingual);
+        assert_eq!(parsed.settings.translation.target_language, "English");
+        assert_eq!(parsed.settings.translation.batch_size, 9);
+        assert!(parsed.settings.output.bilingual);
     }
 
     #[test]
@@ -841,7 +861,7 @@ mod tests {
         assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
         assert!(parsed.json);
         assert_eq!(
-            parsed.settings.review_policy,
+            parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Off
         );
         assert_eq!(parsed.transcription_settings.provider, "whisper_cpp");
