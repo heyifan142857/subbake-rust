@@ -133,7 +133,7 @@ Options:
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format
       --bilingual                  Include source and translated text
-      --review <POLICY>            Review policy
+      --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
       --fast                       Enable fast mode
       --dry-run                    Prepare work without provider calls

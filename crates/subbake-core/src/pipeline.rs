@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, FailureLog, GlossaryEntry,
-    PipelineOptions, PipelineResult, ReviewPolicy, SplitRetryLog, SubtitleDocument,
-    SubtitleSegment, TranslationLine, Usage,
+    PipelineOptions, PipelineResult, ReviewChange, ReviewPolicy, ReviewReport, ReviewStats,
+    SplitRetryLog, SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, TerminologyStats,
+    TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
@@ -196,6 +198,8 @@ where
                     state_path,
                     glossary_path,
                     agent_repairs: self.agent_repairs.clone(),
+                    terminology: TerminologyStats::default(),
+                    review: ReviewStats::default(),
                 },
                 translated_segments: Vec::new(),
             });
@@ -213,6 +217,8 @@ where
                 self.translation_memory.insert(key, text);
             }
         }
+
+        let terminology = self.run_terminology_preflight(document)?;
 
         let resume = self.load_resume_snapshot(&batches)?;
         self.report(
@@ -235,6 +241,9 @@ where
                 .saturating_sub(translated_segments.len()),
         );
         let mut usage = resume.usage;
+        if resume.translation_batches_completed == 0 {
+            usage.add(terminology.usage);
+        }
         if usage != Usage::default() {
             self.dashboard.add_usage(usage);
         }
@@ -286,7 +295,12 @@ where
                 usage,
             );
             let mut generated = self.translate_window(&pending)?;
-            validate_window_terminology(&prepared, &generated, &self.memory)?;
+            validate_window_terminology(
+                &prepared,
+                &generated,
+                &self.memory,
+                self.options.review_policy != ReviewPolicy::Off,
+            )?;
             for (batch_index, tm_hits, pending_batch) in prepared {
                 let batch = &batches[batch_index];
                 let new_lines = if pending_batch.is_empty() {
@@ -376,14 +390,21 @@ where
         } else {
             match self.options.review_policy {
                 ReviewPolicy::Off => Vec::new(),
-                ReviewPolicy::Targeted => {
-                    build_review_plan(&batches, &translated_segments, &self.memory)
-                }
+                ReviewPolicy::Targeted => build_review_plan(
+                    &batches,
+                    &translated_segments,
+                    &self.memory,
+                    &self.options.source_language,
+                    &self.options.target_language,
+                ),
                 ReviewPolicy::Full => build_full_review_plan(&batches, &translated_segments),
             }
         };
         self.dashboard
             .set_total_steps(3 + batches.len() + review_plan.len());
+        let review_started = Instant::now();
+        let review_cache_hits_before = self.cache_hits;
+        let mut review_usage = Usage::default();
 
         let resumed_review_batches = if review_plan.is_empty() {
             0
@@ -442,6 +463,7 @@ where
                         CoreError::Data(format!("review window omitted batch {review_position}"))
                     })?;
                     usage.add(reviewed.usage);
+                    review_usage.add(reviewed.usage);
                     self.dashboard.add_usage(reviewed.usage);
                     let reviewed_segments = apply_lines(&review_batch.source, &reviewed.lines);
                     if let Some(ref store) = self.store {
@@ -469,6 +491,60 @@ where
             }
             validate_full_alignment(&document.segments, &output_segments)?;
             self.dashboard.mark_done("FINAL_REVIEW");
+        } else {
+            self.report(
+                "FINAL_REVIEW",
+                TaskState::Skipped,
+                0,
+                Some(0),
+                0,
+                Usage::default(),
+            );
+        }
+        let changes = review_plan
+            .iter()
+            .flat_map(|batch| {
+                let reviewed = &output_segments
+                    [batch.start_offset..batch.start_offset + batch.translated.len()];
+                batch
+                    .translated
+                    .iter()
+                    .zip(reviewed)
+                    .filter(|(before, after)| before.text != after.text)
+                    .map(|(before, after)| ReviewChange {
+                        batch: batch.batch_index,
+                        id: before.id.clone(),
+                        reasons: batch
+                            .candidate_reasons
+                            .get(&before.id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        before: before.text.clone(),
+                        after: after.text.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let review = ReviewStats {
+            candidate_lines: review_plan
+                .iter()
+                .map(|batch| batch.candidate_reasons.len())
+                .sum(),
+            reviewed_lines: review_plan
+                .iter()
+                .map(|batch| batch.candidate_reasons.len())
+                .sum(),
+            changed_lines: changes.len(),
+            batches: review_plan.len(),
+            cache_hits: self.cache_hits.saturating_sub(review_cache_hits_before),
+            usage: review_usage,
+            duration_ms: duration_ms(review_started),
+        };
+        if let Some(store) = self.store.as_ref() {
+            store.save_review_report(&ReviewReport {
+                terminology: terminology.clone(),
+                review: review.clone(),
+                changes,
+            })?;
         }
         self.cancellation.check()?;
         self.save_run_state(batches.len(), review_plan.len(), true, usage)?;
@@ -496,9 +572,162 @@ where
                 state_path,
                 glossary_path,
                 agent_repairs: self.agent_repairs.clone(),
+                terminology,
+                review,
             },
             translated_segments: output_segments,
         })
+    }
+
+    fn run_terminology_preflight(
+        &mut self,
+        document: &SubtitleDocument,
+    ) -> CoreResult<TerminologyStats> {
+        let started = Instant::now();
+        let candidates = extract_terminology_candidates(&document.segments);
+        let mut stats = TerminologyStats {
+            candidates: candidates.len(),
+            ..TerminologyStats::default()
+        };
+        if !self.options.terminology_preflight
+            || self.options.fast_mode
+            || candidates.is_empty()
+            || !self.backend.supports_terminology_preflight()
+        {
+            self.report(
+                "TERMINOLOGY_PREFLIGHT",
+                TaskState::Skipped,
+                0,
+                Some(candidates.len()),
+                0,
+                Usage::default(),
+            );
+            return Ok(stats);
+        }
+
+        self.report(
+            "TERMINOLOGY_PREFLIGHT",
+            TaskState::Running,
+            0,
+            Some(candidates.len()),
+            0,
+            Usage::default(),
+        );
+        let existing = self.memory.glossary.clone();
+        let messages = build_terminology_messages(&self.options, &candidates);
+        let hash = request_hash(&self.options, CacheStage::Terminology, &messages);
+        let cached = if self.options.use_cache {
+            self.store
+                .as_ref()
+                .map(|store| store.load_cached_response(CacheStage::Terminology, &hash))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        let result = if let Some(response) = cached {
+            stats.cache_hits = 1;
+            self.cache_hits += 1;
+            Ok(response)
+        } else {
+            let mut last_error = None;
+            let mut response = None;
+            for _ in 0..=self.options.retries {
+                self.cancellation.check()?;
+                match self
+                    .backend
+                    .generate_raw_json_cancellable(&messages, &self.cancellation)
+                    .and_then(|(json, usage)| {
+                        let payload = parse_terminology_payload(&json, &candidates)?;
+                        Ok(BackendJsonResult {
+                            payload: BackendPayload::Terminology(payload),
+                            usage,
+                        })
+                    }) {
+                    Ok(value) => {
+                        response = Some(value);
+                        break;
+                    }
+                    Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            response.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    CoreError::Backend("terminology preflight failed".to_owned())
+                })
+            })
+        };
+
+        match result {
+            Ok(response) => {
+                let BackendPayload::Terminology(payload) = response.payload else {
+                    return Err(CoreError::Data(
+                        "terminology cache returned a different payload".to_owned(),
+                    ));
+                };
+                stats.usage = if stats.cache_hits > 0 {
+                    Usage::default()
+                } else {
+                    response.usage
+                };
+                let mut accepted = Vec::new();
+                for entry in payload.entries {
+                    if let Some(current) = self.memory.glossary.get(&entry.source) {
+                        if !current.eq_ignore_ascii_case(&entry.target) {
+                            stats.conflicts_omitted += 1;
+                        }
+                        continue;
+                    }
+                    if accepted.iter().any(|value: &GlossaryEntry| {
+                        value.source.eq_ignore_ascii_case(&entry.source)
+                            && !value.target.eq_ignore_ascii_case(&entry.target)
+                    }) {
+                        stats.conflicts_omitted += 1;
+                        continue;
+                    }
+                    accepted.push(entry);
+                }
+                self.memory.update("", &accepted);
+                stats.entries_added = self.memory.glossary.len().saturating_sub(existing.len());
+                if self.options.use_cache
+                    && stats.cache_hits == 0
+                    && let Some(store) = self.store.as_ref()
+                {
+                    store.save_cached_response(
+                        CacheStage::Terminology,
+                        &hash,
+                        &BackendJsonResult {
+                            payload: BackendPayload::Terminology(TerminologyPreflightResult {
+                                entries: accepted,
+                            }),
+                            usage: response.usage,
+                        },
+                    )?;
+                }
+                if let Some(store) = self.store.as_ref() {
+                    let entries = self
+                        .memory
+                        .glossary
+                        .iter()
+                        .map(|(source, target)| (source.clone(), target.clone()))
+                        .collect::<Vec<_>>();
+                    store.save_glossary(&entries)?;
+                }
+            }
+            Err(_) => stats.degraded = true,
+        }
+        stats.duration_ms = duration_ms(started);
+        self.dashboard.add_usage(stats.usage);
+        self.report(
+            "TERMINOLOGY_PREFLIGHT",
+            TaskState::Completed,
+            candidates.len(),
+            Some(candidates.len()),
+            0,
+            stats.usage,
+        );
+        Ok(stats)
     }
 
     fn translate_batch(
@@ -792,6 +1021,7 @@ where
                 &batch.source,
                 &batch.translated,
                 &batch.reasons,
+                &batch.candidate_reasons,
                 &self.memory,
             );
             if let Some(error) = last_error.as_ref() {
@@ -852,6 +1082,7 @@ where
                 &batch.source,
                 &batch.translated,
                 &batch.reasons,
+                &batch.candidate_reasons,
                 &self.memory,
             );
             let hash = request_hash(&self.options, CacheStage::Review, &messages);
@@ -898,6 +1129,7 @@ where
         for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.and_then(|response| {
                 let mut result = parse_review_payload(&response.json)?;
+                validate_review_candidate_ids(&batch, &result.lines)?;
                 result.lines = merge_review_patch(&batch.translated, &result.lines)?;
                 validate_translation_batch(&batch.source, &result.lines)?;
                 Ok((result, response.usage))
@@ -958,6 +1190,7 @@ where
                     .backend
                     .generate_raw_json_cancellable(messages, &self.cancellation)?;
                 let mut review = parse_review_payload(&payload)?;
+                validate_review_candidate_ids(batch, &review.lines)?;
                 review.lines = merge_review_patch(&batch.translated, &review.lines)?;
                 BackendJsonResult {
                     payload: BackendPayload::Review(review),
@@ -1163,6 +1396,11 @@ where
                 let lines = match &response.payload {
                     BackendPayload::Translation(result) => &result.lines,
                     BackendPayload::Review(result) => &result.lines,
+                    BackendPayload::Terminology(_) => {
+                        return Err(CoreError::Data(
+                            "repair cache returned a terminology payload".to_owned(),
+                        ));
+                    }
                 };
                 validate_translation_batch(source, lines)?;
                 if self.options.use_cache
@@ -1363,6 +1601,136 @@ struct BatchWithUsage {
 struct ReviewWithUsage {
     lines: Vec<TranslationLine>,
     usage: Usage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminologyCandidate {
+    source: String,
+    context: String,
+}
+
+fn extract_terminology_candidates(segments: &[SubtitleSegment]) -> Vec<TerminologyCandidate> {
+    let mut candidates = std::collections::BTreeMap::new();
+    for segment in segments {
+        let words = segment
+            .text
+            .split_whitespace()
+            .map(|word| {
+                word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '\'')
+            })
+            .filter(|word| word.len() >= 2)
+            .collect::<Vec<_>>();
+        let mut index = 0;
+        while index < words.len() {
+            let word = words[index];
+            let is_title = word
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+                && word.chars().skip(1).any(|ch| ch.is_ascii_lowercase());
+            let is_acronym = word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 2
+                && word
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphabetic())
+                    .all(|ch| ch.is_ascii_uppercase());
+            if !is_title && !is_acronym {
+                index += 1;
+                continue;
+            }
+            let mut end = index + 1;
+            while end < words.len() && end - index < 4 {
+                let next = words[end];
+                if !next
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+                {
+                    break;
+                }
+                end += 1;
+            }
+            candidates
+                .entry(word.to_ascii_lowercase())
+                .or_insert_with(|| TerminologyCandidate {
+                    source: word.to_owned(),
+                    context: segment.text.chars().take(240).collect(),
+                });
+            let source = words[index..end].join(" ");
+            if end > index + 1 {
+                candidates
+                    .entry(source.to_ascii_lowercase())
+                    .or_insert_with(|| TerminologyCandidate {
+                        source,
+                        context: segment.text.chars().take(240).collect(),
+                    });
+            }
+            index = end;
+        }
+    }
+    candidates.into_values().take(256).collect()
+}
+
+fn build_terminology_messages(
+    options: &PipelineOptions,
+    candidates: &[TerminologyCandidate],
+) -> Vec<ChatMessage> {
+    let payload = serde_json::json!({
+        "source_language": options.source_language,
+        "target_language": options.target_language,
+        "candidates": candidates.iter().map(|candidate| serde_json::json!({
+            "source": candidate.source,
+            "context": candidate.context,
+        })).collect::<Vec<_>>(),
+    });
+    let payload = serde_json::to_string(&payload).unwrap_or_default();
+    vec![
+        ChatMessage::system(
+            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {\"entries\":[{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}]}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain entries.",
+        ),
+        ChatMessage::user(format!(
+            "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
+        )),
+    ]
+}
+
+fn parse_terminology_payload(
+    payload: &serde_json::Value,
+    candidates: &[TerminologyCandidate],
+) -> CoreResult<TerminologyPreflightResult> {
+    let entries = payload
+        .get("entries")
+        .or_else(|| payload.get("glossary"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CoreError::InvalidTranslation("terminology response missing entries array".to_owned())
+        })?;
+    let mut parsed = Vec::new();
+    for entry in entries {
+        let source = entry["source"].as_str().unwrap_or_default().trim();
+        let target = entry["target"].as_str().unwrap_or_default().trim();
+        if source.is_empty() || target.is_empty() {
+            return Err(CoreError::InvalidTranslation(
+                "terminology entry contains an empty source or target".to_owned(),
+            ));
+        }
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.source.eq_ignore_ascii_case(source))
+        else {
+            return Err(CoreError::InvalidTranslation(format!(
+                "terminology response contains unknown source `{source}`"
+            )));
+        };
+        parsed.push(GlossaryEntry {
+            source: candidate.source.clone(),
+            target: target.to_owned(),
+        });
+    }
+    Ok(TerminologyPreflightResult { entries: parsed })
+}
+
+fn duration_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -1599,10 +1967,27 @@ fn merge_review_patch(
         .collect())
 }
 
+fn validate_review_candidate_ids(
+    batch: &ReviewBatchPlan,
+    changes: &[TranslationLine],
+) -> CoreResult<()> {
+    if let Some(line) = changes
+        .iter()
+        .find(|line| !batch.candidate_reasons.contains_key(&line.id))
+    {
+        return Err(CoreError::InvalidTranslation(format!(
+            "review attempted to modify non-candidate id `{}`",
+            line.id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_window_terminology(
     prepared: &[(usize, HashMap<String, String>, Vec<SubtitleSegment>)],
     generated: &HashMap<usize, BatchWithUsage>,
     memory: &ContextMemory,
+    defer_missing_to_review: bool,
 ) -> CoreResult<()> {
     let mut canonical = memory.glossary.clone();
     for result in generated.values() {
@@ -1633,6 +2018,7 @@ fn validate_window_terminology(
             for (term, target) in &canonical {
                 if source_lower.contains(&term.to_lowercase())
                     && !translation_lower.contains(&target.to_lowercase())
+                    && !defer_missing_to_review
                 {
                     return Err(CoreError::InvalidTranslation(format!(
                         "line {} does not use required glossary translation `{term}` -> `{target}`",
@@ -1910,6 +2296,129 @@ mod tests {
                     total_tokens: 3,
                 },
             ))
+        }
+    }
+
+    struct NoChangeReviewBackend;
+
+    impl LlmBackend for NoChangeReviewBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "no-change"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            EchoBackend.generate_json(messages)
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            _messages: &[ChatMessage],
+        ) -> CoreResult<(serde_json::Value, Usage)> {
+            Ok((
+                serde_json::json!({"changes": []}),
+                Usage {
+                    input_tokens: 5,
+                    output_tokens: 1,
+                    total_tokens: 6,
+                },
+            ))
+        }
+    }
+
+    struct PreflightBackend {
+        contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl LlmBackend for PreflightBackend {
+        fn supports_terminology_preflight(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "preflight"
+        }
+
+        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let context = prompt
+                .split("CONTEXT_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("CONTEXT_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing context json".to_owned()))?;
+            let context: serde_json::Value = serde_json::from_str(context)
+                .map_err(|error| CoreError::Data(format!("invalid context: {error}")))?;
+            self.contexts
+                .lock()
+                .map_err(|_| CoreError::Data("context lock poisoned".to_owned()))?
+                .push(context);
+            let body = prompt
+                .split("BATCH_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("BATCH_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing batch json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::Data(format!("invalid batch: {error}")))?;
+            let batch_lines = parsed["lines"]
+                .as_array()
+                .ok_or_else(|| CoreError::Data("missing batch lines".to_owned()))?;
+            let lines = batch_lines
+                .iter()
+                .map(|line| TranslationLine {
+                    id: line["id"].as_str().unwrap_or_default().to_owned(),
+                    translation: format!("统一译名 {}", line["text"].as_str().unwrap_or_default()),
+                })
+                .collect();
+            Ok(BackendJsonResult {
+                payload: BackendPayload::Translation(BatchTranslationResult {
+                    lines,
+                    summary: String::new(),
+                    glossary_updates: Vec::new(),
+                }),
+                usage: Usage::default(),
+            })
+        }
+
+        fn generate_raw_json(
+            &mut self,
+            messages: &[ChatMessage],
+        ) -> CoreResult<(serde_json::Value, Usage)> {
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = prompt
+                .split("TERMINOLOGY_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("TERMINOLOGY_JSON_END").next())
+                .ok_or_else(|| CoreError::Data("missing terminology json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::Data(format!("invalid terminology: {error}")))?;
+            let candidates = parsed["candidates"]
+                .as_array()
+                .ok_or_else(|| CoreError::Data("missing terminology candidates".to_owned()))?;
+            let entries = candidates
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "source": candidate["source"],
+                        "target": "统一译名",
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((serde_json::json!({"entries": entries}), Usage::default()))
         }
     }
 
@@ -2481,6 +2990,7 @@ mod tests {
         let mut options = PipelineOptions::new("review-agent.txt".into());
         options.batch_size = 1;
         options.retries = 0;
+        options.review_policy = ReviewPolicy::Full;
         let review_calls = Arc::new(AtomicUsize::new(0));
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -2552,20 +3062,100 @@ mod tests {
     fn review_plan_selects_only_high_risk_batches() {
         let batches = vec![
             vec![segment("1", "Hello there.")],
-            vec![segment("2", "Meet Alice now.")],
+            vec![segment("2", "Meet <i>Alice</i> now.")],
             vec![segment("3", &"long ".repeat(20))],
         ];
-        let translated = batches
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<Vec<SubtitleSegment>>();
+        let translated = vec![
+            segment("1", "你好。"),
+            segment("2", "现在去见爱丽丝。"),
+            segment("3", "这是一条很长但有效的译文。"),
+        ];
 
-        let plan = build_review_plan(&batches, &translated, &ContextMemory::new());
+        let plan = build_review_plan(
+            &batches,
+            &translated,
+            &ContextMemory::new(),
+            "en",
+            "zh-Hans",
+        );
 
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].source[0].id, "2");
-        assert_eq!(plan[0].reasons, vec!["names and terms"]);
+        assert_eq!(plan[0].reasons, vec!["formatting mismatch"]);
+    }
+
+    #[test]
+    fn targeted_review_ignores_names_speakers_and_multiline_text_by_themselves() {
+        let batches = vec![vec![
+            segment("1", "Meet Alice now.\nShe is waiting."),
+            segment("2", "- Bob: Come here."),
+        ]];
+        let translated = vec![
+            segment("1", "现在去见爱丽丝。\n她正在等。"),
+            segment("2", "- 鲍勃：过来。"),
+        ];
+
+        let plan = build_review_plan(
+            &batches,
+            &translated,
+            &ContextMemory::new(),
+            "en",
+            "zh-Hans",
+        );
+
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn terminology_payload_accepts_only_known_nonempty_candidates() {
+        let candidates = vec![TerminologyCandidate {
+            source: "Axe Gang".to_owned(),
+            context: "The Axe Gang is here.".to_owned(),
+        }];
+        let parsed = parse_terminology_payload(
+            &serde_json::json!({
+                "entries": [{"source": "Axe Gang", "target": "斧头帮"}]
+            }),
+            &candidates,
+        )
+        .expect("valid terminology");
+        assert_eq!(parsed.entries[0].target, "斧头帮");
+
+        let error = parse_terminology_payload(
+            &serde_json::json!({
+                "entries": [{"source": "Unknown", "target": "未知"}]
+            }),
+            &candidates,
+        )
+        .expect_err("unknown source rejected");
+        assert!(error.to_string().contains("unknown source"));
+    }
+
+    #[test]
+    fn terminology_preflight_freezes_glossary_before_all_translation_batches() {
+        let document = document("terms.txt", &["Meet Alice now.", "Meet Bob now."]);
+        let mut options = PipelineOptions::new("terms.txt".into());
+        options.batch_size = 1;
+        options.resume = false;
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            PreflightBackend {
+                contexts: Arc::clone(&contexts),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("translated");
+        let contexts = contexts.lock().expect("contexts lock");
+
+        assert!(run.result.terminology.entries_added >= 2);
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts.iter().all(|context| {
+            context["glossary"]
+                .as_object()
+                .is_some_and(|map| !map.is_empty())
+        }));
     }
 
     #[test]
@@ -2596,6 +3186,7 @@ mod tests {
         let mut options = PipelineOptions::new("review.txt".into());
         options.batch_size = 2;
         options.resume = false;
+        options.review_policy = ReviewPolicy::Full;
         let translation_calls = Arc::new(AtomicUsize::new(0));
         let review_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -2621,11 +3212,29 @@ mod tests {
     }
 
     #[test]
+    fn full_review_records_zero_changes_for_an_empty_patch() {
+        let document = document("review-zero.txt", &["Meet Alice now."]);
+        let mut options = PipelineOptions::new("review-zero.txt".into());
+        options.review_policy = ReviewPolicy::Full;
+        options.resume = false;
+        let mut pipeline = SubtitlePipeline::new(NoChangeReviewBackend, NoopDashboard, options);
+
+        let run = pipeline.run_document(&document).expect("reviewed run");
+
+        assert_eq!(run.result.review.candidate_lines, 1);
+        assert_eq!(run.result.review.reviewed_lines, 1);
+        assert_eq!(run.result.review.changed_lines, 0);
+        assert_eq!(run.result.review.usage.total_tokens, 6);
+        assert_eq!(run.translated_segments[0].text, "[ECHO] Meet Alice now.");
+    }
+
+    #[test]
     fn pipeline_resumes_review_batches_from_shards() {
         let document = document("review-resume.txt", &["Meet Alice now.", "Meet Bob now."]);
         let mut options = PipelineOptions::new("review-resume.txt".into());
         options.batch_size = 1;
         options.retries = 0;
+        options.review_policy = ReviewPolicy::Full;
         let signature = input_signature_from_bytes(b"Meet Alice now.\nMeet Bob now.\n", Some(1));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -2700,6 +3309,7 @@ mod tests {
         let mut options = PipelineOptions::new("review-cache.txt".into());
         options.batch_size = 1;
         options.resume = false;
+        options.review_policy = ReviewPolicy::Full;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(

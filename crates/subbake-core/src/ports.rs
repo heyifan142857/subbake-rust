@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, ReviewResult, SubtitleSegment, Usage,
+    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleSegment,
+    TerminologyPreflightResult, Usage,
 };
 use crate::error::CoreResult;
 use crate::storage::{RunState, RuntimePaths};
@@ -60,12 +61,14 @@ pub struct BackendJsonResult {
 pub enum BackendPayload {
     Translation(BatchTranslationResult),
     Review(ReviewResult),
+    Terminology(TerminologyPreflightResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStage {
     Translate,
     Review,
+    Terminology,
     AgentTranslateRepair,
     AgentReviewRepair,
 }
@@ -75,6 +78,7 @@ impl CacheStage {
         match self {
             Self::Translate => "translate",
             Self::Review => "review",
+            Self::Terminology => "terminology",
             Self::AgentTranslateRepair => "agent_translate_repair",
             Self::AgentReviewRepair => "agent_review_repair",
         }
@@ -82,6 +86,10 @@ impl CacheStage {
 }
 
 pub trait LlmBackend: Send {
+    fn supports_terminology_preflight(&self) -> bool {
+        false
+    }
+
     fn supports_parallel_generation(&self) -> bool {
         false
     }
@@ -144,6 +152,7 @@ pub trait LlmBackend: Send {
                 let json = match result.payload {
                     BackendPayload::Translation(payload) => serde_json::to_value(payload),
                     BackendPayload::Review(payload) => serde_json::to_value(payload),
+                    BackendPayload::Terminology(payload) => serde_json::to_value(payload),
                 }
                 .map_err(|error| {
                     crate::error::CoreError::Data(format!(
@@ -170,6 +179,10 @@ impl<T> LlmBackend for Box<T>
 where
     T: LlmBackend + ?Sized,
 {
+    fn supports_terminology_preflight(&self) -> bool {
+        (**self).supports_terminology_preflight()
+    }
+
     fn supports_parallel_generation(&self) -> bool {
         (**self).supports_parallel_generation()
     }
@@ -248,6 +261,10 @@ pub trait RuntimeStore {
     fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
         let _ = self;
         Ok(Vec::new())
+    }
+
+    fn save_review_report(&self, _report: &ReviewReport) -> CoreResult<()> {
+        Ok(())
     }
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;

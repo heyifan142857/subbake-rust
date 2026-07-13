@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, ReviewResult, SubtitleSegment, Usage,
+    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleSegment,
+    TerminologyPreflightResult, Usage,
 };
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::ports::{
@@ -52,6 +53,13 @@ struct ReviewCacheEntry {
     usage: Usage,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TerminologyCacheEntry {
+    payload: TerminologyPreflightResult,
+    #[serde(default)]
+    usage: Usage,
+}
+
 impl RuntimeStore for FileRuntimeStore {
     fn paths(&self) -> &RuntimePaths {
         &self.paths
@@ -81,6 +89,12 @@ impl RuntimeStore for FileRuntimeStore {
             &self.paths.translation_memory_path,
             &string_map_json(entries),
         )
+    }
+
+    fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()> {
+        let value = serde_json::to_value(report)
+            .map_err(|error| CoreError::Data(format!("serialize review report failed: {error}")))?;
+        write_json_verified(&self.paths.review_report_path, &value)
     }
 
     fn save_batch_segments(
@@ -196,6 +210,12 @@ impl RuntimeStore for FileRuntimeStore {
                 payload: payload.clone(),
                 usage: response.usage,
             }),
+            (CacheStage::Terminology, BackendPayload::Terminology(payload)) => {
+                serde_json::to_value(TerminologyCacheEntry {
+                    payload: payload.clone(),
+                    usage: response.usage,
+                })
+            }
             _ => {
                 return Err(CoreError::Data(format!(
                     "cached response payload does not match stage {}",
@@ -235,6 +255,16 @@ impl RuntimeStore for FileRuntimeStore {
                 })?;
                 Ok(Some(BackendJsonResult {
                     payload: BackendPayload::Review(entry.payload),
+                    usage: entry.usage,
+                }))
+            }
+            CacheStage::Terminology => {
+                let entry: TerminologyCacheEntry =
+                    serde_json::from_str(&text).map_err(|error| {
+                        CoreError::Data(format!("request cache parse failed: {error}"))
+                    })?;
+                Ok(Some(BackendJsonResult {
+                    payload: BackendPayload::Terminology(entry.payload),
                     usage: entry.usage,
                 }))
             }
@@ -356,6 +386,7 @@ mod tests {
 
     use subbake_core::entities::{
         AgentLog, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry, PipelineOptions,
+        ReviewChange, ReviewReport, ReviewStats, TerminologyPreflightResult, TerminologyStats,
         TranslationLine, Usage,
     };
     use subbake_core::memory::ContextMemory;
@@ -641,6 +672,71 @@ mod tests {
         assert_eq!(value["payload"]["lines"][0]["translation"], "审校后");
         assert_eq!(value["payload"]["review_notes"], "terminology fixed");
         assert!(path.ends_with("review/review-hash.json"));
+    }
+
+    #[test]
+    fn round_trips_terminology_cache_and_writes_review_report() {
+        let root = temp_root("terminology-cache");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "en",
+            "zh-Hans",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        let response = BackendJsonResult {
+            payload: BackendPayload::Terminology(TerminologyPreflightResult {
+                entries: vec![GlossaryEntry {
+                    source: "Axe Gang".to_owned(),
+                    target: "斧头帮".to_owned(),
+                }],
+            }),
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+                total_tokens: 14,
+            },
+        };
+        store
+            .save_cached_response(CacheStage::Terminology, "terms", &response)
+            .expect("save terminology cache");
+        assert_eq!(
+            store
+                .load_cached_response(CacheStage::Terminology, "terms")
+                .expect("load terminology cache"),
+            Some(response)
+        );
+
+        let report = ReviewReport {
+            terminology: TerminologyStats {
+                candidates: 1,
+                entries_added: 1,
+                ..TerminologyStats::default()
+            },
+            review: ReviewStats {
+                candidate_lines: 1,
+                reviewed_lines: 1,
+                changed_lines: 1,
+                ..ReviewStats::default()
+            },
+            changes: vec![ReviewChange {
+                batch: 1,
+                id: "1".to_owned(),
+                reasons: vec!["glossary mismatch".to_owned()],
+                before: "帮派".to_owned(),
+                after: "斧头帮".to_owned(),
+            }],
+        };
+        store.save_review_report(&report).expect("save report");
+        let saved: ReviewReport = serde_json::from_str(
+            &fs::read_to_string(&store.paths().review_report_path).expect("read report"),
+        )
+        .expect("parse report");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(saved, report);
     }
 
     #[test]

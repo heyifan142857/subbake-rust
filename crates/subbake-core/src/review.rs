@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::entities::{PipelineOptions, ReviewResult, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
@@ -6,29 +8,63 @@ use crate::validation::validate_full_alignment;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewBatchPlan {
+    pub(crate) batch_index: usize,
     pub(crate) start_offset: usize,
     pub(crate) source: Vec<SubtitleSegment>,
     pub(crate) translated: Vec<SubtitleSegment>,
     pub(crate) reasons: Vec<String>,
+    pub(crate) candidate_reasons: BTreeMap<String, Vec<String>>,
 }
 
 pub(crate) fn build_review_plan(
     batches: &[Vec<SubtitleSegment>],
     translated_segments: &[SubtitleSegment],
     memory: &ContextMemory,
+    source_language: &str,
+    target_language: &str,
 ) -> Vec<ReviewBatchPlan> {
+    let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (source, translated) in batches.iter().flatten().zip(translated_segments) {
+        translations_by_source
+            .entry(normalize_text(&source.text))
+            .or_default()
+            .insert(normalize_text(&translated.text));
+    }
+
     let mut plan = Vec::new();
     let mut offset = 0usize;
-    for source in batches {
+    for (batch_index, source) in batches.iter().enumerate() {
         let end = offset + source.len();
         let translated = &translated_segments[offset..end];
-        let reasons = review_reasons(source, translated, memory);
-        if !reasons.is_empty() {
+        let candidate_reasons = source
+            .iter()
+            .zip(translated)
+            .filter_map(|(source, translated)| {
+                let reasons = line_review_reasons(
+                    source,
+                    translated,
+                    memory,
+                    &translations_by_source,
+                    !source_language.eq_ignore_ascii_case(target_language),
+                );
+                (!reasons.is_empty()).then(|| (source.id.clone(), reasons))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !candidate_reasons.is_empty() {
+            let reasons = candidate_reasons
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             plan.push(ReviewBatchPlan {
+                batch_index: batch_index + 1,
                 start_offset: offset,
                 source: source.clone(),
                 translated: translated.to_vec(),
                 reasons,
+                candidate_reasons,
             });
         }
         offset = end;
@@ -43,13 +79,19 @@ pub(crate) fn build_full_review_plan(
     let mut offset = 0;
     batches
         .iter()
-        .map(|source| {
+        .enumerate()
+        .map(|(batch_index, source)| {
             let end = offset + source.len();
             let plan = ReviewBatchPlan {
+                batch_index: batch_index + 1,
                 start_offset: offset,
                 source: source.clone(),
                 translated: translated_segments[offset..end].to_vec(),
                 reasons: vec!["full review".to_owned()],
+                candidate_reasons: source
+                    .iter()
+                    .map(|segment| (segment.id.clone(), vec!["full review".to_owned()]))
+                    .collect(),
             };
             offset = end;
             plan
@@ -62,6 +104,7 @@ pub(crate) fn build_review_messages(
     source: &[SubtitleSegment],
     translated: &[SubtitleSegment],
     reasons: &[String],
+    candidate_reasons: &BTreeMap<String, Vec<String>>,
     memory: &ContextMemory,
 ) -> Vec<ChatMessage> {
     let texts = source
@@ -74,15 +117,22 @@ pub(crate) fn build_review_messages(
     let mut payload = serde_json::json!({
         "tgt": options.target_language,
         "reasons": reasons,
-        "expected_count": source.len(),
-        "expected_ids": source.iter().map(|segment| segment.id.as_str()).collect::<Vec<_>>(),
-        "lines": source.iter().zip(translated).map(|(source, translated)| {
-            serde_json::json!({
+        "expected_count": candidate_reasons.len(),
+        "expected_ids": candidate_reasons.keys().collect::<Vec<_>>(),
+        "lines": source.iter().zip(translated)
+            .filter(|(source, _)| candidate_reasons.contains_key(&source.id))
+            .map(|(source, translated)| serde_json::json!({
                 "id": source.id,
                 "source": source.text,
                 "translation": translated.text,
-            })
-        }).collect::<Vec<_>>(),
+                "reasons": candidate_reasons.get(&source.id),
+            })).collect::<Vec<_>>(),
+        "context": source.iter().zip(translated).map(|(source, translated)| serde_json::json!({
+            "id": source.id,
+            "source": source.text,
+            "translation": translated.text,
+            "editable": candidate_reasons.contains_key(&source.id),
+        })).collect::<Vec<_>>(),
     });
     let recent = memory.recent_summaries_for_prompt();
     if !recent.is_empty() {
@@ -101,18 +151,15 @@ pub(crate) fn build_review_messages(
         "You are performing a targeted subtitle QA review.\n\
          Return valid JSON only.\n\
          Review {} subtitles.\n\
-         Only fix terminology, consistency, and readability issues without changing the number of entries.",
+         Only fix the stated deterministic issues without changing entry structure.",
         options.target_language
     );
     let user = format!(
         "TASK_START\nreview_translations\nTASK_END\n\
-         Review only this high-risk batch.\n\
-         Use the input lines array as the complete authoritative list of subtitle entries.\n\
-         Do not remove, reorder, merge, or renumber entries.\n\
-         Return exactly one output object for each input line id, in the same order as expected_ids.\n\
-         Prefer minimal edits; leave good lines untouched.\n\
+         Only ids in expected_ids are editable; context is read-only.\n\
+         Prefer minimal edits and omit unchanged lines.\n\
          Return JSON only as {{\"changes\":[{{\"id\":\"<id>\",\"translation\":\"<replacement>\"}}]}}.\n\
-         Return an empty changes array when every translation is already good.\n\
+         Return an empty changes array when every candidate is already good.\n\
          REVIEW_JSON_START{payload_json}REVIEW_JSON_END"
     );
     vec![ChatMessage::system(system), ChatMessage::user(user)]
@@ -171,158 +218,60 @@ pub(crate) fn restore_review_progress(
     Ok(())
 }
 
-fn review_reasons(
-    source: &[SubtitleSegment],
-    translated: &[SubtitleSegment],
+fn line_review_reasons(
+    source: &SubtitleSegment,
+    translated: &SubtitleSegment,
     memory: &ContextMemory,
+    translations_by_source: &BTreeMap<String, BTreeSet<String>>,
+    cross_language: bool,
 ) -> Vec<String> {
-    let texts = source
-        .iter()
-        .chain(translated)
-        .map(|segment| segment.text.as_str())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
-    let glossary_risk = memory
-        .select_relevant_glossary(&texts)
-        .iter()
-        .any(|(term, _)| is_glossary_term_risky(term, source));
-
     let mut reasons = Vec::new();
-    let mut score = 0usize;
-    if glossary_risk {
-        reasons.push("glossary consistency".to_owned());
-        score += 2;
-    } else if source.iter().any(|segment| has_named_terms(&segment.text)) {
-        reasons.push("names and terms".to_owned());
-        score += 2;
-    }
-    if source
-        .iter()
-        .any(|segment| has_speaker_marker(&segment.text))
-    {
-        reasons.push("speaker changes".to_owned());
-        score += 2;
-    }
-    if source
-        .iter()
-        .any(|segment| contains_formatting(&segment.text))
-    {
-        reasons.push("formatting and tags".to_owned());
-        score += 2;
-    }
-    if source.iter().zip(translated).any(|(source, translated)| {
-        is_dense_segment(&source.text) || is_dense_segment(&translated.text)
+    let source_lower = source.text.to_lowercase();
+    let translated_lower = translated.text.to_lowercase();
+    if memory.glossary.iter().any(|(term, target)| {
+        source_lower.contains(&term.to_lowercase())
+            && !translated_lower.contains(&target.to_lowercase())
     }) {
-        reasons.push("readability".to_owned());
-        score += 1;
+        reasons.push("glossary mismatch".to_owned());
     }
-    if score >= 2 { reasons } else { Vec::new() }
-}
-
-fn has_speaker_marker(text: &str) -> bool {
-    let stripped = text.trim_start();
-    if stripped.starts_with('-')
-        || stripped.starts_with('–')
-        || stripped.starts_with('—')
-        || stripped.starts_with(">>")
-    {
-        return true;
+    if formatting_tokens(&source.text) != formatting_tokens(&translated.text) {
+        reasons.push("formatting mismatch".to_owned());
     }
-    let Some(colon) = stripped.find(':') else {
-        return false;
-    };
-    let label = &stripped[..colon];
-    let mut chars = label.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    first.is_ascii_uppercase()
-        && label.chars().count() <= 21
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '_' | '-'))
-        && stripped[colon + 1..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-}
-
-fn contains_formatting(text: &str) -> bool {
-    has_delimited_text(text, '<', '>') || has_delimited_text(text, '{', '}')
-}
-
-fn has_delimited_text(text: &str, open: char, close: char) -> bool {
-    text.find(open)
-        .and_then(|start| text[start + open.len_utf8()..].find(close))
-        .is_some()
-}
-
-fn has_named_terms(text: &str) -> bool {
-    let mut matches = Vec::new();
-    let mut word_start = None;
-    for (index, ch) in text
-        .char_indices()
-        .chain(std::iter::once((text.len(), ' ')))
+    if translations_by_source
+        .get(&normalize_text(&source.text))
+        .is_some_and(|translations| translations.len() > 1)
     {
-        if ch.is_ascii_alphabetic() {
-            word_start.get_or_insert(index);
-            continue;
-        }
-        let Some(start) = word_start.take() else {
-            continue;
-        };
-        let word = &text[start..index];
-        let mut chars = word.chars();
-        if chars.next().is_some_and(|first| first.is_ascii_uppercase())
-            && chars.clone().count() >= 2
-            && chars.all(|rest| rest.is_ascii_lowercase())
-        {
-            matches.push(start);
+        reasons.push("inconsistent repeated translation".to_owned());
+    }
+    if cross_language
+        && normalize_text(&source.text) == normalize_text(&translated.text)
+        && source.text.trim().chars().count() >= 4
+    {
+        reasons.push("possibly untranslated".to_owned());
+    }
+    reasons
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn formatting_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for (open, close) in [('<', '>'), ('{', '}')] {
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            tokens.push(after[..=end].to_owned());
+            rest = &after[end + close.len_utf8()..];
         }
     }
-    if matches.is_empty() {
-        return false;
-    }
-    if matches.len() == 1 {
-        return !text[..matches[0]]
-            .chars()
-            .all(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
-    }
-    true
-}
-
-fn is_dense_segment(text: &str) -> bool {
-    text.trim().chars().count() >= 84 || text.trim().contains('\n')
-}
-
-fn is_glossary_term_risky(term: &str, source: &[SubtitleSegment]) -> bool {
-    let normalized = term.trim();
-    if normalized.is_empty() {
-        return false;
-    }
-    if normalized.contains(' ')
-        || normalized.contains('-')
-        || normalized.chars().any(|ch| ch.is_ascii_digit())
-        || normalized
-            .chars()
-            .skip(1)
-            .filter(|ch| ch.is_ascii_uppercase())
-            .count()
-            >= 2
-    {
-        return true;
-    }
-    source.iter().any(|segment| {
-        segment.text.match_indices(normalized).any(|(start, _)| {
-            start > 0 && has_word_boundaries(&segment.text, start, normalized.len())
-        })
-    })
-}
-
-fn has_word_boundaries(text: &str, start: usize, length: usize) -> bool {
-    let before = text[..start].chars().next_back();
-    let after = text[start + length..].chars().next();
-    before.is_none_or(|ch| !is_word_char(ch)) && after.is_none_or(|ch| !is_word_char(ch))
-}
-
-fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+    tokens.sort();
+    tokens
 }

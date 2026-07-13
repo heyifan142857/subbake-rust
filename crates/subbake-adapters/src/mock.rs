@@ -1,6 +1,7 @@
 use subbake_core::editing::SubtitleEditPayload;
 use subbake_core::entities::{
-    BatchTranslationResult, GlossaryEntry, ReviewResult, TranslationLine, Usage,
+    BatchTranslationResult, GlossaryEntry, ReviewResult, TerminologyPreflightResult,
+    TranslationLine, Usage,
 };
 use subbake_core::error::{CoreError, CoreResult};
 use subbake_core::languages::{language_short_code, normalize_language_name};
@@ -28,6 +29,10 @@ impl Default for MockBackend {
 }
 
 impl LlmBackend for MockBackend {
+    fn supports_terminology_preflight(&self) -> bool {
+        true
+    }
+
     fn provider_name(&self) -> &str {
         "mock"
     }
@@ -46,6 +51,9 @@ impl LlmBackend for MockBackend {
         let payload = match task {
             "translate_subtitles" => BackendPayload::Translation(translate_subtitles(&prompt)?),
             "review_translations" => BackendPayload::Review(review_translations(&prompt)?),
+            "extract_terminology" => {
+                BackendPayload::Terminology(TerminologyPreflightResult::default())
+            }
             other => {
                 return Err(CoreError::Backend(format!(
                     "unsupported mock task `{other}`"
@@ -90,6 +98,7 @@ impl LlmBackend for MockBackend {
         let payload = match result.payload {
             BackendPayload::Translation(batch) => serde_json::to_value(batch),
             BackendPayload::Review(review) => serde_json::to_value(review),
+            BackendPayload::Terminology(terminology) => serde_json::to_value(terminology),
         }
         .map_err(|error| CoreError::Backend(format!("mock response encode failed: {error}")))?;
         Ok((payload, result.usage))

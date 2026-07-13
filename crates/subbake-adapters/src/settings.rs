@@ -186,7 +186,7 @@ impl Default for TranslationSettings {
             review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
             bilingual: false,
             fast_mode: false,
-            review_policy: ReviewPolicy::Targeted,
+            review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
             dry_run: false,
             resume: true,
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(settings.source_language, "Auto");
         assert_eq!(settings.target_language, "zh-Hans");
         assert_eq!(settings.batch_size, DEFAULT_BATCH_SIZE);
-        assert_eq!(settings.review_policy, ReviewPolicy::Targeted);
+        assert_eq!(settings.review_policy, ReviewPolicy::Off);
         assert!(settings.resume);
         assert!(settings.use_cache);
         assert_eq!(settings.retries, 2);

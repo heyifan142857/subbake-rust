@@ -10,8 +10,8 @@ pub const DEFAULT_REVIEW_CONCURRENCY: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewPolicy {
-    Off,
     #[default]
+    Off,
     Targeted,
     Full,
 }
@@ -64,6 +64,53 @@ pub struct SubtitleDocument {
 pub struct GlossaryEntry {
     pub source: String,
     pub target: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminologyPreflightResult {
+    pub entries: Vec<GlossaryEntry>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminologyStats {
+    pub candidates: usize,
+    pub entries_added: usize,
+    pub conflicts_omitted: usize,
+    pub cache_hits: usize,
+    pub degraded: bool,
+    pub usage: Usage,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewStats {
+    pub candidate_lines: usize,
+    pub reviewed_lines: usize,
+    pub changed_lines: usize,
+    pub batches: usize,
+    pub cache_hits: usize,
+    pub usage: Usage,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewChange {
+    pub batch: usize,
+    pub id: String,
+    pub reasons: Vec<String>,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewReport {
+    pub terminology: TerminologyStats,
+    pub review: ReviewStats,
+    pub changes: Vec<ReviewChange>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +265,7 @@ impl PipelineOptions {
             target_language: default_target_language(),
             source_language: default_source_language(),
             retries: default_retries(),
-            review_policy: ReviewPolicy::Targeted,
+            review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
             timeout_seconds: default_timeout_seconds(),
             api_key: None,
@@ -250,6 +297,8 @@ pub struct PipelineResult {
     pub state_path: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
     pub agent_repairs: Vec<AgentRepairRecord>,
+    pub terminology: TerminologyStats,
+    pub review: ReviewStats,
 }
 
 fn default_provider() -> String {

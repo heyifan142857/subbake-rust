@@ -227,6 +227,10 @@ impl ProtocolAdapter {
     }
 }
 impl LlmBackend for ProtocolAdapter {
+    fn supports_terminology_preflight(&self) -> bool {
+        true
+    }
+
     fn supports_parallel_generation(&self) -> bool {
         true
     }

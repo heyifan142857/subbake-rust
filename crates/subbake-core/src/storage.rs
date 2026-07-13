@@ -7,8 +7,8 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 6;
-pub const RENDER_FINGERPRINT_VERSION: u64 = 3;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 7;
+pub const RENDER_FINGERPRINT_VERSION: u64 = 4;
 pub const CACHE_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,7 @@ pub struct RuntimePaths {
     pub reviewed_batches_dir: PathBuf,
     pub translation_memory_path: PathBuf,
     pub agent_logs_dir: PathBuf,
+    pub review_report_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +223,7 @@ pub fn build_runtime_paths(
             "translation_memory.v2.{language_pair}.{translation_memory_mode}.json"
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
+        review_report_path: run_dir.join("review_report.json"),
     }
 }
 
@@ -564,7 +566,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "0fc059cedead8046c9cee10efda70cfabb65d277"
+            "b4e93099b0432c053ef18b23550da6fed6f549e5"
         );
     }
 

@@ -103,6 +103,34 @@ fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
             result.translation_memory_hits
         ));
     }
+    if result.terminology.candidates > 0 {
+        output.push_str(&format!(
+            "Terminology: {} candidate(s), {} added, {} conflict(s) omitted{}\n",
+            result.terminology.candidates,
+            result.terminology.entries_added,
+            result.terminology.conflicts_omitted,
+            if result.terminology.degraded {
+                ", preflight degraded"
+            } else {
+                ""
+            }
+        ));
+    }
+    if result.review.batches > 0 {
+        let rate = if result.review.reviewed_lines == 0 {
+            0.0
+        } else {
+            result.review.changed_lines as f64 * 100.0 / result.review.reviewed_lines as f64
+        };
+        output.push_str(&format!(
+            "Review: {} candidate line(s), {} changed ({rate:.2}%), {} in / {} out tokens, {} ms\n",
+            result.review.candidate_lines,
+            result.review.changed_lines,
+            result.review.usage.input_tokens,
+            result.review.usage.output_tokens,
+            result.review.duration_ms,
+        ));
+    }
     if !reuse.is_empty() {
         output.push_str(&format!("Reused: {}\n", reuse.join(", ")));
     }
@@ -238,6 +266,8 @@ pub fn result_json(result: &PipelineResult) -> String {
         "resumed_translation_batches": result.resumed_translation_batches,
         "resumed_review_batches": result.resumed_review_batches,
         "translation_memory_hits": result.translation_memory_hits,
+        "terminology": result.terminology,
+        "review": result.review,
         "state_path": state_path,
         "glossary_path": glossary_path,
     }))
@@ -266,6 +296,8 @@ mod tests {
             state_path: None,
             glossary_path: None,
             agent_repairs: Vec::new(),
+            terminology: Default::default(),
+            review: Default::default(),
         };
 
         assert!(result_json(&result).contains("quote\\\"path.txt"));
@@ -292,6 +324,8 @@ mod tests {
             state_path: None,
             glossary_path: None,
             agent_repairs: Vec::new(),
+            terminology: Default::default(),
+            review: Default::default(),
         };
 
         let output = dry_run_text(&result, false);
