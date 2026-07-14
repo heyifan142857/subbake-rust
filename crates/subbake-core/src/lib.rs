@@ -17,10 +17,10 @@ pub use cancellation::{CancellationGuard, CancellationToken};
 pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, BatchTranslationResult, FailureLog,
-    GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, ReviewChange, ReviewPolicy,
-    ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
-    TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
+    AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, BatchTranslationResult,
+    BilingualOrder, FailureLog, GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult,
+    ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
+    SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
 };
 pub use error::{CoreError, CoreResult};
 pub use memory::ContextMemory;

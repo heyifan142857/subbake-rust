@@ -50,6 +50,7 @@ target_language = "Simplified Chinese"
 translation_concurrency = 4
 review_concurrency = 2
 bilingual = true
+bilingual_order = "target_first" # target_first 或 source_first
 ```
 
 ```bash

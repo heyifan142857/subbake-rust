@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use crate::entities::{SubtitleDocument, SubtitleSegment};
+use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
 use crate::error::{CoreError, CoreResult};
-use crate::formats::split_blocks;
+use crate::formats::{bilingual_text, split_blocks};
 
 const TIMESTAMP_SEPARATOR: &str = "-->";
 
@@ -42,6 +42,7 @@ pub fn render(
     source_segments: &[SubtitleSegment],
     segments: &[SubtitleSegment],
     bilingual: bool,
+    bilingual_order: BilingualOrder,
 ) -> CoreResult<String> {
     let mut blocks = Vec::new();
 
@@ -62,7 +63,7 @@ pub fn render(
             source_segments
                 .iter()
                 .find(|source| source.id == segment.id)
-                .map(|source| format!("{}\n{}", source.text, segment.text))
+                .map(|source| bilingual_text(&source.text, &segment.text, bilingual_order))
                 .unwrap_or_else(|| segment.text.clone())
         } else {
             segment.text.clone()

@@ -156,7 +156,8 @@ pub fn translate_subtitle_cancellable_with_progress(
     let render_options = RenderOptions::new(
         request.settings.output.bilingual,
         request.settings.output.format.clone(),
-    );
+    )
+    .with_bilingual_order(request.settings.output.bilingual_order);
     check_cancelled(cancellation)?;
     render_and_write_document(
         &document,
@@ -372,7 +373,7 @@ mod tests {
         );
         assert!(bilingual_path.ends_with("clip.bilingual.txt"));
         assert_eq!(bilingual.result.resumed_translation_batches, 1);
-        assert_eq!(bilingual_text, "hello\n[MOCK-EN] hello\n");
+        assert_eq!(bilingual_text, "[MOCK-EN] hello\nhello\n");
     }
 
     #[test]

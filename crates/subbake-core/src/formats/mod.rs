@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::entities::{SubtitleDocument, SubtitleSegment};
+use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
 use crate::error::{CoreError, CoreResult};
 
 mod srt;
@@ -10,6 +10,7 @@ mod vtt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderOptions {
     pub bilingual: bool,
+    pub bilingual_order: BilingualOrder,
     pub output_format: Option<String>,
 }
 
@@ -17,8 +18,14 @@ impl RenderOptions {
     pub fn new(bilingual: bool, output_format: Option<String>) -> Self {
         Self {
             bilingual,
+            bilingual_order: BilingualOrder::default(),
             output_format,
         }
+    }
+
+    pub fn with_bilingual_order(mut self, bilingual_order: BilingualOrder) -> Self {
+        self.bilingual_order = bilingual_order;
+        self
     }
 }
 
@@ -62,10 +69,32 @@ pub fn render_document(
     };
 
     match target_format.as_str() {
-        "srt" => srt::render(&document.segments, translations, options.bilingual),
-        "vtt" => vtt::render(document, translations, options.bilingual),
-        "txt" => txt::render(&document.segments, translations, options.bilingual),
+        "srt" => srt::render(
+            &document.segments,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+        ),
+        "vtt" => vtt::render(
+            document,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+        ),
+        "txt" => txt::render(
+            &document.segments,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+        ),
         _ => Err(CoreError::UnsupportedFormat(target_format)),
+    }
+}
+
+pub(crate) fn bilingual_text(source: &str, target: &str, order: BilingualOrder) -> String {
+    match order {
+        BilingualOrder::SourceFirst => format!("{source}\n{target}"),
+        BilingualOrder::TargetFirst => format!("{target}\n{source}"),
     }
 }
 
@@ -164,7 +193,7 @@ mod tests {
 
         let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
             .expect("render txt");
-        assert_eq!(rendered, "hello\n你好\nworld\n世界\n");
+        assert_eq!(rendered, "你好\nhello\n世界\nworld\n");
     }
 
     #[test]
@@ -177,8 +206,23 @@ mod tests {
 
         let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
             .expect("render srt");
-        assert!(rendered.contains("Hello\n你好"));
+        assert!(rendered.contains("你好\nHello"));
         assert!(rendered.contains("00:00:00,000 --> 00:00:01,000"));
+    }
+
+    #[test]
+    fn can_render_source_language_first() {
+        let path = PathBuf::from("clip.srt");
+        let doc = parse_document_text(&path, "1\n00:00:00,000 --> 00:00:01,000\nHello\n", None)
+            .expect("parse srt");
+        let mut translated = doc.segments.clone();
+        translated[0].text = "你好".to_owned();
+        let options =
+            RenderOptions::new(true, None).with_bilingual_order(BilingualOrder::SourceFirst);
+
+        let rendered = render_document(&doc, &translated, &options).expect("render srt");
+
+        assert!(rendered.contains("Hello\n你好"));
     }
 
     #[test]
@@ -196,6 +240,6 @@ mod tests {
         let rendered = render_document(&doc, &translated, &RenderOptions::new(true, None))
             .expect("render vtt");
         assert!(rendered.contains("NOTE hello"));
-        assert!(rendered.contains("c1\n00:00.000 --> 00:01.000 align:start\nHello\n你好"));
+        assert!(rendered.contains("c1\n00:00.000 --> 00:01.000 align:start\n你好\nHello"));
     }
 }

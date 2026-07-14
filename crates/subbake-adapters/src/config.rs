@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::providers::ApiFormat;
 use crate::settings::TranslationSettingsPatch;
+use subbake_core::BilingualOrder;
 
 pub fn load_translation_settings_patch(path: &Path) -> io::Result<TranslationSettingsPatch> {
     let content = fs::read_to_string(path)?;
@@ -105,6 +106,9 @@ fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPa
     usize_setting!("translation_concurrency", settings.translation_concurrency);
     usize_setting!("review_concurrency", settings.review_concurrency);
     bool_setting!("bilingual", settings.bilingual);
+    if let Some(value) = settings.bilingual_order {
+        string_setting!("bilingual_order", Some(value.as_str().to_owned()));
+    }
     bool_setting!("fast_mode", settings.fast_mode);
     if let Some(value) = settings.review_policy {
         string_setting!("review_policy", Some(value.as_str().to_owned()));
@@ -347,6 +351,9 @@ fn apply_key_value(
         "translation_concurrency" => patch.translation_concurrency = Some(value.into_usize(key)?),
         "review_concurrency" => patch.review_concurrency = Some(value.into_usize(key)?),
         "bilingual" => patch.bilingual = Some(value.into_bool(key)?),
+        "bilingual_order" => {
+            patch.bilingual_order = Some(BilingualOrder::parse(&value.into_string(key)?)?)
+        }
         "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
         // Normalize the legacy boolean at the configuration boundary. All
         // downstream overlay and application code sees one canonical field.
@@ -507,6 +514,7 @@ mod tests {
             target_language = "English"
             batch_size = 8
             bilingual = true
+            bilingual_order = "source_first"
             final_review = false
             resume = false
             cache = false
@@ -523,6 +531,7 @@ mod tests {
         assert_eq!(patch.target_language.as_deref(), Some("English"));
         assert_eq!(patch.batch_size, Some(8));
         assert_eq!(patch.bilingual, Some(true));
+        assert_eq!(patch.bilingual_order, Some(BilingualOrder::SourceFirst));
         assert_eq!(patch.review_policy, Some(subbake_core::ReviewPolicy::Off));
         assert_eq!(patch.resume, Some(false));
         assert_eq!(patch.use_cache, Some(false));
@@ -536,6 +545,13 @@ mod tests {
         let error =
             parse_translation_settings_patch("unknown = true").expect_err("unknown key fails");
         assert!(error.contains("unsupported config key"));
+    }
+
+    #[test]
+    fn rejects_invalid_bilingual_order() {
+        let error = parse_translation_settings_patch(r#"bilingual_order = "translated""#)
+            .expect_err("invalid bilingual order fails");
+        assert!(error.contains("source_first, target_first"));
     }
 
     #[test]
@@ -616,6 +632,7 @@ mod tests {
             auth_header: Some("also-secret".to_owned()),
             batch_size: Some(12),
             bilingual: Some(true),
+            bilingual_order: Some(BilingualOrder::SourceFirst),
             ..TranslationSettingsPatch::default()
         };
 
@@ -631,6 +648,7 @@ mod tests {
         let profile = parsed.profiles.get("review_copy").expect("new profile");
         assert_eq!(profile.batch_size, Some(12));
         assert_eq!(profile.bilingual, Some(true));
+        assert_eq!(profile.bilingual_order, Some(BilingualOrder::SourceFirst));
         fs::remove_file(path).expect("remove config");
     }
 

@@ -1,7 +1,8 @@
 use std::path::Path;
 
-use crate::entities::{SubtitleDocument, SubtitleSegment};
+use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
 use crate::error::CoreResult;
+use crate::formats::bilingual_text;
 
 pub fn parse(path: &Path, text: &str) -> SubtitleDocument {
     let text = text.trim_start_matches('\u{feff}');
@@ -31,6 +32,7 @@ pub fn render(
     source_segments: &[SubtitleSegment],
     translated_segments: &[SubtitleSegment],
     bilingual: bool,
+    bilingual_order: BilingualOrder,
 ) -> CoreResult<String> {
     let mut rendered_lines = Vec::new();
 
@@ -40,9 +42,14 @@ pub fn render(
                 .iter()
                 .find(|segment| segment.id == translated.id)
         {
-            rendered_lines.push(source.text.clone());
+            rendered_lines.push(bilingual_text(
+                &source.text,
+                &translated.text,
+                bilingual_order,
+            ));
+        } else {
+            rendered_lines.push(translated.text.clone());
         }
-        rendered_lines.push(translated.text.clone());
     }
 
     if rendered_lines.is_empty() {

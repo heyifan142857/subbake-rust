@@ -8,7 +8,7 @@ use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
 pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 7;
-pub const RENDER_FINGERPRINT_VERSION: u64 = 4;
+pub const RENDER_FINGERPRINT_VERSION: u64 = 5;
 pub const CACHE_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +316,10 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
         ),
         ("bilingual".to_owned(), JsonValue::Bool(options.bilingual)),
         (
+            "bilingual_order".to_owned(),
+            JsonValue::String(options.bilingual_order.as_str().to_owned()),
+        ),
+        (
             "review_policy".to_owned(),
             JsonValue::String(format!("{:?}", options.review_policy).to_lowercase()),
         ),
@@ -559,6 +563,18 @@ mod tests {
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
             "b4e93099b0432c053ef18b23550da6fed6f549e5"
+        );
+    }
+
+    #[test]
+    fn render_fingerprint_distinguishes_bilingual_order() {
+        let target_first = PipelineOptions::new("clip.txt".into());
+        let mut source_first = target_first.clone();
+        source_first.bilingual_order = crate::entities::BilingualOrder::SourceFirst;
+
+        assert_ne!(
+            build_render_fingerprint(&target_first),
+            build_render_fingerprint(&source_first)
         );
     }
 

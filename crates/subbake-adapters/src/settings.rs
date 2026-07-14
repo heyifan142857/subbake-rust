@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{
-    DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET, DEFAULT_MODEL,
-    DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY, DEFAULT_SOURCE_LANGUAGE,
-    DEFAULT_TARGET_LANGUAGE, DEFAULT_TRANSLATION_CONCURRENCY, PipelineOptions, ReviewPolicy,
+    BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET,
+    DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY,
+    DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, DEFAULT_TRANSLATION_CONCURRENCY,
+    PipelineOptions, ReviewPolicy,
 };
 
 use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
@@ -20,6 +21,7 @@ pub struct TranslationSettings {
 pub struct OutputSettings {
     pub format: Option<String>,
     pub bilingual: bool,
+    pub bilingual_order: BilingualOrder,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +116,9 @@ impl TranslationSettingsPatch {
         if let Some(value) = other.bilingual {
             self.bilingual = Some(value);
         }
+        if let Some(value) = other.bilingual_order {
+            self.bilingual_order = Some(value);
+        }
         if let Some(value) = other.fast_mode {
             self.fast_mode = Some(value);
         }
@@ -169,6 +174,7 @@ pub struct TranslationSettingsPatch {
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
     pub bilingual: Option<bool>,
+    pub bilingual_order: Option<BilingualOrder>,
     pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
@@ -188,6 +194,7 @@ impl Default for TranslationSettings {
             output: OutputSettings {
                 format: None,
                 bilingual: false,
+                bilingual_order: BilingualOrder::default(),
             },
             backend: BackendSettings {
                 provider: DEFAULT_PROVIDER.to_owned(),
@@ -283,6 +290,9 @@ impl TranslationSettings {
         if let Some(value) = patch.bilingual {
             self.output.bilingual = value;
         }
+        if let Some(value) = patch.bilingual_order {
+            self.output.bilingual_order = value;
+        }
         if let Some(value) = patch.fast_mode {
             self.translation.fast_mode = value;
         }
@@ -355,6 +365,7 @@ impl TranslationSettings {
         options.translation_concurrency = self.translation.translation_concurrency;
         options.review_concurrency = self.translation.review_concurrency;
         options.bilingual = self.output.bilingual;
+        options.bilingual_order = self.output.bilingual_order;
         options.fast_mode = self.translation.fast_mode;
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
@@ -412,6 +423,7 @@ mod tests {
         assert_eq!(settings.translation.target_language, "zh-Hans");
         assert_eq!(settings.translation.batch_size, DEFAULT_BATCH_SIZE);
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
+        assert_eq!(settings.output.bilingual_order, BilingualOrder::TargetFirst);
         assert!(settings.translation.resume);
         assert!(settings.translation.use_cache);
         assert_eq!(settings.translation.retries, 2);
@@ -424,12 +436,14 @@ mod tests {
         let mut settings = TranslationSettings::default();
         settings.translation.target_language = "English".to_owned();
         settings.output.bilingual = true;
+        settings.output.bilingual_order = BilingualOrder::SourceFirst;
         settings.output.format = Some("txt".to_owned());
 
         let options = settings.to_pipeline_options("clip.srt", Some("out.txt".into()));
 
         assert_eq!(options.target_language, "English");
         assert!(options.bilingual);
+        assert_eq!(options.bilingual_order, BilingualOrder::SourceFirst);
         assert_eq!(options.output_format.as_deref(), Some("txt"));
         assert!(options.resume);
         assert!(options.use_cache);
@@ -443,6 +457,7 @@ mod tests {
         let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
             provider: Some("openai".to_owned()),
             batch_size: Some(12),
+            bilingual_order: Some(BilingualOrder::SourceFirst),
             review_policy: Some(ReviewPolicy::Off),
             ..TranslationSettingsPatch::default()
         });
@@ -450,6 +465,7 @@ mod tests {
         assert_eq!(settings.backend.provider, "openai");
         assert_eq!(settings.translation.batch_size, 12);
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
+        assert_eq!(settings.output.bilingual_order, BilingualOrder::SourceFirst);
     }
 
     #[test]

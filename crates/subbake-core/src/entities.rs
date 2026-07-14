@@ -15,6 +15,31 @@ pub const DEFAULT_AGENT_REPAIR_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum BilingualOrder {
+    SourceFirst,
+    #[default]
+    TargetFirst,
+}
+
+impl BilingualOrder {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "source_first" => Ok(Self::SourceFirst),
+            "target_first" => Ok(Self::TargetFirst),
+            _ => Err("bilingual order must be one of: source_first, target_first".to_owned()),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceFirst => "source_first",
+            Self::TargetFirst => "target_first",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewPolicy {
     #[default]
     Off,
@@ -237,6 +262,7 @@ pub struct PipelineOptions {
     pub review_concurrency: usize,
     pub fast_mode: bool,
     pub bilingual: bool,
+    pub bilingual_order: BilingualOrder,
     pub target_language: String,
     pub source_language: String,
     pub retries: usize,
@@ -269,6 +295,7 @@ impl PipelineOptions {
             review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
             fast_mode: false,
             bilingual: false,
+            bilingual_order: BilingualOrder::default(),
             target_language: default_target_language(),
             source_language: default_source_language(),
             retries: DEFAULT_RETRIES,
