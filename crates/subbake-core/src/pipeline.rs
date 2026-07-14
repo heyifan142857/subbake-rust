@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use crate::entities::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
-use crate::memory::ContextMemory;
+use crate::memory::{ContextMemory, english_possessive_base};
 use crate::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink,
     LlmBackend, RuntimeStore,
@@ -40,6 +40,9 @@ pub struct SubtitlePipeline<B, D> {
     dashboard: D,
     options: PipelineOptions,
     memory: ContextMemory,
+    /// Only a user-supplied glossary is authoritative enough to reject a
+    /// translation. Automatically extracted terminology remains advisory.
+    required_glossary: BTreeMap<String, String>,
     store: Option<Box<dyn RuntimeStore>>,
     input_signature: Option<InputSignature>,
     /// Normalised-key → translation text cache loaded from the runtime store.
@@ -64,6 +67,7 @@ where
             dashboard,
             options,
             memory: ContextMemory::new(),
+            required_glossary: BTreeMap::new(),
             store: None,
             input_signature: None,
             translation_memory: HashMap::new(),
@@ -164,11 +168,16 @@ where
             ));
         }
 
-        // Load persisted glossary into context memory at start.
+        // Persisted auto terminology is useful prompt context, but only a
+        // glossary explicitly supplied by the user is a hard requirement.
+        self.required_glossary.clear();
         if let Some(ref store) = self.store {
             self.cancellation.check()?;
             let entries = store.load_glossary()?;
             self.memory.load_glossary(&entries);
+            if self.options.glossary_path.is_some() {
+                self.required_glossary.extend(entries);
+            }
         }
 
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
@@ -282,7 +291,7 @@ where
             validate_window_terminology(
                 &prepared,
                 &generated,
-                &self.memory,
+                &self.required_glossary,
                 self.options.review_policy != ReviewPolicy::Off,
             )?;
             for prepared_batch in prepared {
@@ -673,8 +682,13 @@ where
         let mut results = HashMap::new();
         let mut pending = Vec::new();
         for (batch_index, batch) in batches {
-            let messages =
-                build_translation_messages(&self.options, *batch_index, batch, &self.memory);
+            let messages = build_translation_messages(
+                &self.options,
+                *batch_index,
+                batch,
+                &self.memory,
+                &self.required_glossary,
+            );
             let hash = request_hash(&self.options, CacheStage::Translate, &messages);
             let cached = if self.options.use_cache {
                 self.store
@@ -777,8 +791,13 @@ where
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
-            let mut messages =
-                build_translation_messages(&self.options, batch_index, batch, &self.memory);
+            let mut messages = build_translation_messages(
+                &self.options,
+                batch_index,
+                batch,
+                &self.memory,
+                &self.required_glossary,
+            );
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
             }
@@ -1566,7 +1585,10 @@ fn extract_terminology_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolo
             .text
             .split_whitespace()
             .map(|word| {
-                word.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '\'')
+                let word = word.trim_matches(|ch: char| {
+                    !ch.is_alphanumeric() && ch != '-' && ch != '\'' && ch != '’'
+                });
+                english_possessive_base(word).unwrap_or(word)
             })
             .filter(|word| word.len() >= 2)
             .collect::<Vec<_>>();
@@ -1697,6 +1719,7 @@ fn build_translation_messages(
     batch_index: usize,
     batch: &[SubtitleSegment],
     memory: &ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
 ) -> Vec<ChatMessage> {
     let mut context = serde_json::json!({
         "src": options.source_language,
@@ -1730,11 +1753,22 @@ fn build_translation_messages(
             .collect();
         let glossary = memory.select_relevant_glossary(&batch_texts);
         if !glossary.is_empty() {
-            let map: serde_json::Map<String, serde_json::Value> = glossary
-                .into_iter()
-                .map(|(source, target)| (source, serde_json::Value::String(target)))
-                .collect();
-            context["glossary"] = serde_json::Value::Object(map);
+            let mut required = serde_json::Map::new();
+            let mut advisory = serde_json::Map::new();
+            for (source, target) in glossary {
+                let entry = (source.clone(), serde_json::Value::String(target));
+                if required_glossary.contains_key(&source) {
+                    required.insert(entry.0, entry.1);
+                } else {
+                    advisory.insert(entry.0, entry.1);
+                }
+            }
+            if !required.is_empty() {
+                context["glossary"] = serde_json::Value::Object(required);
+            }
+            if !advisory.is_empty() {
+                context["terminology_hints"] = serde_json::Value::Object(advisory);
+            }
         }
     }
     let lines: Vec<serde_json::Value> = batch
@@ -1756,7 +1790,10 @@ Return JSON only with this shape:\n\
 {\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}],\"summary\":\"\",\"glossary_updates\":[]}\n\
 Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
 The translated text must be in the translation field; do not return it in text or translated_text.\n\
-Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.",
+Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
+Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
+CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
+only when they fit the meaning in the current context.",
         ),
         ChatMessage::user(user),
     ]
@@ -1887,28 +1924,9 @@ fn validate_review_candidate_ids(
 fn validate_window_terminology(
     prepared: &[PreparedBatch],
     generated: &HashMap<usize, BatchWithUsage>,
-    memory: &ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
     defer_missing_to_review: bool,
 ) -> CoreResult<()> {
-    let mut canonical = memory.glossary.clone();
-    for result in generated.values() {
-        for entry in &result.glossary_updates {
-            if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
-                continue;
-            }
-            if let Some(existing) = canonical.get(&entry.source)
-                && !existing.eq_ignore_ascii_case(&entry.target)
-            {
-                return Err(CoreError::InvalidTranslation(format!(
-                    "terminology conflict for `{}`: `{existing}` versus `{}`",
-                    entry.source, entry.target
-                )));
-            }
-            canonical
-                .entry(entry.source.clone())
-                .or_insert_with(|| entry.target.clone());
-        }
-    }
     for batch in prepared {
         let Some(result) = generated.get(&(batch.index + 1)) else {
             continue;
@@ -1916,7 +1934,7 @@ fn validate_window_terminology(
         for (segment, line) in batch.pending.iter().zip(&result.lines) {
             let source_lower = segment.text.to_lowercase();
             let translation_lower = line.translation.to_lowercase();
-            for (term, target) in &canonical {
+            for (term, target) in required_glossary {
                 if source_lower.contains(&term.to_lowercase())
                     && !translation_lower.contains(&target.to_lowercase())
                     && !defer_missing_to_review
@@ -3090,6 +3108,78 @@ mod tests {
     }
 
     #[test]
+    fn terminology_candidates_normalize_english_possessives() {
+        let segments = vec![
+            segment("18", "MacAndrews'."),
+            segment("19", "MacClannough's horse."),
+            segment("20", "James’ horse."),
+        ];
+
+        let sources = extract_terminology_candidates(&segments)
+            .into_iter()
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>();
+
+        assert!(sources.contains(&"MacAndrews".to_owned()));
+        assert!(sources.contains(&"MacClannough".to_owned()));
+        assert!(sources.contains(&"James".to_owned()));
+        assert!(!sources.iter().any(|source| source.contains(['\'', '’'])));
+    }
+
+    #[test]
+    fn auto_terminology_is_advisory_but_explicit_glossary_is_required() {
+        let prepared = vec![translation_stage::PreparedBatch {
+            index: 0,
+            memory_hits: HashMap::new(),
+            pending: vec![segment("69", "The Lord bless thee and keep thee.")],
+        }];
+        let generated = HashMap::from([(
+            1,
+            BatchWithUsage {
+                lines: vec![TranslationLine {
+                    id: "69".to_owned(),
+                    translation: "愿主保佑你，保护你。".to_owned(),
+                }],
+                summary: String::new(),
+                glossary_updates: vec![GlossaryEntry {
+                    source: "Lord".to_owned(),
+                    target: "勋爵".to_owned(),
+                }],
+                usage: Usage::default(),
+            },
+        )]);
+
+        validate_window_terminology(&prepared, &generated, &BTreeMap::new(), false)
+            .expect("automatically learned terminology must remain advisory");
+
+        let mut memory = ContextMemory::new();
+        memory.load_glossary(&[("Lord".to_owned(), "勋爵".to_owned())]);
+        let options = PipelineOptions::new("terms.srt".into());
+        let advisory_messages = build_translation_messages(
+            &options,
+            1,
+            &prepared[0].pending,
+            &memory,
+            &BTreeMap::new(),
+        );
+        let advisory_context = translation_context(&advisory_messages);
+        assert_eq!(advisory_context["terminology_hints"]["Lord"], "勋爵");
+        assert!(advisory_context.get("glossary").is_none());
+
+        let required = BTreeMap::from([("Lord".to_owned(), "勋爵".to_owned())]);
+        let required_messages =
+            build_translation_messages(&options, 1, &prepared[0].pending, &memory, &required);
+        let required_context = translation_context(&required_messages);
+        assert_eq!(required_context["glossary"]["Lord"], "勋爵");
+        assert!(required_context.get("terminology_hints").is_none());
+
+        let error = validate_window_terminology(&prepared, &generated, &required, false)
+            .expect_err("an explicit user glossary must remain authoritative");
+        assert!(error.to_string().contains("line 69"));
+        assert!(error.to_string().contains("`Lord` -> `勋爵`"));
+    }
+
+    #[test]
     fn terminology_preflight_freezes_glossary_before_all_translation_batches() {
         let document = document("terms.txt", &["Meet Alice now.", "Meet Bob now."]);
         let mut options = PipelineOptions::new("terms.txt".into());
@@ -3110,9 +3200,10 @@ mod tests {
         assert!(run.result.terminology.entries_added >= 2);
         assert_eq!(contexts.len(), 2);
         assert!(contexts.iter().all(|context| {
-            context["glossary"]
+            context["terminology_hints"]
                 .as_object()
                 .is_some_and(|map| !map.is_empty())
+                && context.get("glossary").is_none()
         }));
     }
 
@@ -3316,6 +3407,16 @@ mod tests {
             run.translated_segments[0].text,
             "[REVIEWED] [ECHO] Meet Alice now."
         );
+    }
+
+    fn translation_context(messages: &[ChatMessage]) -> serde_json::Value {
+        let context = messages
+            .iter()
+            .find(|message| message.role == "user")
+            .and_then(|message| message.content.split("CONTEXT_JSON_START").nth(1))
+            .and_then(|value| value.split("CONTEXT_JSON_END").next())
+            .expect("translation context");
+        serde_json::from_str(context).expect("valid translation context")
     }
 
     fn segment(id: &str, text: &str) -> SubtitleSegment {

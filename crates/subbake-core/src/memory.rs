@@ -18,6 +18,28 @@ pub const DEFAULT_STYLE_RULES: &[&str] = &[
     "Do not merge or drop subtitle entries.",
 ];
 
+/// Return the lemma-like base of a simple English possessive form. Glossary
+/// consistency is enforced on the base term because target languages may
+/// express possession with particles, word order, or compounds.
+pub(crate) fn english_possessive_base(value: &str) -> Option<&str> {
+    let value = value.trim();
+    for suffix in ["'s", "'S", "’s", "’S"] {
+        if let Some(base) = value.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return Some(base);
+        }
+    }
+    for suffix in ['\'', '’'] {
+        if let Some(base) = value.strip_suffix(suffix)
+            && base.ends_with(['s', 'S'])
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextMemory {
     #[serde(default = "default_style_rules")]
@@ -78,7 +100,9 @@ impl ContextMemory {
             }
         }
         for entry in glossary_updates {
-            if entry.source.is_empty() && entry.target.is_empty() {
+            if (entry.source.is_empty() && entry.target.is_empty())
+                || english_possessive_base(&entry.source).is_some()
+            {
                 continue;
             }
             self.glossary
@@ -96,6 +120,9 @@ impl ContextMemory {
         let haystack = texts.join("\n").to_lowercase();
         let mut matched = Vec::new();
         for (source, target) in &self.glossary {
+            if english_possessive_base(source).is_some() {
+                continue;
+            }
             if haystack.contains(&source.to_lowercase())
                 || haystack.contains(&target.to_lowercase())
             {
@@ -122,6 +149,18 @@ impl ContextMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_simple_english_possessive_forms() {
+        assert_eq!(english_possessive_base("MacAndrews'"), Some("MacAndrews"));
+        assert_eq!(
+            english_possessive_base("MacClannough's"),
+            Some("MacClannough")
+        );
+        assert_eq!(english_possessive_base("James’"), Some("James"));
+        assert_eq!(english_possessive_base("Mornay’s"), Some("Mornay"));
+        assert_eq!(english_possessive_base("MacAndrews"), None);
+    }
 
     #[test]
     fn update_keeps_only_recent_summaries() {
@@ -152,6 +191,33 @@ mod tests {
         assert_eq!(
             memory.glossary.get("alice").map(String::as_str),
             Some("爱丽")
+        );
+    }
+
+    #[test]
+    fn possessive_forms_are_not_retained_or_selected_as_terms() {
+        let mut memory = ContextMemory::new();
+        memory.update(
+            "",
+            &[
+                GlossaryEntry {
+                    source: "MacAndrews".to_owned(),
+                    target: "麦克安德鲁斯".to_owned(),
+                },
+                GlossaryEntry {
+                    source: "MacAndrews'".to_owned(),
+                    target: "麦克安德鲁斯的".to_owned(),
+                },
+            ],
+        );
+        memory
+            .glossary
+            .insert("Mornay's".to_owned(), "莫奈的".to_owned());
+
+        assert!(!memory.glossary.contains_key("MacAndrews'"));
+        assert_eq!(
+            memory.select_relevant_glossary(&["MacAndrews' and Mornay's"]),
+            vec![("MacAndrews".to_owned(), "麦克安德鲁斯".to_owned())]
         );
     }
 
