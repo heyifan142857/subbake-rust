@@ -24,11 +24,13 @@ use crate::discovery::summarize_observation;
 use crate::engine::AgentEngine;
 use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
 use crate::guard::{FileOpAction, FileOpResult};
-use crate::session::EventTag;
+use crate::session::{EventTag, PendingAction};
 use crate::tool_execution::{
     execute_adapter_tool, execute_local_tool, execute_session_tool, execute_translation_tool,
 };
-use crate::tools::{ToolScope, tool_specs_for_scope, validate_tool_call};
+use crate::tools::{
+    ToolAuthorization, ToolIntent, authorize_tool, tool_specs_for_intent, validate_tool_call,
+};
 
 mod intent;
 
@@ -213,14 +215,14 @@ impl AgentEngine {
             return self.finish_response(result.output, false, result.response_text.is_some());
         }
 
-        let (scope, request, inspect_project) = match self.route_request(input, backend)? {
+        let (mut intent, request, inspect_project) = match self.route_request(input, backend)? {
             Route::Respond(text) => return self.finish_response(text, false, true),
             Route::AskUser(text) => return self.finish_response(text, true, true),
             Route::Act {
-                scope,
+                intent,
                 request,
                 inspect_project,
-            } => (scope, request, inspect_project),
+            } => (intent, request, inspect_project),
         };
 
         // 2. Bounded, intent-scoped tool loop.
@@ -233,6 +235,7 @@ impl AgentEngine {
         };
         let mut native_turn: Option<NativeTurn> = None;
         let mut native_validation_failures = 0usize;
+        let mut native_policy_failures = 0usize;
 
         if inspect_project {
             let arguments = json!({"path": "."});
@@ -272,7 +275,7 @@ impl AgentEngine {
 
             // Build context + call LLM.
             let mut decision =
-                self.call_llm_for_decision(backend, &request, &state, &mut native_turn, scope)?;
+                self.call_llm_for_decision(backend, &request, &state, &mut native_turn, intent)?;
 
             if !decision.native_calls.is_empty() {
                 let continuation = decision.native_continuation.take().ok_or_else(|| {
@@ -285,14 +288,13 @@ impl AgentEngine {
                 if has_discovery {
                     let mut results = Vec::new();
                     for call in &decision.native_calls {
-                        if !tool_allowed(scope, &call.name) {
+                        if let Err(error) = authorize_and_refine(&mut intent, &call.name) {
                             results.push(ModelToolResult {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                output: "tool is not allowed for this turn's intent".to_owned(),
+                                output: error,
                                 is_error: true,
                             });
-                            state.force_no_tools = true;
                             continue;
                         }
                         if let Err(error) = validate_tool_call(&call.name, &call.arguments) {
@@ -383,39 +385,45 @@ impl AgentEngine {
                     continue;
                 }
 
+                let mut candidate_intent = intent;
                 let validation_errors = decision
                     .native_calls
                     .iter()
-                    .map(|call| {
-                        if tool_allowed(scope, &call.name) {
-                            validate_tool_call(&call.name, &call.arguments).err()
-                        } else {
-                            Some("tool is not allowed for this turn's intent".to_owned())
-                        }
-                    })
+                    .map(
+                        |call| match authorize_and_refine(&mut candidate_intent, &call.name) {
+                            Ok(()) => {
+                                (validate_tool_call(&call.name, &call.arguments).err(), false)
+                            }
+                            Err(error) => (Some(error), true),
+                        },
+                    )
                     .collect::<Vec<_>>();
-                if validation_errors.iter().any(Option::is_some) {
+                if validation_errors.iter().any(|(error, _)| error.is_some()) {
+                    let has_policy_error = validation_errors.iter().any(|(_, policy)| *policy);
                     native_validation_failures += 1;
+                    native_policy_failures += usize::from(has_policy_error);
                     let details = validation_errors
                         .iter()
-                        .flatten()
-                        .cloned()
+                        .filter_map(|(error, _)| error.as_deref())
                         .collect::<Vec<_>>()
                         .join("; ");
                     if native_validation_failures >= 2 {
-                        return self.finish_response(
+                        let message = if native_policy_failures > 0 {
+                            format!(
+                                "I couldn't execute the proposed action because one or more tools are not available for the routed intent: {details}"
+                            )
+                        } else {
                             format!(
                                 "I couldn't execute the proposed action because its arguments were invalid: {details}"
-                            ),
-                            true,
-                            true,
-                        );
+                            )
+                        };
+                        return self.finish_response(message, true, true);
                     }
                     let results = decision
                         .native_calls
                         .iter()
                         .zip(validation_errors)
-                        .map(|(call, error)| ModelToolResult {
+                        .map(|(call, (error, _))| ModelToolResult {
                             id: call.id.clone(),
                             name: call.name.clone(),
                             output: error.unwrap_or_else(|| {
@@ -470,6 +478,7 @@ impl AgentEngine {
                 }
 
                 DecisionAction::AskUser => {
+                    self.set_pending_action(intent, &request)?;
                     return self.finish_response(decision.text, true, true);
                 }
 
@@ -477,9 +486,9 @@ impl AgentEngine {
                     let tool_name = decision.tool_name.as_deref().unwrap_or("unknown");
                     let args = decision.arguments.unwrap_or(json!({}));
 
-                    if !tool_allowed(scope, tool_name) {
+                    if let Err(error) = authorize_and_refine(&mut intent, tool_name) {
                         return self.finish_response(
-                            "I couldn't use the proposed tool because it does not match this request. Could you clarify the intended action?".to_owned(),
+                            format!("I couldn't use the proposed tool: {error}"),
                             true,
                             true,
                         );
@@ -530,16 +539,19 @@ impl AgentEngine {
                 }
 
                 DecisionAction::Plan => {
-                    if decision
-                        .tool_calls
-                        .iter()
-                        .any(|call| !tool_allowed(scope, &call.tool_name))
-                    {
-                        return self.finish_response(
-                            "The proposed plan contains an action unrelated to this request. Could you clarify the intended action?".to_owned(),
-                            true,
-                            true,
-                        );
+                    let mut candidate_intent = intent;
+                    for call in &decision.tool_calls {
+                        if let Err(error) =
+                            authorize_and_refine(&mut candidate_intent, &call.tool_name)
+                        {
+                            return self.finish_response(
+                                format!(
+                                    "The proposed plan contains an unauthorized action: {error}"
+                                ),
+                                true,
+                                true,
+                            );
+                        }
                     }
                     if self.is_in_plan_mode() {
                         self.store_plan(&decision.text, decision.tool_calls)?;
@@ -581,6 +593,9 @@ impl AgentEngine {
         ask_user: bool,
         notify_observer: bool,
     ) -> io::Result<String> {
+        if !ask_user {
+            self.clear_pending_action()?;
+        }
         let event = if ask_user {
             EventKind::AskUser { text: text.clone() }
         } else {
@@ -647,6 +662,9 @@ impl AgentEngine {
     }
 
     fn route_request(&mut self, input: &str, backend: &mut dyn LlmBackend) -> io::Result<Route> {
+        if let Some(route) = self.pending_action_route(input) {
+            return Ok(route);
+        }
         let messages = self.build_route_messages(input, None);
         if let Some(ref mut observer) = self.observer {
             observer.on_thinking("Understanding your request…");
@@ -691,7 +709,7 @@ impl AgentEngine {
     }
 
     fn build_route_messages(&self, input: &str, repair_error: Option<&str>) -> Vec<ChatMessage> {
-        let mut system = "You are the semantic router for SubBake. No tools are available in this stage. Understand the current message using recent dialogue. Return one JSON object only. Use {\"route\":\"respond\",\"text\":\"...\"} for conversation or informational questions; {\"route\":\"ask_user\",\"text\":\"...\"} when clarification is essential; or {\"route\":\"act\",\"intent\":\"browse|translate|transcribe|edit|diagnose|file_create|file_append|file_replace|file_rename|file_delete|profile|whisper\",\"restated_request\":\"...\",\"inspect_project\":true|false} for an actionable request. Set inspect_project=true only when shallow project files are needed to ground the action. A short reply such as 1/yes/好 may continue an action only when recent dialogue clearly establishes that action; otherwise respond conversationally. Never invent a path or action from old tool activity."
+        let mut system = "You are the semantic router for SubBake. No tools are available in this stage. Understand the current message using recent dialogue. Return one JSON object only. Use {\"route\":\"respond\",\"text\":\"...\"} for conversation or informational questions; {\"route\":\"ask_user\",\"text\":\"...\"} when clarification is essential; or {\"route\":\"act\",\"intent\":\"browse|translate|transcribe|edit|diagnose|file_create|file_append|file_replace|file_rename|file_delete|profile|whisper\",\"restated_request\":\"...\",\"inspect_project\":true|false} for an actionable request. Set inspect_project=true only when shallow project files are needed to ground the action. Route creating a translated or bilingual output from a source subtitle as translate. Route changing an existing .translated or .bilingual subtitle, including combining it with a source subtitle, as edit. A short reply such as 1/yes/好 may continue an action only when recent dialogue clearly establishes that action; otherwise respond conversationally. Never invent a path or action from old tool activity."
             .to_owned();
         if let Some(error) = repair_error {
             system.push_str("\nThe previous route was invalid: ");
@@ -699,11 +717,65 @@ impl AgentEngine {
             system.push_str(". Return a corrected route.");
         }
         let mut user = format!("Current message: {input}");
+        if let Some(pending) = self.pending_action() {
+            user.push_str("\n\nPending action awaiting a user-supplied value:\n");
+            user.push_str(&format!(
+                "intent: {}\nrequest: {}\n",
+                pending.intent, pending.request
+            ));
+            user.push_str(
+                "If the current message supplies the requested value rather than starting a new task, continue this action with the same intent."
+            );
+        }
         if let Some(context) = self.dialogue_context_summary(8) {
             user.push_str("\n\nRecent dialogue:\n");
             user.push_str(&context);
         }
         vec![ChatMessage::system(system), ChatMessage::user(user)]
+    }
+
+    fn pending_action(&self) -> Option<&PendingAction> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.pending_action.as_ref())
+    }
+
+    fn pending_action_route(&self, input: &str) -> Option<Route> {
+        let pending = self.pending_action()?;
+        if !looks_like_path_value(input) {
+            return None;
+        }
+        let intent = ToolIntent::parse(&pending.intent)?;
+        Some(Route::Act {
+            intent,
+            request: format!(
+                "{}\n\nThe user supplied this requested path: {}",
+                pending.request,
+                input.trim()
+            ),
+            inspect_project: false,
+        })
+    }
+
+    fn set_pending_action(&mut self, intent: ToolIntent, request: &str) -> io::Result<()> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        session.pending_action = Some(PendingAction {
+            intent: intent.as_str().to_owned(),
+            request: request.to_owned(),
+        });
+        self.save()
+    }
+
+    fn clear_pending_action(&mut self) -> io::Result<()> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        if session.pending_action.take().is_some() {
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn dialogue_context_summary(&self, limit: usize) -> Option<String> {
@@ -736,7 +808,7 @@ impl AgentEngine {
         user_input: &str,
         state: &LoopState,
         native_turn: &mut Option<NativeTurn>,
-        scope: ToolScope,
+        intent: ToolIntent,
     ) -> io::Result<Decision> {
         if backend.native_tool_support() != NativeToolSupport::Unsupported {
             let input = if let Some(turn) = native_turn.take() {
@@ -746,13 +818,13 @@ impl AgentEngine {
                 }
             } else {
                 ToolGenerationInput::Start {
-                    messages: self.build_native_messages(user_input, state),
+                    messages: self.build_native_messages(user_input, state, intent),
                 }
             };
             let tools = if state.force_no_tools {
                 Vec::new()
             } else {
-                tool_specs_for_scope(scope)
+                tool_specs_for_intent(intent)
                     .into_iter()
                     .map(|spec| spec.native_definition())
                     .collect()
@@ -817,7 +889,7 @@ impl AgentEngine {
                 }
             }
         }
-        self.call_legacy_decision(backend, user_input, state, scope)
+        self.call_legacy_decision(backend, user_input, state, intent)
     }
 
     fn call_legacy_decision(
@@ -825,9 +897,9 @@ impl AgentEngine {
         backend: &mut dyn LlmBackend,
         user_input: &str,
         state: &LoopState,
-        scope: ToolScope,
+        intent: ToolIntent,
     ) -> io::Result<Decision> {
-        let messages = self.build_decision_messages(user_input, state, None, scope);
+        let messages = self.build_decision_messages(user_input, state, None, intent);
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
@@ -843,7 +915,7 @@ impl AgentEngine {
                         user_input,
                         state,
                         Some(&first_error.to_string()),
-                        scope,
+                        intent,
                     );
                     match backend
                         .generate_raw_json_cancellable(&repair_messages, &self.operation_guard)
@@ -899,11 +971,19 @@ impl AgentEngine {
     }
 
     /// Build the LLM message context for the decision call.
-    fn build_native_messages(&self, user_input: &str, state: &LoopState) -> Vec<ChatMessage> {
+    fn build_native_messages(
+        &self,
+        user_input: &str,
+        state: &LoopState,
+        intent: ToolIntent,
+    ) -> Vec<ChatMessage> {
         let system = if state.force_no_tools {
-            "You are SubBake. Tool exploration is finished. Answer from the supplied dialogue and observations, or ask one specific clarification question. Do not request another tool."
+            "You are SubBake. Tool exploration is finished. Answer from the supplied dialogue and observations, or ask one specific clarification question. Do not request another tool.".to_owned()
         } else {
-            "You are SubBake, a subtitle translation assistant. Use only the provided tools and only when they advance the routed action. For an actionable request, do not reply with instructions that the available tools can perform. Preserve subtitle id order, never merge or drop entries. Use translate_file for one explicit subtitle file and translate_series for a directory, batch, or all-files request. Reuse exact paths from tool results. When the user explicitly requests bilingual subtitles, pass bilingual=true. Call one tool at a time unless independent calls are necessary."
+            format!(
+                "You are SubBake, a subtitle translation assistant. The preliminary routed intent is `{}`; provided tools may safely refine translate into edit or edit into translate when discovered file state requires it. Use only the provided tools and only when they advance the routed action. For an actionable request, do not reply with instructions that the available tools can perform. Preserve subtitle id order, never merge or drop entries. Use edit_subtitle when changing an existing .translated or .bilingual subtitle, including combining it with its source subtitle. Use translate_file for one source subtitle file and translate_series for a directory, batch, or all-files request. Reuse exact paths from tool results. When creating bilingual output through a translation tool, pass bilingual=true. Call one tool at a time unless independent calls are necessary.",
+                intent.as_str()
+            )
         };
         vec![
             ChatMessage::system(system),
@@ -916,15 +996,19 @@ impl AgentEngine {
         user_input: &str,
         state: &LoopState,
         repair_error: Option<&str>,
-        scope: ToolScope,
+        intent: ToolIntent,
     ) -> Vec<ChatMessage> {
         let mut system = String::new();
         system.push_str("You are SubBake, a subtitle translation assistant.\n\n");
+        system.push_str(&format!(
+            "The preliminary routed intent is `{}`; adjacent subtitle tools may safely refine translate into edit or edit into translate.\n\n",
+            intent.as_str()
+        ));
         system.push_str("Relevant available tools:\n");
         for spec in if state.force_no_tools {
             Vec::new()
         } else {
-            tool_specs_for_scope(scope)
+            tool_specs_for_intent(intent)
         } {
             system.push_str(&spec.prompt_line());
             if spec.mutating {
@@ -945,8 +1029,11 @@ impl AgentEngine {
         system.push_str("If a translation target is omitted, call candidate_subtitles with path `.` before asking for a path.\n");
         system.push_str("Preserve subtitle id order, never merge or drop entries.\n");
         system.push_str("Use translate_file for one explicit subtitle file and translate_series for a directory, batch, or all-files request.\n");
+        system.push_str("Use edit_subtitle when changing an existing .translated or .bilingual subtitle, including combining it with its source subtitle.\n");
         system.push_str("Reuse exact paths from discovery observations. Use path `.` for the current directory.\n");
-        system.push_str("When the user explicitly requests bilingual subtitles, pass bilingual=true to the translation tool.\n");
+        system.push_str(
+            "When creating bilingual output through a translation tool, pass bilingual=true.\n",
+        );
         if state.force_no_tools {
             system.push_str("Tool exploration is finished. Return respond or ask_user now; do not return tool_call or plan.\n");
         }
@@ -1295,10 +1382,24 @@ fn truncate_text(text: &str, limit: usize) -> String {
     }
 }
 
-fn tool_allowed(scope: ToolScope, name: &str) -> bool {
-    tool_specs_for_scope(scope)
-        .iter()
-        .any(|spec| spec.name == name)
+fn authorize_and_refine(intent: &mut ToolIntent, name: &str) -> Result<(), String> {
+    match authorize_tool(*intent, name).map_err(|error| error.to_string())? {
+        ToolAuthorization::Allowed => Ok(()),
+        ToolAuthorization::Transition(target) => {
+            *intent = target;
+            Ok(())
+        }
+    }
+}
+
+fn looks_like_path_value(input: &str) -> bool {
+    let value = input.trim();
+    !value.is_empty()
+        && (value.starts_with('/')
+            || value.starts_with("./")
+            || value.starts_with("../")
+            || value.starts_with("~/")
+            || value.contains('\\'))
 }
 
 fn observation_made_progress(text: &str) -> bool {
@@ -1527,7 +1628,7 @@ mod tests {
                 force_no_tools: false,
             },
             None,
-            ToolScope::Translate,
+            ToolIntent::Translate,
         );
         let system = messages
             .iter()
@@ -1658,6 +1759,65 @@ mod tests {
                 .expect("event")
                 .kind,
             "ask_user"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn supplied_path_resumes_the_pending_edit_intent() {
+        let root = temp_root("pending-edit-path");
+        std::fs::create_dir_all(&root).expect("create root");
+        let source = root.join("source.srt");
+        std::fs::write(&source, "1\n00:00:00,000 --> 00:00:01,000\nhello\n")
+            .expect("write source subtitle");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = SequenceDecisionBackend {
+            decisions: VecDeque::from([
+                json!({"route":"act","intent":"edit","restated_request":"make the translated subtitle bilingual","inspect_project":false}),
+                json!({"action":"ask_user","text":"Please provide the original subtitle path."}),
+                json!({"action":"tool_call","tool_name":"read_file_preview","arguments":{"path":source}}),
+                json!({"action":"respond","text":"The source subtitle is available."}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine
+            .run_line("make this translated subtitle bilingual", &mut backend)
+            .expect("ask for source");
+        assert_eq!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .pending_action
+                .as_ref()
+                .expect("pending action")
+                .intent,
+            "edit"
+        );
+
+        let response = engine
+            .run_line(&source.display().to_string(), &mut backend)
+            .expect("continue edit");
+
+        assert_eq!(response, "The source subtitle is available.");
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .pending_action
+                .is_none()
+        );
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .events
+                .iter()
+                .any(|event| event.kind == "tool_call" && event.text == "read_file_preview")
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1802,7 +1962,12 @@ mod tests {
             .run_line("work on subtitles", &mut backend)
             .expect("route");
 
-        assert!(response.contains("does not match"), "{response}");
+        assert!(
+            response.contains(
+                "tool `delete_file` requires intent `file_delete`, but this turn is using intent `translate`"
+            ),
+            "{response}"
+        );
         assert!(root.join("keep.txt").exists());
         assert!(
             !engine
@@ -2117,6 +2282,162 @@ mod tests {
         );
         assert_eq!(backend.continued_results.len(), 1);
         assert!(backend.continued_results[0][0].is_error);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_policy_rejection_is_not_reported_as_an_argument_error() {
+        let root = temp_root("native-policy-rejection");
+        std::fs::create_dir_all(&root).expect("create root");
+        let rejected = || ModelToolCall {
+            id: "call_1".to_owned(),
+            name: "delete_file".to_owned(),
+            arguments: json!({"path":"keep.txt"}),
+        };
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = NativeSequenceBackend {
+            scripts: VecDeque::from([
+                NativeScript::Calls(vec![rejected()]),
+                NativeScript::Calls(vec![rejected()]),
+            ]),
+            continued_results: Vec::new(),
+            legacy_decision: Some(json!({
+                "route":"act",
+                "intent":"translate",
+                "restated_request":"translate subtitles",
+                "inspect_project":false
+            })),
+            native_calls: 0,
+            legacy_calls: 0,
+            native_error: None,
+        };
+
+        let response = engine
+            .run_line("please translate subtitles", &mut backend)
+            .expect("native policy rejection");
+
+        assert!(
+            response.contains(
+                "tool `delete_file` requires intent `file_delete`, but this turn is using intent `translate`"
+            ),
+            "{response}"
+        );
+        assert!(!response.contains("arguments were invalid"), "{response}");
+        assert_eq!(backend.continued_results.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_translation_route_refines_to_edit_after_discovery() {
+        let root = temp_root("native-translate-to-edit");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .expect("write source");
+        std::fs::write(
+            root.join("clip.translated.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n",
+        )
+        .expect("write translation");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = NativeSequenceBackend {
+            scripts: VecDeque::from([
+                NativeScript::Calls(vec![ModelToolCall {
+                    id: "read_source".to_owned(),
+                    name: "read_file_preview".to_owned(),
+                    arguments: json!({"path":"clip.srt"}),
+                }]),
+                NativeScript::Calls(vec![ModelToolCall {
+                    id: "edit_translation".to_owned(),
+                    name: "edit_subtitle".to_owned(),
+                    arguments: json!({
+                        "path":"clip.translated.srt",
+                        "instruction":"combine each source line with its translation"
+                    }),
+                }]),
+            ]),
+            continued_results: Vec::new(),
+            legacy_decision: Some(json!({
+                "route":"act",
+                "intent":"translate",
+                "restated_request":"make clip.translated.srt bilingual",
+                "inspect_project":false
+            })),
+            native_calls: 0,
+            legacy_calls: 0,
+            native_error: None,
+        };
+
+        let response = engine
+            .run_line(
+                "make the existing translated subtitle bilingual",
+                &mut backend,
+            )
+            .expect("refine translation route to edit");
+
+        assert!(response.contains("Edited:"), "{response}");
+        assert_eq!(backend.continued_results.len(), 1);
+        assert!(!backend.continued_results[0][0].is_error);
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .events
+                .iter()
+                .any(|event| event.kind == "tool_call" && event.text == "edit_subtitle")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_translation_route_refines_to_edit() {
+        let root = temp_root("legacy-translate-to-edit");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .expect("write source");
+        std::fs::write(
+            root.join("clip.translated.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n",
+        )
+        .expect("write translation");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = SequenceDecisionBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "route":"act",
+                    "intent":"translate",
+                    "restated_request":"make clip.translated.srt bilingual",
+                    "inspect_project":false
+                }),
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"edit_subtitle",
+                    "arguments":{
+                        "path":"clip.translated.srt",
+                        "instruction":"combine each source line with its translation"
+                    }
+                }),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line(
+                "make the existing translated subtitle bilingual",
+                &mut backend,
+            )
+            .expect("refine legacy route to edit");
+
+        assert!(response.contains("Edited:"), "{response}");
         let _ = std::fs::remove_dir_all(root);
     }
 

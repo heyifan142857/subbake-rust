@@ -2,14 +2,14 @@ use std::io;
 
 use serde_json::Value as JsonValue;
 
-use crate::tools::ToolScope;
+use crate::tools::{ToolIntent, find_tool_spec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Route {
     Respond(String),
     AskUser(String),
     Act {
-        scope: ToolScope,
+        intent: ToolIntent,
         request: String,
         inspect_project: bool,
     },
@@ -30,7 +30,7 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
         "respond" => Ok(Route::Respond(text)),
         "ask_user" => Ok(Route::AskUser(text)),
         "act" => {
-            let scope = parse_scope(
+            let intent = parse_intent(
                 value
                     .get("intent")
                     .and_then(JsonValue::as_str)
@@ -43,7 +43,7 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
                 .unwrap_or(original)
                 .to_owned();
             Ok(Route::Act {
-                scope,
+                intent,
                 request,
                 inspect_project: value
                     .get("inspect_project")
@@ -59,7 +59,7 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| io::Error::other("tool route is missing `tool_name`"))?;
             Ok(Route::Act {
-                scope: scope_for_tool(tool)?,
+                intent: intent_for_tool(tool)?,
                 request: original.to_owned(),
                 inspect_project: false,
             })
@@ -73,7 +73,7 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| io::Error::other("plan route has no tool calls"))?;
             Ok(Route::Act {
-                scope: scope_for_tool(tool)?,
+                intent: intent_for_tool(tool)?,
                 request: original.to_owned(),
                 inspect_project: false,
             })
@@ -84,39 +84,13 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
     }
 }
 
-pub(super) fn scope_for_tool(tool: &str) -> io::Result<ToolScope> {
-    let scope = match tool {
-        "list_files" | "search_files" | "read_file_preview" | "read_file" => ToolScope::Browse,
-        "candidate_subtitles" | "translate_file" | "translate_series" => ToolScope::Translate,
-        "transcribe_audio" => ToolScope::Transcribe,
-        "recent_translations" | "edit_subtitle" => ToolScope::Edit,
-        "diagnose_path" | "diagnose_text" => ToolScope::Diagnose,
-        "create_file" => ToolScope::FileCreate,
-        "append_file" => ToolScope::FileAppend,
-        "replace_in_file" => ToolScope::FileReplace,
-        "rename_path" => ToolScope::FileRename,
-        "delete_file" => ToolScope::FileDelete,
-        "list_profiles" | "switch_profile" => ToolScope::Profile,
-        "manage_whisper" => ToolScope::Whisper,
-        other => return Err(io::Error::other(format!("unknown routed tool `{other}`"))),
-    };
-    Ok(scope)
+pub(super) fn intent_for_tool(tool: &str) -> io::Result<ToolIntent> {
+    find_tool_spec(tool)
+        .map(|spec| spec.default_intent)
+        .ok_or_else(|| io::Error::other(format!("unknown routed tool `{tool}`")))
 }
 
-fn parse_scope(value: &str) -> io::Result<ToolScope> {
-    match value {
-        "browse" => Ok(ToolScope::Browse),
-        "translate" => Ok(ToolScope::Translate),
-        "transcribe" => Ok(ToolScope::Transcribe),
-        "edit" => Ok(ToolScope::Edit),
-        "diagnose" => Ok(ToolScope::Diagnose),
-        "file_create" => Ok(ToolScope::FileCreate),
-        "file_append" => Ok(ToolScope::FileAppend),
-        "file_replace" => Ok(ToolScope::FileReplace),
-        "file_rename" => Ok(ToolScope::FileRename),
-        "file_delete" => Ok(ToolScope::FileDelete),
-        "profile" => Ok(ToolScope::Profile),
-        "whisper" => Ok(ToolScope::Whisper),
-        other => Err(io::Error::other(format!("unsupported intent `{other}`"))),
-    }
+fn parse_intent(value: &str) -> io::Result<ToolIntent> {
+    ToolIntent::parse(value)
+        .ok_or_else(|| io::Error::other(format!("unsupported intent `{value}`")))
 }

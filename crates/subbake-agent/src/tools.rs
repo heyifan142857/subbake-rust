@@ -14,6 +14,145 @@ pub enum ToolKind {
     ManageWhisper,
 }
 
+/// The user-facing action currently being routed. This is intentionally
+/// separate from [`ToolKind`]: an intent authorizes one business action plus
+/// the safe discovery tools needed to ground that action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolIntent {
+    Browse,
+    Translate,
+    Transcribe,
+    Edit,
+    Diagnose,
+    FileCreate,
+    FileAppend,
+    FileReplace,
+    FileRename,
+    FileDelete,
+    Profile,
+    Whisper,
+}
+
+/// Security domain for intent refinement. Only domains explicitly marked as
+/// refinable may change intent without asking the user again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolDomain {
+    Browse,
+    SubtitleTransform,
+    Transcribe,
+    Diagnose,
+    FileCreate,
+    FileAppend,
+    FileReplace,
+    FileRename,
+    FileDelete,
+    Profile,
+    Whisper,
+}
+
+impl ToolIntent {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "browse" => Self::Browse,
+            "translate" => Self::Translate,
+            "transcribe" => Self::Transcribe,
+            "edit" => Self::Edit,
+            "diagnose" => Self::Diagnose,
+            "file_create" => Self::FileCreate,
+            "file_append" => Self::FileAppend,
+            "file_replace" => Self::FileReplace,
+            "file_rename" => Self::FileRename,
+            "file_delete" => Self::FileDelete,
+            "profile" => Self::Profile,
+            "whisper" => Self::Whisper,
+            _ => return None,
+        })
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browse => "browse",
+            Self::Translate => "translate",
+            Self::Transcribe => "transcribe",
+            Self::Edit => "edit",
+            Self::Diagnose => "diagnose",
+            Self::FileCreate => "file_create",
+            Self::FileAppend => "file_append",
+            Self::FileReplace => "file_replace",
+            Self::FileRename => "file_rename",
+            Self::FileDelete => "file_delete",
+            Self::Profile => "profile",
+            Self::Whisper => "whisper",
+        }
+    }
+
+    const fn domain(self) -> ToolDomain {
+        match self {
+            Self::Browse => ToolDomain::Browse,
+            Self::Translate | Self::Edit => ToolDomain::SubtitleTransform,
+            Self::Transcribe => ToolDomain::Transcribe,
+            Self::Diagnose => ToolDomain::Diagnose,
+            Self::FileCreate => ToolDomain::FileCreate,
+            Self::FileAppend => ToolDomain::FileAppend,
+            Self::FileReplace => ToolDomain::FileReplace,
+            Self::FileRename => ToolDomain::FileRename,
+            Self::FileDelete => ToolDomain::FileDelete,
+            Self::Profile => ToolDomain::Profile,
+            Self::Whisper => ToolDomain::Whisper,
+        }
+    }
+
+    pub(crate) fn can_transition_to(self, target: Self) -> bool {
+        self != target
+            && matches!(
+                (self.domain(), target.domain()),
+                (ToolDomain::SubtitleTransform, ToolDomain::SubtitleTransform)
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolAuthorization {
+    Allowed,
+    Transition(ToolIntent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolPolicyError {
+    tool: String,
+    current: ToolIntent,
+    required: Option<ToolIntent>,
+}
+
+impl std::fmt::Display for ToolPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.required {
+            Some(required) => write!(
+                formatter,
+                "tool `{}` requires intent `{}`, but this turn is using intent `{}`",
+                self.tool,
+                required.as_str(),
+                self.current.as_str()
+            ),
+            None => write!(
+                formatter,
+                "unknown tool `{}` is not available for intent `{}`",
+                self.tool,
+                self.current.as_str()
+            ),
+        }
+    }
+}
+
+/// Visibility policy declared by each registered tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolAccess {
+    /// A non-mutating, bounded observation that can ground any action.
+    SharedDiscovery,
+    /// A tool available only to the listed routed actions.
+    Intents(&'static [ToolIntent]),
+}
+
 /// Metadata about a registered tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -22,6 +161,8 @@ pub struct ToolSpec {
     pub mutating: bool,
     pub requires_approval: bool,
     pub discovery: bool,
+    pub(crate) default_intent: ToolIntent,
+    pub(crate) access: ToolAccess,
     pub description: &'static str,
     pub arguments: &'static [ToolArgSpec],
     pub(crate) executor: ToolExecutor,
@@ -82,6 +223,12 @@ pub struct ToolArgSpec {
 }
 
 impl ToolSpec {
+    pub(crate) fn allows(&self, intent: ToolIntent) -> bool {
+        match self.access {
+            ToolAccess::SharedDiscovery => true,
+            ToolAccess::Intents(intents) => intents.contains(&intent),
+        }
+    }
     pub fn arguments(&self) -> &'static [ToolArgSpec] {
         self.arguments
     }
@@ -249,13 +396,15 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
 use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
 
 macro_rules! tool {
-    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $description:literal, $arguments:expr, $executor:ident) => {
+    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $intent:ident, $access:expr, $description:literal, $arguments:expr, $executor:ident) => {
         ToolSpec {
             name: $name,
             category: ToolKind::$category,
             mutating: $mutating,
             requires_approval: $approval,
             discovery: $discovery,
+            default_intent: ToolIntent::$intent,
+            access: $access,
             description: $description,
             arguments: $arguments,
             executor: ToolExecutor::$executor,
@@ -271,6 +420,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        Translate,
+        ToolAccess::Intents(&[ToolIntent::Translate]),
         "Translate a subtitle file.",
         TRANSLATE_FILE_ARGS,
         TranslateFile
@@ -281,6 +432,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        Translate,
+        ToolAccess::Intents(&[ToolIntent::Translate]),
         "Translate a series of subtitle files in a directory.",
         TRANSLATE_SERIES_ARGS,
         TranslateSeries
@@ -291,6 +444,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        Edit,
+        ToolAccess::Intents(&[ToolIntent::Edit]),
         "Edit an already translated subtitle file.",
         EDIT_SUBTITLE_ARGS,
         EditSubtitle
@@ -301,6 +456,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        Transcribe,
+        ToolAccess::Intents(&[ToolIntent::Transcribe]),
         "Transcribe a media file to subtitles.",
         PATH_ARGS,
         TranscribeAudio
@@ -311,6 +468,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         true,
         false,
+        Whisper,
+        ToolAccess::Intents(&[ToolIntent::Whisper]),
         "Install, update, or uninstall whisper.cpp.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
@@ -321,6 +480,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Diagnose,
+        ToolAccess::Intents(&[ToolIntent::Diagnose]),
         "Diagnose a translation failure from a run directory.",
         PATH_ARGS,
         DiagnosePath
@@ -331,6 +492,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Diagnose,
+        ToolAccess::Intents(&[ToolIntent::Diagnose]),
         "Diagnose a translation failure from text input.",
         DIAGNOSE_TEXT_ARGS,
         DiagnoseText
@@ -341,6 +504,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Browse,
+        ToolAccess::SharedDiscovery,
         "List files and directories.",
         LIST_FILES_ARGS,
         ListFiles
@@ -351,6 +516,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Browse,
+        ToolAccess::SharedDiscovery,
         "Search files by name glob.",
         SEARCH_FILES_ARGS,
         SearchFiles
@@ -361,6 +528,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Browse,
+        ToolAccess::SharedDiscovery,
         "List recent translation outputs from the session.",
         &[],
         RecentTranslations
@@ -371,6 +540,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Browse,
+        ToolAccess::SharedDiscovery,
         "Find subtitle files that look relevant.",
         CANDIDATE_SUBTITLES_ARGS,
         CandidateSubtitles
@@ -381,6 +552,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        Browse,
+        ToolAccess::SharedDiscovery,
         "Read a short preview of a file.",
         PATH_ARGS,
         ReadFilePreview
@@ -391,6 +564,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
+        FileAppend,
+        ToolAccess::Intents(&[ToolIntent::FileAppend, ToolIntent::FileReplace]),
         "Read the full content of a file.",
         PATH_ARGS,
         ReadFile
@@ -401,6 +576,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        FileCreate,
+        ToolAccess::Intents(&[ToolIntent::FileCreate]),
         "Create a new file.",
         WRITE_FILE_ARGS,
         CreateFile
@@ -411,6 +588,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        FileAppend,
+        ToolAccess::Intents(&[ToolIntent::FileAppend]),
         "Append content to a file.",
         WRITE_FILE_ARGS,
         AppendFile
@@ -421,6 +600,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        FileReplace,
+        ToolAccess::Intents(&[ToolIntent::FileReplace]),
         "Replace text in a file.",
         REPLACE_IN_FILE_ARGS,
         ReplaceInFile
@@ -431,6 +612,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        FileRename,
+        ToolAccess::Intents(&[ToolIntent::FileRename]),
         "Rename or move a file or directory.",
         RENAME_PATH_ARGS,
         RenamePath
@@ -441,6 +624,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
+        FileDelete,
+        ToolAccess::Intents(&[ToolIntent::FileDelete]),
         "Delete a file or directory.",
         PATH_ARGS,
         DeleteFile
@@ -451,6 +636,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         false,
+        Profile,
+        ToolAccess::Intents(&[ToolIntent::Profile]),
         "Switch the active profile.",
         SWITCH_PROFILE_ARGS,
         SwitchProfile
@@ -461,6 +648,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         false,
+        Profile,
+        ToolAccess::Intents(&[ToolIntent::Profile]),
         "List all available profiles.",
         &[],
         ListProfiles
@@ -484,51 +673,39 @@ pub fn tool_specs_for_categories<'a>(
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolScope {
-    Browse,
-    Translate,
-    Transcribe,
-    Edit,
-    Diagnose,
-    FileCreate,
-    FileAppend,
-    FileReplace,
-    FileRename,
-    FileDelete,
-    Profile,
-    Whisper,
+pub(crate) fn tool_specs_for_intent(intent: ToolIntent) -> Vec<&'static ToolSpec> {
+    ALL_TOOL_SPECS
+        .iter()
+        .filter(|spec| {
+            spec.allows(intent)
+                || (intent.can_transition_to(spec.default_intent)
+                    && spec.allows(spec.default_intent))
+        })
+        .collect()
 }
 
-pub(crate) fn tool_specs_for_scope(scope: ToolScope) -> Vec<&'static ToolSpec> {
-    let names: &[&str] = match scope {
-        ToolScope::Browse => &[
-            "list_files",
-            "search_files",
-            "read_file_preview",
-            "read_file",
-        ],
-        ToolScope::Translate => &["candidate_subtitles", "translate_file", "translate_series"],
-        ToolScope::Transcribe => &["search_files", "transcribe_audio"],
-        ToolScope::Edit => &["recent_translations", "read_file_preview", "edit_subtitle"],
-        ToolScope::Diagnose => &[
-            "search_files",
-            "read_file_preview",
-            "diagnose_path",
-            "diagnose_text",
-        ],
-        ToolScope::FileCreate => &["list_files", "create_file"],
-        ToolScope::FileAppend => &["search_files", "read_file", "append_file"],
-        ToolScope::FileReplace => &["search_files", "read_file", "replace_in_file"],
-        ToolScope::FileRename => &["search_files", "rename_path"],
-        ToolScope::FileDelete => &["search_files", "delete_file"],
-        ToolScope::Profile => &["list_profiles", "switch_profile"],
-        ToolScope::Whisper => &["manage_whisper"],
+pub(crate) fn authorize_tool(
+    intent: ToolIntent,
+    name: &str,
+) -> Result<ToolAuthorization, ToolPolicyError> {
+    let Some(spec) = find_tool_spec(name) else {
+        return Err(ToolPolicyError {
+            tool: name.to_owned(),
+            current: intent,
+            required: None,
+        });
     };
-    names
-        .iter()
-        .filter_map(|name| find_tool_spec(name))
-        .collect()
+    if spec.allows(intent) {
+        return Ok(ToolAuthorization::Allowed);
+    }
+    if intent.can_transition_to(spec.default_intent) && spec.allows(spec.default_intent) {
+        return Ok(ToolAuthorization::Transition(spec.default_intent));
+    }
+    Err(ToolPolicyError {
+        tool: name.to_owned(),
+        current: intent,
+        required: Some(spec.default_intent),
+    })
 }
 
 pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(), String> {
@@ -570,25 +747,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translation_scope_keeps_only_translation_and_discovery_tools() {
-        let names = tool_specs_for_scope(ToolScope::Translate)
+    fn translation_intent_includes_shared_discovery_and_subtitle_refinements() {
+        let names = tool_specs_for_intent(ToolIntent::Translate)
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"translate_file"));
         assert!(names.contains(&"candidate_subtitles"));
+        assert!(names.contains(&"read_file_preview"));
+        assert!(names.contains(&"edit_subtitle"));
+        assert!(!names.contains(&"read_file"));
         assert!(!names.contains(&"manage_whisper"));
     }
 
     #[test]
-    fn file_mutation_scopes_expose_only_the_requested_mutation() {
-        let names = tool_specs_for_scope(ToolScope::FileDelete)
+    fn subtitle_intents_can_transition_without_crossing_domains() {
+        assert_eq!(
+            authorize_tool(ToolIntent::Translate, "edit_subtitle"),
+            Ok(ToolAuthorization::Transition(ToolIntent::Edit))
+        );
+        assert_eq!(
+            authorize_tool(ToolIntent::Edit, "translate_file"),
+            Ok(ToolAuthorization::Transition(ToolIntent::Translate))
+        );
+        let error = authorize_tool(ToolIntent::Translate, "delete_file")
+            .expect_err("delete must remain outside subtitle transforms");
+        assert_eq!(
+            error.to_string(),
+            "tool `delete_file` requires intent `file_delete`, but this turn is using intent `translate`"
+        );
+    }
+
+    #[test]
+    fn file_mutation_intents_expose_only_the_requested_mutation() {
+        let names = tool_specs_for_intent(ToolIntent::FileDelete)
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert!(names.contains(&"delete_file"));
         assert!(!names.contains(&"rename_path"));
         assert!(!names.contains(&"create_file"));
+    }
+
+    #[test]
+    fn shared_discovery_tools_are_bounded_and_non_mutating() {
+        for spec in ALL_TOOL_SPECS {
+            if spec.access == ToolAccess::SharedDiscovery {
+                assert!(spec.discovery, "{} must be a discovery tool", spec.name);
+                assert!(!spec.mutating, "{} must not mutate", spec.name);
+            }
+        }
     }
 
     #[test]

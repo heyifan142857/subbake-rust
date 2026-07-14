@@ -11,6 +11,15 @@ use crate::event::PendingPlan;
 
 pub const SESSION_VERSION: u64 = 1;
 
+/// An actionable request paused while the agent waits for a user-provided
+/// value, such as a source subtitle path. The string intent keeps this
+/// persisted contract independent from the in-memory tool registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAction {
+    pub intent: String,
+    pub request: String,
+}
+
 /// Stable discriminants for the v1 wire-format event kinds. `Unknown` keeps
 /// older or future events readable without allowing ad-hoc comparisons in
 /// runtime logic.
@@ -100,6 +109,8 @@ pub struct AgentSession {
     pub config_path: Option<String>,
     pub mode: SessionMode,
     pub pending_plan: Option<PendingPlan>,
+    #[serde(default)]
+    pub pending_action: Option<PendingAction>,
     pub events: Vec<AgentEvent>,
 }
 
@@ -118,6 +129,7 @@ impl AgentSession {
             config_path: None,
             mode: SessionMode::Chat,
             pending_plan: None,
+            pending_action: None,
             events: Vec::new(),
         }
     }
@@ -325,6 +337,20 @@ mod tests {
         assert_eq!(loaded.events[0].data["path"], "hello.srt");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_v1_session_without_pending_action() {
+        let session = AgentSession::new("old-session".to_owned());
+        let mut value = serde_json::to_value(session).expect("serialize session");
+        value
+            .as_object_mut()
+            .expect("session object")
+            .remove("pending_action");
+
+        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
+
+        assert!(loaded.pending_action.is_none());
     }
 
     #[test]
