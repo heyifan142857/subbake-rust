@@ -15,6 +15,7 @@ subbake-adapters = { path = "../subbake-adapters" }
 subbake-core = { path = "../subbake-core" }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+thiserror = "2"
 
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
-use std::io;
 use std::path::PathBuf;
 use subbake_core::{CancellationGuard, NoopProgress, SharedProgress};
 
+use crate::error::AdapterResult;
 use crate::fs::is_supported_subtitle_path;
 use crate::settings::TranslationSettings;
 use crate::transcription::{
@@ -24,7 +24,7 @@ pub enum PipelineOutcome {
     Subtitle(TranslationOutcome),
 }
 
-pub fn run_pipeline(request: PipelineRequest) -> io::Result<PipelineOutcome> {
+pub fn run_pipeline(request: PipelineRequest) -> AdapterResult<PipelineOutcome> {
     run_pipeline_cancellable_with_progress(
         request,
         &CancellationGuard::never(),
@@ -36,7 +36,7 @@ pub fn run_pipeline_cancellable_with_progress(
     request: PipelineRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
-) -> io::Result<PipelineOutcome> {
+) -> AdapterResult<PipelineOutcome> {
     if is_supported_subtitle_path(&request.input_path) {
         let outcome = translate_subtitle_cancellable_with_progress(
             TranslationRequest {

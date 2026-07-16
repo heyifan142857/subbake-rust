@@ -10,6 +10,7 @@ use subbake_core::ports::RuntimeStore;
 use subbake_core::storage::{build_runtime_paths, input_signature_from_bytes};
 use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, SharedProgress};
 
+use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
     stable_runtime_input_path,
@@ -46,14 +47,14 @@ pub struct BatchTranslationOutcome {
     pub outputs: Vec<PathBuf>,
 }
 
-pub fn translate_subtitle(request: TranslationRequest) -> io::Result<TranslationOutcome> {
+pub fn translate_subtitle(request: TranslationRequest) -> AdapterResult<TranslationOutcome> {
     translate_subtitle_cancellable(request, &CancellationGuard::never())
 }
 
 pub fn translate_subtitle_cancellable(
     request: TranslationRequest,
     cancellation: &CancellationGuard,
-) -> io::Result<TranslationOutcome> {
+) -> AdapterResult<TranslationOutcome> {
     translate_subtitle_cancellable_with_progress(
         request,
         cancellation,
@@ -65,10 +66,10 @@ pub fn translate_subtitle_cancellable_with_progress(
     request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
-) -> io::Result<TranslationOutcome> {
+) -> AdapterResult<TranslationOutcome> {
     check_cancelled(cancellation)?;
     if !is_supported_subtitle_path(&request.input_path) {
-        return Err(io::Error::other(
+        return Err(AdapterError::invalid_input(
             "`translate` accepts subtitle files only; use `pipeline` for combined media workflows",
         ));
     }
@@ -94,7 +95,7 @@ pub fn translate_subtitle_cancellable_with_progress(
     let options = request
         .settings
         .to_pipeline_options(request.input_path.clone(), Some(output_path.clone()));
-    let backend = build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
+    let backend = build_backend(&request.settings.backend_config())?;
 
     // Wire runtime store for glossary/TM persistence.
     let stable_input_path = stable_runtime_input_path(&request.input_path)?;
@@ -108,7 +109,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         request.settings.translation.fast_mode,
     );
     let store = FileRuntimeStore::new(paths);
-    store.ensure_layout().map_err(io::Error::other)?;
+    store.ensure_layout().map_err(AdapterError::from)?;
 
     let terminal_progress = progress.clone();
     let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options)
@@ -133,7 +134,7 @@ pub fn translate_subtitle_cancellable_with_progress(
             };
             event.message = Some(error.to_string());
             terminal_progress.emit(event);
-            return Err(core_error(error));
+            return Err(AdapterError::from(error));
         }
     };
 
@@ -187,14 +188,14 @@ pub fn translate_subtitle_cancellable_with_progress(
 
 pub fn translate_subtitle_batch(
     request: BatchTranslationRequest,
-) -> io::Result<BatchTranslationOutcome> {
+) -> AdapterResult<BatchTranslationOutcome> {
     translate_subtitle_batch_cancellable(request, &CancellationGuard::never())
 }
 
 pub fn translate_subtitle_batch_cancellable(
     request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
-) -> io::Result<BatchTranslationOutcome> {
+) -> AdapterResult<BatchTranslationOutcome> {
     translate_subtitle_batch_with_progress(request, cancellation, std::sync::Arc::new(NoopProgress))
 }
 
@@ -202,7 +203,7 @@ pub fn translate_subtitle_batch_with_progress(
     request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
-) -> io::Result<BatchTranslationOutcome> {
+) -> AdapterResult<BatchTranslationOutcome> {
     let files = discover_subtitle_files(&request.root, request.recursive)?;
     let total_files = files.len();
     let mut processed = 0usize;
@@ -260,16 +261,8 @@ pub fn translate_subtitle_batch_with_progress(
     })
 }
 
-fn check_cancelled(cancellation: &CancellationGuard) -> io::Result<()> {
-    cancellation.check().map_err(core_error)
-}
-
-fn core_error(error: CoreError) -> io::Error {
-    if matches!(error, CoreError::Cancelled) {
-        io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
-    } else {
-        io::Error::other(error)
-    }
+fn check_cancelled(cancellation: &CancellationGuard) -> AdapterResult<()> {
+    cancellation.check().map_err(AdapterError::from)
 }
 
 fn discover_subtitle_files(dir: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {

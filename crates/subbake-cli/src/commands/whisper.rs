@@ -1,12 +1,11 @@
-use std::io;
-
 use subbake_adapters::{WhisperRequest, run_whisper_cancellable_with_progress};
 use subbake_core::CancellationGuard;
 
+use crate::CliResult;
 use crate::args::WhisperArgs;
 use crate::output::print_whisper_outcome;
 
-pub fn run(args: WhisperArgs) -> io::Result<()> {
+pub fn run(args: WhisperArgs) -> CliResult<()> {
     let outcome = run_whisper_cancellable_with_progress(
         WhisperRequest {
             action: args.action,

@@ -1,4 +1,3 @@
-use std::io;
 use std::path::PathBuf;
 
 use subbake_adapters::{
@@ -8,6 +7,8 @@ use subbake_adapters::{
 };
 use subbake_agent::{AgentAction, AgentActionKind};
 use subbake_core::entities::{DEFAULT_MODEL, DEFAULT_PROVIDER};
+
+use crate::{CliError, CliResult};
 
 #[derive(Debug, Clone)]
 pub struct AgentArgs {
@@ -80,9 +81,9 @@ impl TranslateArgs {
     }
 }
 
-pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
+pub fn parse_agent_args(args: &[String]) -> CliResult<AgentArgs> {
     if !args.is_empty() {
-        return Err(io::Error::other(
+        return Err(CliError::usage(
             "unsupported agent command; start the agent with `sbake`",
         ));
     }
@@ -95,9 +96,9 @@ pub fn parse_agent_args(args: &[String]) -> io::Result<AgentArgs> {
     Ok(AgentArgs { action })
 }
 
-pub fn parse_resume_args(args: &[String]) -> io::Result<AgentArgs> {
+pub fn parse_resume_args(args: &[String]) -> CliResult<AgentArgs> {
     if args.len() > 1 {
-        return Err(io::Error::other("resume accepts at most one session id"));
+        return Err(CliError::usage("resume accepts at most one session id"));
     }
     Ok(AgentArgs {
         action: AgentAction {
@@ -107,11 +108,11 @@ pub fn parse_resume_args(args: &[String]) -> io::Result<AgentArgs> {
     })
 }
 
-pub fn parse_translate_args(args: &[String]) -> io::Result<TranslateArgs> {
+pub fn parse_translate_args(args: &[String]) -> CliResult<TranslateArgs> {
     parse_file_translation_args(args, "translate requires a subtitle path", "translate")
 }
 
-pub fn parse_pipeline_args(args: &[String]) -> io::Result<TranslateArgs> {
+pub fn parse_pipeline_args(args: &[String]) -> CliResult<TranslateArgs> {
     parse_file_translation_args(args, "pipeline requires an input path", "pipeline")
 }
 
@@ -119,10 +120,10 @@ fn parse_file_translation_args(
     args: &[String],
     missing_input_message: &str,
     command_name: &str,
-) -> io::Result<TranslateArgs> {
+) -> CliResult<TranslateArgs> {
     let input_path = args
         .first()
-        .ok_or_else(|| io::Error::other(missing_input_message))?;
+        .ok_or_else(|| CliError::usage(missing_input_message))?;
     let mut parsed = TranslateArgs::default_for(input_path);
 
     // First pass: extract --config and --profile (store their values).
@@ -168,7 +169,7 @@ fn parse_file_translation_args(
                     &mut parsed.settings,
                 )? => {}
             other => {
-                return Err(io::Error::other(format!(
+                return Err(CliError::usage(format!(
                     "unknown {command_name} option `{other}`"
                 )));
             }
@@ -203,9 +204,9 @@ fn extract_config_and_profile(args: &[String]) -> (Option<PathBuf>, Option<Strin
 }
 
 /// Skip a flag and its value (used to avoid re-consuming --config/--profile).
-fn skip_two(args: &[String], index: &mut usize) -> io::Result<()> {
+fn skip_two(args: &[String], index: &mut usize) -> CliResult<()> {
     if *index + 1 >= args.len() {
-        return Err(io::Error::other(format!(
+        return Err(CliError::usage(format!(
             "{} requires a value",
             args[*index]
         )));
@@ -214,10 +215,10 @@ fn skip_two(args: &[String], index: &mut usize) -> io::Result<()> {
     Ok(())
 }
 
-pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
+pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
     let dir = args
         .first()
-        .ok_or_else(|| io::Error::other("batch requires a directory"))?;
+        .ok_or_else(|| CliError::usage("batch requires a directory"))?;
     let mut parsed = BatchArgs {
         dir: PathBuf::from(dir),
         recursive: false,
@@ -254,7 +255,7 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
                     &mut index,
                     &mut parsed.translate.settings,
                 )? => {}
-            other => return Err(io::Error::other(format!("unknown batch option `{other}`"))),
+            other => return Err(CliError::usage(format!("unknown batch option `{other}`"))),
         }
         index += 1;
     }
@@ -265,19 +266,14 @@ pub fn parse_batch_args(args: &[String]) -> io::Result<BatchArgs> {
 fn load_config_patch(
     path: &std::path::Path,
     profile: Option<&str>,
-) -> io::Result<Option<TranslationSettingsPatch>> {
-    load_and_resolve(path, profile).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to load config `{}`: {error}", path.display()),
-        )
-    })
+) -> CliResult<Option<TranslationSettingsPatch>> {
+    load_and_resolve(path, profile).map_err(CliError::from)
 }
 
-pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
+pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
     let media_path = args
         .first()
-        .ok_or_else(|| io::Error::other("transcribe requires a media path"))?;
+        .ok_or_else(|| CliError::usage("transcribe requires a media path"))?;
     let mut parsed = TranscribeArgs {
         media_path: PathBuf::from(media_path),
         output: None,
@@ -308,10 +304,10 @@ pub fn parse_transcribe_args(args: &[String]) -> io::Result<TranscribeArgs> {
             "--format" => {
                 let value = required_value(args, &mut index, "--format")?;
                 parsed.settings.output_format = TranscriptionFormat::parse(&value)
-                    .ok_or_else(|| io::Error::other("--format must be one of: srt, vtt, txt"))?;
+                    .ok_or_else(|| CliError::usage("--format must be one of: srt, vtt, txt"))?;
             }
             other => {
-                return Err(io::Error::other(format!(
+                return Err(CliError::usage(format!(
                     "unknown transcribe option `{other}`"
                 )));
             }
@@ -327,7 +323,7 @@ fn parse_pipeline_transcription_option(
     args: &[String],
     index: &mut usize,
     settings: &mut TranscriptionSettings,
-) -> io::Result<bool> {
+) -> CliResult<bool> {
     match option {
         "--transcriber" | "--transcriber-provider" => {
             settings.provider = required_value(args, index, option)?
@@ -344,7 +340,7 @@ fn parse_pipeline_transcription_option(
         "--transcribe-format" => {
             let value = required_value(args, index, option)?;
             settings.output_format = TranscriptionFormat::parse(&value).ok_or_else(|| {
-                io::Error::other("--transcribe-format must be one of: srt, vtt, txt")
+                CliError::usage("--transcribe-format must be one of: srt, vtt, txt")
             })?;
         }
         _ => return Ok(false),
@@ -353,9 +349,9 @@ fn parse_pipeline_transcription_option(
     Ok(true)
 }
 
-pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
+pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
     if args.first().is_none_or(|value| value != "check") {
-        return Err(io::Error::other("provider requires `check`"));
+        return Err(CliError::usage("provider requires `check`"));
     }
 
     let mut provider = DEFAULT_PROVIDER.to_owned();
@@ -377,7 +373,7 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
             "--api-format" => {
                 api_format = Some(
                     ApiFormat::parse(&required_value(args, &mut index, "--api-format")?)
-                        .map_err(io::Error::other)?,
+                        .map_err(|error| CliError::usage(error.to_string()))?,
                 )
             }
             "--endpoint-url" => {
@@ -393,7 +389,7 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
                 auth_prefix = Some(required_value(args, &mut index, "--auth-prefix")?)
             }
             other => {
-                return Err(io::Error::other(format!(
+                return Err(CliError::usage(format!(
                     "unknown provider option `{other}`"
                 )));
             }
@@ -418,13 +414,13 @@ pub fn parse_provider_args(args: &[String]) -> io::Result<ProviderArgs> {
     })
 }
 
-pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
+pub fn parse_runtime_args(args: &[String]) -> CliResult<RuntimeArgs> {
     let command = args
         .first()
-        .ok_or_else(|| io::Error::other("runtime requires `inspect` or `clean`"))?;
+        .ok_or_else(|| CliError::usage("runtime requires `inspect` or `clean`"))?;
     let target_path = args
         .get(1)
-        .ok_or_else(|| io::Error::other(format!("runtime {command} requires a target")))?;
+        .ok_or_else(|| CliError::usage(format!("runtime {command} requires a target")))?;
     let mut runtime_dir = None;
     let mut yes = false;
     let mut clean_runs = false;
@@ -443,9 +439,7 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
             "--glossary" if command == "clean" => clean_glossary = true,
             "--all" if command == "clean" => clean_all = true,
             other => {
-                return Err(io::Error::other(format!(
-                    "unknown runtime option `{other}`"
-                )));
+                return Err(CliError::usage(format!("unknown runtime option `{other}`")));
             }
         }
         index += 1;
@@ -460,7 +454,7 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
             clean_glossary,
             all: clean_all,
         },
-        _ => return Err(io::Error::other("runtime requires `inspect` or `clean`")),
+        _ => return Err(CliError::usage("runtime requires `inspect` or `clean`")),
     };
 
     Ok(RuntimeArgs {
@@ -470,7 +464,7 @@ pub fn parse_runtime_args(args: &[String]) -> io::Result<RuntimeArgs> {
     })
 }
 
-pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
+pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
     let command = args.first().map(String::as_str).unwrap_or("status");
     let (action, mut index) = match command {
         "status" => (WhisperAction::Status, 1usize),
@@ -485,11 +479,11 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
             let name = args
                 .get(1)
                 .cloned()
-                .ok_or_else(|| io::Error::other("whisper model requires a model name"))?;
+                .ok_or_else(|| CliError::usage("whisper model requires a model name"))?;
             (WhisperAction::DownloadModel { name }, 2usize)
         }
         other => {
-            return Err(io::Error::other(format!(
+            return Err(CliError::usage(format!(
                 "unknown whisper command `{other}`"
             )));
         }
@@ -510,9 +504,7 @@ pub fn parse_whisper_args(args: &[String]) -> io::Result<WhisperArgs> {
                 parsed.action = WhisperAction::Uninstall { keep_models: true };
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "unknown whisper option `{other}`"
-                )));
+                return Err(CliError::usage(format!("unknown whisper option `{other}`")));
             }
         }
         index += 1;
@@ -526,7 +518,7 @@ fn parse_translation_setting_option(
     args: &[String],
     index: &mut usize,
     settings: &mut TranslationSettings,
-) -> io::Result<bool> {
+) -> CliResult<bool> {
     match option {
         "--output-format" => settings.output.format = Some(required_value(args, index, option)?),
         "--provider" => settings.backend.provider = required_value(args, index, option)?,
@@ -536,7 +528,7 @@ fn parse_translation_setting_option(
         "--api-format" => {
             settings.backend.api_format = Some(
                 ApiFormat::parse(&required_value(args, index, option)?)
-                    .map_err(io::Error::other)?,
+                    .map_err(|error| CliError::usage(error.to_string()))?,
             )
         }
         "--endpoint-url" => {
@@ -575,7 +567,7 @@ fn parse_translation_setting_option(
         "--review" => {
             settings.translation.review_policy =
                 subbake_core::ReviewPolicy::parse(&required_value(args, index, option)?)
-                    .map_err(io::Error::other)?
+                    .map_err(|error| CliError::usage(error.to_string()))?
         }
         "--dry-run" => settings.translation.dry_run = true,
         "--resume" => settings.translation.resume = true,
@@ -595,32 +587,32 @@ fn parse_translation_setting_option(
     Ok(true)
 }
 
-pub(crate) fn required_value(args: &[String], index: &mut usize, flag: &str) -> io::Result<String> {
+pub(crate) fn required_value(args: &[String], index: &mut usize, flag: &str) -> CliResult<String> {
     *index += 1;
     args.get(*index)
         .cloned()
-        .ok_or_else(|| io::Error::other(format!("{flag} requires a value")))
+        .ok_or_else(|| CliError::usage(format!("{flag} requires a value")))
 }
 
-fn required_path(args: &[String], index: &mut usize, flag: &str) -> io::Result<PathBuf> {
+fn required_path(args: &[String], index: &mut usize, flag: &str) -> CliResult<PathBuf> {
     required_value(args, index, flag).map(PathBuf::from)
 }
 
-fn parse_batch_size(args: &[String], index: &mut usize) -> io::Result<usize> {
+fn parse_batch_size(args: &[String], index: &mut usize) -> CliResult<usize> {
     let raw = required_value(args, index, "--batch-size")?;
     let value = raw
         .parse::<usize>()
-        .map_err(|_| io::Error::other("--batch-size must be a positive integer"))?;
+        .map_err(|_| CliError::usage("--batch-size must be a positive integer"))?;
     if value == 0 {
-        return Err(io::Error::other("--batch-size must be greater than zero"));
+        return Err(CliError::usage("--batch-size must be greater than zero"));
     }
     Ok(value)
 }
 
-fn parse_nonnegative_usize(args: &[String], index: &mut usize, flag: &str) -> io::Result<usize> {
+fn parse_nonnegative_usize(args: &[String], index: &mut usize, flag: &str) -> CliResult<usize> {
     required_value(args, index, flag)?
         .parse::<usize>()
-        .map_err(|_| io::Error::other(format!("{flag} must be a non-negative integer")))
+        .map_err(|_| CliError::usage(format!("{flag} must be a non-negative integer")))
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_core::entities::{SubtitleDocument, SubtitleSegment};
@@ -7,6 +6,8 @@ use subbake_core::formats::{
     RenderOptions, normalize_format, parse_document_text, render_document,
     supported_format_from_path,
 };
+
+use crate::error::{AdapterError, AdapterResult};
 
 pub fn is_supported_subtitle_path(path: &Path) -> bool {
     supported_format_from_path(path).is_some()
@@ -17,20 +18,25 @@ pub fn is_supported_subtitle_path(path: &Path) -> bool {
 /// Existing paths are canonicalized to preserve historical run keys. Missing
 /// paths retain their absolute spelling, or are anchored to the current
 /// directory when relative.
-pub fn stable_runtime_input_path(path: &Path) -> io::Result<PathBuf> {
+pub fn stable_runtime_input_path(path: &Path) -> AdapterResult<PathBuf> {
     match path.canonicalize() {
         Ok(canonical) => Ok(canonical),
         Err(_) if path.is_absolute() => Ok(path.to_path_buf()),
         Err(_) => std::env::current_dir()
             .map(|current_dir| current_dir.join(path))
-            .map_err(|error| io::Error::other(format!("resolve current directory: {error}"))),
+            .map_err(|source| AdapterError::external_io("resolve current directory", None, source)),
     }
 }
 
-pub fn read_document(path: &Path) -> io::Result<SubtitleDocument> {
-    let text = fs::read_to_string(path)?;
-    parse_document_text(path, &text, None)
-        .map_err(|error| io::Error::other(format!("failed to parse {}: {error}", path.display())))
+pub fn read_document(path: &Path) -> AdapterResult<SubtitleDocument> {
+    let text = fs::read_to_string(path).map_err(|source| {
+        AdapterError::external_io("read subtitle", Some(path.to_path_buf()), source)
+    })?;
+    parse_document_text(path, &text, None).map_err(|source| AdapterError::CoreContext {
+        operation: "parse subtitle",
+        path: Some(path.to_path_buf()),
+        source,
+    })
 }
 
 pub fn render_and_write_document(
@@ -38,20 +44,37 @@ pub fn render_and_write_document(
     translations: &[SubtitleSegment],
     output_path: &Path,
     options: &RenderOptions,
-) -> io::Result<String> {
-    let rendered = render_document(document, translations, options).map_err(io::Error::other)?;
+) -> AdapterResult<String> {
+    let rendered = render_document(document, translations, options).map_err(AdapterError::from)?;
     if let Some(parent) = output_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|source| {
+            AdapterError::external_io(
+                "create subtitle output directory",
+                Some(parent.to_path_buf()),
+                source,
+            )
+        })?;
     }
-    fs::write(output_path, rendered.as_bytes())?;
-    let written = fs::read_to_string(output_path)?;
+    fs::write(output_path, rendered.as_bytes()).map_err(|source| {
+        AdapterError::external_io(
+            "write rendered subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
+    })?;
+    let written = fs::read_to_string(output_path).map_err(|source| {
+        AdapterError::external_io(
+            "verify rendered subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
+    })?;
     if written != rendered {
-        return Err(io::Error::other(format!(
-            "write verification failed for {}",
-            output_path.display()
+        return Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
+            format!("write verification failed for {}", output_path.display()),
         )));
     }
     Ok(rendered)
@@ -61,12 +84,12 @@ pub fn default_output_path(
     input_path: &Path,
     output_format: Option<&str>,
     bilingual: bool,
-) -> io::Result<PathBuf> {
+) -> AdapterResult<PathBuf> {
     let target_format = match output_format {
-        Some(value) => normalize_format(value).map_err(io::Error::other)?,
+        Some(value) => normalize_format(value).map_err(AdapterError::from)?,
         None => supported_format_from_path(input_path)
             .ok_or_else(|| {
-                io::Error::other(format!("unsupported format: {}", input_path.display()))
+                AdapterError::invalid_input(format!("unsupported format: {}", input_path.display()))
             })?
             .to_owned(),
     };

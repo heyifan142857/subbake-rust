@@ -1,12 +1,11 @@
-use std::io;
-
 use subbake_adapters::{PipelineRequest, run_pipeline_cancellable_with_progress};
 use subbake_core::CancellationGuard;
 
+use crate::CliResult;
 use crate::args::TranslateArgs;
 use crate::output::print_pipeline_outcome;
 
-pub fn run(args: TranslateArgs) -> io::Result<()> {
+pub fn run(args: TranslateArgs) -> CliResult<()> {
     let outcome = run_pipeline_cancellable_with_progress(
         PipelineRequest {
             input_path: args.input_path,

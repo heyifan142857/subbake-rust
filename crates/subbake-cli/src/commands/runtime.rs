@@ -1,11 +1,10 @@
-use std::io;
-
 use subbake_adapters::{RuntimeRequest, run_runtime};
 
+use crate::CliResult;
 use crate::args::RuntimeArgs;
 use crate::output::print_runtime_outcome;
 
-pub fn run(args: RuntimeArgs) -> io::Result<()> {
+pub fn run(args: RuntimeArgs) -> CliResult<()> {
     let outcome = run_runtime(RuntimeRequest {
         action: args.action,
         target_path: args.target_path,

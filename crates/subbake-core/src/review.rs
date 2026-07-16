@@ -200,7 +200,7 @@ pub(crate) fn restore_review_progress(
         .map(|batch| batch.source.len())
         .sum::<usize>();
     if restored_segments.len() != expected_count {
-        return Err(CoreError::Data(format!(
+        return Err(CoreError::DataInvariant(format!(
             "resume state expected {expected_count} reviewed segments across {completed_batches} batches, but loaded {}",
             restored_segments.len()
         )));

@@ -7,7 +7,7 @@ use subbake_core::entities::{
     AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleSegment,
     TerminologyPreflightResult, Usage,
 };
-use subbake_core::error::{CoreError, CoreResult};
+use subbake_core::error::{CoreError, CoreResult, StorageError, StorageIoKind};
 use subbake_core::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeStore,
 };
@@ -92,8 +92,9 @@ impl RuntimeStore for FileRuntimeStore {
     }
 
     fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()> {
-        let value = serde_json::to_value(report)
-            .map_err(|error| CoreError::Data(format!("serialize review report failed: {error}")))?;
+        let value = serde_json::to_value(report).map_err(|error| {
+            CoreError::DataInvariant(format!("serialize review report failed: {error}"))
+        })?;
         write_json_verified(&self.paths.review_report_path, &value)
     }
 
@@ -116,8 +117,10 @@ impl RuntimeStore for FileRuntimeStore {
             return Ok(Vec::new());
         }
         let text = fs::read_to_string(&self.paths.glossary_path).map_err(storage_error)?;
-        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
-            .map_err(|error| CoreError::Data(format!("glossary parse failed: {error}",)))?;
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&text).map_err(|error| {
+                CoreError::DataInvariant(format!("glossary parse failed: {error}",))
+            })?;
         let entries: Vec<(String, String)> = map
             .into_iter()
             .filter_map(|(source, value)| value.as_str().map(|target| (source, target.to_owned())))
@@ -133,7 +136,7 @@ impl RuntimeStore for FileRuntimeStore {
             fs::read_to_string(&self.paths.translation_memory_path).map_err(storage_error)?;
         let map: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&text).map_err(|error| {
-                CoreError::Data(format!("translation memory parse failed: {error}",))
+                CoreError::DataInvariant(format!("translation memory parse failed: {error}",))
             })?;
         let entries: Vec<(String, String)> = map
             .into_iter()
@@ -155,16 +158,20 @@ impl RuntimeStore for FileRuntimeStore {
         for batch_index in 1..=completed_batches {
             let path = self.batch_shard_path(kind, batch_index);
             if !path.exists() {
-                return Err(CoreError::Data(format!(
+                return Err(CoreError::DataInvariant(format!(
                     "missing batch shard for resume: {}",
                     path.display()
                 )));
             }
             let text = fs::read_to_string(&path).map_err(storage_error)?;
-            let payload: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|error| CoreError::Data(format!("batch shard parse failed: {error}")))?;
+            let payload: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+                CoreError::DataInvariant(format!("batch shard parse failed: {error}"))
+            })?;
             let segments = payload["segments"].as_array().ok_or_else(|| {
-                CoreError::Data(format!("batch shard missing segments: {}", path.display()))
+                CoreError::DataInvariant(format!(
+                    "batch shard missing segments: {}",
+                    path.display()
+                ))
             })?;
             for segment in segments {
                 loaded.push(segment_from_json(segment)?);
@@ -174,8 +181,9 @@ impl RuntimeStore for FileRuntimeStore {
     }
 
     fn save_run_state(&self, state: &RunState) -> CoreResult<()> {
-        let payload = serde_json::to_value(state)
-            .map_err(|error| CoreError::Data(format!("serialize run state failed: {error}")))?;
+        let payload = serde_json::to_value(state).map_err(|error| {
+            CoreError::DataInvariant(format!("serialize run state failed: {error}"))
+        })?;
         write_json_verified(&self.paths.state_path, &payload)
     }
 
@@ -186,7 +194,7 @@ impl RuntimeStore for FileRuntimeStore {
         let text = fs::read_to_string(&self.paths.state_path).map_err(storage_error)?;
         serde_json::from_str(&text)
             .map(Some)
-            .map_err(|error| CoreError::Data(format!("run state parse failed: {error}")))
+            .map_err(|error| CoreError::DataInvariant(format!("run state parse failed: {error}")))
     }
 
     fn save_cached_response(
@@ -217,14 +225,15 @@ impl RuntimeStore for FileRuntimeStore {
                 })
             }
             _ => {
-                return Err(CoreError::Data(format!(
+                return Err(CoreError::DataInvariant(format!(
                     "cached response payload does not match stage {}",
                     stage.as_str()
                 )));
             }
         };
-        let value = value
-            .map_err(|error| CoreError::Data(format!("serialize request cache failed: {error}")))?;
+        let value = value.map_err(|error| {
+            CoreError::DataInvariant(format!("serialize request cache failed: {error}"))
+        })?;
         write_json_verified(&self.cache_path(stage, request_hash), &value)
     }
 
@@ -242,7 +251,7 @@ impl RuntimeStore for FileRuntimeStore {
             CacheStage::Translate | CacheStage::AgentTranslateRepair => {
                 let entry: TranslationCacheEntry =
                     serde_json::from_str(&text).map_err(|error| {
-                        CoreError::Data(format!("request cache parse failed: {error}"))
+                        CoreError::DataInvariant(format!("request cache parse failed: {error}"))
                     })?;
                 Ok(Some(BackendJsonResult {
                     payload: BackendPayload::Translation(entry.payload),
@@ -251,7 +260,7 @@ impl RuntimeStore for FileRuntimeStore {
             }
             CacheStage::Review | CacheStage::AgentReviewRepair => {
                 let entry: ReviewCacheEntry = serde_json::from_str(&text).map_err(|error| {
-                    CoreError::Data(format!("request cache parse failed: {error}"))
+                    CoreError::DataInvariant(format!("request cache parse failed: {error}"))
                 })?;
                 Ok(Some(BackendJsonResult {
                     payload: BackendPayload::Review(entry.payload),
@@ -261,7 +270,7 @@ impl RuntimeStore for FileRuntimeStore {
             CacheStage::Terminology => {
                 let entry: TerminologyCacheEntry =
                     serde_json::from_str(&text).map_err(|error| {
-                        CoreError::Data(format!("request cache parse failed: {error}"))
+                        CoreError::DataInvariant(format!("request cache parse failed: {error}"))
                     })?;
                 Ok(Some(BackendJsonResult {
                     payload: BackendPayload::Terminology(entry.payload),
@@ -276,8 +285,9 @@ impl RuntimeStore for FileRuntimeStore {
             .paths
             .failures_dir
             .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index));
-        let value = serde_json::to_value(log)
-            .map_err(|error| CoreError::Data(format!("serialize failure log failed: {error}")))?;
+        let value = serde_json::to_value(log).map_err(|error| {
+            CoreError::DataInvariant(format!("serialize failure log failed: {error}"))
+        })?;
         write_json_verified(&path, &value)?;
         Ok(path)
     }
@@ -287,8 +297,9 @@ impl RuntimeStore for FileRuntimeStore {
             .paths
             .agent_logs_dir
             .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index));
-        let value = serde_json::to_value(log)
-            .map_err(|error| CoreError::Data(format!("serialize agent log failed: {error}")))?;
+        let value = serde_json::to_value(log).map_err(|error| {
+            CoreError::DataInvariant(format!("serialize agent log failed: {error}"))
+        })?;
         write_json_verified(&path, &value)?;
         Ok(path)
     }
@@ -357,7 +368,7 @@ fn write_json_verified(path: &Path, payload: &serde_json::Value) -> CoreResult<(
         fs::create_dir_all(parent).map_err(storage_error)?;
     }
     let serialized = serde_json::to_string(payload)
-        .map_err(|error| CoreError::Data(format!("serialize json failed: {error}")))?;
+        .map_err(|error| CoreError::DataInvariant(format!("serialize json failed: {error}")))?;
     let temp_path = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -368,7 +379,7 @@ fn write_json_verified(path: &Path, payload: &serde_json::Value) -> CoreResult<(
     fs::rename(&temp_path, path).map_err(storage_error)?;
     let written = fs::read_to_string(path).map_err(storage_error)?;
     if written != serialized {
-        return Err(CoreError::Data(format!(
+        return Err(CoreError::DataInvariant(format!(
             "write verification failed for {}",
             path.display()
         )));
@@ -377,7 +388,18 @@ fn write_json_verified(path: &Path, payload: &serde_json::Value) -> CoreResult<(
 }
 
 fn storage_error(error: io::Error) -> CoreError {
-    CoreError::Data(error.to_string())
+    let kind = match error.kind() {
+        io::ErrorKind::NotFound => StorageIoKind::NotFound,
+        io::ErrorKind::PermissionDenied => StorageIoKind::PermissionDenied,
+        io::ErrorKind::AlreadyExists => StorageIoKind::AlreadyExists,
+        _ => StorageIoKind::Other,
+    };
+    CoreError::Storage(StorageError::Io {
+        operation: "runtime storage I/O".to_owned(),
+        path: None,
+        kind,
+        message: error.to_string(),
+    })
 }
 
 #[cfg(test)]

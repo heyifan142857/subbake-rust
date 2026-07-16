@@ -1,6 +1,7 @@
 pub mod decision;
 mod discovery;
 pub mod engine;
+pub mod error;
 pub mod event;
 pub mod guard;
 mod input_editor;
@@ -15,6 +16,7 @@ pub use engine::{
     AgentEngine, EngineObserver, PlanDecision, ProfileChoice, SessionChoice, StreamingObserver,
     is_known_slash_command,
 };
+pub use error::{AgentError, AgentResult};
 pub use guard::FileGuard;
 pub use session::*;
 pub use subbake_core::{CancellationGuard, CancellationToken};

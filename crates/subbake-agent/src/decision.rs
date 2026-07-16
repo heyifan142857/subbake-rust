@@ -23,6 +23,7 @@ use subbake_core::ports::{
 
 use crate::discovery::summarize_observation;
 use crate::engine::AgentEngine;
+use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
 use crate::guard::{FileOpAction, FileOpResult};
 use crate::session::{EventTag, PendingAction};
@@ -171,7 +172,7 @@ struct NativeTurn {
     results: Vec<ModelToolResult>,
 }
 
-fn invalid_decision_response(error: &io::Error) -> Decision {
+fn invalid_decision_response(error: &AgentError) -> Decision {
     Decision {
         action: DecisionAction::AskUser,
         text: format!(
@@ -192,7 +193,7 @@ fn invalid_decision_response(error: &io::Error) -> Decision {
 impl AgentEngine {
     /// Create a profile by appending an effective-settings snapshot. It stays
     /// inactive so the current conversation never loses working credentials.
-    pub fn create_profile(&mut self, name: &str) -> io::Result<String> {
+    pub fn create_profile(&mut self, name: &str) -> AgentResult<String> {
         let Some((path, config)) = self.load_project_config()? else {
             return Ok("No subbake config found. Create one before adding a profile.".to_owned());
         };
@@ -213,7 +214,7 @@ impl AgentEngine {
     /// Process a single user input line.
     ///
     /// Returns the response text to show to the user.
-    pub fn run_line(&mut self, input: &str, backend: &mut dyn LlmBackend) -> io::Result<String> {
+    pub fn run_line(&mut self, input: &str, backend: &mut dyn LlmBackend) -> AgentResult<String> {
         self.check_cancelled()?;
         self.record_if_active(EventKind::User {
             text: input.to_owned(),
@@ -301,7 +302,7 @@ impl AgentEngine {
                             results.push(ModelToolResult {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                output: error,
+                                output: error.to_string(),
                                 is_error: true,
                             });
                             continue;
@@ -310,7 +311,7 @@ impl AgentEngine {
                             results.push(ModelToolResult {
                                 id: call.id.clone(),
                                 name: call.name.clone(),
-                                output: error,
+                                output: error.to_string(),
                                 is_error: true,
                             });
                             continue;
@@ -376,7 +377,7 @@ impl AgentEngine {
                                     is_error: false,
                                 });
                             }
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                            Err(error) if error.is_cancelled() => {
                                 return Err(error);
                             }
                             Err(error) => results.push(ModelToolResult {
@@ -400,10 +401,13 @@ impl AgentEngine {
                     .iter()
                     .map(
                         |call| match authorize_and_refine(&mut candidate_intent, &call.name) {
-                            Ok(()) => {
-                                (validate_tool_call(&call.name, &call.arguments).err(), false)
-                            }
-                            Err(error) => (Some(error), true),
+                            Ok(()) => (
+                                validate_tool_call(&call.name, &call.arguments)
+                                    .err()
+                                    .map(|error| error.to_string()),
+                                false,
+                            ),
+                            Err(error) => (Some(error.to_string()), true),
                         },
                     )
                     .collect::<Vec<_>>();
@@ -601,7 +605,7 @@ impl AgentEngine {
         text: String,
         ask_user: bool,
         notify_observer: bool,
-    ) -> io::Result<String> {
+    ) -> AgentResult<String> {
         if !ask_user {
             self.clear_pending_action()?;
         }
@@ -621,7 +625,7 @@ impl AgentEngine {
     // Quick-path deterministic matching
     // ------------------------------------------------------------------
 
-    fn try_quick_path(&mut self, input: &str) -> io::Result<Option<QuickResult>> {
+    fn try_quick_path(&mut self, input: &str) -> AgentResult<Option<QuickResult>> {
         let trimmed = input.trim();
 
         // Pattern: "translate @<path>" or "translate <path>"
@@ -670,7 +674,7 @@ impl AgentEngine {
         input.trim().trim_start_matches('@').to_owned()
     }
 
-    fn route_request(&mut self, input: &str, backend: &mut dyn LlmBackend) -> io::Result<Route> {
+    fn route_request(&mut self, input: &str, backend: &mut dyn LlmBackend) -> AgentResult<Route> {
         if let Some(route) = self.pending_action_route(input) {
             return Ok(route);
         }
@@ -682,10 +686,7 @@ impl AgentEngine {
         let (value, _) = match first {
             Ok(value) => value,
             Err(LlmCallError::Cancelled) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "operation cancelled",
-                ));
+                return Err(AgentError::Cancelled);
             }
             Err(error) => {
                 return Ok(Route::AskUser(format!(
@@ -704,10 +705,7 @@ impl AgentEngine {
                                 .to_owned(),
                         ))
                     }),
-                    Err(LlmCallError::Cancelled) => Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "operation cancelled",
-                    )),
+                    Err(LlmCallError::Cancelled) => Err(AgentError::Cancelled),
                     Err(_) => Ok(Route::AskUser(
                         "Could you clarify whether you want to discuss something or act on the current project?"
                             .to_owned(),
@@ -766,7 +764,7 @@ impl AgentEngine {
         })
     }
 
-    fn set_pending_action(&mut self, intent: ToolIntent, request: &str) -> io::Result<()> {
+    fn set_pending_action(&mut self, intent: ToolIntent, request: &str) -> AgentResult<()> {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
@@ -777,7 +775,7 @@ impl AgentEngine {
         self.save()
     }
 
-    fn clear_pending_action(&mut self) -> io::Result<()> {
+    fn clear_pending_action(&mut self) -> AgentResult<()> {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
@@ -818,7 +816,7 @@ impl AgentEngine {
         state: &LoopState,
         native_turn: &mut Option<NativeTurn>,
         intent: ToolIntent,
-    ) -> io::Result<Decision> {
+    ) -> AgentResult<Decision> {
         if backend.native_tool_support() != NativeToolSupport::Unsupported {
             let was_continuation = native_turn.is_some();
             let tools = if state.force_no_tools {
@@ -885,10 +883,7 @@ impl AgentEngine {
                 }
                 Err(LlmCallError::UnsupportedCapability(_)) if !was_continuation => {}
                 Err(LlmCallError::Cancelled) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "operation cancelled",
-                    ));
+                    return Err(AgentError::Cancelled);
                 }
                 Err(error) => {
                     if let Some(ref mut observer) = self.observer {
@@ -915,7 +910,7 @@ impl AgentEngine {
         user_input: &str,
         state: &LoopState,
         intent: ToolIntent,
-    ) -> io::Result<Decision> {
+    ) -> AgentResult<Decision> {
         let messages = self.build_decision_messages(user_input, state, None, intent);
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
@@ -944,10 +939,7 @@ impl AgentEngine {
                                 Ok(invalid_decision_response(&second_error))
                             }
                         },
-                        Err(LlmCallError::Cancelled) => Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "operation cancelled",
-                        )),
+                        Err(LlmCallError::Cancelled) => Err(AgentError::Cancelled),
                         Err(error) => Ok(Decision {
                             action: DecisionAction::AskUser,
                             text: format!(
@@ -964,10 +956,7 @@ impl AgentEngine {
             },
             Err(e) => {
                 if matches!(e, LlmCallError::Cancelled) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "operation cancelled",
-                    ));
+                    return Err(AgentError::Cancelled);
                 }
                 if let Some(ref mut obs) = self.observer {
                     obs.on_error(&e.to_string());
@@ -1088,23 +1077,27 @@ impl AgentEngine {
         user
     }
 
-    fn parse_decision_value(&self, parsed: &JsonValue) -> io::Result<Decision> {
+    fn parse_decision_value(&self, parsed: &JsonValue) -> AgentResult<Decision> {
         let object = parsed
             .as_object()
-            .ok_or_else(|| io::Error::other("agent decision must be a JSON object"))?;
+            .ok_or_else(|| AgentError::InvalidDecision {
+                message: "agent decision must be a JSON object".to_owned(),
+            })?;
         let raw_action = object
             .get("action")
             .and_then(JsonValue::as_str)
-            .ok_or_else(|| io::Error::other("agent decision is missing `action`"))?;
+            .ok_or_else(|| AgentError::InvalidDecision {
+                message: "agent decision is missing `action`".to_owned(),
+            })?;
         let action = match raw_action {
             "final_tool_call" | "tool_call" => DecisionAction::ToolCall,
             "respond" => DecisionAction::Respond,
             "plan" => DecisionAction::Plan,
             "ask_user" => DecisionAction::AskUser,
             other => {
-                return Err(io::Error::other(format!(
-                    "unsupported agent action `{other}`"
-                )));
+                return Err(AgentError::InvalidDecision {
+                    message: format!("unsupported agent action `{other}`"),
+                });
             }
         };
         let text = object
@@ -1119,33 +1112,45 @@ impl AgentEngine {
             let name = object
                 .get("tool_name")
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| io::Error::other("tool call is missing `tool_name`"))?;
+                .ok_or_else(|| AgentError::InvalidDecision {
+                    message: "tool call is missing `tool_name`".to_owned(),
+                })?;
             let args = object
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            validate_tool_call(name, &args).map_err(io::Error::other)?;
+            validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
+                message: error.to_string(),
+            })?;
             tool_name = Some(name.to_owned());
             arguments = Some(args);
         } else if action == DecisionAction::Plan {
             let calls = object
                 .get("tool_calls")
                 .and_then(JsonValue::as_array)
-                .ok_or_else(|| io::Error::other("plan is missing `tool_calls`"))?;
+                .ok_or_else(|| AgentError::InvalidDecision {
+                    message: "plan is missing `tool_calls`".to_owned(),
+                })?;
             if calls.is_empty() {
-                return Err(io::Error::other("plan must contain at least one tool call"));
+                return Err(AgentError::InvalidDecision {
+                    message: "plan must contain at least one tool call".to_owned(),
+                });
             }
             for call in calls {
                 let name = call
                     .get("tool_name")
                     .and_then(JsonValue::as_str)
-                    .ok_or_else(|| io::Error::other("planned call is missing `tool_name`"))?;
+                    .ok_or_else(|| AgentError::InvalidDecision {
+                        message: "planned call is missing `tool_name`".to_owned(),
+                    })?;
                 let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                validate_tool_call(name, &args).map_err(io::Error::other)?;
+                validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
+                    message: error.to_string(),
+                })?;
                 if self.is_discovery_tool(name) {
-                    return Err(io::Error::other(
-                        "discovery tools must run before creating a plan",
-                    ));
+                    return Err(AgentError::InvalidDecision {
+                        message: "discovery tools must run before creating a plan".to_owned(),
+                    });
                 }
                 tool_calls.push(ToolCallDraft {
                     tool_name: name.to_owned(),
@@ -1178,7 +1183,7 @@ impl AgentEngine {
     // Tool runner (stub — dispatches to real adapters)
     // ------------------------------------------------------------------
 
-    fn execute_or_plan_tool(&mut self, tool_name: &str, args: &JsonValue) -> io::Result<String> {
+    fn execute_or_plan_tool(&mut self, tool_name: &str, args: &JsonValue) -> AgentResult<String> {
         if let Some(ref mut obs) = self.observer {
             obs.on_tool_call(tool_name, args);
         }
@@ -1195,7 +1200,7 @@ impl AgentEngine {
         self.run_tool(tool_name, args)
     }
 
-    pub(crate) fn record_if_active(&mut self, kind: EventKind) -> io::Result<()> {
+    pub(crate) fn record_if_active(&mut self, kind: EventKind) -> AgentResult<()> {
         if self.session.is_some() {
             self.record(kind)?;
         }
@@ -1203,7 +1208,7 @@ impl AgentEngine {
     }
 
     /// Execute a tool by name with arguments. Returns a text summary.
-    pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> io::Result<String> {
+    pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> AgentResult<String> {
         self.check_cancelled()?;
         self.record_if_active(EventKind::ToolCall {
             tool_name: name.to_owned(),
@@ -1212,11 +1217,8 @@ impl AgentEngine {
 
         let executor = crate::tools::find_tool_spec(name)
             .map(|spec| spec.executor)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown agent tool `{name}`"),
-                )
+            .ok_or_else(|| AgentError::InvalidInput {
+                message: format!("unknown agent tool `{name}`"),
             })?;
 
         if let Some(outcome) = execute_local_tool(executor, args, &self.guard, &self.project_root)?
@@ -1250,7 +1252,9 @@ impl AgentEngine {
                 self.progress.clone(),
                 settings,
             )?
-            .ok_or_else(|| io::Error::other("translation tool executor rejected its tool"))?;
+            .ok_or_else(|| AgentError::InvalidState {
+                message: "translation tool executor rejected its tool".to_owned(),
+            })?;
             let group_id = outcome
                 .group_file_operations
                 .then(|| format!("translate-series-{}", crate::session::iso_now()));
@@ -1281,12 +1285,14 @@ impl AgentEngine {
                 .as_ref()
                 .and_then(|session| session.profile.as_deref());
             let outcome = execute_session_tool(executor, args, events, config, active_profile)?
-                .ok_or_else(|| io::Error::other("session tool executor rejected its tool"))?;
+                .ok_or_else(|| AgentError::InvalidState {
+                    message: "session tool executor rejected its tool".to_owned(),
+                })?;
             if let Some(profile_switch) = outcome.profile_switch {
                 let session = self
                     .session
                     .as_mut()
-                    .ok_or_else(|| io::Error::other("no active session"))?;
+                    .ok_or_else(|| AgentError::invalid_state("no active session"))?;
                 session.profile = Some(profile_switch.name.clone());
                 session.config_path =
                     Some(profile_switch.config_path.to_string_lossy().to_string());
@@ -1298,12 +1304,12 @@ impl AgentEngine {
             return Ok(outcome.text);
         }
 
-        Err(io::Error::other(
-            "tool was not handled by its registered executor",
-        ))
+        Err(AgentError::InvalidState {
+            message: "tool was not handled by its registered executor".to_owned(),
+        })
     }
 
-    fn record_file_operation(&mut self, result: &FileOpResult) -> io::Result<()> {
+    fn record_file_operation(&mut self, result: &FileOpResult) -> AgentResult<()> {
         self.record_file_operation_with_group(result, None)
     }
 
@@ -1311,7 +1317,7 @@ impl AgentEngine {
         &mut self,
         result: &FileOpResult,
         group_id: Option<String>,
-    ) -> io::Result<()> {
+    ) -> AgentResult<()> {
         self.record_if_active(EventKind::FileOperation(FileOpEventData {
             action: file_action_label(result.action).to_owned(),
             path: self.event_path(&result.path),
@@ -1325,13 +1331,13 @@ impl AgentEngine {
         }))
     }
 
-    pub(crate) fn load_project_config(&self) -> io::Result<Option<(PathBuf, ConfigFile)>> {
+    pub(crate) fn load_project_config(&self) -> AgentResult<Option<(PathBuf, ConfigFile)>> {
         if let Some(path) = self
             .session
             .as_ref()
             .and_then(|session| session.config_path.as_deref().map(PathBuf::from))
         {
-            return ConfigFile::load(&path).map(|config| Some((path, config)));
+            return Ok(Some((path.clone(), ConfigFile::load(&path)?)));
         }
 
         let candidates = [
@@ -1340,13 +1346,13 @@ impl AgentEngine {
         ];
         for path in candidates {
             if path.exists() {
-                return ConfigFile::load(&path).map(|config| Some((path, config)));
+                return Ok(Some((path.clone(), ConfigFile::load(&path)?)));
             }
         }
         Ok(None)
     }
 
-    pub(crate) fn active_translation_settings(&self) -> io::Result<TranslationSettings> {
+    pub(crate) fn active_translation_settings(&self) -> AgentResult<TranslationSettings> {
         let profile = self
             .session
             .as_ref()
@@ -1397,8 +1403,10 @@ fn truncate_text(text: &str, limit: usize) -> String {
     }
 }
 
-fn authorize_and_refine(intent: &mut ToolIntent, name: &str) -> Result<(), String> {
-    match authorize_tool(*intent, name).map_err(|error| error.to_string())? {
+fn authorize_and_refine(intent: &mut ToolIntent, name: &str) -> AgentResult<()> {
+    match authorize_tool(*intent, name).map_err(|error| AgentError::ToolPolicy {
+        message: error.to_string(),
+    })? {
         ToolAuthorization::Allowed => Ok(()),
         ToolAuthorization::Transition(target) => {
             *intent = target;
@@ -2252,7 +2260,9 @@ mod tests {
             ),
             native_calls: 0,
             legacy_calls: 0,
-            native_error: Some(subbake_core::CoreError::Backend("rate limited".to_owned())),
+            native_error: Some(subbake_core::CoreError::InvalidBackendResponse(
+                "rate limited".to_owned(),
+            )),
         };
 
         let response = engine
@@ -2852,7 +2862,7 @@ mod tests {
                 &json!({"path": "cancelled.txt", "content": "no"}),
             )
             .expect_err("cancelled tool must not run");
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.is_cancelled());
         assert!(!root.join("cancelled.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2910,7 +2920,7 @@ mod tests {
         let error = engine
             .run_tool("not_registered", &json!({}))
             .expect_err("unknown tool must fail");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(error, AgentError::InvalidInput { .. }));
         assert!(error.to_string().contains("unknown agent tool"));
         let _ = std::fs::remove_dir_all(&root);
     }

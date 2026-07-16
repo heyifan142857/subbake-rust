@@ -11,6 +11,8 @@ use subbake_core::{
 };
 use tokio::runtime::Runtime;
 
+use crate::error::{AdapterError, AdapterResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhisperRequest {
     pub action: WhisperAction,
@@ -55,14 +57,14 @@ pub struct WhisperModel {
     pub path: PathBuf,
 }
 
-pub fn run_whisper(request: WhisperRequest) -> io::Result<WhisperOutcome> {
+pub fn run_whisper(request: WhisperRequest) -> AdapterResult<WhisperOutcome> {
     run_whisper_cancellable(request, &CancellationGuard::never())
 }
 
 pub fn run_whisper_cancellable(
     request: WhisperRequest,
     cancellation: &CancellationGuard,
-) -> io::Result<WhisperOutcome> {
+) -> AdapterResult<WhisperOutcome> {
     run_whisper_cancellable_with_progress(request, cancellation, std::sync::Arc::new(NoopProgress))
 }
 
@@ -70,10 +72,8 @@ pub fn run_whisper_cancellable_with_progress(
     request: WhisperRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
-) -> io::Result<WhisperOutcome> {
-    cancellation
-        .check()
-        .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"))?;
+) -> AdapterResult<WhisperOutcome> {
+    cancellation.check().map_err(AdapterError::from)?;
     let stage = match request.action {
         WhisperAction::Install | WhisperAction::Update => "INSTALL",
         WhisperAction::DownloadModel { .. } => "DOWNLOAD",
@@ -87,7 +87,7 @@ pub fn run_whisper_cancellable_with_progress(
         None,
         ProgressUnit::Steps,
     ));
-    let outcome: io::Result<WhisperOutcome> = match request.action {
+    let outcome: AdapterResult<WhisperOutcome> = match request.action {
         WhisperAction::Status => Ok(WhisperOutcome::Status(inspect_status(&request))),
         WhisperAction::ListModels => Ok(WhisperOutcome::ModelList(list_models(&request)?)),
         WhisperAction::Install => {
@@ -179,7 +179,7 @@ fn detect_platform() -> Option<PlatformAssets> {
     }
 }
 
-fn install_binary(request: &WhisperRequest) -> io::Result<()> {
+fn install_binary(request: &WhisperRequest) -> AdapterResult<()> {
     let binary_path = whisper_binary_path(request);
     let bin_dir = binary_path
         .parent()
@@ -187,8 +187,13 @@ fn install_binary(request: &WhisperRequest) -> io::Result<()> {
         .to_path_buf();
     let version_tag = "latest";
     let target_dir = bin_dir.clone();
-    std::fs::create_dir_all(&target_dir)
-        .map_err(|e| io::Error::other(format!("create binary dir: {e}")))?;
+    std::fs::create_dir_all(&target_dir).map_err(|source| {
+        AdapterError::external_io(
+            "create whisper binary directory",
+            Some(target_dir.clone()),
+            source,
+        )
+    })?;
 
     if let Some(platform) = detect_platform()
         && let Some(asset) =
@@ -236,35 +241,46 @@ struct ReleaseAsset {
     tag: String,
 }
 
-async fn find_latest_release_asset(platform: &PlatformAssets) -> io::Result<Option<ReleaseAsset>> {
+async fn find_latest_release_asset(
+    platform: &PlatformAssets,
+) -> AdapterResult<Option<ReleaseAsset>> {
     let client = reqwest::Client::builder()
         .user_agent("subbake/0.1")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| io::Error::other(format!("http client: {e}")))?;
+        .map_err(|error| AdapterError::from_http("GitHub release client", error))?;
 
     let response = client
         .get(format!("{GITHUB_RELEASES_API}/latest"))
         .send()
         .await
-        .map_err(|e| io::Error::other(format!("release lookup request: {e}")))?;
+        .map_err(|error| AdapterError::from_http("GitHub release lookup", error))?;
     let status = response.status();
+    let retry_after_ms = retry_after_ms(response.headers());
     let body = response
         .text()
         .await
-        .map_err(|e| io::Error::other(format!("release lookup response: {e}")))?;
+        .map_err(|error| AdapterError::from_http("GitHub release response", error))?;
     if !status.is_success() {
-        return Err(io::Error::other(format!(
-            "release lookup failed ({status}): {body}"
-        )));
+        return Err(AdapterError::from_http_status(
+            "GitHub release API",
+            status.as_u16(),
+            body,
+            retry_after_ms,
+        ));
     }
 
-    let payload: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| io::Error::other(format!("release metadata parse: {e}")))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).map_err(|source| AdapterError::Serialization {
+            context: "parse GitHub release metadata",
+            source,
+        })?;
     let tag = payload["tag_name"].as_str().unwrap_or("latest").to_owned();
-    let assets = payload["assets"]
-        .as_array()
-        .ok_or_else(|| io::Error::other("release metadata does not contain an assets array"))?;
+    let assets = payload["assets"].as_array().ok_or_else(|| {
+        AdapterError::Core(subbake_core::CoreError::InvalidBackendResponse(
+            "release metadata does not contain an assets array".to_owned(),
+        ))
+    })?;
 
     Ok(assets
         .iter()
@@ -320,45 +336,66 @@ fn asset_match_score(name: &str, platform: &PlatformAssets) -> Option<usize> {
     }
 }
 
-async fn download_file(url: &str, dest: &Path) -> io::Result<()> {
+async fn download_file(url: &str, dest: &Path) -> AdapterResult<()> {
     let client = reqwest::Client::builder()
         .user_agent("subbake/0.1")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| io::Error::other(format!("http client: {e}")))?;
+        .map_err(|error| AdapterError::from_http("download client", error))?;
 
     let mut response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| io::Error::other(format!("download request: {e}")))?;
+        .map_err(|error| AdapterError::from_http("download request", error))?;
     let status = response.status();
 
     if !status.is_success() {
-        return Err(io::Error::other(format!(
-            "download failed ({status}) from {url}"
-        )));
+        return Err(AdapterError::from_http_status(
+            "download service",
+            status.as_u16(),
+            format!("download failed from {url}"),
+            retry_after_ms(response.headers()),
+        ));
     }
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| io::Error::other(format!("create dest dir: {e}")))?;
+        std::fs::create_dir_all(parent).map_err(|source| {
+            AdapterError::external_io(
+                "create download destination",
+                Some(parent.to_path_buf()),
+                source,
+            )
+        })?;
     }
     let tmp = dest.with_extension("download.tmp");
-    let mut file = std::fs::File::create(&tmp)
-        .map_err(|e| io::Error::other(format!("create download file: {e}")))?;
+    let mut file = std::fs::File::create(&tmp).map_err(|source| {
+        AdapterError::external_io("create temporary download", Some(tmp.clone()), source)
+    })?;
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| io::Error::other(format!("download response: {e}")))?
+        .map_err(|error| AdapterError::from_http("download response", error))?
     {
-        file.write_all(&chunk)
-            .map_err(|e| io::Error::other(format!("write download: {e}")))?;
+        file.write_all(&chunk).map_err(|source| {
+            AdapterError::external_io("write temporary download", Some(tmp.clone()), source)
+        })?;
     }
-    file.flush()
-        .map_err(|e| io::Error::other(format!("flush download: {e}")))?;
-    std::fs::rename(&tmp, dest).map_err(|e| io::Error::other(format!("finalize download: {e}")))?;
+    file.flush().map_err(|source| {
+        AdapterError::external_io("flush temporary download", Some(tmp.clone()), source)
+    })?;
+    std::fs::rename(&tmp, dest).map_err(|source| {
+        AdapterError::external_io("finalize download", Some(dest.to_path_buf()), source)
+    })?;
     Ok(())
+}
+
+fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000))
 }
 
 fn extract_tar_gz(archive: &Path, target: &Path) -> io::Result<()> {
@@ -513,7 +550,7 @@ fn write_install_manifest(
         .map_err(|e| io::Error::other(format!("write install manifest: {e}")))
 }
 
-fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io::Result<()> {
+fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> AdapterResult<()> {
     // cmake source build: clone/download source, cmake + make.
     let build_dir = std::env::temp_dir().join("subbake-whisper-build");
     let src_dir = build_dir.join("source");
@@ -541,7 +578,11 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io
         .status()
         .map_err(|e| io::Error::other(format!("tar source: {e}")))?;
     if !status.success() {
-        return Err(io::Error::other("source extraction failed"));
+        return Err(AdapterError::ChildProcess {
+            program: "tar",
+            status: status.code(),
+            message: "source extraction failed".to_owned(),
+        });
     }
 
     // cmake configure & build
@@ -561,7 +602,11 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io
         .map_err(|e| io::Error::other(format!("cmake configure: {e}")))?;
     if !cmake.status.success() {
         let stderr = String::from_utf8_lossy(&cmake.stderr);
-        return Err(io::Error::other(format!("cmake failed: {stderr}")));
+        return Err(AdapterError::ChildProcess {
+            program: "cmake",
+            status: cmake.status.code(),
+            message: stderr.into_owned(),
+        });
     }
 
     let make = Command::new("cmake")
@@ -595,9 +640,11 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io
             .map_err(|e| io::Error::other(format!("cmake build main: {e}")))?;
         if !make2.status.success() {
             let stderr2 = String::from_utf8_lossy(&make2.stderr);
-            return Err(io::Error::other(format!(
-                "cmake build failed: {stderr} / {stderr2}"
-            )));
+            return Err(AdapterError::ChildProcess {
+                program: "cmake",
+                status: make2.status.code(),
+                message: format!("{stderr} / {stderr2}"),
+            });
         }
     }
 
@@ -628,7 +675,9 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> io
     }
 
     let _ = std::fs::remove_dir_all(&build_dir);
-    Err(io::Error::other("built binary not found after cmake build"))
+    Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
+        "built binary not found after cmake build".to_owned(),
+    )))
 }
 
 fn num_cpus() -> usize {
@@ -643,9 +692,9 @@ fn num_cpus() -> usize {
 
 pub const SUPPORTED_MODELS: &[&str] = &["tiny", "base", "small", "medium", "large-v3"];
 
-fn download_model(request: &WhisperRequest, name: &str) -> io::Result<()> {
+fn download_model(request: &WhisperRequest, name: &str) -> AdapterResult<()> {
     if !SUPPORTED_MODELS.contains(&name) {
-        return Err(io::Error::other(format!(
+        return Err(AdapterError::invalid_input(format!(
             "unknown model `{name}`; supported: {}",
             SUPPORTED_MODELS.join(", ")
         )));
@@ -655,8 +704,13 @@ fn download_model(request: &WhisperRequest, name: &str) -> io::Result<()> {
         .models_dir
         .clone()
         .unwrap_or_else(default_whisper_models_dir);
-    std::fs::create_dir_all(&models_dir)
-        .map_err(|e| io::Error::other(format!("create models dir: {e}")))?;
+    std::fs::create_dir_all(&models_dir).map_err(|source| {
+        AdapterError::external_io(
+            "create whisper models directory",
+            Some(models_dir.clone()),
+            source,
+        )
+    })?;
 
     let dest = models_dir.join(format!("ggml-{name}.bin"));
     if dest.exists() {

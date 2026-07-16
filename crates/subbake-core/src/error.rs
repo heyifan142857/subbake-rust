@@ -3,6 +3,62 @@ use std::fmt::{Display, Formatter};
 
 pub type CoreResult<T> = Result<T, CoreError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageIoKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageError {
+    Io {
+        operation: String,
+        path: Option<String>,
+        kind: StorageIoKind,
+        message: String,
+    },
+    Serialization {
+        operation: String,
+        message: String,
+    },
+    CorruptData {
+        data_kind: String,
+        path: Option<String>,
+        message: String,
+    },
+}
+
+impl Display for StorageError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                message,
+                ..
+            } => match path {
+                Some(path) => write!(formatter, "{operation} `{path}`: {message}"),
+                None => write!(formatter, "{operation}: {message}"),
+            },
+            Self::Serialization { operation, message } => {
+                write!(formatter, "{operation}: {message}")
+            }
+            Self::CorruptData {
+                data_kind,
+                path,
+                message,
+            } => match path {
+                Some(path) => write!(formatter, "invalid {data_kind} in `{path}`: {message}"),
+                None => write!(formatter, "invalid {data_kind}: {message}"),
+            },
+        }
+    }
+}
+
+impl Error for StorageError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmCallError {
     Cancelled,
@@ -76,8 +132,9 @@ pub enum CoreError {
     MalformedSubtitle(String),
     InvalidTranslation(String),
     UnsupportedCapability(String),
-    Backend(String),
-    Data(String),
+    InvalidBackendResponse(String),
+    DataInvariant(String),
+    Storage(StorageError),
 }
 
 impl Display for CoreError {
@@ -97,8 +154,11 @@ impl Display for CoreError {
             CoreError::UnsupportedCapability(value) => {
                 write!(formatter, "unsupported backend capability: {value}")
             }
-            CoreError::Backend(value) => write!(formatter, "backend error: {value}"),
-            CoreError::Data(value) => write!(formatter, "data error: {value}"),
+            CoreError::InvalidBackendResponse(value) => {
+                write!(formatter, "invalid backend response: {value}")
+            }
+            CoreError::DataInvariant(value) => write!(formatter, "data invariant failed: {value}"),
+            CoreError::Storage(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -123,11 +183,60 @@ impl From<CoreError> for LlmCallError {
             CoreError::Cancelled => Self::Cancelled,
             CoreError::UnsupportedCapability(capability) => Self::UnsupportedCapability(capability),
             CoreError::Llm(error) => error,
-            CoreError::Backend(message) => Self::Rejected {
-                status: None,
-                message,
-            },
-            other => Self::InvalidResponse(other.to_string()),
+            CoreError::InvalidBackendResponse(message) => Self::InvalidResponse(message),
+            CoreError::UnsupportedFormat(value) => {
+                Self::InvalidResponse(format!("unsupported subtitle format: {value}"))
+            }
+            CoreError::MalformedSubtitle(value) => {
+                Self::InvalidResponse(format!("malformed subtitle document: {value}"))
+            }
+            CoreError::InvalidTranslation(value) => {
+                Self::InvalidResponse(format!("invalid translation result: {value}"))
+            }
+            CoreError::DataInvariant(value) => {
+                Self::InvalidResponse(format!("data error: {value}"))
+            }
+            CoreError::Storage(error) => {
+                Self::InvalidResponse(format!("runtime storage error: {error}"))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_to_llm_conversion_is_explicit_and_category_preserving() {
+        assert_eq!(
+            LlmCallError::from(CoreError::Cancelled),
+            LlmCallError::Cancelled
+        );
+        assert_eq!(
+            LlmCallError::from(CoreError::UnsupportedCapability("tools".to_owned())),
+            LlmCallError::UnsupportedCapability("tools".to_owned())
+        );
+        assert_eq!(
+            LlmCallError::from(CoreError::InvalidBackendResponse("bad JSON".to_owned())),
+            LlmCallError::InvalidResponse("bad JSON".to_owned())
+        );
+    }
+
+    #[test]
+    fn storage_io_remains_distinguishable_from_domain_invariants() {
+        let error = CoreError::Storage(StorageError::Io {
+            operation: "read cache".to_owned(),
+            path: Some("cache.json".to_owned()),
+            kind: StorageIoKind::PermissionDenied,
+            message: "denied".to_owned(),
+        });
+        assert!(matches!(
+            error,
+            CoreError::Storage(StorageError::Io {
+                kind: StorageIoKind::PermissionDenied,
+                ..
+            })
+        ));
     }
 }

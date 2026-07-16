@@ -1,4 +1,3 @@
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
@@ -13,6 +12,7 @@ use subbake_core::diagnostics::diagnose_text;
 use subbake_core::{CancellationGuard, SharedProgress};
 
 use crate::discovery::rank_subtitle_candidates;
+use crate::error::{AgentError, AgentResult};
 use crate::guard::{FileGuard, FileOpResult};
 use crate::session::AgentEvent;
 use crate::session::EventTag;
@@ -44,7 +44,7 @@ pub(crate) fn execute_local_tool(
     args: &JsonValue,
     guard: &FileGuard,
     project_root: &Path,
-) -> io::Result<Option<LocalToolOutcome>> {
+) -> AgentResult<Option<LocalToolOutcome>> {
     let outcome = match executor {
         ToolExecutor::ListFiles => {
             let dir = optional_string(args, "path", ".");
@@ -152,7 +152,7 @@ pub(crate) fn execute_adapter_tool(
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
-) -> io::Result<Option<String>> {
+) -> AgentResult<Option<String>> {
     let text = match executor {
         ToolExecutor::TranscribeAudio => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
@@ -171,9 +171,9 @@ pub(crate) fn execute_adapter_tool(
                 transcribe_media_cancellable(request, cancellation)
             };
             match transcribed {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(outcome) => format!("Transcribed: {}", outcome.output_path.display()),
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         ToolExecutor::ManageWhisper => {
@@ -193,9 +193,9 @@ pub(crate) fn execute_adapter_tool(
                 subbake_adapters::run_whisper_cancellable(request, cancellation)
             };
             match managed {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
+                Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(_) => "whisper: done".to_owned(),
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         ToolExecutor::DiagnosePath => {
@@ -231,7 +231,7 @@ pub(crate) fn execute_translation_tool(
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
     mut settings: TranslationSettings,
-) -> io::Result<Option<TranslationToolOutcome>> {
+) -> AgentResult<Option<TranslationToolOutcome>> {
     if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
         settings.output.bilingual = bilingual;
     }
@@ -371,7 +371,7 @@ pub(crate) fn execute_session_tool(
     events: &[AgentEvent],
     config: Option<(PathBuf, ConfigFile)>,
     active_profile: Option<&str>,
-) -> io::Result<Option<SessionToolOutcome>> {
+) -> AgentResult<Option<SessionToolOutcome>> {
     let outcome = match executor {
         ToolExecutor::RecentTranslations => SessionToolOutcome {
             text: recent_translation_paths(events),
@@ -448,21 +448,25 @@ fn optional_string<'a>(args: &'a JsonValue, key: &str, default: &'a str) -> &'a 
     args.get(key).and_then(JsonValue::as_str).unwrap_or(default)
 }
 
-fn required_path(args: &JsonValue, key: &str) -> io::Result<PathBuf> {
+fn required_path(args: &JsonValue, key: &str) -> AgentResult<PathBuf> {
     args.get(key)
         .and_then(JsonValue::as_str)
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
+        .ok_or_else(|| AgentError::ToolArguments {
+            message: format!("missing required argument `{key}`"),
+        })
 }
 
-fn required_string(args: &JsonValue, key: &str) -> io::Result<String> {
+fn required_string(args: &JsonValue, key: &str) -> AgentResult<String> {
     args.get(key)
         .and_then(JsonValue::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| io::Error::other(format!("missing required argument `{key}`")))
+        .ok_or_else(|| AgentError::ToolArguments {
+            message: format!("missing required argument `{key}`"),
+        })
 }
 
-fn whisper_action(args: &JsonValue) -> io::Result<WhisperAction> {
+fn whisper_action(args: &JsonValue) -> AgentResult<WhisperAction> {
     match optional_string(args, "action", "status") {
         "install" => Ok(WhisperAction::Install),
         "update" => Ok(WhisperAction::Update),
@@ -477,10 +481,9 @@ fn whisper_action(args: &JsonValue) -> io::Result<WhisperAction> {
         "download" | "download_model" => Ok(WhisperAction::DownloadModel {
             name: optional_string(args, "model", "small").to_owned(),
         }),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown whisper action `{other}`"),
-        )),
+        other => Err(AgentError::InvalidInput {
+            message: format!("unknown whisper action `{other}`"),
+        }),
     }
 }
 
@@ -625,7 +628,7 @@ mod tests {
             None,
         )
         .expect_err("invalid whisper action must fail");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(error, AgentError::InvalidInput { .. }));
         let _ = fs::remove_dir_all(root);
     }
 

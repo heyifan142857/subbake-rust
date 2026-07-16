@@ -19,6 +19,7 @@ serde_json = "1"
 subbake-adapters = { path = "../subbake-adapters" }
 subbake-agent = { path = "../subbake-agent" }
 subbake-core = { path = "../subbake-core" }
+thiserror = "2"
 
 [lints]
 workspace = true

@@ -1,4 +1,3 @@
-use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
@@ -6,13 +5,14 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentActionKind, AgentEngine, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
-    TuiAction, TuiInteraction, is_known_slash_command,
+    AgentActionKind, AgentEngine, AgentError, AgentResult, EchoDecisionBackend, PlanDecision,
+    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
 };
 
+use crate::CliResult;
 use crate::args::AgentArgs;
 
-pub fn run(args: AgentArgs) -> io::Result<()> {
+pub fn run(args: AgentArgs) -> CliResult<()> {
     // No-args / resume → start TUI.
     match args.action.kind {
         AgentActionKind::Start => start_interactive(),
@@ -26,7 +26,7 @@ pub fn run(args: AgentArgs) -> io::Result<()> {
     }
 }
 
-fn start_interactive() -> io::Result<()> {
+fn start_interactive() -> CliResult<()> {
     let project_root = std::env::current_dir()?;
     let mut engine = AgentEngine::new(project_root);
     engine.start_session()?;
@@ -34,7 +34,7 @@ fn start_interactive() -> io::Result<()> {
     run_tui_with_engine(engine, false)
 }
 
-fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
+fn start_interactive_resume(session_id: Option<&str>) -> CliResult<()> {
     let project_root = std::env::current_dir()?;
     let mut engine = AgentEngine::new(project_root);
     engine.resume_session(session_id)?;
@@ -42,7 +42,7 @@ fn start_interactive_resume(session_id: Option<&str>) -> io::Result<()> {
     run_tui_with_engine(engine, session_id.is_none())
 }
 
-fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io::Result<()> {
+fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> CliResult<()> {
     let project_root = engine.project_root().to_path_buf();
     let (mut config_path, needs_config_pin) = session_config_path(&engine);
     if needs_config_pin {
@@ -83,7 +83,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         .with_progress(std::sync::Arc::new(observer.clone()))
         .with_observer(Box::new(observer));
 
-    tui.run(move |action, guard, _obs| {
+    Ok(tui.run(move |action, guard, _obs| {
         engine.begin_operation(guard);
         let submitted_text = match &action {
             TuiAction::SubmitText(text) => Some(text.as_str()),
@@ -126,7 +126,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
             None
         };
 
-        let operation_result = (|| -> io::Result<String> {
+        let operation_result = (|| -> AgentResult<String> {
             Ok(match &action {
                 TuiAction::SubmitText(input) if is_known_slash_command(input) => {
                     if !input.trim().starts_with("/plan") {
@@ -147,13 +147,12 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         })();
         let result = match operation_result {
             Ok(result) => result,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+            Err(error) if error.is_cancelled() => {
                 let _ = engine.record(EventKind::Cancelled);
                 let _ = engine.save();
                 return Err(error);
             }
             Err(error) => {
-                let kind = error.kind();
                 let message = error.to_string();
                 let displayed = match engine.record_error(&message) {
                     Ok(path) => format!("{message}\nError details saved to:\n{}", path.display()),
@@ -161,7 +160,10 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
                         format!("{message}\nWarning: failed to save error details: {save_error}")
                     }
                 };
-                return Err(io::Error::new(kind, displayed));
+                return Err(AgentError::Reported {
+                    message: displayed,
+                    source: Box::new(error),
+                });
             }
         };
 
@@ -242,14 +244,14 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> io
         } else {
             Ok(TuiInteraction::Message { message: result })
         }
-    })
+    })?)
 }
 
 fn prepare_profile_backend(
     engine: &AgentEngine,
     config_path: Option<&Path>,
     profile: &str,
-) -> io::Result<Option<Box<dyn subbake_core::ports::LlmBackend>>> {
+) -> AgentResult<Option<Box<dyn subbake_core::ports::LlmBackend>>> {
     if !engine.profile_choices()?.iter().any(|name| name == profile) {
         return Ok(None);
     }
@@ -265,14 +267,11 @@ fn session_config_path(engine: &AgentEngine) -> (Option<PathBuf>, bool) {
 fn build_agent_decision_backend(
     config_path: Option<&Path>,
     profile: Option<&str>,
-) -> io::Result<Box<dyn subbake_core::ports::LlmBackend>> {
+) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
     let mut settings = TranslationSettings::default();
     if let Some(path) = config_path {
         let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("configuration disappeared: {}", path.display()),
-            )
+            AgentError::invalid_input(format!("configuration disappeared: {}", path.display()))
         })?;
         settings.apply_patch(patch);
     }
@@ -281,21 +280,20 @@ fn build_agent_decision_backend(
         return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
     }
 
-    build_backend(&settings.backend_config())
-        .map_err(|error| io::Error::other(format!("build agent backend: {error}")))
+    build_backend(&settings.backend_config()).map_err(|source| AgentError::AdapterContext {
+        operation: "build agent backend",
+        source: Box::new(source),
+    })
 }
 
 fn resolved_settings(
     config_path: Option<&Path>,
     profile: Option<&str>,
-) -> io::Result<TranslationSettings> {
+) -> AgentResult<TranslationSettings> {
     let mut settings = TranslationSettings::default();
     if let Some(path) = config_path {
         let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("configuration disappeared: {}", path.display()),
-            )
+            AgentError::invalid_input(format!("configuration disappeared: {}", path.display()))
         })?;
         settings.apply_patch(patch);
     }

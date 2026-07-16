@@ -53,7 +53,7 @@ impl ReviewStage {
         let resumed = if plan.is_empty() {
             0
         } else if resumed > plan.len() {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "resume state has {resumed} reviewed batches, but the current review plan has only {}",
                 plan.len()
             )));
@@ -103,10 +103,10 @@ impl ReviewStage {
         usage: Usage,
     ) -> CoreResult<Vec<SubtitleSegment>> {
         let index = position.checked_sub(1).ok_or_else(|| {
-            CoreError::Data("review result has invalid batch position 0".to_owned())
+            CoreError::DataInvariant("review result has invalid batch position 0".to_owned())
         })?;
         let batch = self.plan.get(index).ok_or_else(|| {
-            CoreError::Data(format!(
+            CoreError::DataInvariant(format!(
                 "review result has invalid batch position {position}"
             ))
         })?;

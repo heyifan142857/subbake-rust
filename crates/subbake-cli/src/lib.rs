@@ -1,9 +1,10 @@
-use std::io;
-
 pub mod args;
 pub mod commands;
+pub mod error;
 pub mod output;
 mod progress;
+
+pub use error::{CliError, CliResult};
 
 pub fn command_names() -> &'static [&'static str] {
     &[
@@ -19,6 +20,6 @@ pub fn command_names() -> &'static [&'static str] {
     ]
 }
 
-pub fn run(args: Vec<String>) -> io::Result<()> {
+pub fn run(args: Vec<String>) -> CliResult<()> {
     commands::dispatch(args)
 }

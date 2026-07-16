@@ -104,14 +104,14 @@ impl LlmBackend for MockBackend {
 fn edit_subtitles(prompt: &str) -> CoreResult<SubtitleEditPayload> {
     let edit_json = extract_between(prompt, "EDIT_JSON_START", "EDIT_JSON_END")?;
     let payload: JsonValue = serde_json::from_str(edit_json)
-        .map_err(|err| CoreError::Backend(format!("invalid edit json: {err}")))?;
+        .map_err(|err| CoreError::InvalidBackendResponse(format!("invalid edit json: {err}")))?;
     let instruction = payload["instruction"]
         .as_str()
         .unwrap_or_default()
         .to_lowercase();
-    let entries = payload["lines"]
-        .as_array()
-        .ok_or_else(|| CoreError::Backend("mock edit is missing lines array".to_owned()))?;
+    let entries = payload["lines"].as_array().ok_or_else(|| {
+        CoreError::InvalidBackendResponse("mock edit is missing lines array".to_owned())
+    })?;
 
     let lines = entries
         .iter()
@@ -138,7 +138,7 @@ fn edit_subtitles(prompt: &str) -> CoreResult<SubtitleEditPayload> {
 fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
     let context_json = extract_between(prompt, "CONTEXT_JSON_START", "CONTEXT_JSON_END")?;
     let context: JsonValue = serde_json::from_str(context_json)
-        .map_err(|err| CoreError::Backend(format!("invalid context json: {err}")))?;
+        .map_err(|err| CoreError::InvalidBackendResponse(format!("invalid context json: {err}")))?;
     let target_language = context["tgt"]
         .as_str()
         .map(|value| normalize_language_name(value, false))
@@ -147,10 +147,10 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
 
     let batch_json = extract_between(prompt, "BATCH_JSON_START", "BATCH_JSON_END")?;
     let batch: JsonValue = serde_json::from_str(batch_json)
-        .map_err(|err| CoreError::Backend(format!("invalid batch json: {err}")))?;
-    let entries = batch["lines"]
-        .as_array()
-        .ok_or_else(|| CoreError::Backend("mock batch is missing lines array".to_owned()))?;
+        .map_err(|err| CoreError::InvalidBackendResponse(format!("invalid batch json: {err}")))?;
+    let entries = batch["lines"].as_array().ok_or_else(|| {
+        CoreError::InvalidBackendResponse("mock batch is missing lines array".to_owned())
+    })?;
 
     let mut lines = Vec::new();
     let mut glossary_updates = Vec::new();
@@ -183,10 +183,10 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
 fn review_translations(prompt: &str) -> CoreResult<ReviewResult> {
     let review_json = extract_between(prompt, "REVIEW_JSON_START", "REVIEW_JSON_END")?;
     let review: JsonValue = serde_json::from_str(review_json)
-        .map_err(|err| CoreError::Backend(format!("invalid review json: {err}")))?;
-    let entries = review["lines"]
-        .as_array()
-        .ok_or_else(|| CoreError::Backend("mock review is missing lines array".to_owned()))?;
+        .map_err(|err| CoreError::InvalidBackendResponse(format!("invalid review json: {err}")))?;
+    let entries = review["lines"].as_array().ok_or_else(|| {
+        CoreError::InvalidBackendResponse("mock review is missing lines array".to_owned())
+    })?;
     let lines = entries
         .iter()
         .map(|entry| TranslationLine {
@@ -201,14 +201,13 @@ fn review_translations(prompt: &str) -> CoreResult<ReviewResult> {
 }
 
 fn extract_between<'a>(text: &'a str, start_marker: &str, end_marker: &str) -> CoreResult<&'a str> {
-    let start = text
-        .find(start_marker)
-        .ok_or_else(|| CoreError::Backend(format!("missing marker {start_marker}")))?
-        + start_marker.len();
+    let start = text.find(start_marker).ok_or_else(|| {
+        CoreError::InvalidBackendResponse(format!("missing marker {start_marker}"))
+    })? + start_marker.len();
     let tail = &text[start..];
     let end = tail
         .find(end_marker)
-        .ok_or_else(|| CoreError::Backend(format!("missing marker {end_marker}")))?;
+        .ok_or_else(|| CoreError::InvalidBackendResponse(format!("missing marker {end_marker}")))?;
     Ok(&tail[..end])
 }
 

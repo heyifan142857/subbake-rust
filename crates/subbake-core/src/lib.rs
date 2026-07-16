@@ -22,7 +22,7 @@ pub use entities::{
     ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
     SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
 };
-pub use error::{CoreError, CoreResult, LlmCallError};
+pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use memory::ContextMemory;
 pub use ports::{
     BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,

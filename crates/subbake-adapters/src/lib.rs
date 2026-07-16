@@ -1,6 +1,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod editing;
+pub mod error;
 pub mod fs;
 pub mod llm_backends;
 pub mod mock;
@@ -21,6 +22,7 @@ pub use diagnostics::{diagnose_failure_path, format_diagnostic_report, load_diag
 pub use editing::{
     SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle, edit_subtitle_cancellable,
 };
+pub use error::{AdapterError, AdapterResult, ConfigError};
 pub use fs::{
     default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
     stable_runtime_input_path,

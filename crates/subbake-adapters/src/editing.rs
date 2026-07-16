@@ -1,12 +1,12 @@
-use std::io;
 use std::path::{Path, PathBuf};
 
+use subbake_core::CancellationGuard;
 use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_payload};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
 use subbake_core::ports::{GenerationRequest, LlmBackend};
-use subbake_core::{CancellationGuard, CoreError};
 
+use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{is_supported_subtitle_path, read_document, render_and_write_document};
 use crate::providers::build_backend;
 use crate::settings::TranslationSettings;
@@ -25,29 +25,29 @@ pub struct SubtitleEditOutcome {
     pub edit_notes: String,
 }
 
-pub fn edit_subtitle(request: SubtitleEditRequest) -> io::Result<SubtitleEditOutcome> {
+pub fn edit_subtitle(request: SubtitleEditRequest) -> AdapterResult<SubtitleEditOutcome> {
     edit_subtitle_cancellable(request, &CancellationGuard::never())
 }
 
 pub fn edit_subtitle_cancellable(
     request: SubtitleEditRequest,
     cancellation: &CancellationGuard,
-) -> io::Result<SubtitleEditOutcome> {
-    cancellation.check().map_err(core_error)?;
+) -> AdapterResult<SubtitleEditOutcome> {
+    cancellation.check().map_err(AdapterError::from)?;
     if !request.target_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("subtitle not found: {}", request.target_path.display()),
-        ));
+        return Err(AdapterError::invalid_input(format!(
+            "subtitle not found: {}",
+            request.target_path.display()
+        )));
     }
     if !is_supported_subtitle_path(&request.target_path) {
-        return Err(io::Error::other(format!(
+        return Err(AdapterError::invalid_input(format!(
             "unsupported subtitle format: {}",
             request.target_path.display()
         )));
     }
     if !request.allow_non_generated && !is_generated_output(&request.target_path) {
-        return Err(io::Error::other(
+        return Err(AdapterError::invalid_input(
             "edit_subtitle only edits generated `.translated.*` or `.bilingual.*` files",
         ));
     }
@@ -60,22 +60,19 @@ pub fn edit_subtitle_cancellable(
         &request.instruction,
         &request.settings.translation.target_language,
     )
-    .map_err(io::Error::other)?;
+    .map_err(AdapterError::from)?;
 
-    let mut backend =
-        build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
+    let mut backend = build_backend(&request.settings.backend_config())?;
     let (payload, _) = backend
         .execute(GenerationRequest::json(messages), cancellation)
-        .map_err(subbake_core::CoreError::from)
-        .map_err(core_error)?
+        .map_err(AdapterError::from)?
         .into_json()
-        .map_err(subbake_core::CoreError::from)
-        .map_err(core_error)?;
+        .map_err(AdapterError::from)?;
     let payload =
-        parse_subtitle_edit_payload(payload, &document.segments).map_err(io::Error::other)?;
+        parse_subtitle_edit_payload(payload, &document.segments).map_err(AdapterError::from)?;
 
     let translations = merge_segments(&document.segments, &payload.lines);
-    cancellation.check().map_err(core_error)?;
+    cancellation.check().map_err(AdapterError::from)?;
     render_and_write_document(
         &document,
         &translations,
@@ -87,14 +84,6 @@ pub fn edit_subtitle_cancellable(
         target_path: request.target_path,
         edit_notes: payload.edit_notes,
     })
-}
-
-fn core_error(error: CoreError) -> io::Error {
-    if matches!(error, CoreError::Cancelled) {
-        io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
-    } else {
-        io::Error::other(error)
-    }
 }
 
 fn merge_segments(
@@ -118,7 +107,7 @@ fn merge_segments(
 fn infer_source_document(
     target_path: &Path,
     expected_segments: usize,
-) -> io::Result<Option<subbake_core::entities::SubtitleDocument>> {
+) -> AdapterResult<Option<subbake_core::entities::SubtitleDocument>> {
     let Some(source_path) = infer_source_path(target_path) else {
         return Ok(None);
     };

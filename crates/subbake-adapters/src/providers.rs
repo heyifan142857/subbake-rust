@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use subbake_core::CancellationGuard;
-use subbake_core::error::{CoreError, CoreResult};
+use subbake_core::error::CoreError;
 use subbake_core::ports::{ChatMessage, GenerationRequest, LlmBackend};
 
+use crate::error::{AdapterError, AdapterResult};
 use crate::mock::MockBackend;
 
 /// Wire protocol, deliberately independent of a user-facing profile name.
@@ -16,13 +17,13 @@ pub enum ApiFormat {
 }
 
 impl ApiFormat {
-    pub fn parse(value: &str) -> CoreResult<Self> {
+    pub fn parse(value: &str) -> AdapterResult<Self> {
         match value {
             "anthropic_messages" => Ok(Self::AnthropicMessages),
             "openai_chat" => Ok(Self::OpenaiChat),
             "openai_responses" => Ok(Self::OpenaiResponses),
             "gemini_generate_content" => Ok(Self::GeminiGenerateContent),
-            _ => Err(CoreError::Backend(format!(
+            _ => Err(AdapterError::invalid_input(format!(
                 "invalid api_format `{value}`; expected anthropic_messages, openai_chat, openai_responses, or gemini_generate_content"
             ))),
         }
@@ -79,22 +80,22 @@ impl BackendConfig {
             .or_else(|| resolve_env_var(self.api_key_env.as_deref()))
             .or_else(|| resolve_env_var(default_api_key_env(&self.id)))
     }
-    pub fn validate(&self) -> CoreResult<()> {
+    pub fn validate(&self) -> AdapterResult<()> {
         if self.id.trim().is_empty() || self.model.trim().is_empty() {
-            return Err(CoreError::Backend(
-                "provider id and model are required".to_owned(),
+            return Err(AdapterError::invalid_input(
+                "provider id and model are required",
             ));
         }
         for value in [self.auth_header.as_deref(), self.auth_prefix.as_deref()] {
             if value.is_some_and(|v| v.contains(['\r', '\n'])) {
-                return Err(CoreError::Backend(
-                    "authentication header must not contain CR/LF".to_owned(),
+                return Err(AdapterError::invalid_input(
+                    "authentication header must not contain CR/LF",
                 ));
             }
         }
         if self.id != "mock" && self.api_format.is_none() {
-            return Err(CoreError::Backend(
-                "api_format is required for custom provider profiles".to_owned(),
+            return Err(AdapterError::invalid_input(
+                "api_format is required for custom provider profiles",
             ));
         }
         Ok(())
@@ -140,13 +141,13 @@ pub struct ProviderCheckOutcome {
     pub message: String,
 }
 
-pub fn build_backend(config: &BackendConfig) -> CoreResult<Box<dyn LlmBackend>> {
+pub fn build_backend(config: &BackendConfig) -> AdapterResult<Box<dyn LlmBackend>> {
     build_backend_with_timeout(config, crate::llm_backends::default_timeout_seconds())
 }
 pub fn build_backend_with_timeout(
     config: &BackendConfig,
     timeout: f64,
-) -> CoreResult<Box<dyn LlmBackend>> {
+) -> AdapterResult<Box<dyn LlmBackend>> {
     config.validate()?;
     if config.id.eq_ignore_ascii_case("mock") {
         return Ok(Box::new(MockBackend::new(config.model.clone())));
@@ -154,10 +155,10 @@ pub fn build_backend_with_timeout(
     crate::llm_backends::build_protocol_backend(config, timeout)
 }
 
-pub fn check_provider(request: ProviderCheckRequest) -> CoreResult<ProviderCheckOutcome> {
+pub fn check_provider(request: ProviderCheckRequest) -> AdapterResult<ProviderCheckOutcome> {
     let mut backend = build_backend(&request.config)?;
     if request.config.id.eq_ignore_ascii_case("mock") {
-        let (_, message) = backend.check_credentials()?;
+        let (_, message) = backend.check_credentials().map_err(AdapterError::from)?;
         return Ok(ProviderCheckOutcome {
             provider: backend.provider_name().to_owned(),
             model: backend.model_name().to_owned(),
@@ -173,12 +174,12 @@ pub fn check_provider(request: ProviderCheckRequest) -> CoreResult<ProviderCheck
             )]),
             &CancellationGuard::never(),
         )
-        .map_err(CoreError::from)?;
-    let (json, _) = response.into_json().map_err(CoreError::from)?;
+        .map_err(AdapterError::from)?;
+    let (json, _) = response.into_json().map_err(AdapterError::from)?;
     if json["ok"].as_bool() != Some(true) {
-        return Err(CoreError::Backend(
+        return Err(AdapterError::Core(CoreError::InvalidBackendResponse(
             "provider check response did not satisfy the JSON probe".to_owned(),
-        ));
+        )));
     }
     Ok(ProviderCheckOutcome {
         provider: backend.provider_name().to_owned(),

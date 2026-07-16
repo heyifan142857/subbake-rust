@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +15,25 @@ pub const DEFAULT_SOURCE_LANGUAGE: &str = "Auto";
 pub const DEFAULT_RETRIES: usize = 2;
 pub const DEFAULT_AGENT_REPAIR_ATTEMPTS: usize = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingParseError {
+    pub setting: &'static str,
+    pub value: String,
+    pub expected: &'static str,
+}
+
+impl Display for SettingParseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} must be one of: {} (received `{}`)",
+            self.setting, self.expected, self.value
+        )
+    }
+}
+
+impl Error for SettingParseError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BilingualOrder {
@@ -22,11 +43,15 @@ pub enum BilingualOrder {
 }
 
 impl BilingualOrder {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, SettingParseError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "source_first" => Ok(Self::SourceFirst),
             "target_first" => Ok(Self::TargetFirst),
-            _ => Err("bilingual order must be one of: source_first, target_first".to_owned()),
+            _ => Err(SettingParseError {
+                setting: "bilingual order",
+                value: value.to_owned(),
+                expected: "source_first, target_first",
+            }),
         }
     }
 
@@ -48,12 +73,16 @@ pub enum ReviewPolicy {
 }
 
 impl ReviewPolicy {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, SettingParseError> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" | "false" | "none" => Ok(Self::Off),
             "targeted" | "true" => Ok(Self::Targeted),
             "full" => Ok(Self::Full),
-            _ => Err("review policy must be one of: off, targeted, full".to_owned()),
+            _ => Err(SettingParseError {
+                setting: "review policy",
+                value: value.to_owned(),
+                expected: "off, targeted, full",
+            }),
         }
     }
 

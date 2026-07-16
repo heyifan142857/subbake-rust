@@ -190,5 +190,5 @@ pub(crate) fn backend_payload_json(payload: &BackendPayload) -> CoreResult<serde
         BackendPayload::Review(result) => serde_json::to_value(result),
         BackendPayload::Terminology(result) => serde_json::to_value(result),
     }
-    .map_err(|error| CoreError::Data(format!("serialize backend payload failed: {error}")))
+    .map_err(|error| CoreError::DataInvariant(format!("serialize backend payload failed: {error}")))
 }

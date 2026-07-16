@@ -1,10 +1,9 @@
-use std::io;
-
 use crate::args::{
     parse_agent_args, parse_batch_args, parse_pipeline_args, parse_provider_args,
     parse_resume_args, parse_runtime_args, parse_transcribe_args, parse_translate_args,
     parse_whisper_args,
 };
+use crate::{CliError, CliResult};
 
 mod agent;
 mod pipeline;
@@ -14,7 +13,7 @@ mod transcribe;
 mod translate;
 mod whisper;
 
-pub fn dispatch(args: Vec<String>) -> io::Result<()> {
+pub fn dispatch(args: Vec<String>) -> CliResult<()> {
     if args.is_empty() {
         return agent::run(parse_agent_args(&[])?);
     }
@@ -42,7 +41,7 @@ pub fn dispatch(args: Vec<String>) -> io::Result<()> {
             println!("sbake {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        other => Err(io::Error::other(format!(
+        other => Err(CliError::usage(format!(
             "unknown command `{other}`; run `sbake --help`"
         ))),
     }

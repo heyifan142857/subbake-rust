@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AgentError, AgentResult};
 use crate::event::PendingPlan;
 
 pub const SESSION_VERSION: u64 = 1;
@@ -165,71 +166,97 @@ impl AgentSessionStore {
         self.root.join(format!("{id}.json"))
     }
 
-    pub fn create(&self) -> std::io::Result<AgentSession> {
+    pub fn create(&self) -> AgentResult<AgentSession> {
         let id = format!("{}-{}", iso_now(), hex_id());
         Ok(AgentSession::new(id))
     }
 
-    pub fn save(&self, session: &AgentSession) -> std::io::Result<()> {
+    pub fn save(&self, session: &AgentSession) -> AgentResult<()> {
         let path = self.path_for(&session.id);
         if session.events.is_empty() {
-            match std::fs::remove_file(path) {
+            match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+                Err(source) => {
+                    return Err(AgentError::SessionStorage {
+                        operation: "remove empty session",
+                        path: Some(path),
+                        source,
+                    });
+                }
             }
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| std::io::Error::other(format!("create session dir: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|source| AgentError::SessionStorage {
+                operation: "create session directory",
+                path: Some(parent.to_path_buf()),
+                source,
+            })?;
         }
-        let json = serde_json::to_string_pretty(session)
-            .map_err(|e| std::io::Error::other(format!("serialize session: {e}")))?;
+        let json =
+            serde_json::to_string_pretty(session).map_err(|source| AgentError::SessionData {
+                operation: "serialize session",
+                path: path.clone(),
+                source,
+            })?;
         let tmp = path.with_file_name(format!("{}.tmp", session.id));
-        std::fs::write(&tmp, &json)
-            .map_err(|e| std::io::Error::other(format!("write session: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| std::io::Error::other(format!("rename session: {e}")))?;
+        std::fs::write(&tmp, &json).map_err(|source| AgentError::SessionStorage {
+            operation: "write temporary session",
+            path: Some(tmp.clone()),
+            source,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| AgentError::SessionStorage {
+            operation: "replace session",
+            path: Some(path),
+            source,
+        })?;
         Ok(())
     }
 
-    pub fn load(&self, id: &str) -> std::io::Result<AgentSession> {
+    pub fn load(&self, id: &str) -> AgentResult<AgentSession> {
         let path = self.path_for(id);
-        let json = std::fs::read_to_string(&path)
-            .map_err(|e| std::io::Error::other(format!("read session {id}: {e}")))?;
-        serde_json::from_str(&json)
-            .map_err(|e| std::io::Error::other(format!("parse session {id}: {e}")))
+        let json = std::fs::read_to_string(&path).map_err(|source| AgentError::SessionStorage {
+            operation: "read session",
+            path: Some(path),
+            source,
+        })?;
+        serde_json::from_str(&json).map_err(|source| AgentError::SessionData {
+            operation: "parse session",
+            path: self.path_for(id),
+            source,
+        })
     }
 
-    pub fn latest(&self) -> std::io::Result<Option<AgentSession>> {
+    pub fn latest(&self) -> AgentResult<Option<AgentSession>> {
         Ok(self.list(1)?.into_iter().next())
     }
 
-    pub fn list(&self, limit: usize) -> std::io::Result<Vec<AgentSession>> {
+    pub fn list(&self, limit: usize) -> AgentResult<Vec<AgentSession>> {
         if !self.root.is_dir() {
             return Ok(Vec::new());
         }
         let mut sessions = Vec::new();
-        for entry in std::fs::read_dir(&self.root)
-            .map_err(|e| std::io::Error::other(format!("list sessions: {e}")))?
-        {
-            let entry = entry.map_err(|error| {
-                std::io::Error::other(format!("read session directory entry: {error}"))
+        for entry in std::fs::read_dir(&self.root).map_err(|source| AgentError::SessionStorage {
+            operation: "list sessions",
+            path: Some(self.root.clone()),
+            source,
+        })? {
+            let entry = entry.map_err(|source| AgentError::SessionStorage {
+                operation: "read session directory entry",
+                path: Some(self.root.clone()),
+                source,
             })?;
             if !entry.path().extension().is_some_and(|ext| ext == "json") {
                 continue;
             }
             let path = entry.path();
             let id = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "session filename is not valid UTF-8: {}",
-                    path.display()
-                ))
+                AgentError::InvalidState {
+                    message: format!("session filename is not valid UTF-8: {}", path.display()),
+                }
             })?;
-            let session = self.load(id).map_err(|error| {
-                std::io::Error::other(format!("load session `{}`: {error}", path.display()))
-            })?;
+            let session = self.load(id)?;
             sessions.push(session);
         }
         sessions.sort_by(|a, b| {

@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
+use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, PendingPlan, ToolCallDraft};
 use crate::guard::FileGuard;
 use crate::session::{AgentSessionStore, EventTag, SessionMode};
@@ -215,12 +216,9 @@ impl AgentEngine {
         self.operation_guard = guard;
     }
 
-    pub(crate) fn check_cancelled(&self) -> std::io::Result<()> {
+    pub(crate) fn check_cancelled(&self) -> AgentResult<()> {
         if self.operation_guard.is_cancelled() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "operation cancelled",
-            ))
+            Err(AgentError::Cancelled)
         } else {
             Ok(())
         }
@@ -237,14 +235,14 @@ impl AgentEngine {
     // ------------------------------------------------------------------
 
     /// Create a new session and mark it active.
-    pub fn start_session(&mut self) -> std::io::Result<()> {
+    pub fn start_session(&mut self) -> AgentResult<()> {
         let session = self.session_store.create()?;
         self.session = Some(session);
         Ok(())
     }
 
     /// Resume an existing session by id (or the latest if `None`).
-    pub fn resume_session(&mut self, id: Option<&str>) -> std::io::Result<()> {
+    pub fn resume_session(&mut self, id: Option<&str>) -> AgentResult<()> {
         let session = match id {
             Some(sid) => self.session_store.load(sid)?,
             None => self
@@ -257,7 +255,7 @@ impl AgentEngine {
     }
 
     /// Save the active session to disk.
-    pub fn save(&self) -> std::io::Result<()> {
+    pub fn save(&self) -> AgentResult<()> {
         if let Some(ref session) = self.session {
             self.session_store.save(session)?;
         }
@@ -267,7 +265,7 @@ impl AgentEngine {
     /// Pin configuration discovery to the path chosen by the composition
     /// layer so profile listing, model reporting, and backend construction use
     /// the same source of truth.
-    pub fn set_config_path(&mut self, path: Option<&std::path::Path>) -> std::io::Result<()> {
+    pub fn set_config_path(&mut self, path: Option<&std::path::Path>) -> AgentResult<()> {
         let session = self
             .session
             .as_mut()
@@ -277,7 +275,7 @@ impl AgentEngine {
     }
 
     /// Record an event in the active session and persist.
-    pub fn record(&mut self, kind: EventKind) -> std::io::Result<()> {
+    pub fn record(&mut self, kind: EventKind) -> AgentResult<()> {
         let session = self
             .session
             .as_mut()
@@ -298,7 +296,7 @@ impl AgentEngine {
 
     /// Persist an interactive operation error and return the session log path
     /// that now contains it.
-    pub fn record_error(&mut self, error: &str) -> std::io::Result<PathBuf> {
+    pub fn record_error(&mut self, error: &str) -> AgentResult<PathBuf> {
         self.record(EventKind::Error {
             text: error.to_owned(),
         })?;
@@ -313,11 +311,7 @@ impl AgentEngine {
     // Plan mode
     // ------------------------------------------------------------------
 
-    pub fn store_plan(
-        &mut self,
-        message: &str,
-        tool_calls: Vec<ToolCallDraft>,
-    ) -> std::io::Result<()> {
+    pub fn store_plan(&mut self, message: &str, tool_calls: Vec<ToolCallDraft>) -> AgentResult<()> {
         let event_calls = tool_calls.clone();
         let session = self
             .session
@@ -336,7 +330,7 @@ impl AgentEngine {
         Ok(())
     }
 
-    pub fn approve_plan(&mut self) -> std::io::Result<String> {
+    pub fn approve_plan(&mut self) -> AgentResult<String> {
         self.session
             .as_ref()
             .and_then(|session| session.pending_plan.as_ref())
@@ -387,7 +381,7 @@ impl AgentEngine {
         }
     }
 
-    pub fn reject_plan(&mut self) -> std::io::Result<String> {
+    pub fn reject_plan(&mut self) -> AgentResult<String> {
         let session = self
             .session
             .as_mut()
@@ -398,7 +392,7 @@ impl AgentEngine {
         Ok("Rejected pending plan.".to_owned())
     }
 
-    pub fn handle_plan_decision(&mut self, decision: PlanDecision) -> std::io::Result<String> {
+    pub fn handle_plan_decision(&mut self, decision: PlanDecision) -> AgentResult<String> {
         let result = match decision {
             PlanDecision::Approve => self.approve_plan(),
             PlanDecision::Reject => self.reject_plan(),
@@ -409,7 +403,7 @@ impl AgentEngine {
         Ok(result)
     }
 
-    pub fn select_profile(&mut self, name: &str) -> std::io::Result<String> {
+    pub fn select_profile(&mut self, name: &str) -> AgentResult<String> {
         let result = self.run_tool("switch_profile", &serde_json::json!({"name": name}))?;
         self.record_if_active(EventKind::Assistant {
             text: result.clone(),
@@ -417,7 +411,7 @@ impl AgentEngine {
         Ok(result)
     }
 
-    pub fn toggle_plan_mode(&mut self) -> std::io::Result<String> {
+    pub fn toggle_plan_mode(&mut self) -> AgentResult<String> {
         let enabled = self
             .session
             .as_ref()
@@ -427,7 +421,7 @@ impl AgentEngine {
         self.set_plan_mode(enabled)
     }
 
-    pub fn set_plan_mode(&mut self, enabled: bool) -> std::io::Result<String> {
+    pub fn set_plan_mode(&mut self, enabled: bool) -> AgentResult<String> {
         let session = self
             .session
             .as_mut()
@@ -444,11 +438,11 @@ impl AgentEngine {
         }
     }
 
-    pub fn handle_toggle_plan(&mut self) -> std::io::Result<String> {
+    pub fn handle_toggle_plan(&mut self) -> AgentResult<String> {
         self.toggle_plan_mode()
     }
 
-    pub fn session_summary(&self) -> std::io::Result<String> {
+    pub fn session_summary(&self) -> AgentResult<String> {
         let session = self
             .session
             .as_ref()
@@ -467,7 +461,7 @@ impl AgentEngine {
         ))
     }
 
-    pub fn sessions_summary(&self, limit: usize) -> std::io::Result<String> {
+    pub fn sessions_summary(&self, limit: usize) -> AgentResult<String> {
         let sessions = self.session_store.list(limit)?;
         if sessions.is_empty() {
             return Ok("No saved sessions.".to_owned());
@@ -492,7 +486,7 @@ impl AgentEngine {
             .join("\n"))
     }
 
-    pub fn session_choices(&self, limit: usize) -> std::io::Result<Vec<SessionChoice>> {
+    pub fn session_choices(&self, limit: usize) -> AgentResult<Vec<SessionChoice>> {
         let active_id = self.session.as_ref().map(|session| session.id.as_str());
         self.session_store.list(limit).map(|sessions| {
             sessions
@@ -524,17 +518,17 @@ impl AgentEngine {
         })
     }
 
-    pub fn session_profile(&self, id: &str) -> std::io::Result<Option<String>> {
+    pub fn session_profile(&self, id: &str) -> AgentResult<Option<String>> {
         self.session_store.load(id).map(|session| session.profile)
     }
 
-    pub fn session_config(&self, id: &str) -> std::io::Result<(Option<String>, Option<String>)> {
+    pub fn session_config(&self, id: &str) -> AgentResult<(Option<String>, Option<String>)> {
         self.session_store
             .load(id)
             .map(|session| (session.profile, session.config_path))
     }
 
-    pub fn select_session(&mut self, id: &str) -> std::io::Result<String> {
+    pub fn select_session(&mut self, id: &str) -> AgentResult<String> {
         self.resume_session(Some(id))?;
         let result = self.session_summary()?;
         self.record_if_active(EventKind::Assistant {
@@ -543,7 +537,7 @@ impl AgentEngine {
         Ok(result)
     }
 
-    pub fn history_summary(&self, limit: usize) -> std::io::Result<String> {
+    pub fn history_summary(&self, limit: usize) -> AgentResult<String> {
         let session = self
             .session
             .as_ref()
@@ -569,7 +563,7 @@ impl AgentEngine {
         })
     }
 
-    pub fn clear_session(&mut self) -> std::io::Result<String> {
+    pub fn clear_session(&mut self) -> AgentResult<String> {
         let config_path = self
             .session
             .as_ref()
@@ -609,7 +603,7 @@ impl AgentEngine {
         lines.join("\n")
     }
 
-    pub fn active_model_summary(&self) -> std::io::Result<String> {
+    pub fn active_model_summary(&self) -> AgentResult<String> {
         let settings = self.active_translation_settings()?;
         Ok(format!(
             "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
@@ -617,7 +611,7 @@ impl AgentEngine {
         ))
     }
 
-    pub fn profile_choices(&self) -> std::io::Result<Vec<String>> {
+    pub fn profile_choices(&self) -> AgentResult<Vec<String>> {
         let Some((_, config)) = self.load_project_config()? else {
             return Ok(Vec::new());
         };
@@ -626,7 +620,7 @@ impl AgentEngine {
         Ok(profiles)
     }
 
-    pub fn profile_picker_choices(&self) -> std::io::Result<Vec<ProfileChoice>> {
+    pub fn profile_picker_choices(&self) -> AgentResult<Vec<ProfileChoice>> {
         let Some((_, config)) = self.load_project_config()? else {
             return Ok(Vec::new());
         };
@@ -717,7 +711,7 @@ impl AgentEngine {
             .unwrap_or_default()
     }
 
-    pub fn handle_slash_command(&mut self, input: &str) -> std::io::Result<String> {
+    pub fn handle_slash_command(&mut self, input: &str) -> AgentResult<String> {
         let trimmed = input.trim();
         let result = match trimmed {
             "/plan" => return self.handle_toggle_plan(),
@@ -764,7 +758,7 @@ impl AgentEngine {
     // ------------------------------------------------------------------
 
     /// Undo the last file_operation event (or group of events sharing a group_id).
-    pub fn undo_last(&mut self) -> std::io::Result<String> {
+    pub fn undo_last(&mut self) -> AgentResult<String> {
         let events = {
             let session = self
                 .session

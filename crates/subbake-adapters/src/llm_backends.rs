@@ -18,16 +18,17 @@ use subbake_core::ports::{
 };
 use tokio::runtime::Runtime;
 
+use crate::error::{AdapterError, AdapterResult};
 use crate::providers::{ApiFormat, BackendConfig};
 const TIMEOUT: f64 = 120.0;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TRANSPORT_RETRIES: usize = 2;
 static BACKEND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-fn client(timeout: f64) -> CoreResult<Client> {
+fn client(timeout: f64) -> AdapterResult<Client> {
     Client::builder()
         .timeout(Duration::from_secs_f64(timeout.max(1.0)))
         .build()
-        .map_err(|e| CoreError::Backend(format!("http client build failed: {e}")))
+        .map_err(|error| AdapterError::from_http("LLM HTTP client", error))
 }
 async fn await_http<F, T>(
     future: F,
@@ -84,19 +85,21 @@ pub type GeminiGenerateContentAdapter = ProtocolAdapter;
 pub fn build_protocol_backend(
     config: &BackendConfig,
     timeout: f64,
-) -> CoreResult<Box<dyn LlmBackend>> {
+) -> AdapterResult<Box<dyn LlmBackend>> {
     let format = config
         .api_format
-        .ok_or_else(|| CoreError::Backend("api_format is required".to_owned()))?;
-    let key = config.resolved_api_key().ok_or_else(|| {
-        CoreError::Backend(format!(
-            "Missing API key for {} provider. Set --api-key, api_key, or api_key_env.",
-            config.display_name
-        ))
-    })?;
+        .ok_or_else(|| AdapterError::invalid_input("api_format is required"))?;
+    let key = config
+        .resolved_api_key()
+        .ok_or_else(|| AdapterError::Authentication {
+            message: format!(
+                "Missing API key for {} provider. Set --api-key, api_key, or api_key_env.",
+                config.display_name
+            ),
+        })?;
     if key.contains(['\r', '\n']) {
-        return Err(CoreError::Backend(
-            "authentication header value must not contain CR/LF".to_owned(),
+        return Err(AdapterError::invalid_input(
+            "authentication header value must not contain CR/LF",
         ));
     }
     Ok(Box::new(ProtocolAdapter {
@@ -104,11 +107,11 @@ pub fn build_protocol_backend(
         format,
         key,
         client: client(timeout)?,
-        runtime: Arc::new(
-            Runtime::new().map_err(|error| {
-                CoreError::Backend(format!("tokio runtime build failed: {error}"))
-            })?,
-        ),
+        runtime: Arc::new(Runtime::new().map_err(|source| AdapterError::ExternalIo {
+            operation: "start LLM runtime",
+            path: None,
+            source,
+        })?),
         backend_id: format!(
             "{}:{}:{}",
             config.display_name,
@@ -392,7 +395,7 @@ impl ProtocolAdapter {
                 }),
         };
         text.filter(|s| !s.is_empty()).ok_or_else(|| {
-            CoreError::Backend(format!(
+            CoreError::InvalidBackendResponse(format!(
                 "{} response missing text output",
                 self.config.display_name
             ))
@@ -464,7 +467,7 @@ fn append_native_results(
 ) -> CoreResult<()> {
     for result in results {
         if !continuation.call_ids.contains_key(&result.id) {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "native tool result references unknown call `{}`",
                 result.id
             )));
@@ -702,7 +705,7 @@ fn parse_native_response(
         }
         ApiFormat::OpenaiResponses => {
             let output = body["output"].as_array().ok_or_else(|| {
-                CoreError::Backend("OpenAI Responses output is missing".to_owned())
+                CoreError::InvalidBackendResponse("OpenAI Responses output is missing".to_owned())
             })?;
             for (index, item) in output.iter().enumerate() {
                 continuation.history.push(item.clone());
@@ -710,7 +713,7 @@ fn parse_native_response(
                     continue;
                 }
                 let wire_id = item["call_id"].as_str().ok_or_else(|| {
-                    CoreError::Backend("function call is missing call_id".to_owned())
+                    CoreError::InvalidBackendResponse("function call is missing call_id".to_owned())
                 })?;
                 let id = wire_id.to_owned();
                 continuation
@@ -721,7 +724,7 @@ fn parse_native_response(
                     name: item["name"]
                         .as_str()
                         .ok_or_else(|| {
-                            CoreError::Backend(format!(
+                            CoreError::InvalidBackendResponse(format!(
                                 "function call {} is missing name",
                                 index + 1
                             ))
@@ -734,7 +737,9 @@ fn parse_native_response(
         }
         ApiFormat::AnthropicMessages => {
             let content = body["content"].as_array().ok_or_else(|| {
-                CoreError::Backend("Anthropic response content is missing".to_owned())
+                CoreError::InvalidBackendResponse(
+                    "Anthropic response content is missing".to_owned(),
+                )
             })?;
             let mut texts = Vec::new();
             for (index, block) in content.iter().enumerate() {
@@ -748,7 +753,10 @@ fn parse_native_response(
                         let id = block["id"]
                             .as_str()
                             .ok_or_else(|| {
-                                CoreError::Backend(format!("tool use {} is missing id", index + 1))
+                                CoreError::InvalidBackendResponse(format!(
+                                    "tool use {} is missing id",
+                                    index + 1
+                                ))
                             })?
                             .to_owned();
                         continuation.call_ids.insert(id.clone(), Some(id.clone()));
@@ -757,7 +765,7 @@ fn parse_native_response(
                             name: block["name"]
                                 .as_str()
                                 .ok_or_else(|| {
-                                    CoreError::Backend(format!(
+                                    CoreError::InvalidBackendResponse(format!(
                                         "tool use {} is missing name",
                                         index + 1
                                     ))
@@ -777,7 +785,7 @@ fn parse_native_response(
         ApiFormat::GeminiGenerateContent => {
             let content = body["candidates"][0]["content"].clone();
             let parts = content["parts"].as_array().ok_or_else(|| {
-                CoreError::Backend("Gemini response parts are missing".to_owned())
+                CoreError::InvalidBackendResponse("Gemini response parts are missing".to_owned())
             })?;
             let mut texts = Vec::new();
             for (index, part) in parts.iter().enumerate() {
@@ -797,7 +805,7 @@ fn parse_native_response(
                     name: function_call["name"]
                         .as_str()
                         .ok_or_else(|| {
-                            CoreError::Backend(format!(
+                            CoreError::InvalidBackendResponse(format!(
                                 "function call {} is missing name",
                                 index + 1
                             ))
@@ -830,13 +838,18 @@ fn parse_dsml_tool_calls(content: &str) -> CoreResult<Option<Vec<ModelToolCall>>
     while let Some(start) = remainder.find(&invoke_open) {
         remainder = &remainder[start + invoke_open.len()..];
         let header_end = remainder.find('>').ok_or_else(|| {
-            CoreError::Backend("DSML tool invocation has an unterminated header".to_owned())
+            CoreError::InvalidBackendResponse(
+                "DSML tool invocation has an unterminated header".to_owned(),
+            )
         })?;
-        let name = dsml_attribute(&remainder[..header_end], "name")
-            .ok_or_else(|| CoreError::Backend("DSML tool invocation is missing name".to_owned()))?;
+        let name = dsml_attribute(&remainder[..header_end], "name").ok_or_else(|| {
+            CoreError::InvalidBackendResponse("DSML tool invocation is missing name".to_owned())
+        })?;
         remainder = &remainder[header_end + 1..];
         let body_end = remainder.find(&invoke_close).ok_or_else(|| {
-            CoreError::Backend(format!("DSML tool invocation `{name}` is unterminated"))
+            CoreError::InvalidBackendResponse(format!(
+                "DSML tool invocation `{name}` is unterminated"
+            ))
         })?;
         let body = &remainder[..body_end];
         let mut parameters = serde_json::Map::new();
@@ -844,18 +857,22 @@ fn parse_dsml_tool_calls(content: &str) -> CoreResult<Option<Vec<ModelToolCall>>
         while let Some(parameter_start) = parameter_remainder.find(&parameter_open) {
             parameter_remainder = &parameter_remainder[parameter_start + parameter_open.len()..];
             let parameter_header_end = parameter_remainder.find('>').ok_or_else(|| {
-                CoreError::Backend(format!(
+                CoreError::InvalidBackendResponse(format!(
                     "DSML parameter for `{name}` has an unterminated header"
                 ))
             })?;
             let header = &parameter_remainder[..parameter_header_end];
             let parameter_name = dsml_attribute(header, "name").ok_or_else(|| {
-                CoreError::Backend(format!("DSML parameter for `{name}` is missing name"))
+                CoreError::InvalidBackendResponse(format!(
+                    "DSML parameter for `{name}` is missing name"
+                ))
             })?;
             let is_string = dsml_attribute(header, "string").as_deref() == Some("true");
             parameter_remainder = &parameter_remainder[parameter_header_end + 1..];
             let value_end = parameter_remainder.find(&parameter_close).ok_or_else(|| {
-                CoreError::Backend(format!("DSML parameter `{parameter_name}` is unterminated"))
+                CoreError::InvalidBackendResponse(format!(
+                    "DSML parameter `{parameter_name}` is unterminated"
+                ))
             })?;
             let raw_value = decode_dsml_entities(parameter_remainder[..value_end].trim());
             let value = if is_string {
@@ -880,7 +897,7 @@ fn parse_dsml_tool_calls(content: &str) -> CoreResult<Option<Vec<ModelToolCall>>
         remainder = &remainder[body_end + invoke_close.len()..];
     }
     if calls.is_empty() {
-        return Err(CoreError::Backend(
+        return Err(CoreError::InvalidBackendResponse(
             "DSML tool_calls block contains no invocation".to_owned(),
         ));
     }
@@ -914,14 +931,15 @@ fn required_wire_string<'a>(value: &'a Value, path: &[&str]) -> CoreResult<&'a s
         current = &current[*part];
     }
     current.as_str().ok_or_else(|| {
-        CoreError::Backend(format!("native tool call is missing {}", path.join(".")))
+        CoreError::InvalidBackendResponse(format!("native tool call is missing {}", path.join(".")))
     })
 }
 
 fn parse_wire_arguments(value: &Value) -> CoreResult<Value> {
     if let Some(text) = value.as_str() {
-        serde_json::from_str(text)
-            .map_err(|error| CoreError::Backend(format!("invalid native tool arguments: {error}")))
+        serde_json::from_str(text).map_err(|error| {
+            CoreError::InvalidBackendResponse(format!("invalid native tool arguments: {error}"))
+        })
     } else {
         Ok(value.clone())
     }
@@ -1144,9 +1162,9 @@ fn openai_message(m: &ChatMessage) -> Value {
 }
 pub(crate) fn extract_json_object(text: &str) -> CoreResult<Value> {
     let t = text.trim();
-    let start = t
-        .find('{')
-        .ok_or_else(|| CoreError::Backend("response is missing a JSON object".to_owned()))?;
+    let start = t.find('{').ok_or_else(|| {
+        CoreError::InvalidBackendResponse("response is missing a JSON object".to_owned())
+    })?;
     let (mut d, mut s, mut e) = (0i32, false, false);
     for (i, c) in t.char_indices().skip_while(|(i, _)| *i < start) {
         if s {
@@ -1165,14 +1183,15 @@ pub(crate) fn extract_json_object(text: &str) -> CoreResult<Value> {
             '}' => {
                 d -= 1;
                 if d == 0 {
-                    return serde_json::from_str(&t[start..i + 1])
-                        .map_err(|x| CoreError::Backend(format!("invalid JSON in response: {x}")));
+                    return serde_json::from_str(&t[start..i + 1]).map_err(|x| {
+                        CoreError::InvalidBackendResponse(format!("invalid JSON in response: {x}"))
+                    });
                 }
             }
             _ => {}
         }
     }
-    Err(CoreError::Backend(
+    Err(CoreError::InvalidBackendResponse(
         "response JSON object is unbalanced".to_owned(),
     ))
 }

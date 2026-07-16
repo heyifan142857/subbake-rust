@@ -1,6 +1,8 @@
 // Central registry for agent-callable operations. Each entry owns the tool's
 // schema, policy, category, and executor identity.
 
+use thiserror::Error;
+
 /// High-level category used for filtering which tools the LLM can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
@@ -708,33 +710,65 @@ pub(crate) fn authorize_tool(
     })
 }
 
-pub fn validate_tool_call(name: &str, arguments: &serde_json::Value) -> Result<(), String> {
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ToolValidationError {
+    #[error("unknown tool `{name}`")]
+    UnknownTool { name: String },
+    #[error("arguments for `{name}` must be a JSON object")]
+    ArgumentsNotObject { name: String },
+    #[error("tool `{name}` does not accept argument `{argument}`")]
+    UnexpectedArgument { name: String, argument: String },
+    #[error("tool `{name}` requires {expected} argument `{argument}`")]
+    MissingArgument {
+        name: String,
+        argument: String,
+        expected: &'static str,
+    },
+    #[error("argument `{argument}` for tool `{name}` must be {expected}")]
+    WrongArgumentType {
+        name: String,
+        argument: String,
+        expected: &'static str,
+    },
+}
+
+pub fn validate_tool_call(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<(), ToolValidationError> {
     let Some(spec) = ALL_TOOL_SPECS.iter().find(|spec| spec.name == name) else {
-        return Err(format!("unknown tool `{name}`"));
+        return Err(ToolValidationError::UnknownTool {
+            name: name.to_owned(),
+        });
     };
     let object = arguments
         .as_object()
-        .ok_or_else(|| format!("arguments for `{name}` must be a JSON object"))?;
+        .ok_or_else(|| ToolValidationError::ArgumentsNotObject {
+            name: name.to_owned(),
+        })?;
     for key in object.keys() {
         if !spec.arguments().iter().any(|argument| argument.name == key) {
-            return Err(format!("tool `{name}` does not accept argument `{key}`"));
+            return Err(ToolValidationError::UnexpectedArgument {
+                name: name.to_owned(),
+                argument: key.clone(),
+            });
         }
     }
     for argument in spec.arguments() {
         match object.get(argument.name) {
             None if argument.required => {
-                return Err(format!(
-                    "tool `{name}` requires {} argument `{}`",
-                    argument.kind.name(),
-                    argument.name
-                ));
+                return Err(ToolValidationError::MissingArgument {
+                    name: name.to_owned(),
+                    argument: argument.name.to_owned(),
+                    expected: argument.kind.name(),
+                });
             }
             Some(value) if !argument.kind.matches(value) => {
-                return Err(format!(
-                    "argument `{}` for tool `{name}` must be {}",
-                    argument.name,
-                    argument.kind.name()
-                ));
+                return Err(ToolValidationError::WrongArgumentType {
+                    name: name.to_owned(),
+                    argument: argument.name.to_owned(),
+                    expected: argument.kind.name(),
+                });
             }
             _ => {}
         }

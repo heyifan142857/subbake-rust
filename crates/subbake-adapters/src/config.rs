@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::error::{AdapterError, AdapterResult, ConfigError};
 use crate::providers::ApiFormat;
 use crate::settings::TranslationSettingsPatch;
 use subbake_core::BilingualOrder;
 
-pub fn load_translation_settings_patch(path: &Path) -> io::Result<TranslationSettingsPatch> {
-    let content = fs::read_to_string(path)?;
-    parse_translation_settings_patch(&content).map_err(io::Error::other)
+pub fn load_translation_settings_patch(path: &Path) -> AdapterResult<TranslationSettingsPatch> {
+    let content = fs::read_to_string(path).map_err(|source| {
+        AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
+    })?;
+    parse_translation_settings_patch(&content).map_err(|source| AdapterError::ConfigurationFile {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Append a profile snapshot without rewriting existing configuration, comments,
@@ -19,24 +24,21 @@ pub fn append_profile_snapshot(
     path: &Path,
     name: &str,
     mut settings: TranslationSettingsPatch,
-) -> io::Result<()> {
+) -> AdapterResult<()> {
     if name.is_empty()
         || !name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "profile name may contain only letters, numbers, '-' and '_'",
-        ));
+        return Err(ConfigError::InvalidProfileName.into());
     }
 
     let config = ConfigFile::load(path)?;
     if config.profiles.contains_key(name) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("profile `{name}` already exists"),
-        ));
+        return Err(ConfigError::DuplicateProfile {
+            name: name.to_owned(),
+        }
+        .into());
     }
 
     // Do not proliferate inline credentials when creating a profile. An
@@ -44,7 +46,9 @@ pub fn append_profile_snapshot(
     settings.api_key = None;
     settings.auth_header = None;
 
-    let mut content = fs::read_to_string(path)?;
+    let mut content = fs::read_to_string(path).map_err(|source| {
+        AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
+    })?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -57,14 +61,36 @@ pub fn append_profile_snapshot(
         .and_then(|name| name.to_str())
         .unwrap_or("config");
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let permissions = fs::metadata(path)?.permissions();
-    fs::write(&temporary, content)?;
-    fs::set_permissions(&temporary, permissions)?;
+    let permissions = fs::metadata(path)
+        .map_err(|source| {
+            AdapterError::external_io(
+                "read configuration metadata",
+                Some(path.to_path_buf()),
+                source,
+            )
+        })?
+        .permissions();
+    fs::write(&temporary, content).map_err(|source| {
+        AdapterError::external_io(
+            "write temporary configuration",
+            Some(temporary.clone()),
+            source,
+        )
+    })?;
+    fs::set_permissions(&temporary, permissions).map_err(|source| {
+        AdapterError::external_io(
+            "preserve configuration permissions",
+            Some(temporary.clone()),
+            source,
+        )
+    })?;
     let rename_result = fs::rename(&temporary, path);
     if rename_result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    rename_result
+    rename_result.map_err(|source| {
+        AdapterError::external_io("replace configuration", Some(path.to_path_buf()), source)
+    })
 }
 
 fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPatch) {
@@ -165,10 +191,10 @@ fn dirs_or_default() -> PathBuf {
 pub fn load_and_resolve(
     path: &Path,
     profile: Option<&str>,
-) -> io::Result<Option<TranslationSettingsPatch>> {
+) -> AdapterResult<Option<TranslationSettingsPatch>> {
     let config = match ConfigFile::load(path) {
         Ok(config) => config,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.is_not_found() => return Ok(None),
         Err(error) => return Err(error),
     };
     let resolved = config.resolve(profile);
@@ -179,7 +205,9 @@ pub fn load_and_resolve(
     Ok(Some(resolved))
 }
 
-pub fn parse_translation_settings_patch(content: &str) -> Result<TranslationSettingsPatch, String> {
+pub fn parse_translation_settings_patch(
+    content: &str,
+) -> Result<TranslationSettingsPatch, ConfigError> {
     let mut patch = TranslationSettingsPatch::default();
 
     for (line_number, raw_line) in content.lines().enumerate() {
@@ -190,25 +218,24 @@ pub fn parse_translation_settings_patch(content: &str) -> Result<TranslationSett
         if line.starts_with('[') && line.ends_with(']') {
             let table = line[1..line.len() - 1].trim();
             if table != "defaults" {
-                return Err(format!(
-                    "unsupported config table `[{}]` on line {}",
-                    table,
-                    line_number + 1
-                ));
+                return Err(ConfigError::Line {
+                    line: line_number + 1,
+                    reason: format!("unsupported config table `[{}]`", table),
+                });
             }
             continue;
         }
 
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("expected `key = value` on line {}", line_number + 1))?;
+        let (key, value) = line.split_once('=').ok_or_else(|| ConfigError::Line {
+            line: line_number + 1,
+            reason: "expected `key = value`".to_owned(),
+        })?;
         apply_key_value(
             &mut patch,
             key.trim(),
-            parse_value(value.trim())
-                .map_err(|error| format!("{error} on line {}", line_number + 1))?,
+            parse_value(value.trim()).map_err(|error| error.at_line(line_number + 1))?,
         )
-        .map_err(|error| format!("{error} on line {}", line_number + 1))?;
+        .map_err(|error| error.at_line(line_number + 1))?;
     }
 
     Ok(patch)
@@ -228,14 +255,19 @@ pub struct ConfigFile {
 
 impl ConfigFile {
     /// Load and parse a config file from disk.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let content = fs::read_to_string(path)?;
-        Self::parse(&content).map_err(io::Error::other)
+    pub fn load(path: &Path) -> AdapterResult<Self> {
+        let content = fs::read_to_string(path).map_err(|source| {
+            AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
+        })?;
+        Self::parse(&content).map_err(|source| AdapterError::ConfigurationFile {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     /// Parse TOML-like config content supporting `default_profile`,
     /// `[defaults]`, and `[profiles.<name>]` sections.
-    pub fn parse(content: &str) -> Result<Self, String> {
+    pub fn parse(content: &str) -> Result<Self, ConfigError> {
         let mut default_profile = None;
         let mut defaults = TranslationSettingsPatch::default();
         let mut profiles = HashMap::new();
@@ -257,20 +289,20 @@ impl ConfigFile {
                 } else if let Some(profile_name) = table.strip_prefix("profiles.") {
                     profiles.entry(profile_name.to_owned()).or_default();
                 } else {
-                    return Err(format!(
-                        "unsupported config table `[{table}]` on line {}",
-                        line_number + 1
-                    ));
+                    return Err(ConfigError::Line {
+                        line: line_number + 1,
+                        reason: format!("unsupported config table `[{table}]`"),
+                    });
                 }
                 continue;
             }
 
-            let (key, value) = line
-                .split_once('=')
-                .ok_or_else(|| format!("expected `key = value` on line {}", line_number + 1))?;
+            let (key, value) = line.split_once('=').ok_or_else(|| ConfigError::Line {
+                line: line_number + 1,
+                reason: "expected `key = value`".to_owned(),
+            })?;
             let key = key.trim();
-            let cv = parse_value(value.trim())
-                .map_err(|e| format!("{e} on line {}", line_number + 1))?;
+            let cv = parse_value(value.trim()).map_err(|error| error.at_line(line_number + 1))?;
 
             // Top-level keys (outside any table)
             let table = current_table.as_deref().unwrap_or("");
@@ -279,27 +311,24 @@ impl ConfigFile {
                     default_profile = Some(cv.into_string(key)?);
                     continue;
                 }
-                return Err(format!(
-                    "unsupported top-level key `{key}` on line {}",
-                    line_number + 1
-                ));
+                return Err(ConfigError::Line {
+                    line: line_number + 1,
+                    reason: format!("unsupported top-level key `{key}`"),
+                });
             }
 
             let target = if table == "defaults" {
                 &mut defaults
             } else if let Some(name) = table.strip_prefix("profiles.") {
-                profiles.get_mut(name).ok_or_else(|| {
-                    format!(
-                        "internal: missing profile `{name}` on line {}",
-                        line_number + 1
-                    )
+                profiles.get_mut(name).ok_or_else(|| ConfigError::Line {
+                    line: line_number + 1,
+                    reason: format!("internal: missing profile `{name}`"),
                 })?
             } else {
                 continue; // unreachable
             };
 
-            apply_key_value(target, key, cv)
-                .map_err(|e| format!("{e} on line {}", line_number + 1))?;
+            apply_key_value(target, key, cv).map_err(|error| error.at_line(line_number + 1))?;
         }
 
         Ok(Self {
@@ -329,7 +358,7 @@ fn apply_key_value(
     patch: &mut TranslationSettingsPatch,
     key: &str,
     value: ConfigValue,
-) -> Result<(), String> {
+) -> Result<(), ConfigError> {
     match key {
         "output_format" => patch.output_format = Some(value.into_string(key)?),
         "provider" => patch.provider = Some(value.into_string(key)?),
@@ -337,8 +366,10 @@ fn apply_key_value(
         "api_key" => patch.api_key = Some(value.into_string(key)?),
         "base_url" => patch.base_url = Some(value.into_string(key)?),
         "api_format" => {
-            patch.api_format =
-                Some(ApiFormat::parse(&value.into_string(key)?).map_err(|e| e.to_string())?)
+            patch.api_format = Some(
+                ApiFormat::parse(&value.into_string(key)?)
+                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
+            )
         }
         "endpoint_url" => patch.endpoint_url = Some(value.into_string(key)?),
         "api_key_env" => patch.api_key_env = Some(value.into_string(key)?),
@@ -352,7 +383,10 @@ fn apply_key_value(
         "review_concurrency" => patch.review_concurrency = Some(value.into_usize(key)?),
         "bilingual" => patch.bilingual = Some(value.into_bool(key)?),
         "bilingual_order" => {
-            patch.bilingual_order = Some(BilingualOrder::parse(&value.into_string(key)?)?)
+            patch.bilingual_order = Some(
+                BilingualOrder::parse(&value.into_string(key)?)
+                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
+            )
         }
         "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
         // Normalize the legacy boolean at the configuration boundary. All
@@ -365,7 +399,10 @@ fn apply_key_value(
             });
         }
         "review" | "review_policy" => {
-            patch.review_policy = Some(subbake_core::ReviewPolicy::parse(&value.into_string(key)?)?)
+            patch.review_policy = Some(
+                subbake_core::ReviewPolicy::parse(&value.into_string(key)?)
+                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
+            )
         }
         "terminology_preflight" => patch.terminology_preflight = Some(value.into_bool(key)?),
         "dry_run" => patch.dry_run = Some(value.into_bool(key)?),
@@ -380,7 +417,9 @@ fn apply_key_value(
         "glossary" | "glossary_path" => {
             patch.glossary_path = Some(PathBuf::from(value.into_string(key)?));
         }
-        other => return Err(format!("unsupported config key `{other}`")),
+        other => {
+            return Err(ConfigError::for_key(other, "is not supported"));
+        }
     }
     Ok(())
 }
@@ -393,45 +432,45 @@ enum ConfigValue {
 }
 
 impl ConfigValue {
-    fn into_string(self, key: &str) -> Result<String, String> {
+    fn into_string(self, key: &str) -> Result<String, ConfigError> {
         match self {
             ConfigValue::String(value) => Ok(value),
             ConfigValue::Bool(_) | ConfigValue::Integer(_) => {
-                Err(format!("config key `{key}` expects a string"))
+                Err(ConfigError::for_key(key, "expects a string"))
             }
         }
     }
 
-    fn into_bool(self, key: &str) -> Result<bool, String> {
+    fn into_bool(self, key: &str) -> Result<bool, ConfigError> {
         match self {
             ConfigValue::Bool(value) => Ok(value),
             ConfigValue::String(_) | ConfigValue::Integer(_) => {
-                Err(format!("config key `{key}` expects a boolean"))
+                Err(ConfigError::for_key(key, "expects a boolean"))
             }
         }
     }
 
-    fn into_usize(self, key: &str) -> Result<usize, String> {
+    fn into_usize(self, key: &str) -> Result<usize, ConfigError> {
         match self {
             ConfigValue::Integer(value) if value > 0 => Ok(value),
-            ConfigValue::Integer(_) => Err(format!("config key `{key}` must be greater than zero")),
+            ConfigValue::Integer(_) => Err(ConfigError::for_key(key, "must be greater than zero")),
             ConfigValue::String(_) | ConfigValue::Bool(_) => {
-                Err(format!("config key `{key}` expects an integer"))
+                Err(ConfigError::for_key(key, "expects an integer"))
             }
         }
     }
 
-    fn into_nonnegative_usize(self, key: &str) -> Result<usize, String> {
+    fn into_nonnegative_usize(self, key: &str) -> Result<usize, ConfigError> {
         match self {
             ConfigValue::Integer(value) => Ok(value),
             ConfigValue::String(_) | ConfigValue::Bool(_) => {
-                Err(format!("config key `{key}` expects an integer"))
+                Err(ConfigError::for_key(key, "expects an integer"))
             }
         }
     }
 }
 
-fn parse_value(raw: &str) -> Result<ConfigValue, String> {
+fn parse_value(raw: &str) -> Result<ConfigValue, ConfigError> {
     if let Some(value) = parse_quoted_string(raw)? {
         return Ok(ConfigValue::String(value));
     }
@@ -442,15 +481,15 @@ fn parse_value(raw: &str) -> Result<ConfigValue, String> {
     }
     raw.parse::<usize>()
         .map(ConfigValue::Integer)
-        .map_err(|_| format!("unsupported config value `{raw}`"))
+        .map_err(|_| ConfigError::invalid(format!("unsupported config value `{raw}`")))
 }
 
-fn parse_quoted_string(raw: &str) -> Result<Option<String>, String> {
+fn parse_quoted_string(raw: &str) -> Result<Option<String>, ConfigError> {
     if !raw.starts_with('"') {
         return Ok(None);
     }
     if !raw.ends_with('"') || raw.len() < 2 {
-        return Err("unterminated string".to_owned());
+        return Err(ConfigError::invalid("unterminated string"));
     }
     let inner = &raw[1..raw.len() - 1];
     let mut output = String::new();
@@ -466,8 +505,12 @@ fn parse_quoted_string(raw: &str) -> Result<Option<String>, String> {
             Some('n') => output.push('\n'),
             Some('r') => output.push('\r'),
             Some('t') => output.push('\t'),
-            Some(other) => return Err(format!("unsupported escape sequence `\\{other}`")),
-            None => return Err("trailing escape character".to_owned()),
+            Some(other) => {
+                return Err(ConfigError::invalid(format!(
+                    "unsupported escape sequence `\\{other}`"
+                )));
+            }
+            None => return Err(ConfigError::invalid("trailing escape character")),
         }
     }
     Ok(Some(output))
@@ -544,14 +587,14 @@ mod tests {
     fn rejects_unknown_keys() {
         let error =
             parse_translation_settings_patch("unknown = true").expect_err("unknown key fails");
-        assert!(error.contains("unsupported config key"));
+        assert!(error.to_string().contains("is not supported"));
     }
 
     #[test]
     fn rejects_invalid_bilingual_order() {
         let error = parse_translation_settings_patch(r#"bilingual_order = "translated""#)
             .expect_err("invalid bilingual order fails");
-        assert!(error.contains("source_first, target_first"));
+        assert!(error.to_string().contains("source_first, target_first"));
     }
 
     #[test]
@@ -657,18 +700,14 @@ mod tests {
         let path = temporary_config("profile-validation");
         fs::write(&path, "[profiles.existing]\nmodel = \"mock\"\n").expect("write config");
         let patch = TranslationSettingsPatch::default();
-        assert_eq!(
-            append_profile_snapshot(&path, "bad.name", patch.clone())
-                .expect_err("unsafe name")
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            append_profile_snapshot(&path, "existing", patch)
-                .expect_err("duplicate name")
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
+        assert!(matches!(
+            append_profile_snapshot(&path, "bad.name", patch.clone()).expect_err("unsafe name"),
+            AdapterError::Configuration(ConfigError::InvalidProfileName)
+        ));
+        assert!(matches!(
+            append_profile_snapshot(&path, "existing", patch).expect_err("duplicate name"),
+            AdapterError::Configuration(ConfigError::DuplicateProfile { .. })
+        ));
         fs::remove_file(path).expect("remove config");
     }
 }

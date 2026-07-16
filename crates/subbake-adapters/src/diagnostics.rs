@@ -1,8 +1,9 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use subbake_core::diagnostics::{DiagnosticReport, diagnose_failure_value, diagnose_text};
+
+use crate::error::{AdapterError, AdapterResult};
 
 pub fn format_diagnostic_report(report: &DiagnosticReport) -> String {
     let mut lines = vec![
@@ -25,7 +26,7 @@ pub fn format_diagnostic_report(report: &DiagnosticReport) -> String {
     lines.join("\n")
 }
 
-pub fn load_diagnostic_reports(path: &Path) -> io::Result<Vec<DiagnosticReport>> {
+pub fn load_diagnostic_reports(path: &Path) -> AdapterResult<Vec<DiagnosticReport>> {
     if path.is_file() {
         return Ok(vec![diagnose_failure_path(path)?]);
     }
@@ -37,8 +38,10 @@ pub fn load_diagnostic_reports(path: &Path) -> io::Result<Vec<DiagnosticReport>>
     Ok(reports)
 }
 
-pub fn diagnose_failure_path(path: &Path) -> io::Result<DiagnosticReport> {
-    let content = fs::read_to_string(path)?;
+pub fn diagnose_failure_path(path: &Path) -> AdapterResult<DiagnosticReport> {
+    let content = fs::read_to_string(path).map_err(|source| {
+        AdapterError::external_io("read diagnostic input", Some(path.to_path_buf()), source)
+    })?;
     let source = path.display().to_string();
     if path.extension().is_some_and(|ext| ext == "json")
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content)
@@ -48,14 +51,14 @@ pub fn diagnose_failure_path(path: &Path) -> io::Result<DiagnosticReport> {
     Ok(diagnose_text(&content, source))
 }
 
-fn discover_failure_logs(path: &Path) -> io::Result<Vec<PathBuf>> {
+fn discover_failure_logs(path: &Path) -> AdapterResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     discover_failure_logs_inner(path, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn discover_failure_logs_inner(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+fn discover_failure_logs_inner(path: &Path, files: &mut Vec<PathBuf>) -> AdapterResult<()> {
     if path.is_file() {
         if path.extension().is_some_and(|ext| ext == "json") {
             files.push(path.to_path_buf());

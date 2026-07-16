@@ -313,7 +313,7 @@ where
                         generated
                             .remove(&(prepared_batch.index + 1))
                             .ok_or_else(|| {
-                                CoreError::Data(format!(
+                                CoreError::DataInvariant(format!(
                                     "translation window omitted batch {}",
                                     prepared_batch.index + 1
                                 ))
@@ -433,7 +433,9 @@ where
                 let mut reviewed_window = self.review_window(&pending)?;
                 for (review_position, _) in &pending {
                     let reviewed = reviewed_window.remove(review_position).ok_or_else(|| {
-                        CoreError::Data(format!("review window omitted batch {review_position}"))
+                        CoreError::DataInvariant(format!(
+                            "review window omitted batch {review_position}"
+                        ))
                     })?;
                     usage.add(reviewed.usage);
                     self.dashboard.add_usage(reviewed.usage);
@@ -587,7 +589,7 @@ where
             }
             response.ok_or_else(|| {
                 last_error.unwrap_or_else(|| {
-                    CoreError::Backend("terminology preflight failed".to_owned())
+                    CoreError::InvalidBackendResponse("terminology preflight failed".to_owned())
                 })
             })
         };
@@ -595,7 +597,7 @@ where
         match result {
             Ok(response) => {
                 let BackendPayload::Terminology(payload) = response.payload else {
-                    return Err(CoreError::Data(
+                    return Err(CoreError::DataInvariant(
                         "terminology cache returned a different payload".to_owned(),
                     ));
                 };
@@ -708,7 +710,7 @@ where
             };
             if let Some(response) = cached {
                 let BackendPayload::Translation(payload) = response.payload else {
-                    return Err(CoreError::Data(
+                    return Err(CoreError::DataInvariant(
                         "translation cache returned a review payload".to_owned(),
                     ));
                 };
@@ -740,7 +742,7 @@ where
             )
             .map_err(CoreError::from)?;
         if responses.len() != pending.len() {
-            return Err(CoreError::Backend(format!(
+            return Err(CoreError::InvalidBackendResponse(format!(
                 "backend returned {} responses for {} translation requests",
                 responses.len(),
                 pending.len()
@@ -889,7 +891,7 @@ where
                 }
             }
         }
-        Err(CoreError::Data(
+        Err(CoreError::DataInvariant(
             "translation retry loop ended unexpectedly".to_owned(),
         ))
     }
@@ -925,7 +927,7 @@ where
             }
         };
         let BackendPayload::Translation(result) = &backend_result.payload else {
-            return Err(CoreError::Data(
+            return Err(CoreError::DataInvariant(
                 "translation cache returned a review payload".to_owned(),
             ));
         };
@@ -938,7 +940,7 @@ where
             store.save_cached_response(CacheStage::Translate, request_hash, &backend_result)?;
         }
         let BackendPayload::Translation(result) = backend_result.payload else {
-            return Err(CoreError::Data(
+            return Err(CoreError::DataInvariant(
                 "translation backend returned a review payload".to_owned(),
             ));
         };
@@ -1048,7 +1050,7 @@ where
                 }
             }
         }
-        Err(CoreError::Data(
+        Err(CoreError::DataInvariant(
             "review retry loop ended unexpectedly".to_owned(),
         ))
     }
@@ -1087,7 +1089,7 @@ where
             };
             if let Some(response) = cached {
                 let BackendPayload::Review(result) = response.payload else {
-                    return Err(CoreError::Data(
+                    return Err(CoreError::DataInvariant(
                         "review cache returned a translation payload".to_owned(),
                     ));
                 };
@@ -1117,7 +1119,7 @@ where
             )
             .map_err(CoreError::from)?;
         if responses.len() != pending.len() {
-            return Err(CoreError::Backend(format!(
+            return Err(CoreError::InvalidBackendResponse(format!(
                 "backend returned {} responses for {} review requests",
                 responses.len(),
                 pending.len()
@@ -1195,7 +1197,7 @@ where
             }
         };
         let BackendPayload::Review(result) = &backend_result.payload else {
-            return Err(CoreError::Data(
+            return Err(CoreError::DataInvariant(
                 "review cache returned a translation payload".to_owned(),
             ));
         };
@@ -1208,7 +1210,7 @@ where
             store.save_cached_response(CacheStage::Review, request_hash, &backend_result)?;
         }
         let BackendPayload::Review(result) = backend_result.payload else {
-            return Err(CoreError::Data(
+            return Err(CoreError::DataInvariant(
                 "review backend returned a translation payload".to_owned(),
             ));
         };
@@ -1390,7 +1392,7 @@ where
                     BackendPayload::Translation(result) => &result.lines,
                     BackendPayload::Review(result) => &result.lines,
                     BackendPayload::Terminology(_) => {
-                        return Err(CoreError::Data(
+                        return Err(CoreError::DataInvariant(
                             "repair cache returned a terminology payload".to_owned(),
                         ));
                     }
@@ -1512,7 +1514,7 @@ where
             return Ok(ResumeSnapshot::default());
         };
         if snapshot.translation_batches_completed > batches.len() {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "resume state has {} translated batches, but the current input has only {}",
                 snapshot.translation_batches_completed,
                 batches.len()
@@ -1531,7 +1533,7 @@ where
             )?;
         }
         if snapshot.translated_segments.len() != expected_segment_count {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "resume state expected {expected_segment_count} translated segments across {} batches, but loaded {}",
                 snapshot.translation_batches_completed,
                 snapshot.translated_segments.len()
@@ -1887,7 +1889,7 @@ fn is_agent_repairable(error: &CoreError) -> bool {
     match error {
         CoreError::InvalidTranslation(_) => true,
         CoreError::Llm(crate::error::LlmCallError::InvalidResponse(_)) => true,
-        CoreError::Backend(message) => {
+        CoreError::InvalidBackendResponse(message) => {
             message.contains("invalid JSON in response")
                 || message.contains("response JSON object")
                 || message.contains("response missing lines array")
@@ -2130,12 +2132,12 @@ mod tests {
                 .split("BATCH_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("BATCH_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing batch json".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing batch json".to_owned()))?;
             let parsed: serde_json::Value = serde_json::from_str(body)
-                .map_err(|err| CoreError::Data(format!("invalid batch json: {err}")))?;
+                .map_err(|err| CoreError::DataInvariant(format!("invalid batch json: {err}")))?;
             let lines = parsed["lines"]
                 .as_array()
-                .ok_or_else(|| CoreError::Data("missing lines array".to_owned()))?
+                .ok_or_else(|| CoreError::DataInvariant("missing lines array".to_owned()))?
                 .iter()
                 .map(|entry| {
                     let id = entry["id"].as_str().unwrap_or_default().to_owned();
@@ -2273,12 +2275,13 @@ mod tests {
                 .split("REVIEW_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("REVIEW_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing review json".to_owned()))?;
-            let parsed: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| CoreError::Data(format!("invalid review json: {error}")))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing review json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                CoreError::DataInvariant(format!("invalid review json: {error}"))
+            })?;
             let lines = parsed["lines"]
                 .as_array()
-                .ok_or_else(|| CoreError::Data("missing review lines".to_owned()))?
+                .ok_or_else(|| CoreError::DataInvariant("missing review lines".to_owned()))?
                 .iter()
                 .map(|line| {
                     serde_json::json!({
@@ -2372,12 +2375,15 @@ mod tests {
                     .split("TERMINOLOGY_JSON_START")
                     .nth(1)
                     .and_then(|value| value.split("TERMINOLOGY_JSON_END").next())
-                    .ok_or_else(|| CoreError::Data("missing terminology json".to_owned()))?;
-                let parsed: serde_json::Value = serde_json::from_str(body)
-                    .map_err(|error| CoreError::Data(format!("invalid terminology: {error}")))?;
-                let candidates = parsed["candidates"]
-                    .as_array()
-                    .ok_or_else(|| CoreError::Data("missing terminology candidates".to_owned()))?;
+                    .ok_or_else(|| {
+                        CoreError::DataInvariant("missing terminology json".to_owned())
+                    })?;
+                let parsed: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                    CoreError::DataInvariant(format!("invalid terminology: {error}"))
+                })?;
+                let candidates = parsed["candidates"].as_array().ok_or_else(|| {
+                    CoreError::DataInvariant("missing terminology candidates".to_owned())
+                })?;
                 let entries = candidates
                     .iter()
                     .map(|candidate| {
@@ -2397,23 +2403,23 @@ mod tests {
                 .split("CONTEXT_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("CONTEXT_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing context json".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing context json".to_owned()))?;
             let context: serde_json::Value = serde_json::from_str(context)
-                .map_err(|error| CoreError::Data(format!("invalid context: {error}")))?;
+                .map_err(|error| CoreError::DataInvariant(format!("invalid context: {error}")))?;
             self.contexts
                 .lock()
-                .map_err(|_| CoreError::Data("context lock poisoned".to_owned()))?
+                .map_err(|_| CoreError::DataInvariant("context lock poisoned".to_owned()))?
                 .push(context);
             let body = prompt
                 .split("BATCH_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("BATCH_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing batch json".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing batch json".to_owned()))?;
             let parsed: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| CoreError::Data(format!("invalid batch: {error}")))?;
+                .map_err(|error| CoreError::DataInvariant(format!("invalid batch: {error}")))?;
             let batch_lines = parsed["lines"]
                 .as_array()
-                .ok_or_else(|| CoreError::Data("missing batch lines".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing batch lines".to_owned()))?;
             let lines = batch_lines
                 .iter()
                 .map(|line| TranslationLine {
@@ -2515,12 +2521,13 @@ mod tests {
                 .split("AGENT_REPAIR_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing agent repair json".to_owned()))?;
-            let payload: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| CoreError::Data(format!("invalid repair json: {error}")))?;
-            let source_lines = payload["source_lines"]
-                .as_array()
-                .ok_or_else(|| CoreError::Data("missing repair source lines".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing agent repair json".to_owned()))?;
+            let payload: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                CoreError::DataInvariant(format!("invalid repair json: {error}"))
+            })?;
+            let source_lines = payload["source_lines"].as_array().ok_or_else(|| {
+                CoreError::DataInvariant("missing repair source lines".to_owned())
+            })?;
             let lines = source_lines
                 .iter()
                 .map(|line| {
@@ -2580,12 +2587,13 @@ mod tests {
                     .split("REVIEW_JSON_START")
                     .nth(1)
                     .and_then(|value| value.split("REVIEW_JSON_END").next())
-                    .ok_or_else(|| CoreError::Data("missing review json".to_owned()))?;
-                let payload: serde_json::Value = serde_json::from_str(body)
-                    .map_err(|error| CoreError::Data(format!("invalid review json: {error}")))?;
+                    .ok_or_else(|| CoreError::DataInvariant("missing review json".to_owned()))?;
+                let payload: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                    CoreError::DataInvariant(format!("invalid review json: {error}"))
+                })?;
                 let lines = payload["lines"]
                     .as_array()
-                    .ok_or_else(|| CoreError::Data("missing review lines".to_owned()))?
+                    .ok_or_else(|| CoreError::DataInvariant("missing review lines".to_owned()))?
                     .iter()
                     .map(|line| serde_json::json!({"id": line["id"], "translation": ""}))
                     .collect::<Vec<_>>();
@@ -2603,12 +2611,13 @@ mod tests {
                 .split("AGENT_REPAIR_JSON_START")
                 .nth(1)
                 .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing review repair json".to_owned()))?;
-            let payload: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| CoreError::Data(format!("invalid review repair json: {error}")))?;
-            let current = payload["current_translations"]
-                .as_array()
-                .ok_or_else(|| CoreError::Data("missing current translations".to_owned()))?;
+                .ok_or_else(|| CoreError::DataInvariant("missing review repair json".to_owned()))?;
+            let payload: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+                CoreError::DataInvariant(format!("invalid review repair json: {error}"))
+            })?;
+            let current = payload["current_translations"].as_array().ok_or_else(|| {
+                CoreError::DataInvariant("missing current translations".to_owned())
+            })?;
             let lines = current
                 .iter()
                 .map(|line| {

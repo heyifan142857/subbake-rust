@@ -37,14 +37,14 @@ impl TranslationStage {
         output: Vec<SubtitleSegment>,
     ) -> CoreResult<Self> {
         if resumed > batches.len() {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "resume state has {resumed} translated batches, but the current input has only {}",
                 batches.len()
             )));
         }
         let expected = batches.iter().take(resumed).map(Vec::len).sum::<usize>();
         if output.len() != expected {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "translation stage expected {expected} resumed segments, but received {}",
                 output.len()
             )));
@@ -113,14 +113,14 @@ impl TranslationStage {
         result: Option<BatchWithUsage>,
     ) -> CoreResult<AppliedBatch> {
         if prepared.index != self.next_batch {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "translation stage expected batch {}, but received batch {}",
                 self.next_batch + 1,
                 prepared.index + 1
             )));
         }
         if prepared.pending.is_empty() != result.is_none() {
-            return Err(CoreError::Data(format!(
+            return Err(CoreError::DataInvariant(format!(
                 "translation result availability does not match pending lines for batch {}",
                 prepared.index + 1
             )));

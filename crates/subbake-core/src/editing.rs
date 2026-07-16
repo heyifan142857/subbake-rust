@@ -40,8 +40,9 @@ pub fn build_subtitle_edit_messages(
                 .collect(),
         );
     }
-    let compact = serde_json::to_string(&payload)
-        .map_err(|error| CoreError::Backend(format!("serialize edit payload: {error}")))?;
+    let compact = serde_json::to_string(&payload).map_err(|error| {
+        CoreError::InvalidBackendResponse(format!("serialize edit payload: {error}"))
+    })?;
     Ok(vec![
         ChatMessage::system(format!(
             "You are SubBake's subtitle editing agent.\n\

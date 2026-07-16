@@ -32,6 +32,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use crate::engine::{EngineObserver, ProfileChoice, SessionChoice};
+use crate::error::AgentResult;
 use crate::input_editor::InputEditor;
 use crate::session::iso_now;
 use crate::tui_state::{
@@ -503,13 +504,13 @@ impl SubBakeTui {
     /// response text.
     pub fn run<F>(&mut self, mut process_fn: F) -> io::Result<()>
     where
-        F: FnMut(TuiAction, CancellationGuard, &mut TuiObserver) -> io::Result<TuiInteraction>
+        F: FnMut(TuiAction, CancellationGuard, &mut TuiObserver) -> AgentResult<TuiInteraction>
             + Send
             + 'static,
     {
         let worker_observer = self.observer();
         let (request_tx, request_rx) = mpsc::channel::<(TuiAction, CancellationGuard)>();
-        let (response_tx, response_rx) = mpsc::channel::<io::Result<TuiInteraction>>();
+        let (response_tx, response_rx) = mpsc::channel::<AgentResult<TuiInteraction>>();
         let worker = thread::Builder::new()
             .name("subbake-agent-worker".to_owned())
             .spawn(move || {
@@ -588,7 +589,7 @@ impl SubBakeTui {
                             }
                             self.interaction_state.set_input_mode(InputMode::Editing);
                             if let Ok(mut view) = self.msg_view.lock() {
-                                if error.kind() == io::ErrorKind::Interrupted {
+                                if error.is_cancelled() {
                                     self.interaction_state.set_input_mode(InputMode::Editing);
                                     view.push(MsgStyle::System, "Cancelled.".to_owned());
                                 } else {

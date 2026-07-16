@@ -16,6 +16,7 @@ use subbake_core::{
 };
 use tokio::runtime::Runtime;
 
+use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{read_document, render_and_write_document};
 use crate::whisper::default_whisper_binary_path;
 
@@ -115,14 +116,14 @@ pub trait TranscriberBackend {
         audio_path: &Path,
         language: Option<&str>,
         output_format: TranscriptionFormat,
-    ) -> io::Result<SubtitleDocument>;
+    ) -> AdapterResult<SubtitleDocument>;
     fn transcribe_cancellable(
         &self,
         audio_path: &Path,
         language: Option<&str>,
         output_format: TranscriptionFormat,
         cancellation: &CancellationGuard,
-    ) -> io::Result<SubtitleDocument> {
+    ) -> AdapterResult<SubtitleDocument> {
         check_cancelled(cancellation)?;
         self.transcribe(audio_path, language, output_format)
     }
@@ -145,11 +146,11 @@ impl WhisperApiTranscriber {
         base_url: String,
         model: String,
         timeout_seconds: f64,
-    ) -> io::Result<Self> {
+    ) -> AdapterResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs_f64(timeout_seconds.max(1.0)))
             .build()
-            .map_err(|e| io::Error::other(format!("http client build: {e}")))?;
+            .map_err(|error| AdapterError::from_http("Whisper API client", error))?;
         Ok(Self {
             api_key,
             base_url,
@@ -165,7 +166,7 @@ impl TranscriberBackend for WhisperApiTranscriber {
         audio_path: &Path,
         language: Option<&str>,
         output_format: TranscriptionFormat,
-    ) -> io::Result<SubtitleDocument> {
+    ) -> AdapterResult<SubtitleDocument> {
         self.transcribe_cancellable(
             audio_path,
             language,
@@ -180,15 +181,16 @@ impl TranscriberBackend for WhisperApiTranscriber {
         language: Option<&str>,
         output_format: TranscriptionFormat,
         cancellation: &CancellationGuard,
-    ) -> io::Result<SubtitleDocument> {
+    ) -> AdapterResult<SubtitleDocument> {
         runtime().block_on(async {
             check_cancelled(cancellation)?;
             let url = format!(
                 "{}/audio/transcriptions",
                 self.base_url.trim_end_matches('/')
             );
-            let audio_bytes = std::fs::read(audio_path)
-                .map_err(|e| io::Error::other(format!("read audio file: {e}")))?;
+            let audio_bytes = std::fs::read(audio_path).map_err(|source| {
+                AdapterError::external_io("read audio file", Some(audio_path.to_path_buf()), source)
+            })?;
             let file_name = audio_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -217,7 +219,7 @@ impl TranscriberBackend for WhisperApiTranscriber {
             tokio::pin!(request);
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
             let resp = loop { tokio::select! {
-                result = &mut request => break result.map_err(|e| io::Error::other(format!("whisper api request: {e}")))?,
+                result = &mut request => break result.map_err(|error| AdapterError::from_http("Whisper API request", error))?,
                 _ = interval.tick() => check_cancelled(cancellation)?,
             }};
 
@@ -225,13 +227,16 @@ impl TranscriberBackend for WhisperApiTranscriber {
             let response = resp.text();
             tokio::pin!(response);
             let body = loop { tokio::select! {
-                result = &mut response => break result.map_err(|e| io::Error::other(format!("whisper api response: {e}")))?,
+                result = &mut response => break result.map_err(|error| AdapterError::from_http("Whisper API response", error))?,
                 _ = interval.tick() => check_cancelled(cancellation)?,
             }};
             if !status.is_success() {
-                return Err(io::Error::other(format!(
-                    "whisper api rejected ({status}): {body}"
-                )));
+                return Err(AdapterError::from_http_status(
+                    "Whisper API",
+                    status.as_u16(),
+                    body,
+                    None,
+                ));
             }
             parse_whisper_response(&body, output_format)
         })
@@ -264,7 +269,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
         audio_path: &Path,
         language: Option<&str>,
         output_format: TranscriptionFormat,
-    ) -> io::Result<SubtitleDocument> {
+    ) -> AdapterResult<SubtitleDocument> {
         self.transcribe_cancellable(
             audio_path,
             language,
@@ -279,7 +284,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
         language: Option<&str>,
         output_format: TranscriptionFormat,
         cancellation: &CancellationGuard,
-    ) -> io::Result<SubtitleDocument> {
+    ) -> AdapterResult<SubtitleDocument> {
         check_cancelled(cancellation)?;
         let output_dir = audio_path.parent().unwrap_or_else(|| Path::new("."));
         let base_name = audio_path
@@ -315,11 +320,11 @@ impl TranscriberBackend for WhisperCppTranscriber {
 
         let out = run_command_cancellable(&mut cmd, cancellation, "whisper.cpp execution")?;
         if !out.status.success() {
-            return Err(io::Error::other(format!(
-                "whisper.cpp exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr),
-            )));
+            return Err(AdapterError::ChildProcess {
+                program: "whisper.cpp",
+                status: out.status.code(),
+                message: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
         }
 
         let suffix = match output_format {
@@ -352,14 +357,14 @@ impl TranscriberBackend for WhisperCppTranscriber {
 // Orchestration
 // ---------------------------------------------------------------------------
 
-pub fn transcribe_media(request: TranscriptionRequest) -> io::Result<TranscriptionOutcome> {
+pub fn transcribe_media(request: TranscriptionRequest) -> AdapterResult<TranscriptionOutcome> {
     transcribe_media_cancellable(request, &CancellationGuard::never())
 }
 
 pub fn transcribe_media_cancellable(
     request: TranscriptionRequest,
     cancellation: &CancellationGuard,
-) -> io::Result<TranscriptionOutcome> {
+) -> AdapterResult<TranscriptionOutcome> {
     transcribe_media_cancellable_with_progress(
         request,
         cancellation,
@@ -371,7 +376,7 @@ pub fn transcribe_media_cancellable_with_progress(
     request: TranscriptionRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
-) -> io::Result<TranscriptionOutcome> {
+) -> AdapterResult<TranscriptionOutcome> {
     check_cancelled(cancellation)?;
     progress.emit(ProgressEvent::running(
         TaskKind::Transcription,
@@ -416,10 +421,10 @@ pub fn transcribe_media_cancellable_with_progress(
                 .api_key
                 .clone()
                 .or_else(default_whisper_api_key)
-                .ok_or_else(|| {
-                    io::Error::other(
-                        "Missing API key for Whisper API. Set OPENAI_API_KEY or use --api-key.",
-                    )
+                .ok_or_else(|| AdapterError::Authentication {
+                    message:
+                        "Missing API key for Whisper API. Set OPENAI_API_KEY or use --api-key."
+                            .to_owned(),
                 })?;
             let base_url = request
                 .settings
@@ -457,8 +462,8 @@ pub fn transcribe_media_cancellable_with_progress(
             )?
         }
         other => {
-            return Err(io::Error::other(format!(
-                "unsupported transcriber `{other}"
+            return Err(AdapterError::invalid_input(format!(
+                "unsupported transcriber `{other}`"
             )));
         }
     };
@@ -482,7 +487,7 @@ pub fn transcribe_media_cancellable_with_progress(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> io::Result<PathBuf> {
+fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> AdapterResult<PathBuf> {
     check_cancelled(cancellation)?;
     if is_audio_ext(media_path) {
         return Ok(media_path.to_path_buf());
@@ -519,7 +524,11 @@ fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> io::Resu
     let out = result?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&output);
-        return Err(io::Error::other("ffmpeg audio extraction failed"));
+        return Err(AdapterError::ChildProcess {
+            program: "ffmpeg",
+            status: out.status.code(),
+            message: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
     }
     check_cancelled(cancellation).inspect_err(|_| {
         let _ = std::fs::remove_file(&output);
@@ -527,17 +536,15 @@ fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> io::Resu
     Ok(output)
 }
 
-fn check_cancelled(cancellation: &CancellationGuard) -> io::Result<()> {
-    cancellation
-        .check()
-        .map_err(|_| io::Error::new(io::ErrorKind::Interrupted, "operation cancelled"))
+fn check_cancelled(cancellation: &CancellationGuard) -> AdapterResult<()> {
+    cancellation.check().map_err(AdapterError::from)
 }
 
 fn run_command_cancellable(
     command: &mut Command,
     cancellation: &CancellationGuard,
     context: &str,
-) -> io::Result<Output> {
+) -> AdapterResult<Output> {
     check_cancelled(cancellation)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
@@ -547,13 +554,10 @@ fn run_command_cancellable(
         if cancellation.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "operation cancelled",
-            ));
+            return Err(AdapterError::Cancelled);
         }
         if child.try_wait()?.is_some() {
-            return child.wait_with_output();
+            return Ok(child.wait_with_output()?);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -571,23 +575,23 @@ fn default_whisper_api_key() -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
-fn locate_whisper_binary() -> io::Result<PathBuf> {
+fn locate_whisper_binary() -> AdapterResult<PathBuf> {
     let p = default_whisper_binary_path();
     if p.exists() {
         Ok(p)
     } else {
-        Err(io::Error::other(
+        Err(AdapterError::invalid_input(
             "whisper.cpp binary not found. Run `sbake whisper install` first.",
         ))
     }
 }
 
-fn locate_whisper_model(name: &str) -> io::Result<PathBuf> {
+fn locate_whisper_model(name: &str) -> AdapterResult<PathBuf> {
     let p = PathBuf::from(".subbake/whisper/models").join(format!("ggml-{name}.bin"));
     if p.exists() {
         Ok(p)
     } else {
-        Err(io::Error::other(format!(
+        Err(AdapterError::invalid_input(format!(
             "model `{name}` not found at {}. Run `sbake whisper models --download {name}`.",
             p.display()
         )))
@@ -598,7 +602,7 @@ fn default_output_path(media_path: &Path, fmt: TranscriptionFormat) -> PathBuf {
     media_path.with_extension(fmt.extension())
 }
 
-fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> io::Result<()> {
+fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> AdapterResult<()> {
     let doc = read_document(path)?;
     if fmt != TranscriptionFormat::Txt
         && doc
@@ -606,7 +610,7 @@ fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> io::R
             .iter()
             .any(|s| s.start.is_none() || s.end.is_none())
     {
-        return Err(io::Error::other(
+        return Err(AdapterError::invalid_input(
             "sidecar lacks timing data; use --format txt or a timed subtitle file",
         ));
     }
@@ -615,22 +619,36 @@ fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> io::R
     Ok(())
 }
 
-fn parse_whisper_response(body: &str, fmt: TranscriptionFormat) -> io::Result<SubtitleDocument> {
+fn parse_whisper_response(body: &str, fmt: TranscriptionFormat) -> AdapterResult<SubtitleDocument> {
     match fmt {
         TranscriptionFormat::Srt | TranscriptionFormat::Vtt => {
             let ext = fmt.extension();
             let dir = std::env::temp_dir().join("subbake-whisper");
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| io::Error::other(format!("create tmp dir: {e}")))?;
+            std::fs::create_dir_all(&dir).map_err(|source| {
+                AdapterError::external_io(
+                    "create Whisper response directory",
+                    Some(dir.clone()),
+                    source,
+                )
+            })?;
             let tmp = dir.join(format!("response.{ext}"));
-            std::fs::write(&tmp, body).map_err(|e| io::Error::other(format!("write tmp: {e}")))?;
+            std::fs::write(&tmp, body).map_err(|source| {
+                AdapterError::external_io(
+                    "write temporary Whisper response",
+                    Some(tmp.clone()),
+                    source,
+                )
+            })?;
             let doc = read_document(&tmp)?;
             let _ = std::fs::remove_file(&tmp);
             Ok(doc)
         }
         TranscriptionFormat::Txt => {
-            let parsed: serde_json::Value = serde_json::from_str(body)
-                .map_err(|e| io::Error::other(format!("whisper json parse: {e}")))?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).map_err(|source| AdapterError::Serialization {
+                    context: "parse Whisper JSON response",
+                    source,
+                })?;
             let text = parsed["segments"]
                 .as_array()
                 .map(|segs| {

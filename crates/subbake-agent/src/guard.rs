@@ -9,6 +9,39 @@
 
 use std::path::{Path, PathBuf};
 
+use thiserror::Error;
+
+pub type FileGuardResult<T> = Result<T, FileGuardError>;
+
+#[derive(Debug, Error)]
+pub enum FileGuardError {
+    #[error("path escapes project root `{root}`: {path}")]
+    PathEscape { root: PathBuf, path: PathBuf },
+    #[error("path contains protected component `{component}`: {path}")]
+    ProtectedPath { component: String, path: PathBuf },
+    #[error("file already exists: {path}")]
+    AlreadyExists { path: PathBuf },
+    #[error("cannot back up non-existent file: {path}")]
+    MissingBackupSource { path: PathBuf },
+    #[error("{operation}{path_suffix}: {source}", path_suffix = path.as_ref().map(|value| format!(" `{}`", value.display())).unwrap_or_default())]
+    Io {
+        operation: &'static str,
+        path: Option<PathBuf>,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl From<std::io::Error> for FileGuardError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io {
+            operation: "file operation failed",
+            path: None,
+            source,
+        }
+    }
+}
+
 /// Path components that are never allowed in file operations.
 pub const PROTECTED_PATH_PARTS: [&str; 7] = [
     ".git",
@@ -63,19 +96,19 @@ impl FileGuard {
     // Public operations
     // ------------------------------------------------------------------
 
-    pub fn read_file(&self, path: &Path) -> std::io::Result<String> {
+    pub fn read_file(&self, path: &Path) -> FileGuardResult<String> {
         let safe = self.resolve(path)?;
-        std::fs::read_to_string(&safe)
-            .map_err(|e| std::io::Error::other(format!("read {}: {e}", safe.display())))
+        std::fs::read_to_string(&safe).map_err(|source| FileGuardError::Io {
+            operation: "read file",
+            path: Some(safe),
+            source,
+        })
     }
 
-    pub fn create_file(&self, path: &Path, content: &str) -> std::io::Result<FileOpResult> {
+    pub fn create_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         if safe.exists() {
-            return Err(std::io::Error::other(format!(
-                "file already exists: {}",
-                safe.display()
-            )));
+            return Err(FileGuardError::AlreadyExists { path: safe });
         }
         self.write_atomically(&safe, content)?;
         Ok(FileOpResult {
@@ -86,7 +119,7 @@ impl FileGuard {
         })
     }
 
-    pub fn append_file(&self, path: &Path, content: &str) -> std::io::Result<FileOpResult> {
+    pub fn append_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
         let mut existing = if safe.exists() {
@@ -109,7 +142,7 @@ impl FileGuard {
         path: &Path,
         old: &str,
         new: &str,
-    ) -> std::io::Result<FileOpResult> {
+    ) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
         let content = std::fs::read_to_string(&safe)?;
@@ -123,7 +156,7 @@ impl FileGuard {
         })
     }
 
-    pub fn rename_path(&self, from: &Path, to: &Path) -> std::io::Result<FileOpResult> {
+    pub fn rename_path(&self, from: &Path, to: &Path) -> FileGuardResult<FileOpResult> {
         let safe_from = self.resolve(from)?;
         let safe_to = self.resolve(to)?;
         // Backup both: the source (will be gone) and the destination (will be overwritten).
@@ -143,7 +176,7 @@ impl FileGuard {
         })
     }
 
-    pub fn delete_file(&self, path: &Path) -> std::io::Result<FileOpResult> {
+    pub fn delete_file(&self, path: &Path) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
         if safe.is_dir() {
@@ -161,7 +194,7 @@ impl FileGuard {
 
     /// Snapshot a path before an adapter writes it, so the resulting external
     /// write can participate in the same undo log as direct file operations.
-    pub fn snapshot_write(&self, path: &Path) -> std::io::Result<FileOpResult> {
+    pub fn snapshot_write(&self, path: &Path) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         if safe.exists() {
             Ok(FileOpResult {
@@ -180,7 +213,7 @@ impl FileGuard {
         }
     }
 
-    pub fn list_files(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    pub fn list_files(&self, dir: &Path) -> FileGuardResult<Vec<PathBuf>> {
         let safe = self.resolve(dir)?;
         let mut files = Vec::new();
         for entry in std::fs::read_dir(&safe)? {
@@ -192,7 +225,7 @@ impl FileGuard {
     }
 
     /// Search for files matching a glob-like name pattern under a directory.
-    pub fn search_files(&self, dir: &Path, pattern: &str) -> std::io::Result<Vec<PathBuf>> {
+    pub fn search_files(&self, dir: &Path, pattern: &str) -> FileGuardResult<Vec<PathBuf>> {
         let safe = self.resolve(dir)?;
         let mut results = Vec::new();
         self.search_recursive(&safe, pattern, &mut results)?;
@@ -200,7 +233,7 @@ impl FileGuard {
         Ok(results)
     }
 
-    pub fn resolve_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+    pub fn resolve_path(&self, path: &Path) -> FileGuardResult<PathBuf> {
         self.resolve(path)
     }
 
@@ -210,7 +243,7 @@ impl FileGuard {
 
     /// Resolve a user-supplied path to an absolute path under the project root,
     /// rejecting paths that escape the project root or contain protected components.
-    fn resolve(&self, user_path: &Path) -> std::io::Result<PathBuf> {
+    fn resolve(&self, user_path: &Path) -> FileGuardResult<PathBuf> {
         // Normalise `..` components so `root/../etc/passwd` is caught below.
         let anchored = normalize_path(if user_path.is_absolute() {
             user_path.to_path_buf()
@@ -224,11 +257,10 @@ impl FileGuard {
             .canonicalize()
             .unwrap_or_else(|_| self.project_root.clone());
         if !anchored.starts_with(&root_canon) {
-            return Err(std::io::Error::other(format!(
-                "path escapes project root `{}`: {}",
-                root_canon.display(),
-                anchored.display(),
-            )));
+            return Err(FileGuardError::PathEscape {
+                root: root_canon,
+                path: anchored,
+            });
         }
 
         // Canonicalize existing paths; for new files canonicalize the parent.
@@ -251,11 +283,10 @@ impl FileGuard {
         };
 
         if !safe.starts_with(&root_canon) {
-            return Err(std::io::Error::other(format!(
-                "path escapes project root `{}` after canonicalization: {}",
-                root_canon.display(),
-                safe.display(),
-            )));
+            return Err(FileGuardError::PathEscape {
+                root: root_canon,
+                path: safe,
+            });
         }
 
         // Check for protected components (e.g. .git, .subbake).
@@ -263,10 +294,10 @@ impl FileGuard {
             if let Some(name) = component.as_os_str().to_str()
                 && PROTECTED_PATH_PARTS.contains(&name)
             {
-                return Err(std::io::Error::other(format!(
-                    "path contains protected component `{name}`: {}",
-                    safe.display()
-                )));
+                return Err(FileGuardError::ProtectedPath {
+                    component: name.to_owned(),
+                    path: safe,
+                });
             }
         }
 
@@ -278,7 +309,7 @@ impl FileGuard {
         dir: &Path,
         pattern: &str,
         results: &mut Vec<PathBuf>,
-    ) -> std::io::Result<()> {
+    ) -> FileGuardResult<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -306,12 +337,11 @@ impl FileGuard {
     // ------------------------------------------------------------------
 
     /// Create a timestamped backup of a file before mutating it.
-    fn backup(&self, path: &Path) -> std::io::Result<PathBuf> {
+    fn backup(&self, path: &Path) -> FileGuardResult<PathBuf> {
         if !path.exists() {
-            return Err(std::io::Error::other(format!(
-                "cannot back up non-existent file: {}",
-                path.display()
-            )));
+            return Err(FileGuardError::MissingBackupSource {
+                path: path.to_path_buf(),
+            });
         }
 
         let rel = path.strip_prefix(&self.project_root).unwrap_or(path);
@@ -326,7 +356,7 @@ impl FileGuard {
     }
 
     /// Write content to a file atomically via temp + rename.
-    fn write_atomically(&self, path: &Path, content: &str) -> std::io::Result<()> {
+    fn write_atomically(&self, path: &Path, content: &str) -> FileGuardResult<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -340,7 +370,7 @@ impl FileGuard {
     }
 
     /// Restore a file from a backup. Used by undo.
-    pub fn restore_backup(backup_path: &Path, target: &Path) -> std::io::Result<()> {
+    pub fn restore_backup(backup_path: &Path, target: &Path) -> FileGuardResult<()> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -426,6 +456,7 @@ mod tests {
         let err = guard
             .create_file(Path::new("../etc/passwd"), "data")
             .expect_err("path traversal should be rejected");
+        assert!(matches!(&err, FileGuardError::PathEscape { .. }));
         assert!(err.to_string().contains("escapes project root"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -436,6 +467,7 @@ mod tests {
         let err = guard
             .create_file(Path::new(".git/config"), "data")
             .expect_err("should reject");
+        assert!(matches!(&err, FileGuardError::ProtectedPath { .. }));
         assert!(err.to_string().contains(".git"));
         let _ = std::fs::remove_dir_all(&root);
     }

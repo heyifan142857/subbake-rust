@@ -1,7 +1,6 @@
-use std::io;
-
 use serde_json::Value as JsonValue;
 
+use crate::error::{AgentError, AgentResult};
 use crate::tools::{ToolIntent, find_tool_spec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,12 +14,14 @@ pub(super) enum Route {
     },
 }
 
-pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route> {
+pub(super) fn parse_route(value: &JsonValue, original: &str) -> AgentResult<Route> {
     let action = value
         .get("route")
         .or_else(|| value.get("action"))
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| io::Error::other("semantic route is missing `route`"))?;
+        .ok_or_else(|| AgentError::InvalidDecision {
+            message: "semantic route is missing `route`".to_owned(),
+        })?;
     let text = value
         .get("text")
         .and_then(JsonValue::as_str)
@@ -30,12 +31,12 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
         "respond" => Ok(Route::Respond(text)),
         "ask_user" => Ok(Route::AskUser(text)),
         "act" => {
-            let intent = parse_intent(
-                value
-                    .get("intent")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| io::Error::other("action route is missing `intent`"))?,
-            )?;
+            let intent =
+                parse_intent(value.get("intent").and_then(JsonValue::as_str).ok_or_else(
+                    || AgentError::InvalidDecision {
+                        message: "action route is missing `intent`".to_owned(),
+                    },
+                )?)?;
             let request = value
                 .get("restated_request")
                 .and_then(JsonValue::as_str)
@@ -57,7 +58,9 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
             let tool = value
                 .get("tool_name")
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| io::Error::other("tool route is missing `tool_name`"))?;
+                .ok_or_else(|| AgentError::InvalidDecision {
+                    message: "tool route is missing `tool_name`".to_owned(),
+                })?;
             Ok(Route::Act {
                 intent: intent_for_tool(tool)?,
                 request: original.to_owned(),
@@ -71,26 +74,31 @@ pub(super) fn parse_route(value: &JsonValue, original: &str) -> io::Result<Route
                 .and_then(|calls| calls.first())
                 .and_then(|call| call.get("tool_name"))
                 .and_then(JsonValue::as_str)
-                .ok_or_else(|| io::Error::other("plan route has no tool calls"))?;
+                .ok_or_else(|| AgentError::InvalidDecision {
+                    message: "plan route has no tool calls".to_owned(),
+                })?;
             Ok(Route::Act {
                 intent: intent_for_tool(tool)?,
                 request: original.to_owned(),
                 inspect_project: false,
             })
         }
-        other => Err(io::Error::other(format!(
-            "unsupported semantic route `{other}`"
-        ))),
+        other => Err(AgentError::InvalidDecision {
+            message: format!("unsupported semantic route `{other}`"),
+        }),
     }
 }
 
-pub(super) fn intent_for_tool(tool: &str) -> io::Result<ToolIntent> {
+pub(super) fn intent_for_tool(tool: &str) -> AgentResult<ToolIntent> {
     find_tool_spec(tool)
         .map(|spec| spec.default_intent)
-        .ok_or_else(|| io::Error::other(format!("unknown routed tool `{tool}`")))
+        .ok_or_else(|| AgentError::ToolArguments {
+            message: format!("unknown routed tool `{tool}`"),
+        })
 }
 
-fn parse_intent(value: &str) -> io::Result<ToolIntent> {
-    ToolIntent::parse(value)
-        .ok_or_else(|| io::Error::other(format!("unsupported intent `{value}`")))
+fn parse_intent(value: &str) -> AgentResult<ToolIntent> {
+    ToolIntent::parse(value).ok_or_else(|| AgentError::InvalidDecision {
+        message: format!("unsupported intent `{value}`"),
+    })
 }
