@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use subbake_core::CancellationGuard;
 use subbake_core::error::{CoreError, CoreResult};
-use subbake_core::ports::{ChatMessage, GenerationRequest, LlmBackend, ResponseContract};
+use subbake_core::ports::{ChatMessage, GenerationRequest, LlmBackend};
 
 use crate::mock::MockBackend;
 
@@ -165,13 +166,16 @@ pub fn check_provider(request: ProviderCheckRequest) -> CoreResult<ProviderCheck
     }
     // Deliberately a real minimal generation, rather than a model-list request:
     // it validates the configured endpoint, model, auth and protocol together.
-    let response = backend.generate(GenerationRequest {
-        messages: vec![ChatMessage::user(
-            "Return exactly this JSON object: {\"ok\":true}",
-        )],
-        response_contract: ResponseContract::JsonObject,
-    })?;
-    if response.json["ok"].as_bool() != Some(true) {
+    let response = backend
+        .execute(
+            GenerationRequest::json(vec![ChatMessage::user(
+                "Return exactly this JSON object: {\"ok\":true}",
+            )]),
+            &CancellationGuard::never(),
+        )
+        .map_err(CoreError::from)?;
+    let (json, _) = response.into_json().map_err(CoreError::from)?;
+    if json["ok"].as_bool() != Some(true) {
         return Err(CoreError::Backend(
             "provider check response did not satisfy the JSON probe".to_owned(),
         ));

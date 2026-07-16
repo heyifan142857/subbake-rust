@@ -22,12 +22,12 @@ pub use entities::{
     ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
     SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
 };
-pub use error::{CoreError, CoreResult};
+pub use error::{CoreError, CoreResult, LlmCallError};
 pub use memory::ContextMemory;
 pub use ports::{
-    GenerationRequest, GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport,
-    ResponseContract, ToolChoice, ToolContinuation, ToolDefinition, ToolGenerationInput,
-    ToolGenerationRequest, ToolGenerationResponse,
+    BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,
+    GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract,
+    ToolChoice, ToolConfiguration, ToolContinuation, ToolDefinition,
 };
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,

@@ -1,11 +1,12 @@
+use subbake_core::CancellationGuard;
 use subbake_core::editing::SubtitleEditPayload;
 use subbake_core::entities::{
     BatchTranslationResult, GlossaryEntry, ReviewResult, TerminologyPreflightResult,
     TranslationLine, Usage,
 };
-use subbake_core::error::{CoreError, CoreResult};
+use subbake_core::error::{CoreError, CoreResult, LlmCallError};
 use subbake_core::languages::{language_short_code, normalize_language_name};
-use subbake_core::ports::{BackendJsonResult, BackendPayload, ChatMessage, LlmBackend};
+use subbake_core::ports::{GenerationInput, GenerationRequest, GenerationResponse, LlmBackend};
 
 use serde_json::Value as JsonValue;
 
@@ -41,7 +42,25 @@ impl LlmBackend for MockBackend {
         &self.model
     }
 
-    fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+    fn execute(
+        &mut self,
+        request: GenerationRequest,
+        cancellation: &CancellationGuard,
+    ) -> Result<GenerationResponse, LlmCallError> {
+        cancellation.check().map_err(LlmCallError::from)?;
+        if request.tools.is_some() {
+            return Err(LlmCallError::UnsupportedCapability(
+                "native tools".to_owned(),
+            ));
+        }
+        let messages = match request.input {
+            GenerationInput::Messages(messages) => messages,
+            GenerationInput::Continue { .. } => {
+                return Err(LlmCallError::ContinuationMismatch(
+                    "mock backend cannot continue native tool calls".to_owned(),
+                ));
+            }
+        };
         let prompt = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -49,59 +68,29 @@ impl LlmBackend for MockBackend {
             .join("\n");
         let task = extract_between(&prompt, "TASK_START", "TASK_END")?.trim();
         let payload = match task {
-            "translate_subtitles" => BackendPayload::Translation(translate_subtitles(&prompt)?),
-            "review_translations" => BackendPayload::Review(review_translations(&prompt)?),
-            "extract_terminology" => {
-                BackendPayload::Terminology(TerminologyPreflightResult::default())
-            }
+            "translate_subtitles" => serde_json::to_value(translate_subtitles(&prompt)?),
+            "review_translations" => serde_json::to_value(review_translations(&prompt)?),
+            "extract_terminology" => serde_json::to_value(TerminologyPreflightResult::default()),
+            "agent_edit_subtitle" => serde_json::to_value(edit_subtitles(&prompt)?),
             other => {
-                return Err(CoreError::Backend(format!(
+                return Err(LlmCallError::UnsupportedCapability(format!(
                     "unsupported mock task `{other}`"
                 )));
             }
-        };
+        }
+        .map_err(|error| {
+            LlmCallError::InvalidResponse(format!("mock response encode failed: {error}"))
+        })?;
         let input_tokens = estimate_tokens(&prompt);
-        let output_tokens = estimate_tokens(&format!("{payload:?}"));
-        Ok(BackendJsonResult {
+        let output_tokens = estimate_tokens(&payload.to_string());
+        Ok(GenerationResponse::json(
             payload,
-            usage: Usage {
+            Usage {
                 input_tokens,
                 output_tokens,
                 total_tokens: input_tokens + output_tokens,
             },
-        })
-    }
-
-    fn generate_raw_json(
-        &mut self,
-        messages: &[ChatMessage],
-    ) -> CoreResult<(serde_json::Value, Usage)> {
-        let prompt = messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let task = extract_between(&prompt, "TASK_START", "TASK_END")?.trim();
-        if task == "agent_edit_subtitle" {
-            let payload = serde_json::to_value(edit_subtitles(&prompt)?).map_err(|error| {
-                CoreError::Backend(format!("mock response encode failed: {error}"))
-            })?;
-            let usage = Usage {
-                input_tokens: estimate_tokens(&prompt),
-                output_tokens: estimate_tokens(&payload.to_string()),
-                total_tokens: estimate_tokens(&prompt) + estimate_tokens(&payload.to_string()),
-            };
-            return Ok((payload, usage));
-        }
-
-        let result = self.generate_json(messages)?;
-        let payload = match result.payload {
-            BackendPayload::Translation(batch) => serde_json::to_value(batch),
-            BackendPayload::Review(review) => serde_json::to_value(review),
-            BackendPayload::Terminology(terminology) => serde_json::to_value(terminology),
-        }
-        .map_err(|error| CoreError::Backend(format!("mock response encode failed: {error}")))?;
-        Ok((payload, result.usage))
+        ))
     }
 
     fn check_credentials(&self) -> CoreResult<(bool, String)> {
@@ -230,6 +219,7 @@ fn estimate_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subbake_core::ports::ChatMessage;
 
     fn translate_prompt(text: &str, target_language: &str) -> String {
         let context = serde_json::json!({
@@ -270,10 +260,15 @@ mod tests {
             ChatMessage::system(""),
             ChatMessage::user(translate_prompt("hello world", "Chinese")),
         ];
-        let result = backend.generate_json(&messages).expect("mock generate");
-        let BackendPayload::Translation(batch) = result.payload else {
-            panic!("expected translation payload");
-        };
+        let response = backend
+            .execute(
+                GenerationRequest::json(messages),
+                &CancellationGuard::never(),
+            )
+            .expect("mock generate");
+        let (json, _) = response.into_json().expect("JSON response");
+        let batch: BatchTranslationResult =
+            serde_json::from_value(json).expect("translation payload");
 
         assert_eq!(batch.lines.len(), 1);
         assert!(batch.lines[0].translation.contains("[MOCK-"));
@@ -288,10 +283,15 @@ mod tests {
             ChatMessage::system(""),
             ChatMessage::user(translate_prompt("  ", "Chinese")),
         ];
-        let result = backend.generate_json(&messages).expect("mock generate");
-        let BackendPayload::Translation(batch) = result.payload else {
-            panic!("expected translation payload");
-        };
+        let response = backend
+            .execute(
+                GenerationRequest::json(messages),
+                &CancellationGuard::never(),
+            )
+            .expect("mock generate");
+        let (json, _) = response.into_json().expect("JSON response");
+        let batch: BatchTranslationResult =
+            serde_json::from_value(json).expect("translation payload");
 
         assert_eq!(batch.lines[0].translation, "");
         assert!(batch.glossary_updates.is_empty());
@@ -304,10 +304,14 @@ mod tests {
             ChatMessage::system(""),
             ChatMessage::user(review_prompt("[MOCK-ZH] Meet Alice.")),
         ];
-        let result = backend.generate_json(&messages).expect("mock review");
-        let BackendPayload::Review(review) = result.payload else {
-            panic!("expected review payload");
-        };
+        let response = backend
+            .execute(
+                GenerationRequest::json(messages),
+                &CancellationGuard::never(),
+            )
+            .expect("mock review");
+        let (json, _) = response.into_json().expect("JSON response");
+        let review: ReviewResult = serde_json::from_value(json).expect("review payload");
 
         assert_eq!(review.lines[0].translation, "[MOCK-ZH] Meet Alice.");
         assert!(!review.review_notes.is_empty());

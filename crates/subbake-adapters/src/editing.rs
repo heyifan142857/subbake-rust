@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_payload};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
-use subbake_core::ports::LlmBackend;
+use subbake_core::ports::{GenerationRequest, LlmBackend};
 use subbake_core::{CancellationGuard, CoreError};
 
 use crate::fs::{is_supported_subtitle_path, read_document, render_and_write_document};
@@ -65,7 +65,11 @@ pub fn edit_subtitle_cancellable(
     let mut backend =
         build_backend(&request.settings.backend_config()).map_err(io::Error::other)?;
     let (payload, _) = backend
-        .generate_raw_json_cancellable(&messages, cancellation)
+        .execute(GenerationRequest::json(messages), cancellation)
+        .map_err(subbake_core::CoreError::from)
+        .map_err(core_error)?
+        .into_json()
+        .map_err(subbake_core::CoreError::from)
         .map_err(core_error)?;
     let payload =
         parse_subtitle_edit_payload(payload, &document.segments).map_err(io::Error::other)?;

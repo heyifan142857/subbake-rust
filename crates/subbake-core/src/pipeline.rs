@@ -12,8 +12,8 @@ use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
 use crate::memory::{ContextMemory, english_possessive_base};
 use crate::ports::{
-    BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, ChatMessage, DashboardSink,
-    LlmBackend, RuntimeStore,
+    BackendJsonResult, BackendPayload, BatchExecutionOptions, BatchShardKind, CacheStage,
+    ChatMessage, DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
@@ -82,6 +82,17 @@ where
     pub fn with_progress(mut self, progress: Box<dyn ProgressSink>) -> Self {
         self.progress = Some(progress);
         self
+    }
+
+    fn execute_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(serde_json::Value, Usage)> {
+        self.backend
+            .execute(
+                GenerationRequest::json(messages.to_vec()),
+                &self.cancellation,
+            )
+            .map_err(CoreError::from)?
+            .into_json()
+            .map_err(CoreError::from)
     }
 
     fn report(
@@ -558,21 +569,19 @@ where
             let mut response = None;
             for _ in 0..=self.options.retries {
                 self.cancellation.check()?;
-                match self
-                    .backend
-                    .generate_raw_json_cancellable(&messages, &self.cancellation)
-                    .and_then(|(json, usage)| {
-                        let payload = parse_terminology_payload(&json, &candidates)?;
-                        Ok(BackendJsonResult {
-                            payload: BackendPayload::Terminology(payload),
-                            usage,
-                        })
-                    }) {
+                match self.execute_json(&messages).and_then(|(json, usage)| {
+                    let payload = parse_terminology_payload(&json, &candidates)?;
+                    Ok(BackendJsonResult {
+                        payload: BackendPayload::Terminology(payload),
+                        usage,
+                    })
+                }) {
                     Ok(value) => {
                         response = Some(value);
                         break;
                     }
                     Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                    Err(error) if is_operational_llm_failure(&error) => return Err(error),
                     Err(error) => last_error = Some(error),
                 }
             }
@@ -669,8 +678,6 @@ where
         &mut self,
         batches: &[(usize, Vec<SubtitleSegment>)],
     ) -> CoreResult<HashMap<usize, BatchWithUsage>> {
-        use crate::ports::{GenerationRequest, ResponseContract};
-
         if !self.backend.supports_parallel_generation() {
             let mut results = HashMap::new();
             for (batch_index, batch) in batches {
@@ -722,16 +729,16 @@ where
         }
         let requests = pending
             .iter()
-            .map(|(_, _, _, messages)| GenerationRequest {
-                messages: messages.clone(),
-                response_contract: ResponseContract::JsonObject,
-            })
+            .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
-        let responses = self.backend.generate_many_cancellable(
-            requests,
-            self.options.translation_concurrency,
-            &self.cancellation,
-        )?;
+        let responses = self
+            .backend
+            .execute_many(
+                requests,
+                BatchExecutionOptions::new(self.options.translation_concurrency),
+                &self.cancellation,
+            )
+            .map_err(CoreError::from)?;
         if responses.len() != pending.len() {
             return Err(CoreError::Backend(format!(
                 "backend returned {} responses for {} translation requests",
@@ -740,10 +747,11 @@ where
             )));
         }
         for ((batch_index, batch, hash, _), response) in pending.into_iter().zip(responses) {
-            match response.and_then(|response| {
-                let payload = parse_translation_payload(&response.json)?;
+            match response.map_err(CoreError::from).and_then(|response| {
+                let (json, usage) = response.into_json().map_err(CoreError::from)?;
+                let payload = parse_translation_payload(&json)?;
                 validate_translation_batch(&batch, &payload.lines)?;
-                Ok((payload, response.usage))
+                Ok((payload, usage))
             }) {
                 Ok((payload, response_usage)) => {
                     let backend_result = BackendJsonResult {
@@ -787,6 +795,11 @@ where
         record_failure: bool,
         initial_error: Option<CoreError>,
     ) -> CoreResult<BatchWithUsage> {
+        if let Some(error) = initial_error.as_ref()
+            && is_operational_llm_failure(error)
+        {
+            return Err(error.clone());
+        }
         let mut last_error = initial_error;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
@@ -806,6 +819,9 @@ where
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     if matches!(error, CoreError::Cancelled) {
+                        return Err(error);
+                    }
+                    if is_operational_llm_failure(&error) {
                         return Err(error);
                     }
                     let failure_messages = messages.clone();
@@ -900,9 +916,13 @@ where
                 self.cache_hits += 1;
                 response
             }
-            None => self
-                .backend
-                .generate_json_cancellable(messages, &self.cancellation)?,
+            None => {
+                let (json, usage) = self.execute_json(messages)?;
+                BackendJsonResult {
+                    payload: BackendPayload::Translation(parse_translation_payload(&json)?),
+                    usage,
+                }
+            }
         };
         let BackendPayload::Translation(result) = &backend_result.payload else {
             return Err(CoreError::Data(
@@ -975,6 +995,11 @@ where
         batch: &ReviewBatchPlan,
         initial_error: Option<CoreError>,
     ) -> CoreResult<ReviewWithUsage> {
+        if let Some(error) = initial_error.as_ref()
+            && is_operational_llm_failure(error)
+        {
+            return Err(error.clone());
+        }
         let mut last_error = initial_error;
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
@@ -995,6 +1020,9 @@ where
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     if matches!(error, CoreError::Cancelled) {
+                        return Err(error);
+                    }
+                    if is_operational_llm_failure(&error) {
                         return Err(error);
                     }
                     let failure_messages = messages.clone();
@@ -1029,7 +1057,6 @@ where
         &mut self,
         batches: &[(usize, ReviewBatchPlan)],
     ) -> CoreResult<HashMap<usize, ReviewWithUsage>> {
-        use crate::ports::{GenerationRequest, ResponseContract};
         if !self.backend.supports_parallel_generation() {
             let mut output = HashMap::new();
             for (index, batch) in batches {
@@ -1079,16 +1106,16 @@ where
         }
         let requests = pending
             .iter()
-            .map(|(_, _, _, messages)| GenerationRequest {
-                messages: messages.clone(),
-                response_contract: ResponseContract::JsonObject,
-            })
+            .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
-        let responses = self.backend.generate_many_cancellable(
-            requests,
-            self.options.review_concurrency,
-            &self.cancellation,
-        )?;
+        let responses = self
+            .backend
+            .execute_many(
+                requests,
+                BatchExecutionOptions::new(self.options.review_concurrency),
+                &self.cancellation,
+            )
+            .map_err(CoreError::from)?;
         if responses.len() != pending.len() {
             return Err(CoreError::Backend(format!(
                 "backend returned {} responses for {} review requests",
@@ -1097,12 +1124,13 @@ where
             )));
         }
         for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
-            match response.and_then(|response| {
-                let mut result = parse_review_payload(&response.json)?;
+            match response.map_err(CoreError::from).and_then(|response| {
+                let (json, usage) = response.into_json().map_err(CoreError::from)?;
+                let mut result = parse_review_payload(&json)?;
                 validate_review_candidate_ids(&batch, &result.lines)?;
                 result.lines = merge_review_patch(&batch.translated, &result.lines)?;
                 validate_translation_batch(&batch.source, &result.lines)?;
-                Ok((result, response.usage))
+                Ok((result, usage))
             }) {
                 Ok((result, response_usage)) => {
                     if self.options.use_cache
@@ -1156,9 +1184,7 @@ where
                 response
             }
             None => {
-                let (payload, usage) = self
-                    .backend
-                    .generate_raw_json_cancellable(messages, &self.cancellation)?;
+                let (payload, usage) = self.execute_json(messages)?;
                 let mut review = parse_review_payload(&payload)?;
                 validate_review_candidate_ids(batch, &review.lines)?;
                 review.lines = merge_review_patch(&batch.translated, &review.lines)?;
@@ -1348,18 +1374,15 @@ where
                     self.cache_hits += 1;
                     Ok(response)
                 }
-                None => self
-                    .backend
-                    .generate_raw_json_cancellable(&messages, &self.cancellation)
-                    .and_then(|(payload, usage)| {
-                        total_usage.add(usage);
-                        let payload = if stage == "translate" {
-                            BackendPayload::Translation(parse_translation_payload(&payload)?)
-                        } else {
-                            BackendPayload::Review(parse_review_payload(&payload)?)
-                        };
-                        Ok(BackendJsonResult { payload, usage })
-                    }),
+                None => self.execute_json(&messages).and_then(|(payload, usage)| {
+                    total_usage.add(usage);
+                    let payload = if stage == "translate" {
+                        BackendPayload::Translation(parse_translation_payload(&payload)?)
+                    } else {
+                        BackendPayload::Review(parse_review_payload(&payload)?)
+                    };
+                    Ok(BackendJsonResult { payload, usage })
+                }),
             };
 
             match response_result.and_then(|response| {
@@ -1414,6 +1437,7 @@ where
                     }));
                 }
                 Err(error) => {
+                    let stop_after_attempt = is_operational_llm_failure(&error);
                     repair_error = error;
                     attempts.push(AttemptLog {
                         attempt,
@@ -1430,6 +1454,9 @@ where
                         attempts: attempts.clone(),
                         final_error: Some(repair_error.to_string()),
                     })?;
+                    if stop_after_attempt {
+                        break;
+                    }
                 }
             }
         }
@@ -1859,6 +1886,7 @@ fn failure_error(
 fn is_agent_repairable(error: &CoreError) -> bool {
     match error {
         CoreError::InvalidTranslation(_) => true,
+        CoreError::Llm(crate::error::LlmCallError::InvalidResponse(_)) => true,
         CoreError::Backend(message) => {
             message.contains("invalid JSON in response")
                 || message.contains("response JSON object")
@@ -1866,6 +1894,14 @@ fn is_agent_repairable(error: &CoreError) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_operational_llm_failure(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Llm(llm_error)
+            if !matches!(llm_error, crate::error::LlmCallError::InvalidResponse(_))
+    )
 }
 
 fn merge_review_patch(
@@ -2051,11 +2087,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::entities::{BatchTranslationResult, GlossaryEntry};
-    use crate::ports::{BackendJsonResult, NoopDashboard};
+    use crate::error::LlmCallError;
+    use crate::ports::{GenerationInput, GenerationResponse, NoopDashboard};
     use crate::review::build_review_plan;
     use crate::storage::{RunState, RuntimePaths, build_runtime_paths, input_signature_from_bytes};
 
     use super::*;
+
+    fn request_messages(request: GenerationRequest) -> Result<Vec<ChatMessage>, LlmCallError> {
+        match request.input {
+            GenerationInput::Messages(messages) => Ok(messages),
+            GenerationInput::Continue { .. } => Err(LlmCallError::UnsupportedCapability(
+                "test continuation".to_owned(),
+            )),
+        }
+    }
 
     struct EchoBackend;
 
@@ -2068,7 +2114,13 @@ mod tests {
             "echo"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            let messages = request_messages(request)?;
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
@@ -2096,18 +2148,20 @@ mod tests {
                     TranslationLine { id, translation }
                 })
                 .collect();
-            Ok(BackendJsonResult {
-                payload: BackendPayload::Translation(BatchTranslationResult {
-                    lines,
-                    summary: "ok".to_owned(),
-                    glossary_updates: Vec::<GlossaryEntry>::new(),
-                }),
-                usage: Usage {
+            let payload = serde_json::to_value(BatchTranslationResult {
+                lines,
+                summary: "ok".to_owned(),
+                glossary_updates: Vec::<GlossaryEntry>::new(),
+            })
+            .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+            Ok(GenerationResponse::json(
+                payload,
+                Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                     total_tokens: 2,
                 },
-            })
+            ))
         }
     }
 
@@ -2126,16 +2180,20 @@ mod tests {
             "short-parallel"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoBackend.generate_json(messages)
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            EchoBackend.execute(request, cancellation)
         }
 
-        fn generate_many_cancellable(
+        fn execute_many(
             &mut self,
-            _requests: Vec<crate::ports::GenerationRequest>,
-            _max_concurrency: usize,
+            _requests: Vec<GenerationRequest>,
+            _options: BatchExecutionOptions,
             _cancellation: &CancellationGuard,
-        ) -> CoreResult<Vec<CoreResult<crate::ports::GenerationResponse>>> {
+        ) -> Result<Vec<Result<GenerationResponse, LlmCallError>>, LlmCallError> {
             Ok(Vec::new())
         }
     }
@@ -2154,12 +2212,19 @@ mod tests {
             "echo"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_on_call == Some(call) {
-                return Err(CoreError::Backend("scripted failure".to_owned()));
+                return Err(LlmCallError::Rejected {
+                    status: None,
+                    message: "scripted failure".to_owned(),
+                });
             }
-            EchoBackend.generate_json(messages)
+            EchoBackend.execute(request, cancellation)
         }
     }
 
@@ -2178,18 +2243,26 @@ mod tests {
             "echo"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            self.translation_calls.fetch_add(1, Ordering::SeqCst);
-            EchoBackend.generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(serde_json::Value, Usage)> {
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
+            if !messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("TASK_START\nreview_translations\nTASK_END")
+            }) {
+                self.translation_calls.fetch_add(1, Ordering::SeqCst);
+                return EchoBackend.execute(GenerationRequest::json(messages), cancellation);
+            }
             let call = self.review_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if self.fail_on_review_call == Some(call) {
-                return Err(CoreError::Backend("scripted review failure".to_owned()));
+                return Err(LlmCallError::Rejected {
+                    status: None,
+                    message: "scripted review failure".to_owned(),
+                });
             }
             let prompt = messages
                 .iter()
@@ -2217,7 +2290,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            Ok((
+            Ok(GenerationResponse::json(
                 serde_json::json!({
                     "lines": lines,
                     "review_notes": "reviewed",
@@ -2242,22 +2315,27 @@ mod tests {
             "no-change"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoBackend.generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            _messages: &[ChatMessage],
-        ) -> CoreResult<(serde_json::Value, Usage)> {
-            Ok((
-                serde_json::json!({"changes": []}),
-                Usage {
-                    input_tokens: 5,
-                    output_tokens: 1,
-                    total_tokens: 6,
-                },
-            ))
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
+            if messages.iter().any(|message| {
+                message
+                    .content
+                    .contains("TASK_START\nreview_translations\nTASK_END")
+            }) {
+                return Ok(GenerationResponse::json(
+                    serde_json::json!({"changes": []}),
+                    Usage {
+                        input_tokens: 5,
+                        output_tokens: 1,
+                        total_tokens: 6,
+                    },
+                ));
+            }
+            EchoBackend.execute(GenerationRequest::json(messages), cancellation)
         }
     }
 
@@ -2278,12 +2356,43 @@ mod tests {
             "preflight"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
+            if prompt.contains("TERMINOLOGY_JSON_START") {
+                let body = prompt
+                    .split("TERMINOLOGY_JSON_START")
+                    .nth(1)
+                    .and_then(|value| value.split("TERMINOLOGY_JSON_END").next())
+                    .ok_or_else(|| CoreError::Data("missing terminology json".to_owned()))?;
+                let parsed: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|error| CoreError::Data(format!("invalid terminology: {error}")))?;
+                let candidates = parsed["candidates"]
+                    .as_array()
+                    .ok_or_else(|| CoreError::Data("missing terminology candidates".to_owned()))?;
+                let entries = candidates
+                    .iter()
+                    .map(|candidate| {
+                        serde_json::json!({
+                            "source": candidate["source"],
+                            "target": "统一译名",
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(GenerationResponse::json(
+                    serde_json::json!({"entries": entries}),
+                    Usage::default(),
+                ));
+            }
+            cancellation.check().map_err(LlmCallError::from)?;
             let context = prompt
                 .split("CONTEXT_JSON_START")
                 .nth(1)
@@ -2312,45 +2421,13 @@ mod tests {
                     translation: format!("统一译名 {}", line["text"].as_str().unwrap_or_default()),
                 })
                 .collect();
-            Ok(BackendJsonResult {
-                payload: BackendPayload::Translation(BatchTranslationResult {
-                    lines,
-                    summary: String::new(),
-                    glossary_updates: Vec::new(),
-                }),
-                usage: Usage::default(),
+            let payload = serde_json::to_value(BatchTranslationResult {
+                lines,
+                summary: String::new(),
+                glossary_updates: Vec::new(),
             })
-        }
-
-        fn generate_raw_json(
-            &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(serde_json::Value, Usage)> {
-            let prompt = messages
-                .iter()
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let body = prompt
-                .split("TERMINOLOGY_JSON_START")
-                .nth(1)
-                .and_then(|value| value.split("TERMINOLOGY_JSON_END").next())
-                .ok_or_else(|| CoreError::Data("missing terminology json".to_owned()))?;
-            let parsed: serde_json::Value = serde_json::from_str(body)
-                .map_err(|error| CoreError::Data(format!("invalid terminology: {error}")))?;
-            let candidates = parsed["candidates"]
-                .as_array()
-                .ok_or_else(|| CoreError::Data("missing terminology candidates".to_owned()))?;
-            let entries = candidates
-                .iter()
-                .map(|candidate| {
-                    serde_json::json!({
-                        "source": candidate["source"],
-                        "target": "统一译名",
-                    })
-                })
-                .collect::<Vec<_>>();
-            Ok((serde_json::json!({"entries": entries}), Usage::default()))
+            .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+            Ok(GenerationResponse::json(payload, Usage::default()))
         }
     }
 
@@ -2367,22 +2444,30 @@ mod tests {
             "structural"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            let mut response = EchoBackend.generate_json(messages)?;
-            let BackendPayload::Translation(result) = &mut response.payload else {
-                unreachable!();
-            };
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let response = EchoBackend.execute(request, cancellation)?;
+            let (mut payload, usage) = response.into_json()?;
+            let result = payload["lines"].as_array_mut().ok_or_else(|| {
+                LlmCallError::InvalidResponse("missing translation lines".to_owned())
+            })?;
             self.call_sizes
                 .lock()
                 .expect("call sizes lock")
-                .push(result.lines.len());
-            if result.lines.len() > 1 {
-                result.lines.pop();
+                .push(result.len());
+            if result.len() > 1 {
+                result.pop();
             } else {
-                result.lines[0].translation =
-                    result.lines[0].translation.replacen("[ECHO]", "[SPLIT]", 1);
+                let translation = result[0]["translation"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replacen("[ECHO]", "[SPLIT]", 1);
+                result[0]["translation"] = serde_json::Value::String(translation);
             }
-            Ok(response)
+            Ok(GenerationResponse::json(payload, usage))
         }
     }
 
@@ -2401,28 +2486,31 @@ mod tests {
             "repair"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            self.regular_calls.fetch_add(1, Ordering::SeqCst);
-            let mut response = EchoBackend.generate_json(messages)?;
-            let BackendPayload::Translation(result) = &mut response.payload else {
-                unreachable!();
-            };
-            for line in &mut result.lines {
-                line.translation.clear();
-            }
-            Ok(response)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(serde_json::Value, Usage)> {
-            self.repair_calls.fetch_add(1, Ordering::SeqCst);
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
+            if !prompt.contains("AGENT_REPAIR_JSON_START") {
+                self.regular_calls.fetch_add(1, Ordering::SeqCst);
+                let response =
+                    EchoBackend.execute(GenerationRequest::json(messages), cancellation)?;
+                let (mut payload, usage) = response.into_json()?;
+                let lines = payload["lines"].as_array_mut().ok_or_else(|| {
+                    LlmCallError::InvalidResponse("missing translation lines".to_owned())
+                })?;
+                for line in lines {
+                    line["translation"] = serde_json::Value::String(String::new());
+                }
+                return Ok(GenerationResponse::json(payload, usage));
+            }
+            self.repair_calls.fetch_add(1, Ordering::SeqCst);
             let body = prompt
                 .split("AGENT_REPAIR_JSON_START")
                 .nth(1)
@@ -2446,7 +2534,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            Ok((
+            Ok(GenerationResponse::json(
                 serde_json::json!({
                     "lines": lines,
                     "summary": "agent repaired",
@@ -2475,14 +2563,12 @@ mod tests {
             "review-repair"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoBackend.generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(serde_json::Value, Usage)> {
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
@@ -2503,10 +2589,13 @@ mod tests {
                     .iter()
                     .map(|line| serde_json::json!({"id": line["id"], "translation": ""}))
                     .collect::<Vec<_>>();
-                return Ok((
+                return Ok(GenerationResponse::json(
                     serde_json::json!({"lines": lines, "review_notes": "broken"}),
                     Usage::default(),
                 ));
+            }
+            if !prompt.contains("AGENT_REPAIR_JSON_START") {
+                return EchoBackend.execute(GenerationRequest::json(messages), cancellation);
             }
 
             self.repair_calls.fetch_add(1, Ordering::SeqCst);
@@ -2529,7 +2618,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            Ok((
+            Ok(GenerationResponse::json(
                 serde_json::json!({"lines": lines, "review_notes": "agent repaired"}),
                 Usage {
                     input_tokens: 2,
@@ -2793,7 +2882,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_retries_transient_backend_failure() {
+    fn pipeline_does_not_duplicate_adapter_level_llm_retries() {
         let document = document("retry.txt", &["hello"]);
         let mut options = PipelineOptions::new("retry.txt".into());
         options.review_policy = ReviewPolicy::Off;
@@ -2808,10 +2897,15 @@ mod tests {
             options,
         );
 
-        let run = pipeline.run_document(&document).expect("retry succeeds");
+        let error = pipeline
+            .run_document(&document)
+            .expect_err("operational LLM errors belong to the adapter retry policy");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
+        assert!(matches!(
+            error,
+            CoreError::Llm(crate::error::LlmCallError::Rejected { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

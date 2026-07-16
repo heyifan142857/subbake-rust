@@ -13,11 +13,12 @@ use std::path::PathBuf;
 
 use serde_json::{Value as JsonValue, json};
 use subbake_adapters::{ConfigFile, TranslationSettings, append_profile_snapshot};
-use subbake_core::entities::{BatchTranslationResult, TranslationLine, Usage};
-use subbake_core::error::CoreResult;
+use subbake_core::entities::Usage;
+use subbake_core::error::LlmCallError;
 use subbake_core::ports::{
-    BackendJsonResult, BackendPayload, ChatMessage, LlmBackend, ModelToolCall, ModelToolResult,
-    NativeToolSupport, ToolChoice, ToolContinuation, ToolGenerationInput, ToolGenerationRequest,
+    ChatMessage, GenerationContent, GenerationInput, GenerationRequest, GenerationResponse,
+    LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract, ToolChoice,
+    ToolContinuation,
 };
 
 use crate::discovery::summarize_observation;
@@ -64,27 +65,25 @@ impl LlmBackend for EchoDecisionBackend {
         &self.model
     }
 
-    fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-        let (decision, usage) = self.generate_raw_json(messages)?;
-        let text = serde_json::to_string(&decision).unwrap_or_default();
-
-        Ok(BackendJsonResult {
-            payload: BackendPayload::Translation(BatchTranslationResult {
-                lines: vec![TranslationLine {
-                    id: "1".to_owned(),
-                    translation: text,
-                }],
-                summary: "echo decision".to_owned(),
-                glossary_updates: Vec::new(),
-            }),
-            usage,
-        })
-    }
-
-    fn generate_raw_json(
+    fn execute(
         &mut self,
-        messages: &[ChatMessage],
-    ) -> CoreResult<(serde_json::Value, Usage)> {
+        request: GenerationRequest,
+        cancellation: &subbake_core::CancellationGuard,
+    ) -> Result<GenerationResponse, LlmCallError> {
+        cancellation.check().map_err(LlmCallError::from)?;
+        if request.tools.is_some() {
+            return Err(LlmCallError::UnsupportedCapability(
+                "native tools".to_owned(),
+            ));
+        }
+        let messages = match request.input {
+            GenerationInput::Messages(messages) => messages,
+            GenerationInput::Continue { .. } => {
+                return Err(LlmCallError::ContinuationMismatch(
+                    "echo backend cannot continue native tool calls".to_owned(),
+                ));
+            }
+        };
         // Extract the user message (last user message).
         let user_text = messages
             .iter()
@@ -99,7 +98,7 @@ impl LlmBackend for EchoDecisionBackend {
             "confidence": 1.0
         });
         let input_tokens = user_text.chars().count().div_ceil(4).max(1);
-        Ok((
+        Ok(GenerationResponse::json(
             decision,
             Usage {
                 input_tokens,
@@ -108,6 +107,16 @@ impl LlmBackend for EchoDecisionBackend {
             },
         ))
     }
+}
+
+fn execute_json(
+    backend: &mut dyn LlmBackend,
+    messages: Vec<ChatMessage>,
+    cancellation: &subbake_core::CancellationGuard,
+) -> Result<(JsonValue, Usage), LlmCallError> {
+    backend
+        .execute(GenerationRequest::json(messages), cancellation)?
+        .into_json()
 }
 
 // ---------------------------------------------------------------------------
@@ -669,10 +678,10 @@ impl AgentEngine {
         if let Some(ref mut observer) = self.observer {
             observer.on_thinking("Understanding your request…");
         }
-        let first = backend.generate_raw_json_cancellable(&messages, &self.operation_guard);
+        let first = execute_json(backend, messages, &self.operation_guard);
         let (value, _) = match first {
             Ok(value) => value,
-            Err(subbake_core::CoreError::Cancelled) => {
+            Err(LlmCallError::Cancelled) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "operation cancelled",
@@ -688,14 +697,14 @@ impl AgentEngine {
             Ok(route) => Ok(route),
             Err(error) => {
                 let repair = self.build_route_messages(input, Some(&error.to_string()));
-                match backend.generate_raw_json_cancellable(&repair, &self.operation_guard) {
+                match execute_json(backend, repair, &self.operation_guard) {
                     Ok((value, _)) => parse_route(&value, input).or_else(|_| {
                         Ok(Route::AskUser(
                             "Could you clarify whether you want to discuss something or act on the current project?"
                                 .to_owned(),
                         ))
                     }),
-                    Err(subbake_core::CoreError::Cancelled) => Err(io::Error::new(
+                    Err(LlmCallError::Cancelled) => Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "operation cancelled",
                     )),
@@ -811,16 +820,7 @@ impl AgentEngine {
         intent: ToolIntent,
     ) -> io::Result<Decision> {
         if backend.native_tool_support() != NativeToolSupport::Unsupported {
-            let input = if let Some(turn) = native_turn.take() {
-                ToolGenerationInput::Continue {
-                    continuation: turn.continuation,
-                    results: turn.results,
-                }
-            } else {
-                ToolGenerationInput::Start {
-                    messages: self.build_native_messages(user_input, state, intent),
-                }
-            };
+            let was_continuation = native_turn.is_some();
             let tools = if state.force_no_tools {
                 Vec::new()
             } else {
@@ -832,33 +832,50 @@ impl AgentEngine {
             if let Some(ref mut observer) = self.observer {
                 observer.on_thinking("Deciding next action…");
             }
-            match backend.generate_with_tools_cancellable(
-                ToolGenerationRequest {
-                    input,
+            let choice = if state.force_no_tools {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            };
+            let request = if let Some(turn) = native_turn.take() {
+                GenerationRequest::continue_with_tools(
+                    turn.continuation,
+                    turn.results,
                     tools,
-                    tool_choice: if state.force_no_tools {
-                        ToolChoice::None
-                    } else {
-                        ToolChoice::Auto
-                    },
-                },
-                &self.operation_guard,
-            ) {
+                    choice,
+                    ResponseContract::Text,
+                )
+            } else {
+                GenerationRequest::text(self.build_native_messages(user_input, state, intent))
+                    .with_tools(tools, choice)
+            };
+            match backend.execute(request, &self.operation_guard) {
                 Ok(response) => {
-                    if !response.tool_calls.is_empty() {
+                    let GenerationResponse {
+                        content,
+                        tool_calls,
+                        continuation,
+                        ..
+                    } = response;
+                    let text = match content {
+                        GenerationContent::Empty => String::new(),
+                        GenerationContent::Text(text) => text,
+                        GenerationContent::Json(json) => json.to_string(),
+                    };
+                    if !tool_calls.is_empty() {
                         return Ok(Decision {
                             action: DecisionAction::NativeToolCalls,
-                            text: response.text.unwrap_or_default(),
+                            text,
                             tool_name: None,
                             arguments: None,
                             tool_calls: Vec::new(),
-                            native_calls: response.tool_calls,
-                            native_continuation: response.continuation,
+                            native_calls: tool_calls,
+                            native_continuation: continuation,
                         });
                     }
                     return Ok(Decision {
                         action: DecisionAction::Respond,
-                        text: response.text.unwrap_or_default(),
+                        text,
                         tool_name: None,
                         arguments: None,
                         tool_calls: Vec::new(),
@@ -866,8 +883,8 @@ impl AgentEngine {
                         native_continuation: None,
                     });
                 }
-                Err(subbake_core::CoreError::UnsupportedCapability(_)) => {}
-                Err(subbake_core::CoreError::Cancelled) => {
+                Err(LlmCallError::UnsupportedCapability(_)) if !was_continuation => {}
+                Err(LlmCallError::Cancelled) => {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "operation cancelled",
@@ -903,7 +920,7 @@ impl AgentEngine {
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
-        let result = backend.generate_raw_json_cancellable(&messages, &self.operation_guard);
+        let result = execute_json(backend, messages, &self.operation_guard);
         match result {
             Ok((decision, _usage)) => match self.parse_decision_value(&decision) {
                 Ok(decision) => Ok(decision),
@@ -917,9 +934,7 @@ impl AgentEngine {
                         Some(&first_error.to_string()),
                         intent,
                     );
-                    match backend
-                        .generate_raw_json_cancellable(&repair_messages, &self.operation_guard)
-                    {
+                    match execute_json(backend, repair_messages, &self.operation_guard) {
                         Ok((repaired, _usage)) => match self.parse_decision_value(&repaired) {
                             Ok(decision) => Ok(decision),
                             Err(second_error) => {
@@ -929,7 +944,7 @@ impl AgentEngine {
                                 Ok(invalid_decision_response(&second_error))
                             }
                         },
-                        Err(subbake_core::CoreError::Cancelled) => Err(io::Error::new(
+                        Err(LlmCallError::Cancelled) => Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "operation cancelled",
                         )),
@@ -948,7 +963,7 @@ impl AgentEngine {
                 }
             },
             Err(e) => {
-                if matches!(e, subbake_core::CoreError::Cancelled) {
+                if matches!(e, LlmCallError::Cancelled) {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "operation cancelled",
@@ -1424,8 +1439,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use subbake_core::ports::ToolGenerationResponse;
-
     struct RawDecisionBackend {
         decision: JsonValue,
     }
@@ -1438,6 +1451,7 @@ mod tests {
     enum NativeScript {
         Calls(Vec<ModelToolCall>),
         Text(String),
+        Error(LlmCallError),
     }
 
     struct NativeSequenceBackend {
@@ -1469,14 +1483,51 @@ mod tests {
             }
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoDecisionBackend::new("test").generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(JsonValue, Usage)> {
+            request: GenerationRequest,
+            cancellation: &subbake_core::CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            if request.tools.is_some() {
+                self.native_calls += 1;
+                if let Some(error) = &self.native_error {
+                    return Err(error.clone().into());
+                }
+                if let GenerationInput::Continue { tool_results, .. } = request.input {
+                    self.continued_results.push(tool_results);
+                }
+                return match self
+                    .scripts
+                    .pop_front()
+                    .unwrap_or_else(|| NativeScript::Text("native done".to_owned()))
+                {
+                    NativeScript::Calls(tool_calls) => Ok(GenerationResponse {
+                        content: GenerationContent::Text(String::new()),
+                        tool_calls,
+                        continuation: Some(ToolContinuation::new(
+                            "native-test",
+                            "test continuation".to_owned(),
+                        )),
+                        usage: Usage::default(),
+                    }),
+                    NativeScript::Text(text) => Ok(GenerationResponse {
+                        content: GenerationContent::Text(text),
+                        tool_calls: Vec::new(),
+                        continuation: None,
+                        usage: Usage::default(),
+                    }),
+                    NativeScript::Error(error) => Err(error),
+                };
+            }
+            let messages = match request.input {
+                GenerationInput::Messages(messages) => messages,
+                GenerationInput::Continue { .. } => {
+                    return Err(LlmCallError::ContinuationMismatch(
+                        "test continuation lacks tools".to_owned(),
+                    ));
+                }
+            };
             self.legacy_calls += 1;
             let routing = messages.iter().any(|message| {
                 message.role == "system" && message.content.contains("semantic router")
@@ -1491,8 +1542,9 @@ mod tests {
                     })
                 }),
                 NativeScript::Text(_) => None,
+                NativeScript::Error(_) => None,
             });
-            Ok((
+            Ok(GenerationResponse::json(
                 if routing {
                     self.legacy_decision
                         .clone()
@@ -1503,38 +1555,6 @@ mod tests {
                 },
                 Usage::default(),
             ))
-        }
-
-        fn generate_with_tools_cancellable(
-            &mut self,
-            request: ToolGenerationRequest,
-            _cancellation: &subbake_core::CancellationGuard,
-        ) -> CoreResult<ToolGenerationResponse> {
-            self.native_calls += 1;
-            if let Some(error) = &self.native_error {
-                return Err(error.clone());
-            }
-            if let ToolGenerationInput::Continue { results, .. } = request.input {
-                self.continued_results.push(results);
-            }
-            match self
-                .scripts
-                .pop_front()
-                .unwrap_or_else(|| NativeScript::Text("native done".to_owned()))
-            {
-                NativeScript::Calls(tool_calls) => Ok(ToolGenerationResponse {
-                    text: None,
-                    tool_calls,
-                    continuation: Some(ToolContinuation::new("test continuation".to_owned())),
-                    usage: Usage::default(),
-                }),
-                NativeScript::Text(text) => Ok(ToolGenerationResponse {
-                    text: Some(text),
-                    tool_calls: Vec::new(),
-                    continuation: None,
-                    usage: Usage::default(),
-                }),
-            }
         }
     }
 
@@ -1564,16 +1584,19 @@ mod tests {
             "sequence"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoDecisionBackend::new("test").generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            messages: &[ChatMessage],
-        ) -> CoreResult<(JsonValue, Usage)> {
-            self.prompts.push(messages.to_vec());
-            Ok((
+            request: GenerationRequest,
+            cancellation: &subbake_core::CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            let GenerationInput::Messages(messages) = request.input else {
+                return Err(LlmCallError::ContinuationMismatch(
+                    "sequence backend cannot continue".to_owned(),
+                ));
+            };
+            self.prompts.push(messages);
+            Ok(GenerationResponse::json(
                 self.decisions
                     .pop_front()
                     .unwrap_or_else(|| json!({"action": "respond", "text": "done"})),
@@ -2182,6 +2205,40 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_continuation_does_not_replay_the_legacy_decision() {
+        let root = temp_root("native-continuation-no-fallback");
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        let mut backend = NativeSequenceBackend {
+            scripts: VecDeque::from([
+                NativeScript::Calls(vec![ModelToolCall {
+                    id: "list_1".to_owned(),
+                    name: "list_files".to_owned(),
+                    arguments: json!({"path": "."}),
+                }]),
+                NativeScript::Error(LlmCallError::UnsupportedCapability(
+                    "continuation rejected".to_owned(),
+                )),
+            ]),
+            continued_results: Vec::new(),
+            legacy_decision: None,
+            native_calls: 0,
+            legacy_calls: 0,
+            native_error: None,
+        };
+
+        let response = engine
+            .run_line("show files", &mut backend)
+            .expect("native continuation failure response");
+
+        assert!(response.contains("continuation rejected"), "{response}");
+        assert_eq!(backend.native_calls, 2);
+        assert_eq!(backend.legacy_calls, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn native_backend_failure_does_not_fall_back() {
         let root = temp_root("native-no-fallback");
         std::fs::create_dir_all(&root).expect("create root");
@@ -2489,15 +2546,16 @@ mod tests {
             "decision"
         }
 
-        fn generate_json(&mut self, messages: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-            EchoDecisionBackend::new("test").generate_json(messages)
-        }
-
-        fn generate_raw_json(
+        fn execute(
             &mut self,
-            _messages: &[ChatMessage],
-        ) -> CoreResult<(JsonValue, Usage)> {
-            Ok((self.decision.clone(), Usage::default()))
+            _request: GenerationRequest,
+            cancellation: &subbake_core::CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            Ok(GenerationResponse::json(
+                self.decision.clone(),
+                Usage::default(),
+            ))
         }
     }
 

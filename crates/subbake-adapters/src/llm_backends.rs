@@ -1,23 +1,28 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use subbake_core::CancellationGuard;
-use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine, Usage};
-use subbake_core::error::{CoreError, CoreResult};
+use subbake_core::entities::Usage;
+#[cfg(test)]
+use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine};
+use subbake_core::error::{CoreError, CoreResult, LlmCallError};
 use subbake_core::ports::{
-    BackendJsonResult, BackendPayload, ChatMessage, GenerationRequest, GenerationResponse,
-    LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport, ToolChoice, ToolContinuation,
-    ToolDefinition, ToolGenerationInput, ToolGenerationRequest, ToolGenerationResponse,
+    BatchExecutionOptions, ChatMessage, GenerationContent, GenerationInput, GenerationRequest,
+    GenerationResponse, LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport,
+    ResponseContract, ToolChoice, ToolContinuation, ToolDefinition,
 };
 use tokio::runtime::Runtime;
 
 use crate::providers::{ApiFormat, BackendConfig};
 const TIMEOUT: f64 = 120.0;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_TRANSPORT_RETRIES: usize = 2;
+static BACKEND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 fn client(timeout: f64) -> CoreResult<Client> {
     Client::builder()
         .timeout(Duration::from_secs_f64(timeout.max(1.0)))
@@ -28,15 +33,26 @@ async fn await_http<F, T>(
     future: F,
     cancellation: &CancellationGuard,
     context: &str,
-) -> CoreResult<T>
+) -> Result<T, LlmCallError>
 where
     F: Future<Output = Result<T, reqwest::Error>>,
 {
-    cancellation.check()?;
+    cancellation.check().map_err(LlmCallError::from)?;
     tokio::pin!(future);
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     loop {
-        tokio::select! { out=&mut future => return out.map_err(|e| CoreError::Backend(format!("{context}: {e}"))), _=tick.tick()=>cancellation.check()? }
+        tokio::select! {
+            out=&mut future => {
+                return out.map_err(|error| {
+                    if error.is_timeout() {
+                        LlmCallError::Timeout(format!("{context}: {error}"))
+                    } else {
+                        LlmCallError::Transport(format!("{context}: {error}"))
+                    }
+                });
+            },
+            _=tick.tick()=>cancellation.check().map_err(LlmCallError::from)?,
+        }
     }
 }
 
@@ -49,6 +65,7 @@ pub struct ProtocolAdapter {
     key: String,
     client: Client,
     runtime: Arc<Runtime>,
+    backend_id: String,
     native_tool_support: NativeToolSupport,
 }
 
@@ -91,6 +108,12 @@ pub fn build_protocol_backend(
             Runtime::new().map_err(|error| {
                 CoreError::Backend(format!("tokio runtime build failed: {error}"))
             })?,
+        ),
+        backend_id: format!(
+            "{}:{}:{}",
+            config.display_name,
+            config.model,
+            BACKEND_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ),
         native_tool_support: NativeToolSupport::Unknown,
     }))
@@ -138,8 +161,8 @@ impl ProtocolAdapter {
             ApiFormat::GeminiGenerateContent => request.header("x-goog-api-key", &self.key),
         }
     }
-    fn body(&self, messages: &[ChatMessage]) -> Value {
-        match self.format {
+    fn body(&self, messages: &[ChatMessage], contract: ResponseContract) -> Value {
+        let mut body = match self.format {
             ApiFormat::OpenaiChat => {
                 json!({"model":self.config.model,"messages":messages.iter().map(openai_message).collect::<Vec<_>>() })
             }
@@ -164,36 +187,101 @@ impl ProtocolAdapter {
                     .join("\n\n");
                 json!({"systemInstruction":{"parts":[{"text":system}]},"contents":messages.iter().filter(|m|m.role!="system").map(|m|json!({"role":if m.role=="assistant" {"model"} else {"user"},"parts":[{"text":m.content}]})).collect::<Vec<_>>()})
             }
+        };
+        apply_response_contract(self.format, contract, &mut body);
+        body
+    }
+
+    async fn send_payload(
+        &self,
+        payload: &Value,
+        cancellation: &CancellationGuard,
+        native_tools: bool,
+    ) -> Result<Value, LlmCallError> {
+        let mut attempt = 0;
+        loop {
+            cancellation.check().map_err(LlmCallError::from)?;
+            let response = await_http(
+                self.authenticated(self.client.post(self.endpoint()).json(payload))
+                    .send(),
+                cancellation,
+                "provider request failed",
+            )
+            .await;
+            let result = match response {
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after_ms = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|seconds| seconds.saturating_mul(1_000));
+                    let text = await_http(
+                        response.text(),
+                        cancellation,
+                        "provider response read failed",
+                    )
+                    .await?;
+                    if status.is_success() {
+                        serde_json::from_str(&text).map_err(|error| {
+                            LlmCallError::InvalidResponse(format!(
+                                "{} response decode failed: {error}",
+                                self.config.display_name
+                            ))
+                        })
+                    } else if native_tools && native_tools_unsupported(status.as_u16(), &text) {
+                        Err(LlmCallError::UnsupportedCapability(format!(
+                            "native tools: {text}"
+                        )))
+                    } else {
+                        Err(classify_status_error(status.as_u16(), text, retry_after_ms))
+                    }
+                }
+                Err(error) => Err(error),
+            };
+
+            match result {
+                Err(error) if error.is_retryable() && attempt < MAX_TRANSPORT_RETRIES => {
+                    attempt += 1;
+                    let delay_ms = match &error {
+                        LlmCallError::RateLimited {
+                            retry_after_ms: Some(delay),
+                            ..
+                        } => (*delay).min(5_000),
+                        _ => 100 * (1_u64 << (attempt - 1)),
+                    };
+                    wait_retry(Duration::from_millis(delay_ms), cancellation).await?;
+                }
+                other => return other,
+            }
         }
     }
 
     fn native_payload(
         &self,
-        request: ToolGenerationRequest,
-    ) -> CoreResult<(Value, ProtocolContinuation)> {
-        let tools = request.tools;
-        let choice = request.tool_choice;
+        request: GenerationRequest,
+    ) -> Result<(Value, ProtocolContinuation, ResponseContract), LlmCallError> {
+        let tool_config = request.tools.ok_or_else(|| {
+            LlmCallError::UnsupportedCapability("native tools were not configured".to_owned())
+        })?;
+        let tools = tool_config.definitions;
+        let choice = tool_config.choice;
         let mut continuation = match request.input {
-            ToolGenerationInput::Start { messages } => native_start(self.format, &messages),
-            ToolGenerationInput::Continue {
+            GenerationInput::Messages(messages) => native_start(self.format, &messages),
+            GenerationInput::Continue {
                 continuation,
-                results,
+                tool_results,
             } => {
                 let mut continuation =
-                    continuation
-                        .downcast::<ProtocolContinuation>()
-                        .map_err(|_| {
-                            CoreError::Data(
-                                "native tool continuation belongs to a different backend"
-                                    .to_owned(),
-                            )
-                        })?;
+                    continuation.downcast_for::<ProtocolContinuation>(&self.backend_id)?;
                 if continuation.format != self.format {
-                    return Err(CoreError::Data(
+                    return Err(LlmCallError::ContinuationMismatch(
                         "native tool continuation protocol changed".to_owned(),
                     ));
                 }
-                append_native_results(&mut continuation, &results)?;
+                append_native_results(&mut continuation, &tool_results)
+                    .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
                 continuation
             }
         };
@@ -205,53 +293,42 @@ impl ProtocolAdapter {
             &tools,
             &choice,
         );
-        Ok((payload, continuation))
+        Ok((payload, continuation, request.response_contract))
     }
 
     async fn run_native(
         &self,
-        request: ToolGenerationRequest,
+        request: GenerationRequest,
         cancel: &CancellationGuard,
-    ) -> CoreResult<ToolGenerationResponse> {
-        let (payload, mut continuation) = self.native_payload(request)?;
-        let url = self.endpoint();
-        let response = await_http(
-            self.authenticated(self.client.post(url).json(&payload))
-                .send(),
-            cancel,
-            "provider request failed",
-        )
-        .await?;
-        let status = response.status();
-        let text = await_http(response.text(), cancel, "provider response read failed").await?;
-        if !status.is_success() {
-            if native_tools_unsupported(status.as_u16(), &text) {
-                return Err(CoreError::UnsupportedCapability(format!(
-                    "native tools: {text}"
-                )));
-            }
-            return Err(CoreError::Backend(format!(
-                "{} rejected request ({status}): {text}",
-                self.config.display_name
-            )));
-        }
-        let body: Value = serde_json::from_str(&text).map_err(|error| {
-            CoreError::Backend(format!(
-                "{} response decode failed: {error}",
-                self.config.display_name
-            ))
-        })?;
+    ) -> Result<GenerationResponse, LlmCallError> {
+        let (payload, mut continuation, contract) = self.native_payload(request)?;
+        let body = self.send_payload(&payload, cancel, true).await?;
         let (response_text, tool_calls) =
-            parse_native_response(self.format, &body, &mut continuation)?;
+            parse_native_response(self.format, &body, &mut continuation)
+                .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
         let usage = usage(
             self.format,
             &body,
             response_text.as_deref().unwrap_or(""),
             &payload,
         );
-        let continuation = (!tool_calls.is_empty()).then(|| ToolContinuation::new(continuation));
-        Ok(ToolGenerationResponse {
-            text: response_text,
+        let continuation = (!tool_calls.is_empty())
+            .then(|| ToolContinuation::new(self.backend_id.clone(), continuation));
+        let content = if !tool_calls.is_empty() && response_text.is_none() {
+            GenerationContent::Empty
+        } else {
+            match contract {
+                ResponseContract::JsonObject => GenerationContent::Json(
+                    extract_json_object(response_text.as_deref().unwrap_or_default())
+                        .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?,
+                ),
+                ResponseContract::Text => {
+                    GenerationContent::Text(response_text.unwrap_or_default())
+                }
+            }
+        };
+        Ok(GenerationResponse {
+            content,
             tool_calls,
             continuation,
             usage,
@@ -261,36 +338,26 @@ impl ProtocolAdapter {
     async fn run(
         &self,
         messages: &[ChatMessage],
+        contract: ResponseContract,
         cancel: &CancellationGuard,
-    ) -> CoreResult<GenerationResponse> {
-        let payload = self.body(messages);
-        let url = self.endpoint();
-        let response = await_http(
-            self.authenticated(self.client.post(url).json(&payload))
-                .send(),
-            cancel,
-            "provider request failed",
-        )
-        .await?;
-        let status = response.status();
-        let text = await_http(response.text(), cancel, "provider response read failed").await?;
-        if !status.is_success() {
-            return Err(CoreError::Backend(format!(
-                "{} rejected request ({status}): {text}",
-                self.config.display_name
-            )));
-        }
-        let body: Value = serde_json::from_str(&text).map_err(|e| {
-            CoreError::Backend(format!(
-                "{} response decode failed: {e}",
-                self.config.display_name
-            ))
-        })?;
-        let content = self.content(&body)?;
-        let json = extract_json_object(&content)?;
+    ) -> Result<GenerationResponse, LlmCallError> {
+        let payload = self.body(messages, contract);
+        let body = self.send_payload(&payload, cancel, false).await?;
+        let text = self
+            .content(&body)
+            .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+        let content = match contract {
+            ResponseContract::JsonObject => GenerationContent::Json(
+                extract_json_object(&text)
+                    .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?,
+            ),
+            ResponseContract::Text => GenerationContent::Text(text.clone()),
+        };
         Ok(GenerationResponse {
-            usage: usage(self.format, &body, &content, &payload),
-            json,
+            usage: usage(self.format, &body, &text, &payload),
+            content,
+            tool_calls: Vec::new(),
+            continuation: None,
         })
     }
     fn content(&self, body: &Value) -> CoreResult<String> {
@@ -872,6 +939,54 @@ fn responses_text(body: &Value) -> Option<String> {
     })
 }
 
+async fn wait_retry(
+    duration: Duration,
+    cancellation: &CancellationGuard,
+) -> Result<(), LlmCallError> {
+    let sleep = tokio::time::sleep(duration);
+    tokio::pin!(sleep);
+    let mut tick = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return Ok(()),
+            _ = tick.tick() => cancellation.check().map_err(LlmCallError::from)?,
+        }
+    }
+}
+
+fn classify_status_error(
+    status: u16,
+    message: String,
+    retry_after_ms: Option<u64>,
+) -> LlmCallError {
+    match status {
+        401 | 403 => LlmCallError::Authentication(message),
+        429 => LlmCallError::RateLimited {
+            message,
+            retry_after_ms,
+        },
+        _ => LlmCallError::Rejected {
+            status: Some(status),
+            message,
+        },
+    }
+}
+
+fn apply_response_contract(format: ApiFormat, contract: ResponseContract, body: &mut Value) {
+    if contract != ResponseContract::JsonObject {
+        return;
+    }
+    match format {
+        ApiFormat::OpenaiChat => {
+            body["response_format"] = json!({"type": "json_object"});
+        }
+        ApiFormat::OpenaiResponses => {
+            body["text"] = json!({"format": {"type": "json_object"}});
+        }
+        ApiFormat::AnthropicMessages | ApiFormat::GeminiGenerateContent => {}
+    }
+}
+
 fn native_tools_unsupported(status: u16, body: &str) -> bool {
     if !matches!(status, 400 | 404 | 422) {
         return false;
@@ -915,62 +1030,52 @@ impl LlmBackend for ProtocolAdapter {
     fn model_name(&self) -> &str {
         &self.config.model
     }
-    fn generate_json(&mut self, m: &[ChatMessage]) -> CoreResult<BackendJsonResult> {
-        let r = self.generate_raw_json(m)?;
-        Ok(BackendJsonResult {
-            payload: BackendPayload::Translation(parse_translation_payload(&r.0)?),
-            usage: r.1,
-        })
-    }
-    fn generate_raw_json(&mut self, m: &[ChatMessage]) -> CoreResult<(Value, Usage)> {
-        self.generate_raw_json_cancellable(m, &CancellationGuard::never())
-    }
-    fn generate_raw_json_cancellable(
-        &mut self,
-        m: &[ChatMessage],
-        c: &CancellationGuard,
-    ) -> CoreResult<(Value, Usage)> {
-        let r = self.runtime.block_on(self.run(m, c))?;
-        Ok((r.json, r.usage))
-    }
-    fn generate_with_tools_cancellable(
-        &mut self,
-        request: ToolGenerationRequest,
-        cancellation: &CancellationGuard,
-    ) -> CoreResult<ToolGenerationResponse> {
-        if self.native_tool_support == NativeToolSupport::Unsupported {
-            return Err(CoreError::UnsupportedCapability("native tools".to_owned()));
-        }
-        let result = self
-            .runtime
-            .block_on(self.run_native(request, cancellation));
-        match &result {
-            Ok(_) => self.native_tool_support = NativeToolSupport::Supported,
-            Err(CoreError::UnsupportedCapability(_)) => {
-                self.native_tool_support = NativeToolSupport::Unsupported;
-            }
-            Err(_) => {}
-        }
-        result
-    }
-    fn generate_cancellable(
+    fn execute(
         &mut self,
         request: GenerationRequest,
-        c: &CancellationGuard,
-    ) -> CoreResult<GenerationResponse> {
-        self.runtime.block_on(self.run(&request.messages, c))
+        cancellation: &CancellationGuard,
+    ) -> Result<GenerationResponse, LlmCallError> {
+        if request.tools.is_some() {
+            if self.native_tool_support == NativeToolSupport::Unsupported {
+                return Err(LlmCallError::UnsupportedCapability(
+                    "native tools".to_owned(),
+                ));
+            }
+            let result = self
+                .runtime
+                .block_on(self.run_native(request, cancellation));
+            match &result {
+                Ok(_) => self.native_tool_support = NativeToolSupport::Supported,
+                Err(LlmCallError::UnsupportedCapability(_)) => {
+                    self.native_tool_support = NativeToolSupport::Unsupported;
+                }
+                Err(_) => {}
+            }
+            return result;
+        }
+        match request.input {
+            GenerationInput::Messages(messages) => {
+                self.runtime
+                    .block_on(self.run(&messages, request.response_contract, cancellation))
+            }
+            GenerationInput::Continue { .. } => Err(LlmCallError::ContinuationMismatch(
+                "continuation request is missing native tool configuration".to_owned(),
+            )),
+        }
     }
-    fn generate_many_cancellable(
+
+    fn execute_many(
         &mut self,
         requests: Vec<GenerationRequest>,
-        max_concurrency: usize,
+        options: BatchExecutionOptions,
         cancellation: &CancellationGuard,
-    ) -> CoreResult<Vec<CoreResult<GenerationResponse>>> {
+    ) -> Result<Vec<Result<GenerationResponse, LlmCallError>>, LlmCallError> {
         let adapter = self.clone();
         let cancellation = cancellation.clone();
-        self.runtime.block_on(async move {
+        let deadline = options.deadline;
+        let batch = async move {
             let semaphore =
-                std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1)));
+                std::sync::Arc::new(tokio::sync::Semaphore::new(options.max_concurrency));
             let mut set = tokio::task::JoinSet::new();
             for (index, request) in requests.into_iter().enumerate() {
                 let adapter = adapter.clone();
@@ -978,25 +1083,56 @@ impl LlmBackend for ProtocolAdapter {
                 let semaphore = semaphore.clone();
                 set.spawn(async move {
                     let permit = semaphore.acquire_owned().await.map_err(|error| {
-                        CoreError::Backend(format!("concurrency limiter closed: {error}"))
+                        LlmCallError::Transport(format!("concurrency limiter closed: {error}"))
                     })?;
-                    let result = adapter.run(&request.messages, &cancellation).await;
+                    cancellation.check().map_err(LlmCallError::from)?;
+                    let result = if request.tools.is_some() {
+                        adapter.run_native(request, &cancellation).await
+                    } else {
+                        match request.input {
+                            GenerationInput::Messages(messages) => {
+                                adapter
+                                    .run(&messages, request.response_contract, &cancellation)
+                                    .await
+                            }
+                            GenerationInput::Continue { .. } => {
+                                Err(LlmCallError::ContinuationMismatch(
+                                    "continuation request is missing native tool configuration"
+                                        .to_owned(),
+                                ))
+                            }
+                        }
+                    };
                     drop(permit);
-                    Ok::<_, CoreError>((index, result))
+                    Ok::<_, LlmCallError>((index, result))
                 });
             }
             let mut ordered = Vec::new();
             while let Some(joined) = set.join_next().await {
                 match joined {
+                    Ok(Ok((_, Err(LlmCallError::Cancelled)))) => {
+                        return Err(LlmCallError::Cancelled);
+                    }
                     Ok(Ok(item)) => ordered.push(item),
                     Ok(Err(error)) => return Err(error),
                     Err(error) => {
-                        return Err(CoreError::Backend(format!("provider task failed: {error}")));
+                        return Err(LlmCallError::Transport(format!(
+                            "provider task failed: {error}"
+                        )));
                     }
                 }
             }
             ordered.sort_by_key(|(index, _)| *index);
             Ok(ordered.into_iter().map(|(_, result)| result).collect())
+        };
+        self.runtime.block_on(async move {
+            if let Some(deadline) = deadline {
+                tokio::time::timeout(deadline, batch)
+                    .await
+                    .map_err(|_| LlmCallError::Timeout("batch deadline elapsed".to_owned()))?
+            } else {
+                batch.await
+            }
         })
     }
 }
@@ -1040,6 +1176,7 @@ pub(crate) fn extract_json_object(text: &str) -> CoreResult<Value> {
         "response JSON object is unbalanced".to_owned(),
     ))
 }
+#[cfg(test)]
 pub(crate) fn parse_translation_payload(v: &Value) -> CoreResult<BatchTranslationResult> {
     let lines = v["lines"]
         .as_array()
@@ -1071,6 +1208,7 @@ pub(crate) fn parse_translation_payload(v: &Value) -> CoreResult<BatchTranslatio
         glossary_updates,
     })
 }
+#[cfg(test)]
 fn parse_translation_line(v: &Value, index: usize) -> CoreResult<TranslationLine> {
     let id = v["id"].as_str().ok_or_else(|| {
         CoreError::InvalidTranslation(format!("line {} is missing string field `id`", index + 1))
@@ -1126,11 +1264,13 @@ fn estimate(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use subbake_core::ports::{ModelToolResult, ToolChoice, ToolDefinition};
+    use subbake_core::error::LlmCallError;
+    use subbake_core::ports::{ModelToolResult, ResponseContract, ToolChoice, ToolDefinition};
 
     use super::{
-        ApiFormat, append_native_results, native_request_body, native_start,
-        native_tools_unsupported, parse_native_response, parse_translation_payload,
+        ApiFormat, append_native_results, apply_response_contract, classify_status_error,
+        native_request_body, native_start, native_tools_unsupported, parse_native_response,
+        parse_translation_payload,
     };
 
     fn tool() -> ToolDefinition {
@@ -1167,6 +1307,56 @@ mod tests {
                 .to_string()
                 .contains("missing string field `translation`")
         );
+    }
+
+    #[test]
+    fn response_contract_is_encoded_only_by_protocol_adapters_that_support_it() {
+        let mut chat = json!({"model": "x"});
+        apply_response_contract(
+            ApiFormat::OpenaiChat,
+            ResponseContract::JsonObject,
+            &mut chat,
+        );
+        assert_eq!(chat["response_format"]["type"], "json_object");
+
+        let mut responses = json!({"model": "x"});
+        apply_response_contract(
+            ApiFormat::OpenaiResponses,
+            ResponseContract::JsonObject,
+            &mut responses,
+        );
+        assert_eq!(responses["text"]["format"]["type"], "json_object");
+
+        let mut anthropic = json!({"model": "x"});
+        apply_response_contract(
+            ApiFormat::AnthropicMessages,
+            ResponseContract::JsonObject,
+            &mut anthropic,
+        );
+        assert!(anthropic.get("response_format").is_none());
+
+        let mut text = json!({"model": "x"});
+        apply_response_contract(ApiFormat::OpenaiChat, ResponseContract::Text, &mut text);
+        assert!(text.get("response_format").is_none());
+    }
+
+    #[test]
+    fn status_errors_keep_authentication_rate_limit_and_retry_categories() {
+        assert!(matches!(
+            classify_status_error(401, "bad key".to_owned(), None),
+            LlmCallError::Authentication(_)
+        ));
+        let limited = classify_status_error(429, "slow down".to_owned(), Some(2_000));
+        assert!(matches!(
+            &limited,
+            LlmCallError::RateLimited {
+                retry_after_ms: Some(2_000),
+                ..
+            }
+        ));
+        assert!(limited.is_retryable());
+        assert!(classify_status_error(503, "unavailable".to_owned(), None).is_retryable());
+        assert!(!classify_status_error(400, "invalid request".to_owned(), None).is_retryable());
     }
 
     #[test]
