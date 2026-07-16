@@ -19,16 +19,15 @@
 验收：每个提取后的模块只拥有一种主要职责，公共类型位于所属 crate 的明确边界，
 原编排入口只负责组装和顺序控制。
 
-## 2. 配置模型的最终收敛尚未完成
+## 2. 配置模型已收敛
 
-默认值已集中到 core，旧 `final_review` 已在配置边界规范化；但配置文件兼容层、CLI
-覆盖、profile 更新和运行时展示仍跨多个模块维护字段映射。
+配置文件现使用显式 `version = 1` 和 backend、translation、output、storage 分组，
+不再读取旧扁平字段。配置文件、profile 和 CLI 覆盖统一转换为 `SettingsOverrides`，
+再由 `ConfigurationResolver` 按内置默认值、defaults、profile、CLI 的固定顺序解析为
+`ResolvedSettings`。
 
-后续应以一个明确的兼容解码层读取扁平配置，再转换为 backend、translation、storage
-和 output 等拥有者的类型；profile 写入也应复用同一映射。
-
-验收：新增配置项只在其拥有者及一个兼容映射处出现；优先级不依赖赋值顺序，并有
-defaults/profile/CLI 三层覆盖测试。
+profile 写入复用同一分组序列化模型；翻译命令、provider check 和交互式 Agent 均使用
+相同解析规则。新增配置项只需在所属分组及其覆盖类型中定义。
 
 ## 3. 交互式终端的真实 PTY 验证待补
 

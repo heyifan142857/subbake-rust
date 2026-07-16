@@ -27,8 +27,15 @@ fn help_is_available_without_required_operands() {
 
 #[test]
 fn pipeline_media_input_attempts_transcription() {
-    let error = subbake_cli::run(vec!["pipeline".to_owned(), "movie.mp4".to_owned()])
-        .expect_err("media pipeline should attempt transcription");
+    let config = empty_config("pipeline");
+    let error = subbake_cli::run(vec![
+        "pipeline".to_owned(),
+        "movie.mp4".to_owned(),
+        "--config".to_owned(),
+        config.to_string_lossy().into_owned(),
+    ])
+    .expect_err("media pipeline should attempt transcription");
+    let _ = std::fs::remove_file(config);
 
     let msg = error.to_string();
     // The old stub said "pending migration"; now it tries real transcription.
@@ -52,8 +59,15 @@ fn transcribe_media_attempts_transcription() {
 
 #[test]
 fn provider_check_uses_mock_backend() {
-    subbake_cli::run(vec!["provider".to_owned(), "check".to_owned()])
-        .expect("mock provider should check");
+    let config = empty_config("provider");
+    subbake_cli::run(vec![
+        "provider".to_owned(),
+        "check".to_owned(),
+        "--config".to_owned(),
+        config.to_string_lossy().into_owned(),
+    ])
+    .expect("mock provider should check");
+    let _ = std::fs::remove_file(config);
 }
 
 #[test]
@@ -108,4 +122,12 @@ fn whisper_model_attempts_download() {
         !msg.contains("pending"),
         "should no longer be a stub: {msg}"
     );
+}
+fn empty_config(label: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "subbake-cli-shape-{}-{label}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, "version = 1\n").expect("write empty config");
+    path
 }

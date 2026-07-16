@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use subbake_adapters::{
-    BatchTranslationRequest, ConfigFile, SubtitleEditRequest, TranscriptionRequest,
-    TranscriptionSettings, TranslationRequest, TranslationSettings, WhisperAction, WhisperRequest,
-    default_output_path, diagnose_failure_path, edit_subtitle_cancellable,
-    format_diagnostic_report, is_supported_subtitle_path, load_diagnostic_reports,
-    transcribe_media_cancellable, translate_subtitle_cancellable,
+    BatchTranslationRequest, ConfigFile, SettingsOverrides, SubtitleEditRequest,
+    TranscriptionRequest, TranscriptionSettings, TranslationRequest, TranslationSettings,
+    WhisperAction, WhisperRequest, default_output_path, diagnose_failure_path,
+    edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_path,
+    load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
 };
 use subbake_core::diagnostics::diagnose_text;
 use subbake_core::{CancellationGuard, SharedProgress};
@@ -416,11 +416,13 @@ pub(crate) fn execute_session_tool(
                     profile_switch: None,
                 }));
             }
-            let settings = TranslationSettings::default().with_patch(config.resolve(Some(&name)));
+            let (settings, _) = config
+                .resolve(Some(&name), SettingsOverrides::default())
+                .map_err(subbake_adapters::AdapterError::from)?;
             SessionToolOutcome {
                 text: format!(
                     "Profile switched: {name} ({}/{})",
-                    settings.backend.provider, settings.backend.model
+                    settings.backend.id, settings.backend.model
                 ),
                 profile_switch: Some(ProfileSwitch { name, config_path }),
             }

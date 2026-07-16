@@ -607,7 +607,7 @@ impl AgentEngine {
         let settings = self.active_translation_settings()?;
         Ok(format!(
             "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
-            settings.backend.provider, settings.backend.model
+            settings.backend.id, settings.backend.model
         ))
     }
 
@@ -633,16 +633,16 @@ impl AgentEngine {
             .profiles
             .keys()
             .map(|name| {
-                let settings = self.settings_for_profile(&config, Some(name));
-                ProfileChoice {
+                let settings = self.settings_for_profile(&config, Some(name))?;
+                Ok(ProfileChoice {
                     name: name.clone(),
-                    provider: settings.backend.provider,
+                    provider: settings.backend.id,
                     model: settings.backend.model,
                     active: active == Some(name.as_str()),
                     create: false,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<AgentResult<Vec<_>>>()?;
         profiles.sort_by(|left, right| left.name.cmp(&right.name));
         profiles.push(ProfileChoice {
             name: "new profile…".to_owned(),

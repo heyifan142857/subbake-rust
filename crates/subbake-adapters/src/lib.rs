@@ -15,8 +15,8 @@ pub mod translation;
 pub mod whisper;
 
 pub use config::{
-    ConfigFile, append_profile_snapshot, discover_config_path, load_and_resolve,
-    load_translation_settings_patch, parse_translation_settings_patch,
+    CONFIG_VERSION, ConfigFile, ConfigurationResolver, ResolveRequest, ResolvedConfiguration,
+    append_profile_snapshot, discover_config_path,
 };
 pub use diagnostics::{diagnose_failure_path, format_diagnostic_report, load_diagnostic_reports};
 pub use editing::{
@@ -41,8 +41,9 @@ pub use runtime::{
 };
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{
-    BackendSettings, OutputSettings, RuntimeSettings, TranslationDomainSettings,
-    TranslationSettings, TranslationSettingsPatch,
+    BackendOverrides, BackendSettings, OutputOverrides, OutputSettings, ResolvedSettings,
+    SettingsOverrides, StorageOverrides, StorageSettings, TranslationDomainSettings,
+    TranslationOverrides, TranslationSettings,
 };
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{

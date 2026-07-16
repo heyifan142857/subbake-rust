@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
     BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET,
     DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY,
@@ -7,15 +8,20 @@ use subbake_core::entities::{
     PipelineOptions, ReviewPolicy,
 };
 
-use crate::providers::{ApiFormat, BackendConfig, legacy_api_format};
+use crate::error::{AdapterError, AdapterResult};
+use crate::providers::{ApiFormat, BackendConfig};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TranslationSettings {
+pub struct ResolvedSettings {
     pub output: OutputSettings,
     pub backend: BackendSettings,
     pub translation: TranslationDomainSettings,
-    pub runtime: RuntimeSettings,
+    pub storage: StorageSettings,
 }
+
+/// Compatibility alias for service request types. New configuration code
+/// should name the complete resolved value `ResolvedSettings`.
+pub type TranslationSettings = ResolvedSettings;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputSettings {
@@ -26,7 +32,7 @@ pub struct OutputSettings {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendSettings {
-    pub provider: String,
+    pub id: String,
     pub model: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -57,108 +63,24 @@ pub struct TranslationDomainSettings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RuntimeSettings {
+pub struct StorageSettings {
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
 
-impl TranslationSettingsPatch {
-    /// Overlay `other` onto `self` — `Some` fields in `other` replace `self`.
-    pub fn merge(&mut self, other: TranslationSettingsPatch) {
-        if let Some(value) = other.output_format {
-            self.output_format = Some(value);
-        }
-        if let Some(value) = other.provider {
-            self.provider = Some(value);
-        }
-        if let Some(value) = other.model {
-            self.model = Some(value);
-        }
-        if let Some(value) = other.api_key {
-            self.api_key = Some(value);
-        }
-        if let Some(value) = other.base_url {
-            self.base_url = Some(value);
-        }
-        if let Some(value) = other.api_format {
-            self.api_format = Some(value);
-        }
-        if let Some(value) = other.endpoint_url {
-            self.endpoint_url = Some(value);
-        }
-        if let Some(value) = other.api_key_env {
-            self.api_key_env = Some(value);
-        }
-        if let Some(value) = other.auth_header {
-            self.auth_header = Some(value);
-        }
-        if let Some(value) = other.auth_prefix {
-            self.auth_prefix = Some(value);
-        }
-        if let Some(value) = other.source_language {
-            self.source_language = Some(value);
-        }
-        if let Some(value) = other.target_language {
-            self.target_language = Some(value);
-        }
-        if let Some(value) = other.batch_size {
-            self.batch_size = Some(value);
-        }
-        if let Some(value) = other.batch_token_budget {
-            self.batch_token_budget = Some(value);
-        }
-        if let Some(value) = other.translation_concurrency {
-            self.translation_concurrency = Some(value);
-        }
-        if let Some(value) = other.review_concurrency {
-            self.review_concurrency = Some(value);
-        }
-        if let Some(value) = other.bilingual {
-            self.bilingual = Some(value);
-        }
-        if let Some(value) = other.bilingual_order {
-            self.bilingual_order = Some(value);
-        }
-        if let Some(value) = other.fast_mode {
-            self.fast_mode = Some(value);
-        }
-        if let Some(value) = other.review_policy {
-            self.review_policy = Some(value);
-        }
-        if let Some(value) = other.terminology_preflight {
-            self.terminology_preflight = Some(value);
-        }
-        if let Some(value) = other.dry_run {
-            self.dry_run = Some(value);
-        }
-        if let Some(value) = other.resume {
-            self.resume = Some(value);
-        }
-        if let Some(value) = other.use_cache {
-            self.use_cache = Some(value);
-        }
-        if let Some(value) = other.retries {
-            self.retries = Some(value);
-        }
-        if let Some(value) = other.agent {
-            self.agent = Some(value);
-        }
-        if let Some(value) = other.agent_repair_attempts {
-            self.agent_repair_attempts = Some(value);
-        }
-        if let Some(value) = other.runtime_dir {
-            self.runtime_dir = Some(value);
-        }
-        if let Some(value) = other.glossary_path {
-            self.glossary_path = Some(value);
-        }
-    }
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SettingsOverrides {
+    pub backend: BackendOverrides,
+    pub translation: TranslationOverrides,
+    pub output: OutputOverrides,
+    pub storage: StorageOverrides,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct TranslationSettingsPatch {
-    pub output_format: Option<String>,
-    pub provider: Option<String>,
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackendOverrides {
+    pub id: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -167,14 +89,17 @@ pub struct TranslationSettingsPatch {
     pub api_key_env: Option<String>,
     pub auth_header: Option<String>,
     pub auth_prefix: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranslationOverrides {
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     pub batch_size: Option<usize>,
     pub batch_token_budget: Option<usize>,
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
-    pub bilingual: Option<bool>,
-    pub bilingual_order: Option<BilingualOrder>,
     pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
@@ -184,11 +109,139 @@ pub struct TranslationSettingsPatch {
     pub retries: Option<usize>,
     pub agent: Option<bool>,
     pub agent_repair_attempts: Option<usize>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputOverrides {
+    pub format: Option<String>,
+    pub bilingual: Option<bool>,
+    pub bilingual_order: Option<BilingualOrder>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageOverrides {
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
 
-impl Default for TranslationSettings {
+impl SettingsOverrides {
+    pub fn merge(&mut self, other: Self) {
+        self.backend.merge(other.backend);
+        self.translation.merge(other.translation);
+        self.output.merge(other.output);
+        self.storage.merge(other.storage);
+    }
+
+    pub fn from_resolved(settings: &ResolvedSettings) -> Self {
+        Self {
+            backend: BackendOverrides {
+                id: Some(settings.backend.id.clone()),
+                model: Some(settings.backend.model.clone()),
+                api_key: settings.backend.api_key.clone(),
+                base_url: settings.backend.base_url.clone(),
+                api_format: settings.backend.api_format,
+                endpoint_url: settings.backend.endpoint_url.clone(),
+                api_key_env: settings.backend.api_key_env.clone(),
+                auth_header: settings.backend.auth_header.clone(),
+                auth_prefix: settings.backend.auth_prefix.clone(),
+            },
+            translation: TranslationOverrides {
+                source_language: Some(settings.translation.source_language.clone()),
+                target_language: Some(settings.translation.target_language.clone()),
+                batch_size: Some(settings.translation.batch_size),
+                batch_token_budget: Some(settings.translation.batch_token_budget),
+                translation_concurrency: Some(settings.translation.translation_concurrency),
+                review_concurrency: Some(settings.translation.review_concurrency),
+                fast_mode: Some(settings.translation.fast_mode),
+                review_policy: Some(settings.translation.review_policy),
+                terminology_preflight: Some(settings.translation.terminology_preflight),
+                dry_run: Some(settings.translation.dry_run),
+                resume: Some(settings.translation.resume),
+                use_cache: Some(settings.translation.use_cache),
+                retries: Some(settings.translation.retries),
+                agent: Some(settings.translation.agent),
+                agent_repair_attempts: Some(settings.translation.agent_repair_attempts),
+            },
+            output: OutputOverrides {
+                format: settings.output.format.clone(),
+                bilingual: Some(settings.output.bilingual),
+                bilingual_order: Some(settings.output.bilingual_order),
+            },
+            storage: StorageOverrides {
+                runtime_dir: settings.storage.runtime_dir.clone(),
+                glossary_path: settings.storage.glossary_path.clone(),
+            },
+        }
+    }
+}
+
+macro_rules! merge_optional_fields {
+    ($self:expr, $other:expr, $($field:ident),+ $(,)?) => {
+        $(
+            if $other.$field.is_some() {
+                $self.$field = $other.$field;
+            }
+        )+
+    };
+}
+
+impl BackendOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(
+            self,
+            other,
+            id,
+            model,
+            api_key,
+            base_url,
+            api_format,
+            endpoint_url,
+            api_key_env,
+            auth_header,
+            auth_prefix
+        );
+    }
+}
+
+impl TranslationOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(
+            self,
+            other,
+            source_language,
+            target_language,
+            batch_size,
+            batch_token_budget,
+            translation_concurrency,
+            review_concurrency,
+            fast_mode,
+            review_policy,
+            terminology_preflight,
+            dry_run,
+            resume,
+            use_cache,
+            retries,
+            agent,
+            agent_repair_attempts
+        );
+    }
+}
+
+impl OutputOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(self, other, format, bilingual, bilingual_order);
+    }
+}
+
+impl StorageOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(self, other, runtime_dir, glossary_path);
+    }
+}
+
+impl Default for ResolvedSettings {
     fn default() -> Self {
         Self {
             output: OutputSettings {
@@ -197,7 +250,7 @@ impl Default for TranslationSettings {
                 bilingual_order: BilingualOrder::default(),
             },
             backend: BackendSettings {
-                provider: DEFAULT_PROVIDER.to_owned(),
+                id: DEFAULT_PROVIDER.to_owned(),
                 model: DEFAULT_MODEL.to_owned(),
                 api_key: None,
                 base_url: None,
@@ -224,7 +277,7 @@ impl Default for TranslationSettings {
                 agent: true,
                 agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
             },
-            runtime: RuntimeSettings {
+            storage: StorageSettings {
                 runtime_dir: None,
                 glossary_path: None,
             },
@@ -232,111 +285,192 @@ impl Default for TranslationSettings {
     }
 }
 
-impl TranslationSettings {
-    pub fn with_patch(mut self, patch: TranslationSettingsPatch) -> Self {
-        self.apply_patch(patch);
-        self
+impl ResolvedSettings {
+    pub fn with_overrides(mut self, overrides: SettingsOverrides) -> AdapterResult<Self> {
+        self.apply_overrides(overrides);
+        self.validate()?;
+        Ok(self)
     }
 
-    pub fn apply_patch(&mut self, patch: TranslationSettingsPatch) {
-        if let Some(value) = patch.output_format {
-            self.output.format = Some(value);
+    pub fn apply_overrides(&mut self, overrides: SettingsOverrides) {
+        let BackendOverrides {
+            id,
+            model,
+            api_key,
+            base_url,
+            api_format,
+            endpoint_url,
+            api_key_env,
+            auth_header,
+            auth_prefix,
+        } = overrides.backend;
+        if let Some(value) = id {
+            self.backend.id = value;
         }
-        if let Some(value) = patch.provider {
-            self.backend.provider = value;
-        }
-        if let Some(value) = patch.model {
+        if let Some(value) = model {
             self.backend.model = value;
         }
-        if let Some(value) = patch.api_key {
+        if let Some(value) = api_key {
             self.backend.api_key = Some(value);
         }
-        if let Some(value) = patch.base_url {
+        if let Some(value) = base_url {
             self.backend.base_url = Some(value);
         }
-        if let Some(value) = patch.api_format {
+        if let Some(value) = api_format {
             self.backend.api_format = Some(value);
         }
-        if let Some(value) = patch.endpoint_url {
+        if let Some(value) = endpoint_url {
             self.backend.endpoint_url = Some(value);
         }
-        if let Some(value) = patch.api_key_env {
+        if let Some(value) = api_key_env {
             self.backend.api_key_env = Some(value);
         }
-        if let Some(value) = patch.auth_header {
+        if let Some(value) = auth_header {
             self.backend.auth_header = Some(value);
         }
-        if let Some(value) = patch.auth_prefix {
+        if let Some(value) = auth_prefix {
             self.backend.auth_prefix = Some(value);
         }
-        if let Some(value) = patch.source_language {
+
+        let TranslationOverrides {
+            source_language,
+            target_language,
+            batch_size,
+            batch_token_budget,
+            translation_concurrency,
+            review_concurrency,
+            fast_mode,
+            review_policy,
+            terminology_preflight,
+            dry_run,
+            resume,
+            use_cache,
+            retries,
+            agent,
+            agent_repair_attempts,
+        } = overrides.translation;
+        if let Some(value) = source_language {
             self.translation.source_language = value;
         }
-        if let Some(value) = patch.target_language {
+        if let Some(value) = target_language {
             self.translation.target_language = value;
         }
-        if let Some(value) = patch.batch_size {
+        if let Some(value) = batch_size {
             self.translation.batch_size = value;
         }
-        if let Some(value) = patch.batch_token_budget {
+        if let Some(value) = batch_token_budget {
             self.translation.batch_token_budget = value;
         }
-        if let Some(value) = patch.translation_concurrency {
+        if let Some(value) = translation_concurrency {
             self.translation.translation_concurrency = value;
         }
-        if let Some(value) = patch.review_concurrency {
+        if let Some(value) = review_concurrency {
             self.translation.review_concurrency = value;
         }
-        if let Some(value) = patch.bilingual {
-            self.output.bilingual = value;
-        }
-        if let Some(value) = patch.bilingual_order {
-            self.output.bilingual_order = value;
-        }
-        if let Some(value) = patch.fast_mode {
+        if let Some(value) = fast_mode {
             self.translation.fast_mode = value;
         }
-        if let Some(value) = patch.review_policy {
+        if let Some(value) = review_policy {
             self.translation.review_policy = value;
         }
-        if let Some(value) = patch.terminology_preflight {
+        if let Some(value) = terminology_preflight {
             self.translation.terminology_preflight = value;
         }
-        if let Some(value) = patch.dry_run {
+        if let Some(value) = dry_run {
             self.translation.dry_run = value;
         }
-        if let Some(value) = patch.resume {
+        if let Some(value) = resume {
             self.translation.resume = value;
         }
-        if let Some(value) = patch.use_cache {
+        if let Some(value) = use_cache {
             self.translation.use_cache = value;
         }
-        if let Some(value) = patch.retries {
+        if let Some(value) = retries {
             self.translation.retries = value;
         }
-        if let Some(value) = patch.agent {
+        if let Some(value) = agent {
             self.translation.agent = value;
         }
-        if let Some(value) = patch.agent_repair_attempts {
+        if let Some(value) = agent_repair_attempts {
             self.translation.agent_repair_attempts = value;
         }
-        if let Some(value) = patch.runtime_dir {
-            self.runtime.runtime_dir = Some(value);
+
+        let OutputOverrides {
+            format,
+            bilingual,
+            bilingual_order,
+        } = overrides.output;
+        if let Some(value) = format {
+            self.output.format = Some(value);
         }
-        if let Some(value) = patch.glossary_path {
-            self.runtime.glossary_path = Some(value);
+        if let Some(value) = bilingual {
+            self.output.bilingual = value;
         }
+        if let Some(value) = bilingual_order {
+            self.output.bilingual_order = value;
+        }
+
+        let StorageOverrides {
+            runtime_dir,
+            glossary_path,
+        } = overrides.storage;
+        if let Some(value) = runtime_dir {
+            self.storage.runtime_dir = Some(value);
+        }
+        if let Some(value) = glossary_path {
+            self.storage.glossary_path = Some(value);
+        }
+    }
+
+    pub fn validate(&self) -> AdapterResult<()> {
+        for (name, value) in [
+            ("backend.id", self.backend.id.as_str()),
+            ("backend.model", self.backend.model.as_str()),
+            (
+                "translation.source_language",
+                self.translation.source_language.as_str(),
+            ),
+            (
+                "translation.target_language",
+                self.translation.target_language.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(AdapterError::invalid_input(format!(
+                    "configuration field `{name}` must not be empty"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("translation.batch_size", self.translation.batch_size),
+            (
+                "translation.batch_token_budget",
+                self.translation.batch_token_budget,
+            ),
+            (
+                "translation.translation_concurrency",
+                self.translation.translation_concurrency,
+            ),
+            (
+                "translation.review_concurrency",
+                self.translation.review_concurrency,
+            ),
+        ] {
+            if value == 0 {
+                return Err(AdapterError::invalid_input(format!(
+                    "configuration field `{name}` must be greater than zero"
+                )));
+            }
+        }
+        self.backend_config().validate()?;
+        Ok(())
     }
 
     pub fn backend_config(&self) -> BackendConfig {
         BackendConfig {
-            id: self.backend.provider.clone(),
-            provider: self.backend.provider.clone(),
-            display_name: self.backend.provider.clone(),
-            api_format: self
-                .backend
-                .api_format
-                .or_else(|| legacy_api_format(&self.backend.provider)),
+            id: self.backend.id.clone(),
+            display_name: self.backend.id.clone(),
+            api_format: self.backend.api_format,
             model: self.backend.model.clone(),
             api_key: self.backend.api_key.clone(),
             api_key_env: self.backend.api_key_env.clone(),
@@ -355,7 +489,7 @@ impl TranslationSettings {
         let mut options = PipelineOptions::new(input_path.into());
         options.output_path = output_path;
         options.output_format = self.output.format.clone();
-        options.provider = self.backend.provider.clone();
+        options.provider = self.backend.id.clone();
         options.model = self.backend.model.clone();
         options.provider_fingerprint = self.provider_fingerprint();
         options.source_language = self.translation.source_language.clone();
@@ -375,8 +509,8 @@ impl TranslationSettings {
         options.retries = self.translation.retries;
         options.agent = self.translation.agent;
         options.agent_repair_attempts = self.translation.agent_repair_attempts;
-        options.runtime_dir = self.runtime.runtime_dir.clone();
-        options.glossary_path = self.runtime.glossary_path.clone();
+        options.runtime_dir = self.storage.runtime_dir.clone();
+        options.glossary_path = self.storage.glossary_path.clone();
         options
     }
 
@@ -385,15 +519,15 @@ impl TranslationSettings {
     }
 
     pub fn runtime_dir(&self) -> Option<&Path> {
-        self.runtime.runtime_dir.as_deref()
+        self.storage.runtime_dir.as_deref()
     }
 
     pub fn glossary_path(&self) -> Option<&Path> {
-        self.runtime.glossary_path.as_deref()
+        self.storage.glossary_path.as_deref()
     }
 
     fn provider_fingerprint(&self) -> Option<String> {
-        if self.backend.provider.eq_ignore_ascii_case("mock") {
+        if self.backend.id.eq_ignore_ascii_case("mock") {
             return None;
         }
         let config = self.backend_config();
@@ -414,71 +548,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_current_cli_behavior() {
-        let settings = TranslationSettings::default();
+    fn grouped_overrides_apply_to_their_owner() {
+        let settings = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                backend: BackendOverrides {
+                    id: Some("openai".to_owned()),
+                    model: Some("gpt-test".to_owned()),
+                    api_format: Some(ApiFormat::OpenaiChat),
+                    ..BackendOverrides::default()
+                },
+                translation: TranslationOverrides {
+                    batch_size: Some(12),
+                    ..TranslationOverrides::default()
+                },
+                output: OutputOverrides {
+                    bilingual: Some(true),
+                    ..OutputOverrides::default()
+                },
+                storage: StorageOverrides {
+                    runtime_dir: Some(".runtime".into()),
+                    ..StorageOverrides::default()
+                },
+            })
+            .expect("valid overrides");
 
-        assert_eq!(settings.backend.provider, "mock");
-        assert_eq!(settings.backend.model, "mock-zh");
-        assert_eq!(settings.translation.source_language, "Auto");
-        assert_eq!(settings.translation.target_language, "zh-Hans");
-        assert_eq!(settings.translation.batch_size, DEFAULT_BATCH_SIZE);
-        assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
-        assert_eq!(settings.output.bilingual_order, BilingualOrder::TargetFirst);
-        assert!(settings.translation.resume);
-        assert!(settings.translation.use_cache);
-        assert_eq!(settings.translation.retries, 2);
-        assert!(settings.translation.agent);
-        assert_eq!(settings.translation.agent_repair_attempts, 2);
-    }
-
-    #[test]
-    fn builds_pipeline_options_from_settings() {
-        let mut settings = TranslationSettings::default();
-        settings.translation.target_language = "English".to_owned();
-        settings.output.bilingual = true;
-        settings.output.bilingual_order = BilingualOrder::SourceFirst;
-        settings.output.format = Some("txt".to_owned());
-
-        let options = settings.to_pipeline_options("clip.srt", Some("out.txt".into()));
-
-        assert_eq!(options.target_language, "English");
-        assert!(options.bilingual);
-        assert_eq!(options.bilingual_order, BilingualOrder::SourceFirst);
-        assert_eq!(options.output_format.as_deref(), Some("txt"));
-        assert!(options.resume);
-        assert!(options.use_cache);
-        assert_eq!(options.retries, 2);
-        assert!(options.agent);
-        assert_eq!(options.agent_repair_attempts, 2);
-    }
-
-    #[test]
-    fn applies_patch_over_defaults() {
-        let settings = TranslationSettings::default().with_patch(TranslationSettingsPatch {
-            provider: Some("openai".to_owned()),
-            batch_size: Some(12),
-            bilingual_order: Some(BilingualOrder::SourceFirst),
-            review_policy: Some(ReviewPolicy::Off),
-            ..TranslationSettingsPatch::default()
-        });
-
-        assert_eq!(settings.backend.provider, "openai");
+        assert_eq!(settings.backend.id, "openai");
+        assert_eq!(settings.backend.model, "gpt-test");
         assert_eq!(settings.translation.batch_size, 12);
-        assert_eq!(settings.translation.review_policy, ReviewPolicy::Off);
-        assert_eq!(settings.output.bilingual_order, BilingualOrder::SourceFirst);
+        assert!(settings.output.bilingual);
+        assert_eq!(settings.storage.runtime_dir, Some(".runtime".into()));
     }
 
     #[test]
-    fn builds_backend_config_with_api_key_sources() {
-        let mut settings = TranslationSettings::default();
-        settings.backend.provider = "openai".to_owned();
-        settings.backend.model = "gpt".to_owned();
-        settings.backend.api_key = Some("direct-key".to_owned());
-        settings.backend.base_url = Some("https://example.test/v1".to_owned());
-
-        let config = settings.backend_config();
-
-        assert_eq!(config.api_key.as_deref(), Some("direct-key"));
-        assert_eq!(config.base_url.as_deref(), Some("https://example.test/v1"));
+    fn validation_rejects_zero_work_limits() {
+        let error = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                translation: TranslationOverrides {
+                    batch_size: Some(0),
+                    ..TranslationOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect_err("zero batch size");
+        assert!(error.to_string().contains("batch_size"));
     }
 }

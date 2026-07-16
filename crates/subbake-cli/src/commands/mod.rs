@@ -190,6 +190,8 @@ const PROVIDER_HELP: &str = r#"Validate a model provider configuration
 Usage: sbake provider check [OPTIONS]
 
 Options:
+      --config <PATH>        Configuration file
+      --profile <NAME>       Named runtime profile
       --provider <NAME>       Provider name
       --model <NAME>          Model name
       --api-format <FORMAT>   Provider wire protocol

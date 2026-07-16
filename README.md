@@ -39,18 +39,24 @@ sbake whisper model base
 SubBake 会依次查找 `~/.config/subbake/config.toml` 和项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
 
 ```toml
+version = 1
 default_profile = "openai"
 
-[profiles.openai]
-provider = "openai"
-model = "gpt-4.1-mini"
-api_key_env = "OPENAI_API_KEY"
+[defaults.translation]
 source_language = "English"
 target_language = "Simplified Chinese"
 translation_concurrency = 4
 review_concurrency = 2
+
+[defaults.output]
 bilingual = true
 bilingual_order = "target_first" # target_first 或 source_first
+
+[profiles.openai.backend]
+id = "openai"
+model = "gpt-4.1-mini"
+api_format = "openai_chat"
+api_key_env = "OPENAI_API_KEY"
 ```
 
 ```bash
@@ -58,7 +64,9 @@ export OPENAI_API_KEY="your-api-key"
 sbake provider check --profile openai
 ```
 
-也可以使用 `--config` 指定配置文件，或使用 `--profile` 切换配置档案。
+也可以使用 `--config` 指定配置文件，或使用 `--profile` 切换完整运行档案。
+配置格式版本必须为 `1`；旧的扁平字段不会被读取。可配置分组为
+`backend`、`translation`、`output` 和 `storage`。
 
 ## 使用
 

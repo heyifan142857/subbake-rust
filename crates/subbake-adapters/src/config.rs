@@ -1,38 +1,184 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::{AdapterError, AdapterResult, ConfigError};
-use crate::providers::ApiFormat;
-use crate::settings::TranslationSettingsPatch;
-use subbake_core::BilingualOrder;
+use serde::{Deserialize, Serialize};
 
-pub fn load_translation_settings_patch(path: &Path) -> AdapterResult<TranslationSettingsPatch> {
-    let content = fs::read_to_string(path).map_err(|source| {
-        AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
-    })?;
-    parse_translation_settings_patch(&content).map_err(|source| AdapterError::ConfigurationFile {
-        path: path.to_path_buf(),
-        source,
-    })
+use crate::error::{AdapterError, AdapterResult, ConfigError};
+use crate::settings::{ResolvedSettings, SettingsOverrides};
+
+pub const CONFIG_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigFile {
+    pub version: u64,
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub defaults: SettingsOverrides,
+    #[serde(default)]
+    pub profiles: HashMap<String, SettingsOverrides>,
 }
 
-/// Append a profile snapshot without rewriting existing configuration, comments,
-/// or inline credentials. The caller can keep using its current profile until
-/// the newly created profile has been reviewed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ResolveRequest {
+    pub explicit_path: Option<PathBuf>,
+    pub pinned_path: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub cli_overrides: SettingsOverrides,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedConfiguration {
+    pub settings: ResolvedSettings,
+    pub config_path: Option<PathBuf>,
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConfigurationResolver;
+
+impl ConfigFile {
+    pub fn load(path: &Path) -> AdapterResult<Self> {
+        let content = fs::read_to_string(path).map_err(|source| {
+            AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
+        })?;
+        Self::parse(&content).map_err(|source| AdapterError::ConfigurationFile {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn parse(content: &str) -> Result<Self, ConfigError> {
+        let config: Self =
+            toml::from_str(content).map_err(|error| ConfigError::invalid(error.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != CONFIG_VERSION {
+            return Err(ConfigError::invalid(format!(
+                "unsupported configuration version `{}`; expected `{CONFIG_VERSION}`",
+                self.version
+            )));
+        }
+        for name in self.profiles.keys() {
+            validate_profile_name(name)?;
+        }
+        if let Some(name) = self.default_profile.as_deref()
+            && !self.profiles.contains_key(name)
+        {
+            return Err(ConfigError::invalid(format!(
+                "default profile `{name}` is not defined"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn selected_profile<'a>(
+        &'a self,
+        requested: Option<&'a str>,
+    ) -> Result<Option<&'a str>, ConfigError> {
+        let selected = requested.or(self.default_profile.as_deref());
+        if let Some(name) = selected
+            && !self.profiles.contains_key(name)
+        {
+            return Err(ConfigError::invalid(format!(
+                "profile `{name}` is not defined"
+            )));
+        }
+        Ok(selected)
+    }
+
+    pub fn resolve(
+        &self,
+        requested_profile: Option<&str>,
+        cli_overrides: SettingsOverrides,
+    ) -> Result<(ResolvedSettings, Option<String>), ConfigError> {
+        let selected = self.selected_profile(requested_profile)?;
+        let mut overrides = self.defaults.clone();
+        if let Some(name) = selected {
+            let profile = self
+                .profiles
+                .get(name)
+                .ok_or_else(|| ConfigError::invalid(format!("profile `{name}` is not defined")))?;
+            overrides.merge(profile.clone());
+        }
+        overrides.merge(cli_overrides);
+        let settings = ResolvedSettings::default()
+            .with_overrides(overrides)
+            .map_err(|error| ConfigError::invalid(error.to_string()))?;
+        Ok((settings, selected.map(str::to_owned)))
+    }
+}
+
+impl ConfigurationResolver {
+    pub fn resolve(&self, request: ResolveRequest) -> AdapterResult<ResolvedConfiguration> {
+        let requested_path = request.pinned_path.or(request.explicit_path);
+        let path = requested_path.clone().or_else(discover_config_path);
+        let Some(path) = path else {
+            if let Some(profile) = request.profile {
+                return Err(ConfigError::invalid(format!(
+                    "profile `{profile}` requires a configuration file"
+                ))
+                .into());
+            }
+            return Ok(ResolvedConfiguration {
+                settings: ResolvedSettings::default().with_overrides(request.cli_overrides)?,
+                config_path: None,
+                profile: None,
+            });
+        };
+
+        if !path.exists() {
+            if requested_path.is_some() {
+                return Err(AdapterError::ConfigurationFile {
+                    path,
+                    source: ConfigError::invalid("configuration file does not exist"),
+                });
+            }
+            return Ok(ResolvedConfiguration {
+                settings: ResolvedSettings::default().with_overrides(request.cli_overrides)?,
+                config_path: None,
+                profile: None,
+            });
+        }
+
+        let config = ConfigFile::load(&path)?;
+        let (settings, profile) = config
+            .resolve(request.profile.as_deref(), request.cli_overrides)
+            .map_err(|source| AdapterError::ConfigurationFile {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(ResolvedConfiguration {
+            settings,
+            config_path: Some(path),
+            profile,
+        })
+    }
+}
+
+pub fn discover_config_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        candidates.push(PathBuf::from(path).join("subbake/config.toml"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".config/subbake/config.toml"));
+    }
+    candidates.push(PathBuf::from("subbake.toml"));
+    candidates.push(PathBuf::from(".subbake.toml"));
+    candidates.into_iter().find(|path| path.exists())
+}
+
 pub fn append_profile_snapshot(
     path: &Path,
     name: &str,
-    mut settings: TranslationSettingsPatch,
+    settings: &ResolvedSettings,
 ) -> AdapterResult<()> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        return Err(ConfigError::InvalidProfileName.into());
-    }
-
+    validate_profile_name(name)?;
     let config = ConfigFile::load(path)?;
     if config.profiles.contains_key(name) {
         return Err(ConfigError::DuplicateProfile {
@@ -41,10 +187,19 @@ pub fn append_profile_snapshot(
         .into());
     }
 
-    // Do not proliferate inline credentials when creating a profile. An
-    // environment-variable reference remains safe to reuse.
-    settings.api_key = None;
-    settings.auth_header = None;
+    let mut snapshot = SettingsOverrides::from_resolved(settings);
+    snapshot.backend.api_key = None;
+    snapshot.backend.auth_header = None;
+
+    #[derive(Serialize)]
+    struct ProfileAppend {
+        profiles: BTreeMap<String, SettingsOverrides>,
+    }
+
+    let mut profiles = BTreeMap::new();
+    profiles.insert(name.to_owned(), snapshot);
+    let rendered = toml::to_string(&ProfileAppend { profiles })
+        .map_err(|error| ConfigError::invalid(error.to_string()))?;
 
     let mut content = fs::read_to_string(path).map_err(|source| {
         AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
@@ -53,8 +208,7 @@ pub fn append_profile_snapshot(
         content.push('\n');
     }
     content.push('\n');
-    content.push_str(&format!("[profiles.{name}]\n"));
-    write_profile_settings(&mut content, &settings);
+    content.push_str(&rendered);
 
     let file_name = path
         .file_name()
@@ -93,621 +247,200 @@ pub fn append_profile_snapshot(
     })
 }
 
-fn write_profile_settings(content: &mut String, settings: &TranslationSettingsPatch) {
-    macro_rules! string_setting {
-        ($key:literal, $value:expr) => {
-            if let Some(value) = &$value {
-                content.push_str(&format!("{} = {}\n", $key, quote_string(value)));
-            }
-        };
-    }
-    macro_rules! bool_setting {
-        ($key:literal, $value:expr) => {
-            if let Some(value) = $value {
-                content.push_str(&format!("{} = {}\n", $key, value));
-            }
-        };
-    }
-    macro_rules! usize_setting {
-        ($key:literal, $value:expr) => {
-            if let Some(value) = $value {
-                content.push_str(&format!("{} = {}\n", $key, value));
-            }
-        };
-    }
-    string_setting!("output_format", settings.output_format);
-    string_setting!("provider", settings.provider);
-    string_setting!("model", settings.model);
-    string_setting!("base_url", settings.base_url);
-    if let Some(value) = settings.api_format {
-        string_setting!("api_format", Some(value.as_str().to_owned()));
-    }
-    string_setting!("endpoint_url", settings.endpoint_url);
-    string_setting!("api_key_env", settings.api_key_env);
-    string_setting!("auth_prefix", settings.auth_prefix);
-    string_setting!("source_language", settings.source_language);
-    string_setting!("target_language", settings.target_language);
-    usize_setting!("batch_size", settings.batch_size);
-    usize_setting!("batch_token_budget", settings.batch_token_budget);
-    usize_setting!("translation_concurrency", settings.translation_concurrency);
-    usize_setting!("review_concurrency", settings.review_concurrency);
-    bool_setting!("bilingual", settings.bilingual);
-    if let Some(value) = settings.bilingual_order {
-        string_setting!("bilingual_order", Some(value.as_str().to_owned()));
-    }
-    bool_setting!("fast_mode", settings.fast_mode);
-    if let Some(value) = settings.review_policy {
-        string_setting!("review_policy", Some(value.as_str().to_owned()));
-    }
-    bool_setting!("terminology_preflight", settings.terminology_preflight);
-    bool_setting!("dry_run", settings.dry_run);
-    bool_setting!("resume", settings.resume);
-    bool_setting!("use_cache", settings.use_cache);
-    usize_setting!("retries", settings.retries);
-    bool_setting!("agent", settings.agent);
-    usize_setting!("agent_repair_attempts", settings.agent_repair_attempts);
-    if let Some(value) = &settings.runtime_dir {
-        string_setting!("runtime_dir", Some(value.to_string_lossy().into_owned()));
-    }
-    if let Some(value) = &settings.glossary_path {
-        string_setting!("glossary_path", Some(value.to_string_lossy().into_owned()));
-    }
-}
-
-fn quote_string(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r")
-            .replace('\t', "\\t")
-    )
-}
-
-/// Discover config file from XDG paths or project root.
-pub fn discover_config_path() -> Option<PathBuf> {
-    // 1. XDG_CONFIG_HOME / default ~/.config
-    let candidates = vec![
-        std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_or_default())
-            .join("subbake/config.toml"),
-        dirs_or_default().join("subbake/config.toml"),
-        PathBuf::from(".subbake.toml"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
-}
-
-fn dirs_or_default() -> PathBuf {
-    std::env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".config"))
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// Load a config file (full format) and resolve the named profile
-/// (or `default_profile`). Returns `None` if the file doesn't exist.
-pub fn load_and_resolve(
-    path: &Path,
-    profile: Option<&str>,
-) -> AdapterResult<Option<TranslationSettingsPatch>> {
-    let config = match ConfigFile::load(path) {
-        Ok(config) => config,
-        Err(error) if error.is_not_found() => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let resolved = config.resolve(profile);
-    if resolved == TranslationSettingsPatch::default() {
-        // All fields are None → nothing to apply.
-        return Ok(None);
-    }
-    Ok(Some(resolved))
-}
-
-pub fn parse_translation_settings_patch(
-    content: &str,
-) -> Result<TranslationSettingsPatch, ConfigError> {
-    let mut patch = TranslationSettingsPatch::default();
-
-    for (line_number, raw_line) in content.lines().enumerate() {
-        let line = strip_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            let table = line[1..line.len() - 1].trim();
-            if table != "defaults" {
-                return Err(ConfigError::Line {
-                    line: line_number + 1,
-                    reason: format!("unsupported config table `[{}]`", table),
-                });
-            }
-            continue;
-        }
-
-        let (key, value) = line.split_once('=').ok_or_else(|| ConfigError::Line {
-            line: line_number + 1,
-            reason: "expected `key = value`".to_owned(),
-        })?;
-        apply_key_value(
-            &mut patch,
-            key.trim(),
-            parse_value(value.trim()).map_err(|error| error.at_line(line_number + 1))?,
-        )
-        .map_err(|error| error.at_line(line_number + 1))?;
-    }
-
-    Ok(patch)
-}
-
-// ---------------------------------------------------------------------------
-// Full config file parser (multi-profile)
-// ---------------------------------------------------------------------------
-
-/// Parsed representation of a `subbake.toml` / `config.toml`.
-#[derive(Debug, Clone)]
-pub struct ConfigFile {
-    pub default_profile: Option<String>,
-    pub defaults: TranslationSettingsPatch,
-    pub profiles: HashMap<String, TranslationSettingsPatch>,
-}
-
-impl ConfigFile {
-    /// Load and parse a config file from disk.
-    pub fn load(path: &Path) -> AdapterResult<Self> {
-        let content = fs::read_to_string(path).map_err(|source| {
-            AdapterError::external_io("read configuration", Some(path.to_path_buf()), source)
-        })?;
-        Self::parse(&content).map_err(|source| AdapterError::ConfigurationFile {
-            path: path.to_path_buf(),
-            source,
-        })
-    }
-
-    /// Parse TOML-like config content supporting `default_profile`,
-    /// `[defaults]`, and `[profiles.<name>]` sections.
-    pub fn parse(content: &str) -> Result<Self, ConfigError> {
-        let mut default_profile = None;
-        let mut defaults = TranslationSettingsPatch::default();
-        let mut profiles = HashMap::new();
-        let mut current_table: Option<String> = None;
-
-        for (line_number, raw_line) in content.lines().enumerate() {
-            let line = strip_comment(raw_line).trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Section header
-            if line.starts_with('[') && line.ends_with(']') {
-                let table = line[1..line.len() - 1].trim().to_owned();
-                current_table = Some(table.clone());
-
-                if table == "defaults" {
-                    // valid
-                } else if let Some(profile_name) = table.strip_prefix("profiles.") {
-                    profiles.entry(profile_name.to_owned()).or_default();
-                } else {
-                    return Err(ConfigError::Line {
-                        line: line_number + 1,
-                        reason: format!("unsupported config table `[{table}]`"),
-                    });
-                }
-                continue;
-            }
-
-            let (key, value) = line.split_once('=').ok_or_else(|| ConfigError::Line {
-                line: line_number + 1,
-                reason: "expected `key = value`".to_owned(),
-            })?;
-            let key = key.trim();
-            let cv = parse_value(value.trim()).map_err(|error| error.at_line(line_number + 1))?;
-
-            // Top-level keys (outside any table)
-            let table = current_table.as_deref().unwrap_or("");
-            if table.is_empty() {
-                if key == "default_profile" {
-                    default_profile = Some(cv.into_string(key)?);
-                    continue;
-                }
-                return Err(ConfigError::Line {
-                    line: line_number + 1,
-                    reason: format!("unsupported top-level key `{key}`"),
-                });
-            }
-
-            let target = if table == "defaults" {
-                &mut defaults
-            } else if let Some(name) = table.strip_prefix("profiles.") {
-                profiles.get_mut(name).ok_or_else(|| ConfigError::Line {
-                    line: line_number + 1,
-                    reason: format!("internal: missing profile `{name}`"),
-                })?
-            } else {
-                continue; // unreachable
-            };
-
-            apply_key_value(target, key, cv).map_err(|error| error.at_line(line_number + 1))?;
-        }
-
-        Ok(Self {
-            default_profile,
-            defaults,
-            profiles,
-        })
-    }
-
-    /// Resolve settings for `profile_name` (falls back to default_profile,
-    /// then to `defaults`, then to built-in defaults).
-    pub fn resolve(&self, profile_name: Option<&str>) -> TranslationSettingsPatch {
-        let name = profile_name
-            .or(self.default_profile.as_deref())
-            .unwrap_or("");
-        let mut patch = self.defaults.clone();
-        if !name.is_empty()
-            && let Some(profile) = self.profiles.get(name)
-        {
-            patch.merge(profile.clone());
-        }
-        patch
-    }
-}
-
-fn apply_key_value(
-    patch: &mut TranslationSettingsPatch,
-    key: &str,
-    value: ConfigValue,
-) -> Result<(), ConfigError> {
-    match key {
-        "output_format" => patch.output_format = Some(value.into_string(key)?),
-        "provider" => patch.provider = Some(value.into_string(key)?),
-        "model" => patch.model = Some(value.into_string(key)?),
-        "api_key" => patch.api_key = Some(value.into_string(key)?),
-        "base_url" => patch.base_url = Some(value.into_string(key)?),
-        "api_format" => {
-            patch.api_format = Some(
-                ApiFormat::parse(&value.into_string(key)?)
-                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
-            )
-        }
-        "endpoint_url" => patch.endpoint_url = Some(value.into_string(key)?),
-        "api_key_env" => patch.api_key_env = Some(value.into_string(key)?),
-        "auth_header" => patch.auth_header = Some(value.into_string(key)?),
-        "auth_prefix" => patch.auth_prefix = Some(value.into_string(key)?),
-        "source_language" | "source_lang" => patch.source_language = Some(value.into_string(key)?),
-        "target_language" | "target_lang" => patch.target_language = Some(value.into_string(key)?),
-        "batch_size" => patch.batch_size = Some(value.into_usize(key)?),
-        "batch_token_budget" => patch.batch_token_budget = Some(value.into_usize(key)?),
-        "translation_concurrency" => patch.translation_concurrency = Some(value.into_usize(key)?),
-        "review_concurrency" => patch.review_concurrency = Some(value.into_usize(key)?),
-        "bilingual" => patch.bilingual = Some(value.into_bool(key)?),
-        "bilingual_order" => {
-            patch.bilingual_order = Some(
-                BilingualOrder::parse(&value.into_string(key)?)
-                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
-            )
-        }
-        "fast" | "fast_mode" => patch.fast_mode = Some(value.into_bool(key)?),
-        // Normalize the legacy boolean at the configuration boundary. All
-        // downstream overlay and application code sees one canonical field.
-        "final_review" => {
-            patch.review_policy = Some(if value.into_bool(key)? {
-                subbake_core::ReviewPolicy::Targeted
-            } else {
-                subbake_core::ReviewPolicy::Off
-            });
-        }
-        "review" | "review_policy" => {
-            patch.review_policy = Some(
-                subbake_core::ReviewPolicy::parse(&value.into_string(key)?)
-                    .map_err(|error| ConfigError::for_key(key, error.to_string()))?,
-            )
-        }
-        "terminology_preflight" => patch.terminology_preflight = Some(value.into_bool(key)?),
-        "dry_run" => patch.dry_run = Some(value.into_bool(key)?),
-        "resume" => patch.resume = Some(value.into_bool(key)?),
-        "cache" | "use_cache" => patch.use_cache = Some(value.into_bool(key)?),
-        "retries" => patch.retries = Some(value.into_nonnegative_usize(key)?),
-        "agent" => patch.agent = Some(value.into_bool(key)?),
-        "agent_repair_attempts" => {
-            patch.agent_repair_attempts = Some(value.into_nonnegative_usize(key)?);
-        }
-        "runtime_dir" => patch.runtime_dir = Some(PathBuf::from(value.into_string(key)?)),
-        "glossary" | "glossary_path" => {
-            patch.glossary_path = Some(PathBuf::from(value.into_string(key)?));
-        }
-        other => {
-            return Err(ConfigError::for_key(other, "is not supported"));
-        }
+fn validate_profile_name(name: &str) -> Result<(), ConfigError> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(ConfigError::InvalidProfileName);
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ConfigValue {
-    String(String),
-    Bool(bool),
-    Integer(usize),
-}
-
-impl ConfigValue {
-    fn into_string(self, key: &str) -> Result<String, ConfigError> {
-        match self {
-            ConfigValue::String(value) => Ok(value),
-            ConfigValue::Bool(_) | ConfigValue::Integer(_) => {
-                Err(ConfigError::for_key(key, "expects a string"))
-            }
-        }
-    }
-
-    fn into_bool(self, key: &str) -> Result<bool, ConfigError> {
-        match self {
-            ConfigValue::Bool(value) => Ok(value),
-            ConfigValue::String(_) | ConfigValue::Integer(_) => {
-                Err(ConfigError::for_key(key, "expects a boolean"))
-            }
-        }
-    }
-
-    fn into_usize(self, key: &str) -> Result<usize, ConfigError> {
-        match self {
-            ConfigValue::Integer(value) if value > 0 => Ok(value),
-            ConfigValue::Integer(_) => Err(ConfigError::for_key(key, "must be greater than zero")),
-            ConfigValue::String(_) | ConfigValue::Bool(_) => {
-                Err(ConfigError::for_key(key, "expects an integer"))
-            }
-        }
-    }
-
-    fn into_nonnegative_usize(self, key: &str) -> Result<usize, ConfigError> {
-        match self {
-            ConfigValue::Integer(value) => Ok(value),
-            ConfigValue::String(_) | ConfigValue::Bool(_) => {
-                Err(ConfigError::for_key(key, "expects an integer"))
-            }
-        }
-    }
-}
-
-fn parse_value(raw: &str) -> Result<ConfigValue, ConfigError> {
-    if let Some(value) = parse_quoted_string(raw)? {
-        return Ok(ConfigValue::String(value));
-    }
-    match raw {
-        "true" => return Ok(ConfigValue::Bool(true)),
-        "false" => return Ok(ConfigValue::Bool(false)),
-        _ => {}
-    }
-    raw.parse::<usize>()
-        .map(ConfigValue::Integer)
-        .map_err(|_| ConfigError::invalid(format!("unsupported config value `{raw}`")))
-}
-
-fn parse_quoted_string(raw: &str) -> Result<Option<String>, ConfigError> {
-    if !raw.starts_with('"') {
-        return Ok(None);
-    }
-    if !raw.ends_with('"') || raw.len() < 2 {
-        return Err(ConfigError::invalid("unterminated string"));
-    }
-    let inner = &raw[1..raw.len() - 1];
-    let mut output = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            output.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('"') => output.push('"'),
-            Some('\\') => output.push('\\'),
-            Some('n') => output.push('\n'),
-            Some('r') => output.push('\r'),
-            Some('t') => output.push('\t'),
-            Some(other) => {
-                return Err(ConfigError::invalid(format!(
-                    "unsupported escape sequence `\\{other}`"
-                )));
-            }
-            None => return Err(ConfigError::invalid("trailing escape character")),
-        }
-    }
-    Ok(Some(output))
-}
-
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, ch) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '#' if !in_string => return &line[..index],
-            _ => {}
-        }
-    }
-    line
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{
+        BackendOverrides, OutputOverrides, StorageOverrides, TranslationOverrides,
+    };
 
-    fn temporary_config(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
+    fn temporary_config(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("subbake-{name}-{unique}.toml"))
+        std::env::temp_dir().join(format!("subbake-{label}-{nonce}.toml"))
     }
 
     #[test]
-    fn parses_defaults_table() {
-        let patch = parse_translation_settings_patch(
-            r#"
-            [defaults]
-            provider = "mock"
-            model = "mock-en"
-            base_url = "https://example.test/v1"
-            target_language = "English"
-            batch_size = 8
-            bilingual = true
-            bilingual_order = "source_first"
-            final_review = false
-            resume = false
-            cache = false
-            retries = 0
-            agent = false
-            agent_repair_attempts = 3
-            "#,
-        )
-        .expect("config should parse");
-
-        assert_eq!(patch.provider.as_deref(), Some("mock"));
-        assert_eq!(patch.model.as_deref(), Some("mock-en"));
-        assert_eq!(patch.base_url.as_deref(), Some("https://example.test/v1"));
-        assert_eq!(patch.target_language.as_deref(), Some("English"));
-        assert_eq!(patch.batch_size, Some(8));
-        assert_eq!(patch.bilingual, Some(true));
-        assert_eq!(patch.bilingual_order, Some(BilingualOrder::SourceFirst));
-        assert_eq!(patch.review_policy, Some(subbake_core::ReviewPolicy::Off));
-        assert_eq!(patch.resume, Some(false));
-        assert_eq!(patch.use_cache, Some(false));
-        assert_eq!(patch.retries, Some(0));
-        assert_eq!(patch.agent, Some(false));
-        assert_eq!(patch.agent_repair_attempts, Some(3));
-    }
-
-    #[test]
-    fn rejects_unknown_keys() {
-        let error =
-            parse_translation_settings_patch("unknown = true").expect_err("unknown key fails");
-        assert!(error.to_string().contains("is not supported"));
-    }
-
-    #[test]
-    fn rejects_invalid_bilingual_order() {
-        let error = parse_translation_settings_patch(r#"bilingual_order = "translated""#)
-            .expect_err("invalid bilingual order fails");
-        assert!(error.to_string().contains("source_first, target_first"));
-    }
-
-    #[test]
-    fn parses_user_config_file() {
+    fn resolves_builtin_defaults_then_defaults_profile_and_cli() {
         let config = ConfigFile::parse(
             r#"
-            default_profile = "deepseek"
+            version = 1
+            default_profile = "quality"
 
-            [defaults]
-            target_language = "zh"
-            batch_size = 30
-
-            [profiles.deepseek]
-            provider = "openai"
-            model = "deepseek-v4-flash"
-            base_url = "https://api.deepseek.com"
-            api_key = "sk-test123"
-            "#,
-        )
-        .expect("config should parse");
-
-        assert_eq!(config.default_profile.as_deref(), Some("deepseek"));
-        assert_eq!(
-            config
-                .profiles
-                .get("deepseek")
-                .and_then(|p| p.provider.as_deref()),
-            Some("openai")
-        );
-        assert_eq!(
-            config
-                .profiles
-                .get("deepseek")
-                .and_then(|p| p.model.as_deref()),
-            Some("deepseek-v4-flash")
-        );
-    }
-
-    #[test]
-    fn resolve_merges_defaults_and_profile() {
-        let config = ConfigFile::parse(
-            r#"
-            [defaults]
-            target_language = "Chinese"
+            [defaults.translation]
+            target_language = "Japanese"
             batch_size = 20
 
-            [profiles.custom]
-            provider = "anthropic"
-            model = "claude-sonnet-4"
+            [defaults.output]
+            bilingual = true
+
+            [defaults.storage]
+            runtime_dir = "defaults-runtime"
+
+            [profiles.quality.backend]
+            id = "openai"
+            model = "gpt-profile"
+            api_format = "openai_chat"
+
+            [profiles.quality.translation]
+            batch_size = 10
+
+            [profiles.quality.output]
+            bilingual = false
+
+            [profiles.quality.storage]
+            runtime_dir = "profile-runtime"
             "#,
         )
-        .expect("config should parse");
+        .expect("v1 config");
 
-        let resolved = config.resolve(Some("custom"));
-        assert_eq!(resolved.target_language.as_deref(), Some("Chinese"));
-        assert_eq!(resolved.batch_size, Some(20));
-        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
-        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-4"));
+        let (settings, profile) = config
+            .resolve(
+                None,
+                SettingsOverrides {
+                    translation: TranslationOverrides {
+                        target_language: Some("English".to_owned()),
+                        ..TranslationOverrides::default()
+                    },
+                    output: OutputOverrides {
+                        bilingual: Some(true),
+                        ..OutputOverrides::default()
+                    },
+                    storage: StorageOverrides {
+                        runtime_dir: Some("cli-runtime".into()),
+                        ..StorageOverrides::default()
+                    },
+                    ..SettingsOverrides::default()
+                },
+            )
+            .expect("resolved config");
+
+        assert_eq!(profile.as_deref(), Some("quality"));
+        assert_eq!(settings.backend.id, "openai");
+        assert_eq!(settings.backend.model, "gpt-profile");
+        assert_eq!(settings.translation.target_language, "English");
+        assert_eq!(settings.translation.batch_size, 10);
+        assert!(settings.output.bilingual);
+        assert_eq!(settings.storage.runtime_dir, Some("cli-runtime".into()));
+        assert_eq!(settings.translation.source_language, "Auto");
     }
 
     #[test]
-    fn preserves_hash_inside_quoted_string() {
-        let patch = parse_translation_settings_patch(r#"model = "mock#tag" # comment"#)
-            .expect("config should parse");
-        assert_eq!(patch.model.as_deref(), Some("mock#tag"));
+    fn rejects_old_flat_configuration() {
+        let error = ConfigFile::parse(
+            r#"
+            version = 1
+            [profiles.openai]
+            provider = "openai"
+            model = "gpt"
+            "#,
+        )
+        .expect_err("flat fields are invalid");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn appends_profile_snapshot_without_rewriting_comments_or_credentials() {
-        let path = temporary_config("new-profile");
-        let original = "# keep this comment\n[defaults]\nprovider = \"mock\"\n";
-        fs::write(&path, original).expect("write config");
-        let patch = TranslationSettingsPatch {
-            provider: Some("custom".to_owned()),
-            model: Some("model\\\"name".to_owned()),
-            api_key: Some("secret".to_owned()),
-            api_key_env: Some("CUSTOM_API_KEY".to_owned()),
-            auth_header: Some("also-secret".to_owned()),
-            batch_size: Some(12),
-            bilingual: Some(true),
-            bilingual_order: Some(BilingualOrder::SourceFirst),
-            ..TranslationSettingsPatch::default()
+    fn rejects_missing_or_invalid_versions_and_profiles() {
+        assert!(ConfigFile::parse("[defaults.output]\nbilingual = true").is_err());
+        assert!(ConfigFile::parse("version = 2").is_err());
+        assert!(ConfigFile::parse("version = 1\ndefault_profile = \"missing\"").is_err());
+        let config = ConfigFile::parse("version = 1").expect("empty v1 config");
+        assert!(
+            config
+                .resolve(Some("missing"), SettingsOverrides::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn grouped_types_round_trip() {
+        let config = ConfigFile {
+            version: CONFIG_VERSION,
+            default_profile: Some("test".to_owned()),
+            defaults: SettingsOverrides {
+                output: OutputOverrides {
+                    format: Some("vtt".to_owned()),
+                    ..OutputOverrides::default()
+                },
+                storage: StorageOverrides {
+                    runtime_dir: Some(".runtime".into()),
+                    ..StorageOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            },
+            profiles: HashMap::from([(
+                "test".to_owned(),
+                SettingsOverrides {
+                    backend: BackendOverrides {
+                        id: Some("mock".to_owned()),
+                        model: Some("mock-en".to_owned()),
+                        ..BackendOverrides::default()
+                    },
+                    ..SettingsOverrides::default()
+                },
+            )]),
         };
-
-        append_profile_snapshot(&path, "review_copy", patch).expect("append profile");
-        let content = fs::read_to_string(&path).expect("read config");
-        assert!(content.starts_with(original));
-        assert!(content.contains("[profiles.review_copy]"));
-        assert!(content.contains("model = \"model\\\\\\\"name\""));
-        assert!(content.contains("api_key_env = \"CUSTOM_API_KEY\""));
-        assert!(!content.contains("secret"));
-
-        let parsed = ConfigFile::load(&path).expect("parse appended config");
-        let profile = parsed.profiles.get("review_copy").expect("new profile");
-        assert_eq!(profile.batch_size, Some(12));
-        assert_eq!(profile.bilingual, Some(true));
-        assert_eq!(profile.bilingual_order, Some(BilingualOrder::SourceFirst));
-        fs::remove_file(path).expect("remove config");
+        let text = toml::to_string(&config).expect("serialize config");
+        assert_eq!(ConfigFile::parse(&text).expect("parse config"), config);
     }
 
     #[test]
-    fn profile_snapshot_rejects_unsafe_and_duplicate_names() {
-        let path = temporary_config("profile-validation");
-        fs::write(&path, "[profiles.existing]\nmodel = \"mock\"\n").expect("write config");
-        let patch = TranslationSettingsPatch::default();
-        assert!(matches!(
-            append_profile_snapshot(&path, "bad.name", patch.clone()).expect_err("unsafe name"),
-            AdapterError::Configuration(ConfigError::InvalidProfileName)
-        ));
-        assert!(matches!(
-            append_profile_snapshot(&path, "existing", patch).expect_err("duplicate name"),
-            AdapterError::Configuration(ConfigError::DuplicateProfile { .. })
-        ));
-        fs::remove_file(path).expect("remove config");
+    fn profile_snapshot_uses_grouped_v1_shape_without_inline_secrets() {
+        let path = temporary_config("profile-snapshot");
+        fs::write(
+            &path,
+            "# preserve this comment\nversion = 1\n\n[defaults.output]\nbilingual = true\n",
+        )
+        .expect("write config");
+        let settings = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                backend: BackendOverrides {
+                    id: Some("openai".to_owned()),
+                    model: Some("gpt-test".to_owned()),
+                    api_format: Some(crate::ApiFormat::OpenaiChat),
+                    api_key: Some("inline-secret".to_owned()),
+                    api_key_env: Some("OPENAI_API_KEY".to_owned()),
+                    auth_header: Some("X-Secret".to_owned()),
+                    ..BackendOverrides::default()
+                },
+                output: OutputOverrides {
+                    bilingual: Some(true),
+                    ..OutputOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect("settings");
+
+        append_profile_snapshot(&path, "copy", &settings).expect("append profile");
+
+        let content = fs::read_to_string(&path).expect("read config");
+        assert!(content.starts_with("# preserve this comment"));
+        assert!(content.contains("[profiles.copy.backend]"));
+        assert!(content.contains("id = \"openai\""));
+        assert!(content.contains("api_key_env = \"OPENAI_API_KEY\""));
+        assert!(!content.contains("inline-secret"));
+        assert!(!content.contains("X-Secret"));
+
+        let parsed = ConfigFile::load(&path).expect("parse updated config");
+        let (copied, _) = parsed
+            .resolve(Some("copy"), SettingsOverrides::default())
+            .expect("resolve copied profile");
+        assert_eq!(copied.backend.id, "openai");
+        assert_eq!(copied.backend.model, "gpt-test");
+        assert!(copied.output.bilingual);
+        let _ = fs::remove_file(path);
     }
 }

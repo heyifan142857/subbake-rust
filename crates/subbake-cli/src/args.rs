@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    ApiFormat, BackendConfig, RuntimeAction, TranscriptionFormat, TranscriptionSettings,
-    TranslationSettings, TranslationSettingsPatch, WhisperAction, discover_config_path,
-    load_and_resolve,
+    ApiFormat, BackendConfig, ConfigurationResolver, ResolveRequest, RuntimeAction,
+    SettingsOverrides, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
+    WhisperAction,
 };
 use subbake_agent::{AgentAction, AgentActionKind};
-use subbake_core::entities::{DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 use crate::{CliError, CliResult};
 
@@ -129,19 +128,7 @@ fn parse_file_translation_args(
     // First pass: extract --config and --profile (store their values).
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
 
-    // Discover config file if none given via --config.
-    let cfg_file = explicit_config.clone().unwrap_or_else(|| {
-        discover_config_path().unwrap_or_else(|| PathBuf::from(".subbake.toml"))
-    });
-
-    // Load config + resolve profile as the baseline.
-    if let Some(patch) = load_config_patch(&cfg_file, explicit_profile.as_deref())? {
-        parsed.settings.apply_patch(patch);
-    }
-    if cfg_file.exists() {
-        parsed.config_path = Some(cfg_file);
-    }
-    parsed.profile = explicit_profile;
+    let mut overrides = SettingsOverrides::default();
 
     // Second pass: all remaining CLI flags override.
     let mut index = 1usize;
@@ -161,13 +148,8 @@ fn parse_file_translation_args(
                         &mut index,
                         &mut parsed.transcription_settings,
                     )? => {}
-            value
-                if parse_translation_setting_option(
-                    value,
-                    args,
-                    &mut index,
-                    &mut parsed.settings,
-                )? => {}
+            value if parse_translation_setting_option(value, args, &mut index, &mut overrides)? => {
+            }
             other => {
                 return Err(CliError::usage(format!(
                     "unknown {command_name} option `{other}`"
@@ -176,6 +158,10 @@ fn parse_file_translation_args(
         }
         index += 1;
     }
+    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    parsed.settings = resolved.settings;
+    parsed.config_path = resolved.config_path;
+    parsed.profile = resolved.profile;
     Ok(parsed)
 }
 
@@ -229,16 +215,7 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
     };
 
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
-    let cfg_file = explicit_config.clone().unwrap_or_else(|| {
-        discover_config_path().unwrap_or_else(|| PathBuf::from(".subbake.toml"))
-    });
-    if let Some(patch) = load_config_patch(&cfg_file, explicit_profile.as_deref())? {
-        parsed.translate.settings.apply_patch(patch);
-    }
-    if cfg_file.exists() {
-        parsed.config_path = Some(cfg_file);
-    }
-    parsed.profile = explicit_profile;
+    let mut overrides = SettingsOverrides::default();
 
     let mut index = 1usize;
     while index < args.len() {
@@ -248,26 +225,33 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
             "--config" | "--profile" => {
                 skip_two(args, &mut index)?;
             }
-            value
-                if parse_translation_setting_option(
-                    value,
-                    args,
-                    &mut index,
-                    &mut parsed.translate.settings,
-                )? => {}
+            value if parse_translation_setting_option(value, args, &mut index, &mut overrides)? => {
+            }
             other => return Err(CliError::usage(format!("unknown batch option `{other}`"))),
         }
         index += 1;
     }
+    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    parsed.translate.settings = resolved.settings;
+    parsed.config_path = resolved.config_path;
+    parsed.profile = resolved.profile;
 
     Ok(parsed)
 }
 
-fn load_config_patch(
-    path: &std::path::Path,
-    profile: Option<&str>,
-) -> CliResult<Option<TranslationSettingsPatch>> {
-    load_and_resolve(path, profile).map_err(CliError::from)
+fn resolve_settings(
+    explicit_path: Option<PathBuf>,
+    profile: Option<String>,
+    cli_overrides: SettingsOverrides,
+) -> CliResult<subbake_adapters::ResolvedConfiguration> {
+    ConfigurationResolver
+        .resolve(ResolveRequest {
+            explicit_path,
+            profile,
+            cli_overrides,
+            ..ResolveRequest::default()
+        })
+        .map_err(CliError::from)
 }
 
 pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
@@ -354,39 +338,45 @@ pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
         return Err(CliError::usage("provider requires `check`"));
     }
 
-    let mut provider = DEFAULT_PROVIDER.to_owned();
-    let mut model = DEFAULT_MODEL.to_owned();
-    let mut api_key = None;
-    let mut base_url = None;
-    let mut api_format = None;
-    let mut endpoint_url = None;
-    let mut api_key_env = None;
-    let mut auth_header = None;
-    let mut auth_prefix = None;
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
+    let mut overrides = SettingsOverrides::default();
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
-            "--provider" => provider = required_value(args, &mut index, "--provider")?,
-            "--model" => model = required_value(args, &mut index, "--model")?,
-            "--api-key" => api_key = Some(required_value(args, &mut index, "--api-key")?),
-            "--base-url" => base_url = Some(required_value(args, &mut index, "--base-url")?),
+            "--config" | "--profile" => skip_two(args, &mut index)?,
+            "--provider" => {
+                overrides.backend.id = Some(required_value(args, &mut index, "--provider")?)
+            }
+            "--model" => {
+                overrides.backend.model = Some(required_value(args, &mut index, "--model")?)
+            }
+            "--api-key" => {
+                overrides.backend.api_key = Some(required_value(args, &mut index, "--api-key")?)
+            }
+            "--base-url" => {
+                overrides.backend.base_url = Some(required_value(args, &mut index, "--base-url")?)
+            }
             "--api-format" => {
-                api_format = Some(
+                overrides.backend.api_format = Some(
                     ApiFormat::parse(&required_value(args, &mut index, "--api-format")?)
                         .map_err(|error| CliError::usage(error.to_string()))?,
                 )
             }
             "--endpoint-url" => {
-                endpoint_url = Some(required_value(args, &mut index, "--endpoint-url")?)
+                overrides.backend.endpoint_url =
+                    Some(required_value(args, &mut index, "--endpoint-url")?)
             }
             "--api-key-env" => {
-                api_key_env = Some(required_value(args, &mut index, "--api-key-env")?)
+                overrides.backend.api_key_env =
+                    Some(required_value(args, &mut index, "--api-key-env")?)
             }
             "--auth-header" => {
-                auth_header = Some(required_value(args, &mut index, "--auth-header")?)
+                overrides.backend.auth_header =
+                    Some(required_value(args, &mut index, "--auth-header")?)
             }
             "--auth-prefix" => {
-                auth_prefix = Some(required_value(args, &mut index, "--auth-prefix")?)
+                overrides.backend.auth_prefix =
+                    Some(required_value(args, &mut index, "--auth-prefix")?)
             }
             other => {
                 return Err(CliError::usage(format!(
@@ -396,21 +386,10 @@ pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
         }
         index += 1;
     }
+    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
 
     Ok(ProviderArgs {
-        config: BackendConfig {
-            id: provider.clone(),
-            provider: provider.clone(),
-            display_name: provider,
-            api_format,
-            model,
-            api_key,
-            base_url,
-            endpoint_url,
-            api_key_env,
-            auth_header,
-            auth_prefix,
-        },
+        config: resolved.settings.backend_config(),
     })
 }
 
@@ -517,69 +496,79 @@ fn parse_translation_setting_option(
     option: &str,
     args: &[String],
     index: &mut usize,
-    settings: &mut TranslationSettings,
+    overrides: &mut SettingsOverrides,
 ) -> CliResult<bool> {
     match option {
-        "--output-format" => settings.output.format = Some(required_value(args, index, option)?),
-        "--provider" => settings.backend.provider = required_value(args, index, option)?,
-        "--model" => settings.backend.model = required_value(args, index, option)?,
-        "--api-key" => settings.backend.api_key = Some(required_value(args, index, option)?),
-        "--base-url" => settings.backend.base_url = Some(required_value(args, index, option)?),
+        "--output-format" => overrides.output.format = Some(required_value(args, index, option)?),
+        "--provider" => overrides.backend.id = Some(required_value(args, index, option)?),
+        "--model" => overrides.backend.model = Some(required_value(args, index, option)?),
+        "--api-key" => overrides.backend.api_key = Some(required_value(args, index, option)?),
+        "--base-url" => overrides.backend.base_url = Some(required_value(args, index, option)?),
         "--api-format" => {
-            settings.backend.api_format = Some(
+            overrides.backend.api_format = Some(
                 ApiFormat::parse(&required_value(args, index, option)?)
                     .map_err(|error| CliError::usage(error.to_string()))?,
             )
         }
         "--endpoint-url" => {
-            settings.backend.endpoint_url = Some(required_value(args, index, option)?)
+            overrides.backend.endpoint_url = Some(required_value(args, index, option)?)
         }
         "--api-key-env" => {
-            settings.backend.api_key_env = Some(required_value(args, index, option)?)
+            overrides.backend.api_key_env = Some(required_value(args, index, option)?)
         }
         "--auth-header" => {
-            settings.backend.auth_header = Some(required_value(args, index, option)?)
+            overrides.backend.auth_header = Some(required_value(args, index, option)?)
         }
         "--auth-prefix" => {
-            settings.backend.auth_prefix = Some(required_value(args, index, option)?)
+            overrides.backend.auth_prefix = Some(required_value(args, index, option)?)
         }
         "--source-lang" => {
-            settings.translation.source_language = required_value(args, index, option)?
+            overrides.translation.source_language = Some(required_value(args, index, option)?)
         }
         "--target-lang" => {
-            settings.translation.target_language = required_value(args, index, option)?
+            overrides.translation.target_language = Some(required_value(args, index, option)?)
         }
-        "--batch-size" => settings.translation.batch_size = parse_batch_size(args, index)?,
+        "--batch-size" => {
+            overrides.translation.batch_size = Some(parse_batch_size(args, index, option)?)
+        }
         "--batch-token-budget" => {
-            settings.translation.batch_token_budget = parse_batch_size(args, index)?
+            overrides.translation.batch_token_budget = Some(parse_batch_size(args, index, option)?)
         }
         "--translation-concurrency" => {
-            settings.translation.translation_concurrency = parse_batch_size(args, index)?
+            overrides.translation.translation_concurrency =
+                Some(parse_batch_size(args, index, option)?)
         }
         "--review-concurrency" => {
-            settings.translation.review_concurrency = parse_batch_size(args, index)?
+            overrides.translation.review_concurrency = Some(parse_batch_size(args, index, option)?)
         }
-        "--runtime-dir" => settings.runtime.runtime_dir = Some(required_path(args, index, option)?),
-        "--glossary" => settings.runtime.glossary_path = Some(required_path(args, index, option)?),
-        "--bilingual" => settings.output.bilingual = true,
-        "--fast" => settings.translation.fast_mode = true,
-        "--no-review" => settings.translation.review_policy = subbake_core::ReviewPolicy::Off,
+        "--runtime-dir" => {
+            overrides.storage.runtime_dir = Some(required_path(args, index, option)?)
+        }
+        "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
+        "--bilingual" => overrides.output.bilingual = Some(true),
+        "--fast" => overrides.translation.fast_mode = Some(true),
+        "--no-review" => {
+            overrides.translation.review_policy = Some(subbake_core::ReviewPolicy::Off)
+        }
         "--review" => {
-            settings.translation.review_policy =
+            overrides.translation.review_policy = Some(
                 subbake_core::ReviewPolicy::parse(&required_value(args, index, option)?)
-                    .map_err(|error| CliError::usage(error.to_string()))?
+                    .map_err(|error| CliError::usage(error.to_string()))?,
+            )
         }
-        "--dry-run" => settings.translation.dry_run = true,
-        "--resume" => settings.translation.resume = true,
-        "--no-resume" => settings.translation.resume = false,
-        "--cache" => settings.translation.use_cache = true,
-        "--no-cache" => settings.translation.use_cache = false,
-        "--retries" => settings.translation.retries = parse_nonnegative_usize(args, index, option)?,
-        "--agent" => settings.translation.agent = true,
-        "--no-agent" => settings.translation.agent = false,
+        "--dry-run" => overrides.translation.dry_run = Some(true),
+        "--resume" => overrides.translation.resume = Some(true),
+        "--no-resume" => overrides.translation.resume = Some(false),
+        "--cache" => overrides.translation.use_cache = Some(true),
+        "--no-cache" => overrides.translation.use_cache = Some(false),
+        "--retries" => {
+            overrides.translation.retries = Some(parse_nonnegative_usize(args, index, option)?)
+        }
+        "--agent" => overrides.translation.agent = Some(true),
+        "--no-agent" => overrides.translation.agent = Some(false),
         "--agent-repair-attempts" => {
-            settings.translation.agent_repair_attempts =
-                parse_nonnegative_usize(args, index, option)?
+            overrides.translation.agent_repair_attempts =
+                Some(parse_nonnegative_usize(args, index, option)?)
         }
         _ => return Ok(false),
     }
@@ -598,13 +587,13 @@ fn required_path(args: &[String], index: &mut usize, flag: &str) -> CliResult<Pa
     required_value(args, index, flag).map(PathBuf::from)
 }
 
-fn parse_batch_size(args: &[String], index: &mut usize) -> CliResult<usize> {
-    let raw = required_value(args, index, "--batch-size")?;
+fn parse_batch_size(args: &[String], index: &mut usize, flag: &str) -> CliResult<usize> {
+    let raw = required_value(args, index, flag)?;
     let value = raw
         .parse::<usize>()
-        .map_err(|_| CliError::usage("--batch-size must be a positive integer"))?;
+        .map_err(|_| CliError::usage(format!("{flag} must be a positive integer")))?;
     if value == 0 {
-        return Err(CliError::usage("--batch-size must be greater than zero"));
+        return Err(CliError::usage(format!("{flag} must be greater than zero")));
     }
     Ok(value)
 }
@@ -619,6 +608,15 @@ fn parse_nonnegative_usize(args: &[String], index: &mut usize, flag: &str) -> Cl
 mod tests {
     use super::*;
 
+    fn empty_config(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-{label}-empty.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "version = 1\n").expect("write empty config");
+        path
+    }
+
     #[test]
     fn parse_translate_rejects_zero_batch_size() {
         let args = vec![
@@ -632,8 +630,11 @@ mod tests {
 
     #[test]
     fn parse_translate_accepts_resume_and_cache_switches() {
+        let config = empty_config("translate-switches");
         let args = vec![
             "clip.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--no-resume".to_owned(),
             "--no-cache".to_owned(),
             "--retries".to_owned(),
@@ -643,6 +644,7 @@ mod tests {
             "3".to_owned(),
         ];
         let parsed = parse_translate_args(&args).expect("translate args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert!(!parsed.settings.translation.resume);
         assert!(!parsed.settings.translation.use_cache);
@@ -653,8 +655,11 @@ mod tests {
 
     #[test]
     fn parse_translate_accepts_review_and_concurrency_options() {
+        let config = empty_config("translation-options");
         let args = vec![
             "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--review".to_owned(),
             "full".to_owned(),
             "--translation-concurrency".to_owned(),
@@ -665,6 +670,7 @@ mod tests {
             "1800".to_owned(),
         ];
         let parsed = parse_translate_args(&args).expect("translation options");
+        let _ = std::fs::remove_file(config);
         assert_eq!(
             parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Full
@@ -691,12 +697,16 @@ mod tests {
 
     #[test]
     fn parse_batch_reuses_translation_options() {
+        let config = empty_config("batch-options");
         let args = vec![
             "season".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--recursive".to_owned(),
             "--bilingual".to_owned(),
         ];
         let parsed = parse_batch_args(&args).expect("batch args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert!(parsed.recursive);
         assert!(parsed.translate.settings.output.bilingual);
@@ -708,7 +718,11 @@ mod tests {
             "subbake-test-{}-translate-invalid.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "[defaults]\nbatch_size = nope\n").expect("write config");
+        std::fs::write(
+            &path,
+            "version = 1\n[defaults.translation]\nbatch_size = \"nope\"\n",
+        )
+        .expect("write config");
         let args = vec![
             "clip.srt".to_owned(),
             "--config".to_owned(),
@@ -728,7 +742,11 @@ mod tests {
             "subbake-test-{}-batch-invalid.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "[defaults]\nunknown_setting = true\n").expect("write config");
+        std::fs::write(
+            &path,
+            "version = 1\n[defaults.translation]\nunknown_setting = true\n",
+        )
+        .expect("write config");
         let args = vec![
             "season".to_owned(),
             "--config".to_owned(),
@@ -743,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_uses_translation_defaults() {
+    fn explicit_missing_config_is_an_error() {
         let path =
             std::env::temp_dir().join(format!("subbake-test-{}-missing.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -753,10 +771,8 @@ mod tests {
             path.to_string_lossy().into_owned(),
         ];
 
-        let parsed = parse_translate_args(&args).expect("missing config should use defaults");
-
-        assert_eq!(parsed.settings, TranslationSettings::default());
-        assert_eq!(parsed.config_path, None);
+        let error = parse_translate_args(&args).expect_err("explicit config must exist");
+        assert!(error.to_string().contains("configuration"));
     }
 
     #[test]
@@ -770,10 +786,12 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            [defaults]
+            version = 1
+
+            [defaults.translation]
             target_language = "Japanese"
 
-            [profiles.zh]
+            [profiles.zh.translation]
             target_language = "Chinese"
             batch_size = 7
             "#,
@@ -809,9 +827,13 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            [defaults]
+            version = 1
+
+            [defaults.translation]
             target_language = "Japanese"
             batch_size = 9
+
+            [defaults.output]
             bilingual = true
             "#,
         )
@@ -834,8 +856,11 @@ mod tests {
 
     #[test]
     fn parse_pipeline_reuses_file_translation_options() {
+        let config = empty_config("pipeline-options");
         let args = vec![
             "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--output".to_owned(),
             "movie.zh.srt".to_owned(),
             "--json".to_owned(),
@@ -849,6 +874,7 @@ mod tests {
         ];
 
         let parsed = parse_pipeline_args(&args).expect("pipeline args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.input_path, PathBuf::from("movie.srt"));
         assert_eq!(parsed.output, Some(PathBuf::from("movie.zh.srt")));
@@ -905,21 +931,32 @@ mod tests {
 
     #[test]
     fn parse_provider_check_defaults_to_mock() {
-        let args = vec!["check".to_owned()];
+        let config = empty_config("provider-default");
+        let args = vec![
+            "check".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+        ];
 
         let parsed = parse_provider_args(&args).expect("provider check should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.config, BackendConfig::new("mock", "mock-zh"));
     }
 
     #[test]
     fn parse_provider_check_accepts_api_key_and_base_url() {
+        let config = empty_config("provider-options");
         let args = vec![
             "check".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--provider".to_owned(),
             "openai".to_owned(),
             "--model".to_owned(),
             "gpt".to_owned(),
+            "--api-format".to_owned(),
+            "openai_chat".to_owned(),
             "--api-key".to_owned(),
             "sk-test".to_owned(),
             "--base-url".to_owned(),
@@ -927,13 +964,55 @@ mod tests {
         ];
 
         let parsed = parse_provider_args(&args).expect("provider check should parse");
+        let _ = std::fs::remove_file(config);
 
-        assert_eq!(parsed.config.provider, "openai");
+        assert_eq!(parsed.config.id, "openai");
         assert_eq!(parsed.config.api_key.as_deref(), Some("sk-test"));
         assert_eq!(
             parsed.config.base_url.as_deref(),
             Some("https://example.test/v1")
         );
+    }
+
+    #[test]
+    fn provider_check_uses_profile_then_cli_backend_overrides() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-provider-profile.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            version = 1
+
+            [profiles.remote.backend]
+            id = "openai"
+            model = "profile-model"
+            api_format = "openai_chat"
+            base_url = "https://profile.test/v1"
+            "#,
+        )
+        .expect("write provider profile");
+        let args = vec![
+            "check".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--profile".to_owned(),
+            "remote".to_owned(),
+            "--model".to_owned(),
+            "cli-model".to_owned(),
+        ];
+
+        let parsed = parse_provider_args(&args).expect("provider profile should resolve");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(parsed.config.id, "openai");
+        assert_eq!(parsed.config.model, "cli-model");
+        assert_eq!(
+            parsed.config.base_url.as_deref(),
+            Some("https://profile.test/v1")
+        );
+        assert_eq!(parsed.config.api_format, Some(ApiFormat::OpenaiChat));
     }
 
     #[test]

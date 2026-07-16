@@ -42,8 +42,6 @@ impl ApiFormat {
 pub struct BackendConfig {
     /// Stable profile identifier. It never selects a protocol.
     pub id: String,
-    /// Deprecated compatibility alias for `id`; new code should use `id`.
-    pub provider: String,
     pub display_name: String,
     pub api_format: Option<ApiFormat>,
     pub model: String,
@@ -56,15 +54,13 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
-    /// Legacy constructor: known built-ins retain their historical mapping.
+    /// Construct a backend identity without selecting a wire protocol.
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
         let id = provider.into();
-        let api_format = legacy_api_format(&id);
         Self {
             display_name: id.clone(),
-            provider: id.clone(),
             id,
-            api_format,
+            api_format: None,
             model: model.into(),
             base_url: None,
             endpoint_url: None,
@@ -102,15 +98,6 @@ impl BackendConfig {
     }
 }
 
-pub fn legacy_api_format(provider: &str) -> Option<ApiFormat> {
-    match provider.to_ascii_lowercase().as_str() {
-        "openai" => Some(ApiFormat::OpenaiChat),
-        "anthropic" => Some(ApiFormat::AnthropicMessages),
-        "gemini" => Some(ApiFormat::OpenaiChat),
-        "deepseek" => Some(ApiFormat::OpenaiChat),
-        _ => None,
-    }
-}
 pub fn default_api_key_env(provider: &str) -> Option<&'static str> {
     match provider.to_ascii_lowercase().as_str() {
         "openai" => Some("OPENAI_API_KEY"),
@@ -195,19 +182,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_profiles_keep_their_protocol_mapping() {
-        assert_eq!(
-            BackendConfig::new("openai", "x").api_format,
-            Some(ApiFormat::OpenaiChat)
-        );
-        assert_eq!(
-            BackendConfig::new("anthropic", "x").api_format,
-            Some(ApiFormat::AnthropicMessages)
-        );
-        assert_eq!(
-            BackendConfig::new("gemini", "x").api_format,
-            Some(ApiFormat::OpenaiChat)
-        );
+    fn provider_ids_do_not_select_a_wire_protocol() {
+        assert_eq!(BackendConfig::new("openai", "x").api_format, None);
+        assert_eq!(BackendConfig::new("anthropic", "x").api_format, None);
+        assert_eq!(BackendConfig::new("gemini", "x").api_format, None);
     }
 
     #[test]
@@ -220,7 +198,7 @@ mod tests {
 
     #[test]
     fn rejects_header_injection() {
-        let mut config = BackendConfig::new("openai", "x");
+        let mut config = BackendConfig::new("mock", "x");
         config.auth_header = Some("X-Key\r\nInjected: yes".to_owned());
         assert!(config.validate().is_err());
     }

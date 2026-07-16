@@ -12,7 +12,9 @@ use std::io;
 use std::path::PathBuf;
 
 use serde_json::{Value as JsonValue, json};
-use subbake_adapters::{ConfigFile, TranslationSettings, append_profile_snapshot};
+use subbake_adapters::{
+    ConfigFile, SettingsOverrides, TranslationSettings, append_profile_snapshot,
+};
 use subbake_core::entities::Usage;
 use subbake_core::error::LlmCallError;
 use subbake_core::ports::{
@@ -201,7 +203,10 @@ impl AgentEngine {
             .session
             .as_ref()
             .and_then(|session| session.profile.as_deref());
-        append_profile_snapshot(&path, name, config.resolve(active))?;
+        let (settings, _) = config
+            .resolve(active, SettingsOverrides::default())
+            .map_err(subbake_adapters::AdapterError::from)?;
+        append_profile_snapshot(&path, name, &settings)?;
         let result = format!(
             "Created profile `{name}` from the active settings. Inline credentials were not copied; review it, then select it with `/profile {name}`."
         );
@@ -1360,15 +1365,19 @@ impl AgentEngine {
         let Some((_, config)) = self.load_project_config()? else {
             return Ok(TranslationSettings::default());
         };
-        Ok(self.settings_for_profile(&config, profile))
+        self.settings_for_profile(&config, profile)
     }
 
     pub(crate) fn settings_for_profile(
         &self,
         config: &ConfigFile,
         profile: Option<&str>,
-    ) -> TranslationSettings {
-        TranslationSettings::default().with_patch(config.resolve(profile))
+    ) -> AgentResult<TranslationSettings> {
+        config
+            .resolve(profile, SettingsOverrides::default())
+            .map(|(settings, _)| settings)
+            .map_err(subbake_adapters::AdapterError::from)
+            .map_err(Into::into)
     }
 
     fn event_path(&self, path: &std::path::Path) -> String {
@@ -3011,10 +3020,11 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::write(
             root.join("subbake.toml"),
-            "default_profile = \"fast\"\n\
-             [defaults]\nprovider = \"mock\"\n\
-             [profiles.fast]\nmodel = \"mock-fast\"\n\
-             [profiles.strict]\nmodel = \"mock-strict\"\n",
+            "version = 1\n\
+             default_profile = \"fast\"\n\
+             [defaults.backend]\nid = \"mock\"\n\
+             [profiles.fast.backend]\nmodel = \"mock-fast\"\n\
+             [profiles.strict.backend]\nmodel = \"mock-strict\"\n",
         )
         .expect("write config");
         let mut engine = AgentEngine::new(root.clone());
@@ -3040,10 +3050,11 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::write(
             root.join("subbake.toml"),
-            "default_profile = \"fast\"\n\
-             [defaults]\nprovider = \"mock\"\n\
-             [profiles.fast]\nmodel = \"mock-fast\"\n\
-             [profiles.strict]\nmodel = \"mock-strict\"\n",
+            "version = 1\n\
+             default_profile = \"fast\"\n\
+             [defaults.backend]\nid = \"mock\"\n\
+             [profiles.fast.backend]\nmodel = \"mock-fast\"\n\
+             [profiles.strict.backend]\nmodel = \"mock-strict\"\n",
         )
         .expect("write config");
         let mut engine = AgentEngine::new(root.clone());

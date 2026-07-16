@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    TranslationSettings, build_backend, discover_config_path, load_and_resolve,
+    ConfigurationResolver, ResolveRequest, TranslationSettings, build_backend, discover_config_path,
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
@@ -59,7 +59,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
     let initial_plan_mode = engine.is_plan_mode();
     let mut tui = SubBakeTui::new()?;
     tui.set_startup_info(StartupInfo {
-        provider: startup_settings.backend.provider,
+        provider: startup_settings.backend.id,
         model: startup_settings.backend.model,
         config: config_path
             .as_deref()
@@ -268,15 +268,9 @@ fn build_agent_decision_backend(
     config_path: Option<&Path>,
     profile: Option<&str>,
 ) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
-    let mut settings = TranslationSettings::default();
-    if let Some(path) = config_path {
-        let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
-            AgentError::invalid_input(format!("configuration disappeared: {}", path.display()))
-        })?;
-        settings.apply_patch(patch);
-    }
+    let settings = resolved_settings(config_path, profile)?;
 
-    if settings.backend.provider == "mock" {
+    if settings.backend.id == "mock" {
         return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
     }
 
@@ -290,14 +284,14 @@ fn resolved_settings(
     config_path: Option<&Path>,
     profile: Option<&str>,
 ) -> AgentResult<TranslationSettings> {
-    let mut settings = TranslationSettings::default();
-    if let Some(path) = config_path {
-        let patch = load_and_resolve(path, profile)?.ok_or_else(|| {
-            AgentError::invalid_input(format!("configuration disappeared: {}", path.display()))
-        })?;
-        settings.apply_patch(patch);
-    }
-    Ok(settings)
+    ConfigurationResolver
+        .resolve(ResolveRequest {
+            pinned_path: config_path.map(Path::to_path_buf),
+            profile: profile.map(str::to_owned),
+            ..ResolveRequest::default()
+        })
+        .map(|resolved| resolved.settings)
+        .map_err(Into::into)
 }
 
 fn display_config_path(path: &Path) -> String {
@@ -324,14 +318,17 @@ mod tests {
         let path = std::env::temp_dir().join(format!("subbake-agent-bad-profile-{nonce}.toml"));
         std::fs::write(
             &path,
-            "[profiles.bad]\nprovider = \"not-a-provider\"\nmodel = \"none\"\n",
+            "version = 1\n\
+             [profiles.bad.backend]\n\
+             id = \"not-a-provider\"\n\
+             model = \"none\"\n",
         )
         .expect("write config");
 
         let error = build_agent_decision_backend(Some(&path), Some("bad"))
             .err()
             .expect("invalid provider must fail");
-        assert!(error.to_string().contains("build agent backend"));
+        assert!(error.to_string().contains("api_format"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -346,7 +343,10 @@ mod tests {
         let path = root.join("subbake.toml");
         std::fs::write(
             &path,
-            "[profiles.bad]\nprovider = \"not-a-provider\"\nmodel = \"none\"\n",
+            "version = 1\n\
+             [profiles.bad.backend]\n\
+             id = \"not-a-provider\"\n\
+             model = \"none\"\n",
         )
         .expect("write config");
         let mut engine = AgentEngine::new(root.clone());
