@@ -300,15 +300,21 @@ pub(crate) fn execute_translation_tool(
                     undo_snapshots.push((output.clone(), guard.snapshot_write(&output)?));
                 }
             }
-            let translated = subbake_adapters::translate_subtitle_batch_cancellable(
-                BatchTranslationRequest {
-                    root: input,
-                    recursive,
-                    overwrite,
-                    settings,
-                },
-                cancellation,
-            )?;
+            let request = BatchTranslationRequest {
+                root: input,
+                recursive,
+                overwrite,
+                settings,
+            };
+            let translated = if let Some(progress) = progress {
+                subbake_adapters::translate_subtitle_batch_with_progress(
+                    request,
+                    cancellation,
+                    progress,
+                )?
+            } else {
+                subbake_adapters::translate_subtitle_batch_cancellable(request, cancellation)?
+            };
             let file_operations = translated
                 .outputs
                 .iter()
@@ -541,11 +547,24 @@ fn format_file_list(files: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use subbake_core::{ProgressEvent, ProgressSink, TaskKind};
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl ProgressSink for RecordingProgress {
+        fn emit(&self, event: ProgressEvent) {
+            self.events.lock().expect("progress events").push(event);
+        }
+    }
 
     #[test]
     fn local_mutation_returns_undo_bookkeeping_data() {
@@ -607,6 +626,41 @@ mod tests {
         )
         .expect_err("invalid whisper action must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn translate_series_forwards_batch_progress() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("episode.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        )
+        .expect("write subtitle");
+        let guard = FileGuard::new(root.clone());
+        let progress = Arc::new(RecordingProgress::default());
+
+        let outcome = execute_translation_tool(
+            ToolExecutor::TranslateSeries,
+            &json!({"path": root}),
+            &guard,
+            &CancellationGuard::never(),
+            Some(progress.clone()),
+            TranslationSettings::default(),
+        )
+        .expect("translate series")
+        .expect("translation outcome");
+
+        assert_eq!(outcome.text, "Translated 1 files, skipped 0.");
+        assert!(
+            progress
+                .events
+                .lock()
+                .expect("progress events")
+                .iter()
+                .any(|event| event.task == TaskKind::BatchTranslation)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
