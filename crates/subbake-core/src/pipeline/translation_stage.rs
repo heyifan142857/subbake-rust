@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 
-use super::{BatchWithUsage, apply_lines, merge_translation_lines, translation_memory_key};
+use super::BatchWithUsage;
+use super::support::{apply_lines, merge_translation_lines, translation_memory_key};
 
 pub(super) struct PreparedBatch {
     pub index: usize,

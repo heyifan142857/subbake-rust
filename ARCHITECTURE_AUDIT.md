@@ -1,23 +1,28 @@
-# 未完成的架构整改项
+# 架构整改状态
 
-本文档只记录仍未完成的整改项；已完成的历史审计结论已移除，避免把
-旧状态误当作当前架构保证。
+当前审计列出的整改项均已完成。以下内容记录现有边界及其验收依据，
+避免后续改动重新把独立职责堆回编排入口。
 
-## 1. 拆分仍然过大的编排模块
+## 1. 过大的编排模块已拆分
 
-`subbake-adapters/src/llm_backends.rs`、
-`subbake-agent/src/decision.rs`、`subbake-agent/src/engine.rs` 与
-`subbake-agent/src/tui.rs` 仍分别承担多项职责。虽然部分 reducer、工具执行器
-和协议转换已经抽出，但主要编排文件依然过长，修改一项流程时容易影响无关逻辑。
+原先集中在少数大文件中的职责已按稳定边界拆开：
 
-后续应按稳定边界继续拆分，而不是仅移动代码：
+- `subbake-adapters/src/llm_backends/` 分离 HTTP 传输与重试、各协议请求/响应转换，
+  以及原生工具调用的 continuation 和结果回传；`llm_backends.rs` 只保留适配器组装
+  与 `LlmBackend` 编排。
+- `subbake-agent/src/decision/` 分离决策数据模型、提示词和意图路由；
+  `tool_runner.rs` 负责注册工具的实际执行。
+- Agent 会话生命周期、计划持久化、profile 解析与切换、对话呈现和 undo 分别由
+  `session_controller.rs`、`plan_coordinator.rs`、`profile_coordinator.rs`、
+  `presentation.rs` 和 `undo.rs` 管理；`engine.rs` 只协调这些协作者。
+- `subbake-agent/src/tui/` 分离 typed protocol、输入路由、渲染、历史/observer、
+  terminal RAII 和 worker 生命周期；`tui.rs` 保留应用状态与主事件循环。
+- 翻译管线的术语预处理、恢复/持久化、翻译阶段编排和复审阶段编排分别位于
+  `pipeline/terminology.rs`、`pipeline/persistence.rs`、
+  `pipeline/translation_runner.rs` 和 `pipeline/review_runner.rs`。
 
-- 将各 LLM 协议的请求/响应转换、原生工具调用和 HTTP 重试拆到独立模块；
-- 将 Agent 决策、计划执行、配置切换和对话呈现分为独立协作者；
-- 将 TUI 的键盘路由、渲染、worker 生命周期和 picker/form 进一步解耦。
-
-验收：每个提取后的模块只拥有一种主要职责，公共类型位于所属 crate 的明确边界，
-原编排入口只负责组装和顺序控制。
+提取后的模块仅暴露 crate 内所需接口；跨 crate 的公共类型仍从所属 crate 根模块
+统一导出。完整 workspace 测试（包括真实 PTY 测试）和 Clippy 严格检查均通过。
 
 ## 2. 配置模型已收敛
 

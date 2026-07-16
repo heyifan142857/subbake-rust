@@ -110,7 +110,7 @@ impl ReviewStage {
                 "review result has invalid batch position {position}"
             ))
         })?;
-        let reviewed = super::apply_lines(&batch.source, lines);
+        let reviewed = super::support::apply_lines(&batch.source, lines);
         self.output[batch.start_offset..batch.start_offset + reviewed.len()]
             .clone_from_slice(&reviewed);
         self.usage.add(usage);
@@ -159,7 +159,7 @@ impl ReviewStage {
                 batches: self.plan.len(),
                 cache_hits: cache_hits.saturating_sub(self.cache_hits_before),
                 usage: self.usage,
-                duration_ms: super::duration_ms(self.started),
+                duration_ms: super::support::duration_ms(self.started),
             },
             output: self.output,
             changes,

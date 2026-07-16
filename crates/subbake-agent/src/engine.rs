@@ -9,10 +9,16 @@ use std::path::PathBuf;
 use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, PendingPlan, ToolCallDraft};
+use crate::event::{EventKind, ToolCallDraft};
 use crate::guard::FileGuard;
-use crate::session::{AgentSessionStore, EventTag, SessionMode};
+use crate::plan_coordinator::PlanCoordinator;
+use crate::presentation::ConversationPresenter;
+pub use crate::presentation::{ProfileChoice, SessionChoice};
+use crate::profile_coordinator::ProfileCoordinator;
+use crate::session::{AgentSessionStore, SessionMode};
+use crate::session_controller::SessionController;
 use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
+use crate::undo::UndoService;
 
 // ---------------------------------------------------------------------------
 // Observer trait — enables streaming output
@@ -40,27 +46,6 @@ pub trait EngineObserver: Send {
 
     /// The agent loop reached its step limit.
     fn on_step_limit(&mut self) {}
-}
-
-/// A compact, human-readable session row for the resume picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionChoice {
-    pub id: String,
-    pub title: String,
-    pub updated_at: String,
-    pub cwd: String,
-    pub event_count: usize,
-    pub active: bool,
-}
-
-/// A configured model profile row for the interactive picker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileChoice {
-    pub name: String,
-    pub provider: String,
-    pub model: String,
-    pub active: bool,
-    pub create: bool,
 }
 
 /// Observer that prints every engine lifecycle event to stdout.
@@ -236,27 +221,17 @@ impl AgentEngine {
 
     /// Create a new session and mark it active.
     pub fn start_session(&mut self) -> AgentResult<()> {
-        let session = self.session_store.create()?;
-        self.session = Some(session);
-        Ok(())
+        SessionController::new(&self.session_store, &mut self.session).start()
     }
 
     /// Resume an existing session by id (or the latest if `None`).
     pub fn resume_session(&mut self, id: Option<&str>) -> AgentResult<()> {
-        let session = match id {
-            Some(sid) => self.session_store.load(sid)?,
-            None => self
-                .session_store
-                .latest()?
-                .ok_or_else(|| std::io::Error::other("no sessions to resume"))?,
-        };
-        self.session = Some(session);
-        Ok(())
+        SessionController::new(&self.session_store, &mut self.session).resume(id)
     }
 
     /// Save the active session to disk.
     pub fn save(&self) -> AgentResult<()> {
-        if let Some(ref session) = self.session {
+        if let Some(session) = self.session.as_ref() {
             self.session_store.save(session)?;
         }
         Ok(())
@@ -266,45 +241,18 @@ impl AgentEngine {
     /// layer so profile listing, model reporting, and backend construction use
     /// the same source of truth.
     pub fn set_config_path(&mut self, path: Option<&std::path::Path>) -> AgentResult<()> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.config_path = path.map(|path| path.to_string_lossy().into_owned());
-        self.session_store.save(session)
+        SessionController::new(&self.session_store, &mut self.session).set_config_path(path)
     }
 
     /// Record an event in the active session and persist.
     pub fn record(&mut self, kind: EventKind) -> AgentResult<()> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("no active session"))?;
-
-        let now = crate::session::iso_now();
-        let (kind_str, text, data) = serialize_event(&kind);
-        session.events.push(crate::session::AgentEvent {
-            kind: kind_str,
-            text,
-            data,
-            created_at: now,
-        });
-        session.updated_at = crate::session::iso_now();
-        self.session_store.save(session)?;
-        Ok(())
+        SessionController::new(&self.session_store, &mut self.session).record(kind)
     }
 
     /// Persist an interactive operation error and return the session log path
     /// that now contains it.
     pub fn record_error(&mut self, error: &str) -> AgentResult<PathBuf> {
-        self.record(EventKind::Error {
-            text: error.to_owned(),
-        })?;
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("no active session"))?;
-        Ok(self.session_store.path_for(&session.id))
+        SessionController::new(&self.session_store, &mut self.session).record_error(error)
     }
 
     // ------------------------------------------------------------------
@@ -317,12 +265,7 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = SessionMode::Plan;
-        session.pending_plan = Some(PendingPlan {
-            message: message.to_owned(),
-            tool_calls,
-            created_at: crate::session::iso_now(),
-        });
+        PlanCoordinator::store(session, message, tool_calls);
         self.record(EventKind::Plan {
             message: message.to_owned(),
             tool_calls: event_calls,
@@ -331,19 +274,13 @@ impl AgentEngine {
     }
 
     pub fn approve_plan(&mut self) -> AgentResult<String> {
-        self.session
-            .as_ref()
-            .and_then(|session| session.pending_plan.as_ref())
-            .ok_or_else(|| std::io::Error::other("no pending plan to approve"))?;
-
         let mut outputs = Vec::new();
         loop {
-            let call = self
-                .session
-                .as_ref()
-                .and_then(|session| session.pending_plan.as_ref())
-                .and_then(|plan| plan.tool_calls.first())
-                .cloned();
+            let call = PlanCoordinator::next_call(
+                self.session
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("no active session"))?,
+            )?;
             let Some(call) = call else {
                 break;
             };
@@ -355,20 +292,14 @@ impl AgentEngine {
                 .session
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("no active session"))?;
-            let plan = session
-                .pending_plan
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("pending plan disappeared"))?;
-            plan.tool_calls.remove(0);
-            self.session_store.save(session)?;
+            PlanCoordinator::commit_completed_call(&self.session_store, session)?;
         }
 
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = SessionMode::Chat;
-        session.pending_plan = None;
+        PlanCoordinator::finish(session);
         self.record(EventKind::Approve)?;
 
         if outputs.is_empty() {
@@ -386,8 +317,7 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.mode = SessionMode::Chat;
-        session.pending_plan = None;
+        PlanCoordinator::finish(session);
         self.record(EventKind::Reject)?;
         Ok("Rejected pending plan.".to_owned())
     }
@@ -426,14 +356,10 @@ impl AgentEngine {
             .session
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
+        PlanCoordinator::set_mode(&self.session_store, session, enabled)?;
         if !enabled {
-            session.mode = SessionMode::Chat;
-            session.pending_plan = None;
-            self.session_store.save(session)?;
             Ok("Plan mode off.".to_owned())
         } else {
-            session.mode = SessionMode::Plan;
-            self.session_store.save(session)?;
             Ok("Plan mode on. Mutating tools will wait for your approval.".to_owned())
         }
     }
@@ -447,75 +373,15 @@ impl AgentEngine {
             .session
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        let pending = if session.pending_plan.is_some() {
-            "pending plan"
-        } else {
-            "no pending plan"
-        };
-        Ok(format!(
-            "Session: {}\nMode: {}\nEvents: {}\n{}",
-            session.id,
-            session.mode,
-            session.events.len(),
-            pending
-        ))
+        Ok(ConversationPresenter::session_summary(session))
     }
 
     pub fn sessions_summary(&self, limit: usize) -> AgentResult<String> {
-        let sessions = self.session_store.list(limit)?;
-        if sessions.is_empty() {
-            return Ok("No saved sessions.".to_owned());
-        }
-        let active_id = self.session.as_ref().map(|session| session.id.as_str());
-        Ok(sessions
-            .iter()
-            .map(|session| {
-                let marker = if Some(session.id.as_str()) == active_id {
-                    "*"
-                } else {
-                    " "
-                };
-                format!(
-                    "{marker} {}  {}  {} events",
-                    session.id,
-                    session.mode,
-                    session.events.len()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
+        ConversationPresenter::sessions_summary(&self.session_store, self.session.as_ref(), limit)
     }
 
     pub fn session_choices(&self, limit: usize) -> AgentResult<Vec<SessionChoice>> {
-        let active_id = self.session.as_ref().map(|session| session.id.as_str());
-        self.session_store.list(limit).map(|sessions| {
-            sessions
-                .into_iter()
-                .map(|session| {
-                    let title = session
-                        .events
-                        .iter()
-                        .find(|event| {
-                            event.tag() == EventTag::User && !event.text.trim().is_empty()
-                        })
-                        .map(|event| truncate_session_title(&event.text, 48))
-                        .unwrap_or_else(|| "New session".to_owned());
-                    let cwd = std::path::Path::new(&session.cwd)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(&session.cwd)
-                        .to_owned();
-                    SessionChoice {
-                        active: Some(session.id.as_str()) == active_id,
-                        id: session.id,
-                        title,
-                        updated_at: session.updated_at,
-                        cwd,
-                        event_count: session.events.len(),
-                    }
-                })
-                .collect()
-        })
+        ConversationPresenter::session_choices(&self.session_store, self.session.as_ref(), limit)
     }
 
     pub fn session_profile(&self, id: &str) -> AgentResult<Option<String>> {
@@ -542,25 +408,7 @@ impl AgentEngine {
             .session
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        let start = session.events.len().saturating_sub(limit);
-        let lines = session.events[start..]
-            .iter()
-            .filter_map(|event| {
-                let label = match event.tag() {
-                    EventTag::User => "You",
-                    EventTag::Assistant | EventTag::AskUser => "Agent",
-                    EventTag::ToolCall => "Tool",
-                    EventTag::Error => "Error",
-                    _ => return None,
-                };
-                Some(format!("{label}: {}", event.text))
-            })
-            .collect::<Vec<_>>();
-        Ok(if lines.is_empty() {
-            "No conversation history.".to_owned()
-        } else {
-            lines.join("\n")
-        })
+        Ok(ConversationPresenter::history_summary(session, limit))
     }
 
     pub fn clear_session(&mut self) -> AgentResult<String> {
@@ -583,28 +431,16 @@ impl AgentEngine {
     }
 
     pub fn pending_plan_summary(&self) -> String {
-        let Some(plan) = self
+        let plan = self
             .session
             .as_ref()
-            .and_then(|session| session.pending_plan.as_ref())
-        else {
-            return "No pending plan.".to_owned();
-        };
-        let mut lines = vec!["Plan awaiting approval:".to_owned()];
-        if !plan.message.trim().is_empty() {
-            lines.push(plan.message.trim().to_owned());
-        }
-        lines.extend(
-            plan.tool_calls.iter().enumerate().map(|(index, call)| {
-                format!("{}. {} {}", index + 1, call.tool_name, call.arguments)
-            }),
-        );
-        lines.push("Choose an action below: approve, reject, or revise the plan.".to_owned());
-        lines.join("\n")
+            .and_then(|session| session.pending_plan.as_ref());
+        ConversationPresenter::pending_plan_summary(plan)
     }
 
     pub fn active_model_summary(&self) -> AgentResult<String> {
-        let settings = self.active_translation_settings()?;
+        let settings =
+            ProfileCoordinator::new(&self.project_root, self.session.as_ref()).active_settings()?;
         Ok(format!(
             "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
             settings.backend.id, settings.backend.model
@@ -612,96 +448,19 @@ impl AgentEngine {
     }
 
     pub fn profile_choices(&self) -> AgentResult<Vec<String>> {
-        let Some((_, config)) = self.load_project_config()? else {
-            return Ok(Vec::new());
-        };
-        let mut profiles = config.profiles.keys().cloned().collect::<Vec<_>>();
-        profiles.sort();
-        Ok(profiles)
+        ProfileCoordinator::new(&self.project_root, self.session.as_ref()).names()
     }
 
     pub fn profile_picker_choices(&self) -> AgentResult<Vec<ProfileChoice>> {
-        let Some((_, config)) = self.load_project_config()? else {
-            return Ok(Vec::new());
-        };
-        let active = self
-            .session
-            .as_ref()
-            .and_then(|session| session.profile.as_deref())
-            .or(config.default_profile.as_deref());
-        let mut profiles = config
-            .profiles
-            .keys()
-            .map(|name| {
-                let settings = self.settings_for_profile(&config, Some(name))?;
-                Ok(ProfileChoice {
-                    name: name.clone(),
-                    provider: settings.backend.id,
-                    model: settings.backend.model,
-                    active: active == Some(name.as_str()),
-                    create: false,
-                })
-            })
-            .collect::<AgentResult<Vec<_>>>()?;
-        profiles.sort_by(|left, right| left.name.cmp(&right.name));
-        profiles.push(ProfileChoice {
-            name: "new profile…".to_owned(),
-            provider: String::new(),
-            model: "copy active settings without credentials".to_owned(),
-            active: false,
-            create: true,
-        });
-        Ok(profiles)
+        ProfileCoordinator::new(&self.project_root, self.session.as_ref()).picker_choices()
     }
 
     pub fn conversation_context_summary(&self, limit: usize) -> Option<String> {
-        let session = self.session.as_ref()?;
-        let mut lines = session
-            .events
-            .iter()
-            .rev()
-            .skip_while(|event| event.tag() == EventTag::User)
-            .filter_map(|event| {
-                let label = match event.tag() {
-                    EventTag::User => "User",
-                    EventTag::Assistant => "Assistant",
-                    EventTag::AskUser => "Assistant question",
-                    EventTag::ToolCall => "Tool",
-                    EventTag::FileOperation => "File operation",
-                    EventTag::Plan => "Plan",
-                    EventTag::Error => "Error",
-                    _ => return None,
-                };
-                let text = if event.text.trim().is_empty() {
-                    event.data.to_string()
-                } else {
-                    event.text.clone()
-                };
-                Some(format!("{label}: {}", truncate_summary(&text, 240)))
-            })
-            .take(limit)
-            .collect::<Vec<_>>();
-        lines.reverse();
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        ConversationPresenter::conversation_context(self.session.as_ref()?, limit)
     }
 
     pub fn input_history(&self) -> Vec<String> {
-        self.session
-            .as_ref()
-            .map(|session| {
-                session
-                    .events
-                    .iter()
-                    .filter(|event| event.tag() == EventTag::User && !event.text.trim().is_empty())
-                    .map(|event| event.text.clone())
-                    .fold(Vec::<String>::new(), |mut history, input| {
-                        if history.last() != Some(&input) {
-                            history.push(input);
-                        }
-                        history
-                    })
-            })
-            .unwrap_or_default()
+        ConversationPresenter::input_history(self.session.as_ref())
     }
 
     pub fn session_events(&self) -> Vec<crate::session::AgentEvent> {
@@ -759,109 +518,13 @@ impl AgentEngine {
 
     /// Undo the last file_operation event (or group of events sharing a group_id).
     pub fn undo_last(&mut self) -> AgentResult<String> {
-        let events = {
-            let session = self
-                .session
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("no active session"))?;
-            session.events.clone()
-        };
-
-        // Find the latest non-undone file_operation event.
-        let target = events
-            .iter()
-            .rev()
-            .find(|event| {
-                event.tag() == EventTag::FileOperation
-                    && !event
-                        .data
-                        .get("undone")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-            })
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("nothing to undo"))?;
-
-        let group_id = target
-            .data
-            .get("group_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        // Collect all events in this undo group.
-        let targets: Vec<_> = if let Some(ref gid) = group_id {
-            events
-                .iter()
-                .filter(|e| {
-                    e.tag() == EventTag::FileOperation
-                        && e.data.get("group_id").and_then(|v| v.as_str()) == Some(gid.as_str())
-                        && !e
-                            .data
-                            .get("undone")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
-        } else {
-            vec![target.clone()]
-        };
-
-        let mut count = 0usize;
-        for event in &targets {
-            let action = event
-                .data
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = event
-                .data
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let backup = event.data.get("backup_path").and_then(|v| v.as_str());
-
-            let target_path = self.project_root.join(path);
-
-            match action {
-                "created" => {
-                    // Remove the created file/directory.
-                    let _ = std::fs::remove_file(&target_path);
-                    let _ = std::fs::remove_dir_all(&target_path);
-                }
-                "renamed" => {
-                    if let Some(new_path) = event.data.get("new_path").and_then(|v| v.as_str()) {
-                        let moved_path = self.project_root.join(new_path);
-                        let _ = std::fs::remove_file(&moved_path);
-                        let _ = std::fs::remove_dir_all(&moved_path);
-                    }
-                    if let Some(bp) = backup {
-                        FileGuard::restore_backup(PathBuf::from(bp).as_path(), &target_path)?;
-                    }
-                }
-                "deleted" | "modified" | "appended" => {
-                    if let Some(bp) = backup {
-                        FileGuard::restore_backup(PathBuf::from(bp).as_path(), &target_path)?;
-                    }
-                }
-                _ => {}
-            }
-
-            // Mark as undone.
-            if let Some(session) = self.session.as_mut() {
-                for se in session.events.iter_mut().rev() {
-                    if se.created_at == event.created_at && se.tag() == EventTag::FileOperation {
-                        if let Some(obj) = se.data.as_object_mut() {
-                            obj.insert("undone".to_owned(), serde_json::Value::Bool(true));
-                        }
-                        break;
-                    }
-                }
-            }
-            count += 1;
-        }
-
-        self.save()?;
+        let count = UndoService::undo_last(
+            &self.project_root,
+            &self.session_store,
+            self.session
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("no active session"))?,
+        )?;
         self.record(EventKind::Undo)?;
 
         if count > 1 {
@@ -888,81 +551,6 @@ impl AgentEngine {
     /// List tool specs filtered by category for the LLM context.
     pub fn tool_specs_for_llm(&self, categories: &[ToolKind]) -> Vec<&crate::tools::ToolSpec> {
         crate::tools::tool_specs_for_categories(ALL_TOOL_SPECS, categories)
-    }
-}
-
-fn truncate_session_title(title: &str, max_chars: usize) -> String {
-    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_chars {
-        normalized
-    } else {
-        format!(
-            "{}…",
-            normalized
-                .chars()
-                .take(max_chars.saturating_sub(1))
-                .collect::<String>()
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
-    match kind {
-        EventKind::User { text } => ("user".into(), text.clone(), serde_json::json!({})),
-        EventKind::Assistant { text } => ("assistant".into(), text.clone(), serde_json::json!({})),
-        EventKind::AskUser { text } => ("ask_user".into(), text.clone(), serde_json::json!({})),
-        EventKind::ToolCall {
-            tool_name,
-            arguments,
-        } => (
-            "tool_call".into(),
-            tool_name.clone(),
-            serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
-        ),
-        EventKind::FinalToolCall {
-            tool_name,
-            arguments,
-        } => (
-            "final_tool_call".into(),
-            tool_name.clone(),
-            serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
-        ),
-        EventKind::FileOperation(data) => (
-            "file_operation".into(),
-            format!("{} {}", data.action, data.path),
-            serde_json::to_value(data).unwrap_or_default(),
-        ),
-        EventKind::Plan {
-            message,
-            tool_calls,
-        } => (
-            "plan".into(),
-            message.clone(),
-            serde_json::json!({"message": message, "tool_calls": tool_calls}),
-        ),
-        EventKind::Approve => ("approve".into(), String::new(), serde_json::json!({})),
-        EventKind::Reject => ("reject".into(), String::new(), serde_json::json!({})),
-        EventKind::Undo => ("undo".into(), String::new(), serde_json::json!({})),
-        EventKind::Profile { name } => ("profile".into(), name.clone(), serde_json::json!({})),
-        EventKind::Error { text } => ("error".into(), text.clone(), serde_json::json!({})),
-        EventKind::Cancelled => (
-            "cancelled".into(),
-            "Cancelled.".into(),
-            serde_json::json!({}),
-        ),
-    }
-}
-
-fn truncate_summary(text: &str, limit: usize) -> String {
-    let value = text.chars().take(limit).collect::<String>();
-    if text.chars().count() > limit {
-        format!("{value}...")
-    } else {
-        value
     }
 }
 

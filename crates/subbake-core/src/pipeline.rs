@@ -1,19 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, FailureLog, GlossaryEntry, PipelineOptions,
-    PipelineResult, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
-    SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
+    PipelineResult, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
+    TerminologyStats, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
-use crate::memory::{ContextMemory, english_possessive_base};
+use crate::memory::ContextMemory;
 use crate::ports::{
-    BackendJsonResult, BackendPayload, BatchExecutionOptions, BatchShardKind, CacheStage,
-    ChatMessage, DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
+    BackendJsonResult, BackendPayload, BatchExecutionOptions, CacheStage, ChatMessage,
+    DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
@@ -21,19 +20,40 @@ use crate::recovery::{
     parse_translation_payload, retry_correction_message, split_index,
 };
 use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
-use crate::storage::{
-    InputSignature, JsonValue, ResumeSnapshot, RunState, build_request_hash, build_request_hash_v2,
-    build_translation_fingerprint,
-};
-use crate::validation::{validate_full_alignment, validate_translation_batch};
+use crate::storage::{InputSignature, ResumeSnapshot};
+use crate::validation::validate_translation_batch;
 
+mod persistence;
 mod planning;
+mod review_runner;
 mod review_stage;
+mod support;
+mod terminology;
+mod translation_runner;
 mod translation_stage;
 
+use persistence::PipelinePersistence;
 use planning::BatchPlanner;
-use review_stage::ReviewStage;
-use translation_stage::{PreparedBatch, TranslationStage};
+use review_runner::ReviewRun;
+pub use support::translation_memory_key;
+use support::{
+    build_translation_messages, is_agent_repairable, is_operational_llm_failure,
+    merge_review_patch, request_hash, validate_review_candidate_ids,
+};
+use terminology::TerminologyStage;
+#[cfg(test)]
+use terminology::{
+    TerminologyCandidate, extract_candidates as extract_terminology_candidates,
+    parse_payload as parse_terminology_payload,
+};
+use translation_runner::TranslationRun;
+
+#[cfg(test)]
+use crate::entities::{ReviewPolicy, ReviewReport};
+#[cfg(test)]
+use crate::ports::BatchShardKind;
+#[cfg(test)]
+use support::validate_window_terminology;
 
 pub struct SubtitlePipeline<B, D> {
     backend: B,
@@ -242,249 +262,26 @@ where
         let terminology = self.run_terminology_preflight(document)?;
 
         let resume = self.load_resume_snapshot(&batches)?;
-        self.report(
-            "TRANSLATE",
-            if resume.translation_batches_completed > 0 {
-                TaskState::Resuming
-            } else {
-                TaskState::Running
-            },
-            resume.translation_batches_completed,
-            Some(batches.len()),
-            resume.translation_batches_completed,
-            Usage::default(),
-        );
-        let mut translation_stage = TranslationStage::new(
+        let TranslationRun {
             batches,
-            resume.translation_batches_completed,
-            resume.translated_segments,
-        )?;
-        let mut usage = resume.usage;
-        if resume.translation_batches_completed == 0 {
-            usage.add(terminology.usage);
-        }
-        if usage != Usage::default() {
-            self.dashboard.add_usage(usage);
-        }
-        while !translation_stage.is_complete() {
-            self.cancellation.check()?;
-            let concurrency = if self.backend.supports_parallel_generation() {
-                self.options.translation_concurrency.max(1)
-            } else {
-                1
-            };
-            let prepared = translation_stage.prepare_window(
-                concurrency,
-                self.options.use_cache,
-                &self.translation_memory,
-            );
-            self.report(
-                "TRANSLATE",
-                TaskState::Running,
-                translation_stage.next_batch(),
-                Some(translation_stage.len()),
-                resume.translation_batches_completed,
-                usage,
-            );
-            let pending = prepared
-                .iter()
-                .filter(|batch| !batch.pending.is_empty())
-                .map(|batch| (batch.index + 1, batch.pending.clone()))
-                .collect::<Vec<_>>();
-            self.report_translation_window(
-                translation_stage.batches(),
-                translation_stage.next_batch(),
-                pending.len(),
-                resume.translation_batches_completed,
-                usage,
-            );
-            let mut generated = self.translate_window(&pending)?;
-            validate_window_terminology(
-                &prepared,
-                &generated,
-                &self.required_glossary,
-                self.options.review_policy != ReviewPolicy::Off,
-            )?;
-            for prepared_batch in prepared {
-                let result = if prepared_batch.pending.is_empty() {
-                    None
-                } else {
-                    Some(
-                        generated
-                            .remove(&(prepared_batch.index + 1))
-                            .ok_or_else(|| {
-                                CoreError::DataInvariant(format!(
-                                    "translation window omitted batch {}",
-                                    prepared_batch.index + 1
-                                ))
-                            })?,
-                    )
-                };
-                let applied = translation_stage.apply(prepared_batch, result)?;
-                if let Some(result) = applied.result.as_ref() {
-                    usage.add(result.usage);
-                    self.dashboard.add_usage(result.usage);
-                    self.memory
-                        .update(&result.summary, &result.glossary_updates);
-                }
-                self.translation_memory_hits = translation_stage.memory_hits();
-                if self.options.use_cache {
-                    update_translation_memory(
-                        &mut self.translation_memory,
-                        &applied.source,
-                        &applied.translated,
-                    );
-                }
-
-                // Persist glossary, TM, batch segments after each batch.
-                if let Some(ref store) = self.store {
-                    self.cancellation.check()?;
-                    let glossary_entries: Vec<(String, String)> = self
-                        .memory
-                        .glossary
-                        .iter()
-                        .map(|(source, target)| (source.clone(), target.clone()))
-                        .collect();
-                    store.save_glossary(&glossary_entries)?;
-                    store.save_batch_segments(
-                        BatchShardKind::Translated,
-                        applied.index + 1,
-                        &applied.translated,
-                    )?;
-                    if self.options.use_cache {
-                        let tm_entries: Vec<(String, String)> = self
-                            .translation_memory
-                            .iter()
-                            .map(|(key, text)| (key.clone(), text.clone()))
-                            .collect();
-                        store.save_translation_memory(&tm_entries)?;
-                    }
-                }
-
-                self.cancellation.check()?;
-                self.save_run_state(
-                    applied.index + 1,
-                    resume.review_batches_completed,
-                    false,
-                    usage,
-                )?;
-                self.report(
-                    "TRANSLATE",
-                    TaskState::Running,
-                    applied.index + 1,
-                    Some(translation_stage.len()),
-                    resume.translation_batches_completed,
-                    usage,
-                );
-            }
-            self.report_translation_window(
-                translation_stage.batches(),
-                translation_stage.next_batch(),
-                0,
-                resume.translation_batches_completed,
-                usage,
-            );
-        }
-
-        validate_full_alignment(&document.segments, translation_stage.output())?;
-        self.cancellation.check()?;
-        self.save_run_state(
-            translation_stage.len(),
-            resume.review_batches_completed,
-            true,
+            segments: translated_segments,
             usage,
-        )?;
-        self.dashboard.mark_done("TRANSLATE");
-
-        let batches = translation_stage.batches().to_vec();
-        let translated_segments = translation_stage.finish();
-
-        let mut review_stage = ReviewStage::new(
-            &self.options,
+        } = translation_runner::run(self, document, batches, &resume, &terminology)?;
+        let ReviewRun {
+            output,
+            stats: review,
+            batches: review_batches,
+            resumed: resumed_review_batches,
+            usage,
+        } = review_runner::run(
+            self,
+            document,
             &batches,
             &translated_segments,
-            &self.memory,
-            resume.review_batches_completed,
-            &resume.reviewed_segments,
-            self.cache_hits,
+            &resume,
+            &terminology,
+            usage,
         )?;
-        self.dashboard
-            .set_total_steps(3 + batches.len() + review_stage.len());
-        let resumed_review_batches = review_stage.resumed();
-        if !review_stage.is_empty() {
-            self.dashboard.mark_running("FINAL_REVIEW");
-            let mut next_review = resumed_review_batches;
-            while next_review < review_stage.len() {
-                self.cancellation.check()?;
-                let concurrency = if self.backend.supports_parallel_generation() {
-                    self.options.review_concurrency.max(1)
-                } else {
-                    1
-                };
-                self.report(
-                    "FINAL_REVIEW",
-                    TaskState::Running,
-                    next_review,
-                    Some(review_stage.len()),
-                    resumed_review_batches,
-                    usage,
-                );
-                let pending = review_stage.window(next_review, concurrency);
-                let mut reviewed_window = self.review_window(&pending)?;
-                for (review_position, _) in &pending {
-                    let reviewed = reviewed_window.remove(review_position).ok_or_else(|| {
-                        CoreError::DataInvariant(format!(
-                            "review window omitted batch {review_position}"
-                        ))
-                    })?;
-                    usage.add(reviewed.usage);
-                    self.dashboard.add_usage(reviewed.usage);
-                    let reviewed_segments =
-                        review_stage.apply(*review_position, &reviewed.lines, reviewed.usage)?;
-                    if let Some(ref store) = self.store {
-                        self.cancellation.check()?;
-                        store.save_batch_segments(
-                            BatchShardKind::Reviewed,
-                            *review_position,
-                            &reviewed_segments,
-                        )?;
-                    }
-                    self.save_run_state(batches.len(), *review_position, true, usage)?;
-                    self.report(
-                        "FINAL_REVIEW",
-                        TaskState::Running,
-                        *review_position,
-                        Some(review_stage.len()),
-                        resumed_review_batches,
-                        usage,
-                    );
-                }
-                next_review += pending.len();
-            }
-            validate_full_alignment(&document.segments, review_stage.output())?;
-            self.dashboard.mark_done("FINAL_REVIEW");
-        } else {
-            self.report(
-                "FINAL_REVIEW",
-                TaskState::Skipped,
-                0,
-                Some(0),
-                0,
-                Usage::default(),
-            );
-        }
-        let review_batches = review_stage.len();
-        let review_outcome = review_stage.finish(self.cache_hits);
-        let review = review_outcome.stats;
-        if let Some(store) = self.store.as_ref() {
-            store.save_review_report(&ReviewReport {
-                terminology: terminology.clone(),
-                review: review.clone(),
-                changes: review_outcome.changes,
-            })?;
-        }
-        self.cancellation.check()?;
-        self.save_run_state(batches.len(), review_batches, true, usage)?;
         self.report(
             "WRITE_OUTPUT",
             TaskState::Running,
@@ -512,7 +309,7 @@ where
                 terminology,
                 review,
             },
-            translated_segments: review_outcome.output,
+            translated_segments: output,
         })
     }
 
@@ -520,152 +317,17 @@ where
         &mut self,
         document: &SubtitleDocument,
     ) -> CoreResult<TerminologyStats> {
-        let started = Instant::now();
-        let candidates = extract_terminology_candidates(&document.segments);
-        let mut stats = TerminologyStats {
-            candidates: candidates.len(),
-            ..TerminologyStats::default()
-        };
-        if !self.options.terminology_preflight
-            || self.options.fast_mode
-            || candidates.is_empty()
-            || !self.backend.supports_terminology_preflight()
-        {
-            self.report(
-                "TERMINOLOGY_PREFLIGHT",
-                TaskState::Skipped,
-                0,
-                Some(candidates.len()),
-                0,
-                Usage::default(),
-            );
-            return Ok(stats);
+        TerminologyStage {
+            backend: &mut self.backend,
+            dashboard: &mut self.dashboard,
+            options: &self.options,
+            memory: &mut self.memory,
+            store: self.store.as_deref(),
+            cancellation: &self.cancellation,
+            progress: self.progress.as_deref(),
+            cache_hits: &mut self.cache_hits,
         }
-
-        self.report(
-            "TERMINOLOGY_PREFLIGHT",
-            TaskState::Running,
-            0,
-            Some(candidates.len()),
-            0,
-            Usage::default(),
-        );
-        let existing = self.memory.glossary.clone();
-        let messages = build_terminology_messages(&self.options, &candidates);
-        let hash = request_hash(&self.options, CacheStage::Terminology, &messages);
-        let cached = if self.options.use_cache {
-            self.store
-                .as_ref()
-                .map(|store| store.load_cached_response(CacheStage::Terminology, &hash))
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-        let result = if let Some(response) = cached {
-            stats.cache_hits = 1;
-            self.cache_hits += 1;
-            Ok(response)
-        } else {
-            let mut last_error = None;
-            let mut response = None;
-            for _ in 0..=self.options.retries {
-                self.cancellation.check()?;
-                match self.execute_json(&messages).and_then(|(json, usage)| {
-                    let payload = parse_terminology_payload(&json, &candidates)?;
-                    Ok(BackendJsonResult {
-                        payload: BackendPayload::Terminology(payload),
-                        usage,
-                    })
-                }) {
-                    Ok(value) => {
-                        response = Some(value);
-                        break;
-                    }
-                    Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-                    Err(error) if is_operational_llm_failure(&error) => return Err(error),
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            response.ok_or_else(|| {
-                last_error.unwrap_or_else(|| {
-                    CoreError::InvalidBackendResponse("terminology preflight failed".to_owned())
-                })
-            })
-        };
-
-        match result {
-            Ok(response) => {
-                let BackendPayload::Terminology(payload) = response.payload else {
-                    return Err(CoreError::DataInvariant(
-                        "terminology cache returned a different payload".to_owned(),
-                    ));
-                };
-                stats.usage = if stats.cache_hits > 0 {
-                    Usage::default()
-                } else {
-                    response.usage
-                };
-                let mut accepted = Vec::new();
-                for entry in payload.entries {
-                    if let Some(current) = self.memory.glossary.get(&entry.source) {
-                        if !current.eq_ignore_ascii_case(&entry.target) {
-                            stats.conflicts_omitted += 1;
-                        }
-                        continue;
-                    }
-                    if accepted.iter().any(|value: &GlossaryEntry| {
-                        value.source.eq_ignore_ascii_case(&entry.source)
-                            && !value.target.eq_ignore_ascii_case(&entry.target)
-                    }) {
-                        stats.conflicts_omitted += 1;
-                        continue;
-                    }
-                    accepted.push(entry);
-                }
-                self.memory.update("", &accepted);
-                stats.entries_added = self.memory.glossary.len().saturating_sub(existing.len());
-                if self.options.use_cache
-                    && stats.cache_hits == 0
-                    && let Some(store) = self.store.as_ref()
-                {
-                    store.save_cached_response(
-                        CacheStage::Terminology,
-                        &hash,
-                        &BackendJsonResult {
-                            payload: BackendPayload::Terminology(TerminologyPreflightResult {
-                                entries: accepted,
-                            }),
-                            usage: response.usage,
-                        },
-                    )?;
-                }
-                if let Some(store) = self.store.as_ref() {
-                    let entries = self
-                        .memory
-                        .glossary
-                        .iter()
-                        .map(|(source, target)| (source.clone(), target.clone()))
-                        .collect::<Vec<_>>();
-                    store.save_glossary(&entries)?;
-                }
-            }
-            Err(error) => {
-                stats.degraded = true;
-                stats.degraded_reason = Some(error.to_string());
-            }
-        }
-        stats.duration_ms = duration_ms(started);
-        self.dashboard.add_usage(stats.usage);
-        self.report(
-            "TERMINOLOGY_PREFLIGHT",
-            TaskState::Completed,
-            candidates.len(),
-            Some(candidates.len()),
-            0,
-            stats.usage,
-        );
-        Ok(stats)
+        .run(document)
     }
 
     fn translate_batch(
@@ -1497,63 +1159,12 @@ where
         &mut self,
         batches: &[Vec<SubtitleSegment>],
     ) -> CoreResult<ResumeSnapshot> {
-        if !self.options.resume {
-            return Ok(ResumeSnapshot::default());
+        PipelinePersistence {
+            options: &self.options,
+            store: self.store.as_deref(),
+            input_signature: self.input_signature.as_ref(),
         }
-        let Some(input_signature) = self.input_signature.as_ref() else {
-            return Ok(ResumeSnapshot::default());
-        };
-        let Some(store) = self.store.as_ref() else {
-            return Ok(ResumeSnapshot::default());
-        };
-        let expected_fingerprint = build_translation_fingerprint(&self.options, input_signature);
-        let Some(state) = store.load_run_state()? else {
-            return Ok(ResumeSnapshot::default());
-        };
-        let Some(mut snapshot) = state.resume_snapshot(&expected_fingerprint) else {
-            return Ok(ResumeSnapshot::default());
-        };
-        if snapshot.translation_batches_completed > batches.len() {
-            return Err(CoreError::DataInvariant(format!(
-                "resume state has {} translated batches, but the current input has only {}",
-                snapshot.translation_batches_completed,
-                batches.len()
-            )));
-        }
-
-        let expected_segment_count: usize = batches
-            .iter()
-            .take(snapshot.translation_batches_completed)
-            .map(Vec::len)
-            .sum();
-        if snapshot.translation_batches_completed > 0 && snapshot.translated_segments.is_empty() {
-            snapshot.translated_segments = store.load_batch_segments(
-                BatchShardKind::Translated,
-                snapshot.translation_batches_completed,
-            )?;
-        }
-        if snapshot.translated_segments.len() != expected_segment_count {
-            return Err(CoreError::DataInvariant(format!(
-                "resume state expected {expected_segment_count} translated segments across {} batches, but loaded {}",
-                snapshot.translation_batches_completed,
-                snapshot.translated_segments.len()
-            )));
-        }
-
-        let resumed_source: Vec<SubtitleSegment> = batches
-            .iter()
-            .take(snapshot.translation_batches_completed)
-            .flatten()
-            .cloned()
-            .collect();
-        validate_full_alignment(&resumed_source, &snapshot.translated_segments)?;
-
-        if snapshot.review_batches_completed > 0 && snapshot.reviewed_segments.is_empty() {
-            snapshot.reviewed_segments = store
-                .load_batch_segments(BatchShardKind::Reviewed, snapshot.review_batches_completed)?;
-        }
-        self.memory = snapshot.memory.clone();
-        Ok(snapshot)
+        .load_resume_snapshot(batches, &mut self.memory)
     }
 
     fn save_run_state(
@@ -1563,21 +1174,18 @@ where
         validation_completed: bool,
         usage: Usage,
     ) -> CoreResult<()> {
-        let (Some(store), Some(input_signature)) =
-            (self.store.as_ref(), self.input_signature.as_ref())
-        else {
-            return Ok(());
-        };
-        let state = RunState::new(
-            &self.options,
-            input_signature.clone(),
-            usage,
-            self.memory.clone(),
+        PipelinePersistence {
+            options: &self.options,
+            store: self.store.as_deref(),
+            input_signature: self.input_signature.as_ref(),
+        }
+        .save_run_state(
+            &self.memory,
             translation_batches_completed,
             review_batches_completed,
             validation_completed,
-        );
-        store.save_run_state(&state)
+            usage,
+        )
     }
 }
 
@@ -1601,139 +1209,6 @@ struct ReviewWithUsage {
     usage: Usage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TerminologyCandidate {
-    source: String,
-    context: String,
-}
-
-fn extract_terminology_candidates(segments: &[SubtitleSegment]) -> Vec<TerminologyCandidate> {
-    let mut candidates = std::collections::BTreeMap::new();
-    for segment in segments {
-        let words = segment
-            .text
-            .split_whitespace()
-            .map(|word| {
-                let word = word.trim_matches(|ch: char| {
-                    !ch.is_alphanumeric() && ch != '-' && ch != '\'' && ch != '’'
-                });
-                english_possessive_base(word).unwrap_or(word)
-            })
-            .filter(|word| word.len() >= 2)
-            .collect::<Vec<_>>();
-        let mut index = 0;
-        while index < words.len() {
-            let word = words[index];
-            let is_title = word
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-                && word.chars().skip(1).any(|ch| ch.is_ascii_lowercase());
-            let is_acronym = word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 2
-                && word
-                    .chars()
-                    .filter(|ch| ch.is_ascii_alphabetic())
-                    .all(|ch| ch.is_ascii_uppercase());
-            if !is_title && !is_acronym {
-                index += 1;
-                continue;
-            }
-            let mut end = index + 1;
-            while end < words.len() && end - index < 4 {
-                let next = words[end];
-                if !next
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-                {
-                    break;
-                }
-                end += 1;
-            }
-            candidates
-                .entry(word.to_ascii_lowercase())
-                .or_insert_with(|| TerminologyCandidate {
-                    source: word.to_owned(),
-                    context: segment.text.chars().take(240).collect(),
-                });
-            let source = words[index..end].join(" ");
-            if end > index + 1 {
-                candidates
-                    .entry(source.to_ascii_lowercase())
-                    .or_insert_with(|| TerminologyCandidate {
-                        source,
-                        context: segment.text.chars().take(240).collect(),
-                    });
-            }
-            index = end;
-        }
-    }
-    candidates.into_values().take(256).collect()
-}
-
-fn build_terminology_messages(
-    options: &PipelineOptions,
-    candidates: &[TerminologyCandidate],
-) -> Vec<ChatMessage> {
-    let payload = serde_json::json!({
-        "source_language": options.source_language,
-        "target_language": options.target_language,
-        "candidates": candidates.iter().map(|candidate| serde_json::json!({
-            "source": candidate.source,
-            "context": candidate.context,
-        })).collect::<Vec<_>>(),
-    });
-    let payload = serde_json::to_string(&payload).unwrap_or_default();
-    vec![
-        ChatMessage::system(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {\"entries\":[{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}]}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain entries.",
-        ),
-        ChatMessage::user(format!(
-            "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
-        )),
-    ]
-}
-
-fn parse_terminology_payload(
-    payload: &serde_json::Value,
-    candidates: &[TerminologyCandidate],
-) -> CoreResult<TerminologyPreflightResult> {
-    let entries = payload
-        .get("entries")
-        .or_else(|| payload.get("glossary"))
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            CoreError::InvalidTranslation("terminology response missing entries array".to_owned())
-        })?;
-    let mut parsed = Vec::new();
-    for entry in entries {
-        let source = entry["source"].as_str().unwrap_or_default().trim();
-        let target = entry["target"].as_str().unwrap_or_default().trim();
-        if source.is_empty() || target.is_empty() {
-            return Err(CoreError::InvalidTranslation(
-                "terminology entry contains an empty source or target".to_owned(),
-            ));
-        }
-        let Some(candidate) = candidates
-            .iter()
-            .find(|candidate| candidate.source.eq_ignore_ascii_case(source))
-        else {
-            return Err(CoreError::InvalidTranslation(format!(
-                "terminology response contains unknown source `{source}`"
-            )));
-        };
-        parsed.push(GlossaryEntry {
-            source: candidate.source.clone(),
-            target: target.to_owned(),
-        });
-    }
-    Ok(TerminologyPreflightResult { entries: parsed })
-}
-
-fn duration_ms(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
 #[derive(Debug, Clone)]
 struct RepairOutcome {
     payload: Option<BackendPayload>,
@@ -1741,120 +1216,6 @@ struct RepairOutcome {
     attempts: Vec<AttemptLog>,
     log_path: Option<PathBuf>,
     error: Option<String>,
-}
-
-fn build_translation_messages(
-    options: &PipelineOptions,
-    batch_index: usize,
-    batch: &[SubtitleSegment],
-    memory: &ContextMemory,
-    required_glossary: &BTreeMap<String, String>,
-) -> Vec<ChatMessage> {
-    let mut context = serde_json::json!({
-        "src": options.source_language,
-        "tgt": options.target_language,
-        "batch_index": batch_index,
-        "fast": options.fast_mode,
-    });
-    if !options.fast_mode {
-        context["rules"] = serde_json::Value::Array(
-            memory
-                .style_rules
-                .iter()
-                .cloned()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-        let recent = memory.recent_summaries_for_prompt();
-        if !recent.is_empty() {
-            context["recent"] = serde_json::Value::Array(
-                recent
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
-        let batch_texts: Vec<&str> = batch
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .filter(|text| !text.is_empty())
-            .collect();
-        let glossary = memory.select_relevant_glossary(&batch_texts);
-        if !glossary.is_empty() {
-            let mut required = serde_json::Map::new();
-            let mut advisory = serde_json::Map::new();
-            for (source, target) in glossary {
-                let entry = (source.clone(), serde_json::Value::String(target));
-                if required_glossary.contains_key(&source) {
-                    required.insert(entry.0, entry.1);
-                } else {
-                    advisory.insert(entry.0, entry.1);
-                }
-            }
-            if !required.is_empty() {
-                context["glossary"] = serde_json::Value::Object(required);
-            }
-            if !advisory.is_empty() {
-                context["terminology_hints"] = serde_json::Value::Object(advisory);
-            }
-        }
-    }
-    let lines: Vec<serde_json::Value> = batch
-        .iter()
-        .map(|segment| serde_json::json!({"id": segment.id, "text": segment.text}))
-        .collect();
-    let batch_payload = serde_json::json!({"lines": lines});
-
-    let context_json = serde_json::to_string(&context).unwrap_or_default();
-    let batch_json = serde_json::to_string(&batch_payload).unwrap_or_default();
-    let user = format!(
-        "CONTEXT_JSON_START{context_json}CONTEXT_JSON_END\nBATCH_JSON_START{batch_json}BATCH_JSON_END"
-    );
-
-    vec![
-        ChatMessage::system(
-            "TASK_START\ntranslate_subtitles\nTASK_END\n\
-Return JSON only with this shape:\n\
-{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}],\"summary\":\"\",\"glossary_updates\":[]}\n\
-Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
-The translated text must be in the translation field; do not return it in text or translated_text.\n\
-Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
-Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
-CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context.",
-        ),
-        ChatMessage::user(user),
-    ]
-}
-
-fn messages_json(messages: &[ChatMessage]) -> JsonValue {
-    JsonValue::Array(
-        messages
-            .iter()
-            .map(|message| {
-                JsonValue::Object(vec![
-                    ("role".to_owned(), JsonValue::String(message.role.clone())),
-                    (
-                        "content".to_owned(),
-                        JsonValue::String(message.content.clone()),
-                    ),
-                ])
-            })
-            .collect(),
-    )
-}
-
-fn request_hash(options: &PipelineOptions, stage: CacheStage, messages: &[ChatMessage]) -> String {
-    if let Some(fingerprint) = &options.provider_fingerprint {
-        return build_request_hash_v2(fingerprint, stage.as_str(), messages_json(messages));
-    }
-    build_request_hash(
-        &options.provider,
-        &options.model,
-        stage.as_str(),
-        messages_json(messages),
-    )
 }
 
 fn failure_error(
@@ -1883,204 +1244,6 @@ fn failure_error(
         message.push_str(&format!("\nFailure sample saved to:\n{}", path.display()));
     }
     CoreError::InvalidTranslation(message)
-}
-
-fn is_agent_repairable(error: &CoreError) -> bool {
-    match error {
-        CoreError::InvalidTranslation(_) => true,
-        CoreError::Llm(crate::error::LlmCallError::InvalidResponse(_)) => true,
-        CoreError::InvalidBackendResponse(message) => {
-            message.contains("invalid JSON in response")
-                || message.contains("response JSON object")
-                || message.contains("response missing lines array")
-        }
-        _ => false,
-    }
-}
-
-fn is_operational_llm_failure(error: &CoreError) -> bool {
-    matches!(
-        error,
-        CoreError::Llm(llm_error)
-            if !matches!(llm_error, crate::error::LlmCallError::InvalidResponse(_))
-    )
-}
-
-fn merge_review_patch(
-    translated: &[SubtitleSegment],
-    changes: &[TranslationLine],
-) -> CoreResult<Vec<TranslationLine>> {
-    let mut replacements = HashMap::new();
-    for change in changes {
-        if change.translation.trim().is_empty()
-            || replacements
-                .insert(&change.id, &change.translation)
-                .is_some()
-        {
-            return Err(CoreError::InvalidTranslation(format!(
-                "review patch contains an empty or duplicate change for `{}`",
-                change.id
-            )));
-        }
-    }
-    if replacements
-        .keys()
-        .any(|id| !translated.iter().any(|segment| segment.id == ***id))
-    {
-        return Err(CoreError::InvalidTranslation(
-            "review patch contains an unknown id".to_owned(),
-        ));
-    }
-    Ok(translated
-        .iter()
-        .map(|segment| TranslationLine {
-            id: segment.id.clone(),
-            translation: replacements.get(&segment.id).map_or_else(
-                || segment.text.clone(),
-                |translation| (*translation).clone(),
-            ),
-        })
-        .collect())
-}
-
-fn validate_review_candidate_ids(
-    batch: &ReviewBatchPlan,
-    changes: &[TranslationLine],
-) -> CoreResult<()> {
-    if let Some(line) = changes
-        .iter()
-        .find(|line| !batch.candidate_reasons.contains_key(&line.id))
-    {
-        return Err(CoreError::InvalidTranslation(format!(
-            "review attempted to modify non-candidate id `{}`",
-            line.id
-        )));
-    }
-    Ok(())
-}
-
-fn validate_window_terminology(
-    prepared: &[PreparedBatch],
-    generated: &HashMap<usize, BatchWithUsage>,
-    required_glossary: &BTreeMap<String, String>,
-    defer_missing_to_review: bool,
-) -> CoreResult<()> {
-    for batch in prepared {
-        let Some(result) = generated.get(&(batch.index + 1)) else {
-            continue;
-        };
-        for (segment, line) in batch.pending.iter().zip(&result.lines) {
-            let source_lower = segment.text.to_lowercase();
-            let translation_lower = line.translation.to_lowercase();
-            for (term, target) in required_glossary {
-                if source_lower.contains(&term.to_lowercase())
-                    && !translation_lower.contains(&target.to_lowercase())
-                    && !defer_missing_to_review
-                {
-                    return Err(CoreError::InvalidTranslation(format!(
-                        "line {} does not use required glossary translation `{term}` -> `{target}`",
-                        segment.id
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn apply_lines(source: &[SubtitleSegment], lines: &[TranslationLine]) -> Vec<SubtitleSegment> {
-    source
-        .iter()
-        .map(|segment| {
-            let translation = lines
-                .iter()
-                .find(|line| line.id == segment.id)
-                .map(|line| line.translation.clone())
-                .unwrap_or_default();
-            let mut translated = segment.clone();
-            translated.text = translation;
-            translated
-        })
-        .collect()
-}
-
-/// Normalise a subtitle text for translation-memory lookup.
-/// Builds the stable translation-memory key used by compatible runtime data:
-///   lower-case → collapse whitespace → attach punctuation.
-pub fn translation_memory_key(text: &str) -> String {
-    let lower = text.trim().to_lowercase();
-    // Collapse whitespace runs to a single space.
-    let mut collapsed = String::with_capacity(lower.len());
-    let mut prev_was_space = false;
-    for ch in lower.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                collapsed.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            collapsed.push(ch);
-            prev_was_space = false;
-        }
-    }
-    // Remove spaces before punctuation (,.!?;:).
-    let mut attached = String::with_capacity(collapsed.len());
-    let mut chars = collapsed.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == ' '
-            && chars
-                .peek()
-                .is_some_and(|&next| matches!(next, ',' | '.' | '!' | '?' | ';' | ':'))
-        {
-            continue; // skip space before punctuation
-        }
-        attached.push(ch);
-    }
-    attached
-}
-
-/// Interleave TM-matched lines with LLM-generated lines in source order.
-/// For each segment in the batch, prefer a TM hit, fall back to the new line,
-/// and log a `TranslationLine` with the segment's id either way.
-fn merge_translation_lines(
-    batch: &[SubtitleSegment],
-    tm_hits: &HashMap<String, String>,
-    new_lines: &[TranslationLine],
-) -> Vec<TranslationLine> {
-    batch
-        .iter()
-        .map(|seg| {
-            if let Some(translation) = tm_hits.get(&seg.id) {
-                TranslationLine {
-                    id: seg.id.clone(),
-                    translation: translation.clone(),
-                }
-            } else {
-                new_lines
-                    .iter()
-                    .find(|line| line.id == seg.id)
-                    .cloned()
-                    .unwrap_or_else(|| TranslationLine {
-                        id: seg.id.clone(),
-                        translation: String::new(),
-                    })
-            }
-        })
-        .collect()
-}
-
-fn update_translation_memory(
-    memory: &mut HashMap<String, String>,
-    source: &[SubtitleSegment],
-    translated: &[SubtitleSegment],
-) {
-    for (source, translated) in source.iter().zip(translated) {
-        let key = translation_memory_key(&source.text);
-        if key.is_empty() || translated.text.trim().is_empty() {
-            continue;
-        }
-        memory.insert(key, translated.text.clone());
-    }
 }
 
 #[cfg(test)]

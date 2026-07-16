@@ -9,36 +9,38 @@
 //!      - `respond` / `ask_user` / step-limit exit.
 
 use std::io;
-use std::path::PathBuf;
 
 use serde_json::{Value as JsonValue, json};
-use subbake_adapters::{
-    ConfigFile, SettingsOverrides, TranslationSettings, append_profile_snapshot,
-};
 use subbake_core::entities::Usage;
 use subbake_core::error::LlmCallError;
 use subbake_core::ports::{
     ChatMessage, GenerationContent, GenerationInput, GenerationRequest, GenerationResponse,
-    LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract, ToolChoice,
-    ToolContinuation,
+    LlmBackend, ModelToolResult, NativeToolSupport, ResponseContract, ToolChoice,
 };
+#[cfg(test)]
+use subbake_core::ports::{ModelToolCall, ToolContinuation};
 
 use crate::discovery::summarize_observation;
 use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, FileOpEventData, ToolCallDraft};
-use crate::guard::{FileOpAction, FileOpResult};
+use crate::event::{EventKind, ToolCallDraft};
+use crate::profile_coordinator::ProfileCoordinator;
 use crate::session::{EventTag, PendingAction};
-use crate::tool_execution::{
-    execute_adapter_tool, execute_local_tool, execute_session_tool, execute_translation_tool,
-};
+use crate::tool_runner::ToolRunner;
 use crate::tools::{
     ToolAuthorization, ToolIntent, authorize_tool, tool_specs_for_intent, validate_tool_call,
 };
 
 mod intent;
+mod model;
+mod prompts;
 
 use intent::{Route, parse_route};
+use model::{
+    Decision, DecisionAction, LoopState, NativeTurn, Observation, invalid_decision_response,
+    parse_decision_value,
+};
+use prompts::{build_decision_messages, build_native_messages, build_route_messages};
 
 // ---------------------------------------------------------------------------
 // Echo backend for agent decision loop (no TASK_START markers needed)
@@ -129,66 +131,6 @@ fn execute_json(
 pub const AGENT_LOOP_MAX_STEPS: usize = 5;
 
 // ---------------------------------------------------------------------------
-// Loop-state types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct Observation {
-    tool_name: String,
-    arguments: JsonValue,
-    text: String,
-    summary: String,
-}
-
-#[derive(Debug, Clone)]
-struct LoopState {
-    step: usize,
-    max_steps: usize,
-    observations: Vec<Observation>,
-    discovery_calls: usize,
-    force_no_tools: bool,
-}
-
-/// The LLM's structured decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecisionAction {
-    Respond,
-    ToolCall,
-    Plan,
-    AskUser,
-    NativeToolCalls,
-}
-
-struct Decision {
-    action: DecisionAction,
-    text: String,
-    tool_name: Option<String>,
-    arguments: Option<JsonValue>,
-    tool_calls: Vec<ToolCallDraft>,
-    native_calls: Vec<ModelToolCall>,
-    native_continuation: Option<ToolContinuation>,
-}
-
-struct NativeTurn {
-    continuation: ToolContinuation,
-    results: Vec<ModelToolResult>,
-}
-
-fn invalid_decision_response(error: &AgentError) -> Decision {
-    Decision {
-        action: DecisionAction::AskUser,
-        text: format!(
-            "I couldn't execute the proposed action because its arguments were invalid: {error}"
-        ),
-        tool_name: None,
-        arguments: None,
-        tool_calls: Vec::new(),
-        native_calls: Vec::new(),
-        native_continuation: None,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Engine entry point
 // ---------------------------------------------------------------------------
 
@@ -196,20 +138,8 @@ impl AgentEngine {
     /// Create a profile by appending an effective-settings snapshot. It stays
     /// inactive so the current conversation never loses working credentials.
     pub fn create_profile(&mut self, name: &str) -> AgentResult<String> {
-        let Some((path, config)) = self.load_project_config()? else {
-            return Ok("No subbake config found. Create one before adding a profile.".to_owned());
-        };
-        let active = self
-            .session
-            .as_ref()
-            .and_then(|session| session.profile.as_deref());
-        let (settings, _) = config
-            .resolve(active, SettingsOverrides::default())
-            .map_err(subbake_adapters::AdapterError::from)?;
-        append_profile_snapshot(&path, name, &settings)?;
-        let result = format!(
-            "Created profile `{name}` from the active settings. Inline credentials were not copied; review it, then select it with `/profile {name}`."
-        );
+        let result = ProfileCoordinator::new(&self.project_root, self.session.as_ref())
+            .create_snapshot(name)?;
         self.record_if_active(EventKind::Assistant {
             text: result.clone(),
         })?;
@@ -683,7 +613,12 @@ impl AgentEngine {
         if let Some(route) = self.pending_action_route(input) {
             return Ok(route);
         }
-        let messages = self.build_route_messages(input, None);
+        let messages = build_route_messages(
+            input,
+            None,
+            self.pending_action(),
+            self.dialogue_context_summary(8),
+        );
         if let Some(ref mut observer) = self.observer {
             observer.on_thinking("Understanding your request…");
         }
@@ -702,7 +637,12 @@ impl AgentEngine {
         match parse_route(&value, input) {
             Ok(route) => Ok(route),
             Err(error) => {
-                let repair = self.build_route_messages(input, Some(&error.to_string()));
+                let repair = build_route_messages(
+                    input,
+                    Some(&error.to_string()),
+                    self.pending_action(),
+                    self.dialogue_context_summary(8),
+                );
                 match execute_json(backend, repair, &self.operation_guard) {
                     Ok((value, _)) => parse_route(&value, input).or_else(|_| {
                         Ok(Route::AskUser(
@@ -718,32 +658,6 @@ impl AgentEngine {
                 }
             }
         }
-    }
-
-    fn build_route_messages(&self, input: &str, repair_error: Option<&str>) -> Vec<ChatMessage> {
-        let mut system = "You are the semantic router for SubBake. No tools are available in this stage. Understand the current message using recent dialogue. Return one JSON object only. Use {\"route\":\"respond\",\"text\":\"...\"} for conversation or informational questions; {\"route\":\"ask_user\",\"text\":\"...\"} when clarification is essential; or {\"route\":\"act\",\"intent\":\"browse|translate|transcribe|edit|diagnose|file_create|file_append|file_replace|file_rename|file_delete|profile|whisper\",\"restated_request\":\"...\",\"inspect_project\":true|false} for an actionable request. Set inspect_project=true only when shallow project files are needed to ground the action. Route creating a translated or bilingual output from a source subtitle as translate. Route changing an existing .translated or .bilingual subtitle, including combining it with a source subtitle, as edit. A short reply such as 1/yes/好 may continue an action only when recent dialogue clearly establishes that action; otherwise respond conversationally. Never invent a path or action from old tool activity."
-            .to_owned();
-        if let Some(error) = repair_error {
-            system.push_str("\nThe previous route was invalid: ");
-            system.push_str(error);
-            system.push_str(". Return a corrected route.");
-        }
-        let mut user = format!("Current message: {input}");
-        if let Some(pending) = self.pending_action() {
-            user.push_str("\n\nPending action awaiting a user-supplied value:\n");
-            user.push_str(&format!(
-                "intent: {}\nrequest: {}\n",
-                pending.intent, pending.request
-            ));
-            user.push_str(
-                "If the current message supplies the requested value rather than starting a new task, continue this action with the same intent."
-            );
-        }
-        if let Some(context) = self.dialogue_context_summary(8) {
-            user.push_str("\n\nRecent dialogue:\n");
-            user.push_str(&context);
-        }
-        vec![ChatMessage::system(system), ChatMessage::user(user)]
     }
 
     fn pending_action(&self) -> Option<&PendingAction> {
@@ -849,8 +763,13 @@ impl AgentEngine {
                     ResponseContract::Text,
                 )
             } else {
-                GenerationRequest::text(self.build_native_messages(user_input, state, intent))
-                    .with_tools(tools, choice)
+                GenerationRequest::text(build_native_messages(
+                    user_input,
+                    state,
+                    intent,
+                    self.dialogue_context_summary(12),
+                ))
+                .with_tools(tools, choice)
             };
             match backend.execute(request, &self.operation_guard) {
                 Ok(response) => {
@@ -866,25 +785,9 @@ impl AgentEngine {
                         GenerationContent::Json(json) => json.to_string(),
                     };
                     if !tool_calls.is_empty() {
-                        return Ok(Decision {
-                            action: DecisionAction::NativeToolCalls,
-                            text,
-                            tool_name: None,
-                            arguments: None,
-                            tool_calls: Vec::new(),
-                            native_calls: tool_calls,
-                            native_continuation: continuation,
-                        });
+                        return Ok(Decision::native(text, tool_calls, continuation));
                     }
-                    return Ok(Decision {
-                        action: DecisionAction::Respond,
-                        text,
-                        tool_name: None,
-                        arguments: None,
-                        tool_calls: Vec::new(),
-                        native_calls: Vec::new(),
-                        native_continuation: None,
-                    });
+                    return Ok(Decision::response(text));
                 }
                 Err(LlmCallError::UnsupportedCapability(_)) if !was_continuation => {}
                 Err(LlmCallError::Cancelled) => {
@@ -894,15 +797,7 @@ impl AgentEngine {
                     if let Some(ref mut observer) = self.observer {
                         observer.on_error(&error.to_string());
                     }
-                    return Ok(Decision {
-                        action: DecisionAction::Respond,
-                        text: format!("Error: {error}"),
-                        tool_name: None,
-                        arguments: None,
-                        tool_calls: Vec::new(),
-                        native_calls: Vec::new(),
-                        native_continuation: None,
-                    });
+                    return Ok(Decision::response(format!("Error: {error}")));
                 }
             }
         }
@@ -916,26 +811,37 @@ impl AgentEngine {
         state: &LoopState,
         intent: ToolIntent,
     ) -> AgentResult<Decision> {
-        let messages = self.build_decision_messages(user_input, state, None, intent);
+        let messages = build_decision_messages(
+            user_input,
+            state,
+            None,
+            intent,
+            self.dialogue_context_summary(12),
+        );
         if let Some(ref mut obs) = self.observer {
             obs.on_thinking("Deciding next action…");
         }
         let result = execute_json(backend, messages, &self.operation_guard);
         match result {
-            Ok((decision, _usage)) => match self.parse_decision_value(&decision) {
+            Ok((decision, _usage)) => match parse_decision_value(&decision, |name| {
+                self.is_discovery_tool(name)
+            }) {
                 Ok(decision) => Ok(decision),
                 Err(first_error) => {
                     if let Some(ref mut obs) = self.observer {
                         obs.on_error(&first_error.to_string());
                     }
-                    let repair_messages = self.build_decision_messages(
+                    let repair_messages = build_decision_messages(
                         user_input,
                         state,
                         Some(&first_error.to_string()),
                         intent,
+                        self.dialogue_context_summary(12),
                     );
                     match execute_json(backend, repair_messages, &self.operation_guard) {
-                        Ok((repaired, _usage)) => match self.parse_decision_value(&repaired) {
+                        Ok((repaired, _usage)) => match parse_decision_value(&repaired, |name| {
+                            self.is_discovery_tool(name)
+                        }) {
                             Ok(decision) => Ok(decision),
                             Err(second_error) => {
                                 if let Some(ref mut obs) = self.observer {
@@ -945,17 +851,9 @@ impl AgentEngine {
                             }
                         },
                         Err(LlmCallError::Cancelled) => Err(AgentError::Cancelled),
-                        Err(error) => Ok(Decision {
-                            action: DecisionAction::AskUser,
-                            text: format!(
-                                "The proposed action was invalid ({first_error}), and the repair attempt failed: {error}"
-                            ),
-                            tool_name: None,
-                            arguments: None,
-                            tool_calls: Vec::new(),
-                            native_calls: Vec::new(),
-                            native_continuation: None,
-                        }),
+                        Err(error) => Ok(Decision::ask_user(format!(
+                            "The proposed action was invalid ({first_error}), and the repair attempt failed: {error}"
+                        ))),
                     }
                 }
             },
@@ -966,212 +864,9 @@ impl AgentEngine {
                 if let Some(ref mut obs) = self.observer {
                     obs.on_error(&e.to_string());
                 }
-                Ok(Decision {
-                    action: DecisionAction::Respond,
-                    text: format!("Error: {e}"),
-                    tool_name: None,
-                    arguments: None,
-                    tool_calls: Vec::new(),
-                    native_calls: Vec::new(),
-                    native_continuation: None,
-                })
+                Ok(Decision::response(format!("Error: {e}")))
             }
         }
-    }
-
-    /// Build the LLM message context for the decision call.
-    fn build_native_messages(
-        &self,
-        user_input: &str,
-        state: &LoopState,
-        intent: ToolIntent,
-    ) -> Vec<ChatMessage> {
-        let system = if state.force_no_tools {
-            "You are SubBake. Tool exploration is finished. Answer from the supplied dialogue and observations, or ask one specific clarification question. Do not request another tool.".to_owned()
-        } else {
-            format!(
-                "You are SubBake, a subtitle translation assistant. The preliminary routed intent is `{}`; provided tools may safely refine translate into edit or edit into translate when discovered file state requires it. Use only the provided tools and only when they advance the routed action. For an actionable request, do not reply with instructions that the available tools can perform. Preserve subtitle id order, never merge or drop entries. Use edit_subtitle when changing an existing .translated or .bilingual subtitle, including combining it with its source subtitle. Use translate_file for one source subtitle file and translate_series for a directory, batch, or all-files request. Reuse exact paths from tool results. When creating bilingual output through a translation tool, pass bilingual=true. Call one tool at a time unless independent calls are necessary.",
-                intent.as_str()
-            )
-        };
-        vec![
-            ChatMessage::system(system),
-            ChatMessage::user(self.build_user_context(user_input, state)),
-        ]
-    }
-
-    fn build_decision_messages(
-        &self,
-        user_input: &str,
-        state: &LoopState,
-        repair_error: Option<&str>,
-        intent: ToolIntent,
-    ) -> Vec<ChatMessage> {
-        let mut system = String::new();
-        system.push_str("You are SubBake, a subtitle translation assistant.\n\n");
-        system.push_str(&format!(
-            "The preliminary routed intent is `{}`; adjacent subtitle tools may safely refine translate into edit or edit into translate.\n\n",
-            intent.as_str()
-        ));
-        system.push_str("Relevant available tools:\n");
-        for spec in if state.force_no_tools {
-            Vec::new()
-        } else {
-            tool_specs_for_intent(intent)
-        } {
-            system.push_str(&spec.prompt_line());
-            if spec.mutating {
-                system.push_str(" (mutating)");
-            }
-            system.push('\n');
-        }
-        system.push_str("\nDecide the next action. Return JSON with keys:\n");
-        system.push_str(r#"{"action": "respond" | "tool_call" | "plan" | "ask_user", "text": "...", "tool_name": "...", "arguments": {...}, "tool_calls": [{"tool_name": "...", "arguments": {...}}]}"#);
-        system.push_str("\n- `respond`: reply to the user directly.\n");
-        system.push_str("- `tool_call`: invoke a tool. Discovery tools feed observations back; mutating tools execute immediately.\n");
-        system.push_str(
-            "- `plan`: propose one or more mutating tool calls that must wait for `/approve`.\n",
-        );
-        system.push_str("- `ask_user`: ask the user for clarification.\n");
-        system.push_str("Use tools before asking the user for project facts that a read-only tool can discover.\n");
-        system.push_str("For an actionable request, do not `respond` with instructions that the available tools can perform.\n");
-        system.push_str("If a translation target is omitted, call candidate_subtitles with path `.` before asking for a path.\n");
-        system.push_str("Preserve subtitle id order, never merge or drop entries.\n");
-        system.push_str("Use translate_file for one explicit subtitle file and translate_series for a directory, batch, or all-files request.\n");
-        system.push_str("Use edit_subtitle when changing an existing .translated or .bilingual subtitle, including combining it with its source subtitle.\n");
-        system.push_str("Reuse exact paths from discovery observations. Use path `.` for the current directory.\n");
-        system.push_str(
-            "When creating bilingual output through a translation tool, pass bilingual=true.\n",
-        );
-        if state.force_no_tools {
-            system.push_str("Tool exploration is finished. Return respond or ask_user now; do not return tool_call or plan.\n");
-        }
-        if let Some(error) = repair_error {
-            system.push_str("\nYour previous decision was rejected by local validation. Return one corrected JSON decision and do not repeat the error:\n");
-            system.push_str(error);
-            system.push('\n');
-        }
-
-        let user = self.build_user_context(user_input, state);
-
-        vec![ChatMessage::system(&system), ChatMessage::user(&user)]
-    }
-
-    fn build_user_context(&self, user_input: &str, state: &LoopState) -> String {
-        let mut user = String::new();
-        user.push_str("User: ");
-        user.push_str(user_input);
-        user.push('\n');
-
-        if let Some(summary) = self.dialogue_context_summary(12) {
-            user.push_str("\nRecent session context:\n");
-            user.push_str(&summary);
-            user.push('\n');
-        }
-
-        if !state.observations.is_empty() {
-            user.push_str("\nObservations from earlier steps:\n");
-            for (i, obs) in state.observations.iter().enumerate() {
-                user.push_str(&format!("  [{i}] {}: {}\n", obs.tool_name, obs.summary));
-                for line in obs.text.lines().take(3) {
-                    user.push_str(&format!("      {}\n", truncate_text(line, 240)));
-                }
-            }
-        }
-
-        user
-    }
-
-    fn parse_decision_value(&self, parsed: &JsonValue) -> AgentResult<Decision> {
-        let object = parsed
-            .as_object()
-            .ok_or_else(|| AgentError::InvalidDecision {
-                message: "agent decision must be a JSON object".to_owned(),
-            })?;
-        let raw_action = object
-            .get("action")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| AgentError::InvalidDecision {
-                message: "agent decision is missing `action`".to_owned(),
-            })?;
-        let action = match raw_action {
-            "final_tool_call" | "tool_call" => DecisionAction::ToolCall,
-            "respond" => DecisionAction::Respond,
-            "plan" => DecisionAction::Plan,
-            "ask_user" => DecisionAction::AskUser,
-            other => {
-                return Err(AgentError::InvalidDecision {
-                    message: format!("unsupported agent action `{other}`"),
-                });
-            }
-        };
-        let text = object
-            .get("text")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let mut tool_name = None;
-        let mut arguments = None;
-        let mut tool_calls = Vec::new();
-        if action == DecisionAction::ToolCall {
-            let name = object
-                .get("tool_name")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| AgentError::InvalidDecision {
-                    message: "tool call is missing `tool_name`".to_owned(),
-                })?;
-            let args = object
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
-                message: error.to_string(),
-            })?;
-            tool_name = Some(name.to_owned());
-            arguments = Some(args);
-        } else if action == DecisionAction::Plan {
-            let calls = object
-                .get("tool_calls")
-                .and_then(JsonValue::as_array)
-                .ok_or_else(|| AgentError::InvalidDecision {
-                    message: "plan is missing `tool_calls`".to_owned(),
-                })?;
-            if calls.is_empty() {
-                return Err(AgentError::InvalidDecision {
-                    message: "plan must contain at least one tool call".to_owned(),
-                });
-            }
-            for call in calls {
-                let name = call
-                    .get("tool_name")
-                    .and_then(JsonValue::as_str)
-                    .ok_or_else(|| AgentError::InvalidDecision {
-                        message: "planned call is missing `tool_name`".to_owned(),
-                    })?;
-                let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
-                    message: error.to_string(),
-                })?;
-                if self.is_discovery_tool(name) {
-                    return Err(AgentError::InvalidDecision {
-                        message: "discovery tools must run before creating a plan".to_owned(),
-                    });
-                }
-                tool_calls.push(ToolCallDraft {
-                    tool_name: name.to_owned(),
-                    arguments: args,
-                });
-            }
-        }
-        Ok(Decision {
-            action,
-            text,
-            tool_name,
-            arguments,
-            tool_calls,
-            native_calls: Vec::new(),
-            native_continuation: None,
-        })
     }
 
     // ------------------------------------------------------------------
@@ -1214,192 +909,7 @@ impl AgentEngine {
 
     /// Execute a tool by name with arguments. Returns a text summary.
     pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> AgentResult<String> {
-        self.check_cancelled()?;
-        self.record_if_active(EventKind::ToolCall {
-            tool_name: name.to_owned(),
-            arguments: args.clone(),
-        })?;
-
-        let executor = crate::tools::find_tool_spec(name)
-            .map(|spec| spec.executor)
-            .ok_or_else(|| AgentError::InvalidInput {
-                message: format!("unknown agent tool `{name}`"),
-            })?;
-
-        if let Some(outcome) = execute_local_tool(executor, args, &self.guard, &self.project_root)?
-        {
-            if let Some(operation) = outcome.file_operation {
-                self.record_file_operation(&operation)?;
-            }
-            return Ok(outcome.text);
-        }
-        if let Some(text) = execute_adapter_tool(
-            executor,
-            args,
-            &self.guard,
-            &self.operation_guard,
-            self.progress.clone(),
-        )? {
-            return Ok(text);
-        }
-        if matches!(
-            executor,
-            crate::tools::ToolExecutor::TranslateFile
-                | crate::tools::ToolExecutor::TranslateSeries
-                | crate::tools::ToolExecutor::EditSubtitle
-        ) {
-            let settings = self.active_translation_settings()?;
-            let outcome = execute_translation_tool(
-                executor,
-                args,
-                &self.guard,
-                &self.operation_guard,
-                self.progress.clone(),
-                settings,
-            )?
-            .ok_or_else(|| AgentError::InvalidState {
-                message: "translation tool executor rejected its tool".to_owned(),
-            })?;
-            let group_id = outcome
-                .group_file_operations
-                .then(|| format!("translate-series-{}", crate::session::iso_now()));
-            for operation in &outcome.file_operations {
-                self.record_file_operation_with_group(operation, group_id.clone())?;
-            }
-            return Ok(outcome.text);
-        }
-
-        if matches!(
-            executor,
-            crate::tools::ToolExecutor::RecentTranslations
-                | crate::tools::ToolExecutor::ListProfiles
-                | crate::tools::ToolExecutor::SwitchProfile
-        ) {
-            let config = if matches!(executor, crate::tools::ToolExecutor::RecentTranslations) {
-                None
-            } else {
-                self.load_project_config()?
-            };
-            let events = self
-                .session
-                .as_ref()
-                .map(|session| session.events.as_slice())
-                .unwrap_or(&[]);
-            let active_profile = self
-                .session
-                .as_ref()
-                .and_then(|session| session.profile.as_deref());
-            let outcome = execute_session_tool(executor, args, events, config, active_profile)?
-                .ok_or_else(|| AgentError::InvalidState {
-                    message: "session tool executor rejected its tool".to_owned(),
-                })?;
-            if let Some(profile_switch) = outcome.profile_switch {
-                let session = self
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| AgentError::invalid_state("no active session"))?;
-                session.profile = Some(profile_switch.name.clone());
-                session.config_path =
-                    Some(profile_switch.config_path.to_string_lossy().to_string());
-                self.save()?;
-                self.record_if_active(EventKind::Profile {
-                    name: profile_switch.name,
-                })?;
-            }
-            return Ok(outcome.text);
-        }
-
-        Err(AgentError::InvalidState {
-            message: "tool was not handled by its registered executor".to_owned(),
-        })
-    }
-
-    fn record_file_operation(&mut self, result: &FileOpResult) -> AgentResult<()> {
-        self.record_file_operation_with_group(result, None)
-    }
-
-    fn record_file_operation_with_group(
-        &mut self,
-        result: &FileOpResult,
-        group_id: Option<String>,
-    ) -> AgentResult<()> {
-        self.record_if_active(EventKind::FileOperation(FileOpEventData {
-            action: file_action_label(result.action).to_owned(),
-            path: self.event_path(&result.path),
-            new_path: result.new_path.as_ref().map(|path| self.event_path(path)),
-            backup_path: result
-                .backup_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            group_id,
-            undone: false,
-        }))
-    }
-
-    pub(crate) fn load_project_config(&self) -> AgentResult<Option<(PathBuf, ConfigFile)>> {
-        if let Some(path) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.config_path.as_deref().map(PathBuf::from))
-        {
-            return Ok(Some((path.clone(), ConfigFile::load(&path)?)));
-        }
-
-        let candidates = [
-            self.project_root.join("subbake.toml"),
-            self.project_root.join(".subbake.toml"),
-        ];
-        for path in candidates {
-            if path.exists() {
-                return Ok(Some((path.clone(), ConfigFile::load(&path)?)));
-            }
-        }
-        Ok(None)
-    }
-
-    pub(crate) fn active_translation_settings(&self) -> AgentResult<TranslationSettings> {
-        let profile = self
-            .session
-            .as_ref()
-            .and_then(|session| session.profile.as_deref());
-        let Some((_, config)) = self.load_project_config()? else {
-            return Ok(TranslationSettings::default());
-        };
-        self.settings_for_profile(&config, profile)
-    }
-
-    pub(crate) fn settings_for_profile(
-        &self,
-        config: &ConfigFile,
-        profile: Option<&str>,
-    ) -> AgentResult<TranslationSettings> {
-        config
-            .resolve(profile, SettingsOverrides::default())
-            .map(|(settings, _)| settings)
-            .map_err(subbake_adapters::AdapterError::from)
-            .map_err(Into::into)
-    }
-
-    fn event_path(&self, path: &std::path::Path) -> String {
-        let root = self
-            .project_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.project_root.clone());
-        path.strip_prefix(&root)
-            .or_else(|_| path.strip_prefix(&self.project_root))
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string()
-    }
-}
-
-fn file_action_label(action: FileOpAction) -> &'static str {
-    match action {
-        FileOpAction::Create => "created",
-        FileOpAction::Append => "appended",
-        FileOpAction::Modified => "modified",
-        FileOpAction::Renamed => "renamed",
-        FileOpAction::Deleted => "deleted",
+        ToolRunner::run(self, name, args)
     }
 }
 
@@ -1653,7 +1163,7 @@ mod tests {
     fn translation_prompt_distinguishes_directory_and_bilingual_requests() {
         let root = temp_root("translation-prompt");
         let engine = AgentEngine::new(root);
-        let messages = engine.build_decision_messages(
+        let messages = build_decision_messages(
             "翻译目录下的srt文件成为中英双语字幕",
             &LoopState {
                 step: 1,
@@ -1669,6 +1179,7 @@ mod tests {
             },
             None,
             ToolIntent::Translate,
+            engine.dialogue_context_summary(12),
         );
         let system = messages
             .iter()
