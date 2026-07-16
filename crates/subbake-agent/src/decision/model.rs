@@ -1,49 +1,82 @@
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use subbake_core::ports::{ModelToolCall, ModelToolResult, ToolContinuation};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::ToolCallDraft;
-use crate::tools::validate_tool_call;
 
-#[derive(Debug, Clone)]
-pub(super) struct Observation {
-    pub(super) tool_name: String,
-    pub(super) arguments: JsonValue,
-    pub(super) text: String,
-    pub(super) summary: String,
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ToolFeedback {
+    pub(super) success: bool,
+    pub(super) tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error_category: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) available_tools: Vec<String>,
+}
+
+impl ToolFeedback {
+    pub(super) fn success(tool: &str, output: String) -> Self {
+        Self {
+            success: true,
+            tool: tool.to_owned(),
+            output: Some(output),
+            error: None,
+            error_category: None,
+            available_tools: Vec::new(),
+        }
+    }
+
+    pub(super) fn failure(
+        tool: &str,
+        error: String,
+        category: &str,
+        available_tools: Vec<String>,
+    ) -> Self {
+        Self {
+            success: false,
+            tool: tool.to_owned(),
+            output: None,
+            error: Some(error),
+            error_category: Some(category.to_owned()),
+            available_tools,
+        }
+    }
+
+    pub(super) fn json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"success":false,"error":"failed to serialize tool result"}"#.to_owned()
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct LoopState {
-    pub(super) step: usize,
-    pub(super) max_steps: usize,
-    pub(super) observations: Vec<Observation>,
-    pub(super) discovery_calls: usize,
-    pub(super) force_no_tools: bool,
+pub(super) struct ToolExchange {
+    pub(super) name: String,
+    pub(super) arguments: JsonValue,
+    pub(super) feedback: ToolFeedback,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct AgentTaskLoop {
+    pub(super) exchanges: Vec<ToolExchange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DecisionAction {
     Respond,
-    ToolCall,
-    Plan,
     AskUser,
-    NativeToolCalls,
+    ToolCalls,
 }
 
 pub(super) struct Decision {
     pub(super) action: DecisionAction,
     pub(super) text: String,
-    pub(super) tool_name: Option<String>,
-    pub(super) arguments: Option<JsonValue>,
-    pub(super) tool_calls: Vec<ToolCallDraft>,
-    pub(super) native_calls: Vec<ModelToolCall>,
-    pub(super) native_continuation: Option<ToolContinuation>,
-}
-
-pub(super) struct NativeTurn {
-    pub(super) continuation: ToolContinuation,
-    pub(super) results: Vec<ModelToolResult>,
+    pub(super) calls: Vec<ModelToolCall>,
+    pub(super) continuation: Option<ToolContinuation>,
 }
 
 impl Decision {
@@ -51,11 +84,8 @@ impl Decision {
         Self {
             action: DecisionAction::Respond,
             text,
-            tool_name: None,
-            arguments: None,
-            tool_calls: Vec::new(),
-            native_calls: Vec::new(),
-            native_continuation: None,
+            calls: Vec::new(),
+            continuation: None,
         }
     }
 
@@ -63,131 +93,77 @@ impl Decision {
         Self {
             action: DecisionAction::AskUser,
             text,
-            tool_name: None,
-            arguments: None,
-            tool_calls: Vec::new(),
-            native_calls: Vec::new(),
-            native_continuation: None,
+            calls: Vec::new(),
+            continuation: None,
         }
     }
 
-    pub(super) fn native(
+    pub(super) fn native_calls(
         text: String,
-        native_calls: Vec<ModelToolCall>,
-        native_continuation: Option<ToolContinuation>,
+        calls: Vec<ModelToolCall>,
+        continuation: Option<ToolContinuation>,
     ) -> Self {
         Self {
-            action: DecisionAction::NativeToolCalls,
+            action: DecisionAction::ToolCalls,
             text,
-            tool_name: None,
-            arguments: None,
-            tool_calls: Vec::new(),
-            native_calls,
-            native_continuation,
+            calls,
+            continuation,
         }
     }
 }
 
-pub(super) fn invalid_decision_response(error: &AgentError) -> Decision {
-    Decision::ask_user(format!(
-        "I couldn't execute the proposed action because its arguments were invalid: {error}"
-    ))
+pub(super) struct NativeTurn {
+    pub(super) continuation: ToolContinuation,
+    pub(super) results: Vec<ModelToolResult>,
 }
 
-pub(super) fn parse_decision_value(
-    parsed: &JsonValue,
-    is_discovery_tool: impl Fn(&str) -> bool,
-) -> AgentResult<Decision> {
-    let object = parsed
+pub(super) fn parse_json_decision(value: &JsonValue) -> AgentResult<Decision> {
+    let object = value
         .as_object()
         .ok_or_else(|| AgentError::InvalidDecision {
             message: "agent decision must be a JSON object".to_owned(),
         })?;
-    let raw_action = object
+    let action = object
         .get("action")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| AgentError::InvalidDecision {
             message: "agent decision is missing `action`".to_owned(),
         })?;
-    let action = match raw_action {
-        "final_tool_call" | "tool_call" => DecisionAction::ToolCall,
-        "respond" => DecisionAction::Respond,
-        "plan" => DecisionAction::Plan,
-        "ask_user" => DecisionAction::AskUser,
-        other => {
-            return Err(AgentError::InvalidDecision {
-                message: format!("unsupported agent action `{other}`"),
-            });
-        }
-    };
     let text = object
         .get("text")
         .and_then(JsonValue::as_str)
-        .unwrap_or("")
+        .unwrap_or_default()
         .to_owned();
-    let mut tool_name = None;
-    let mut arguments = None;
-    let mut tool_calls = Vec::new();
-    if action == DecisionAction::ToolCall {
-        let name = object
-            .get("tool_name")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| AgentError::InvalidDecision {
-                message: "tool call is missing `tool_name`".to_owned(),
-            })?;
-        let args = object
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
-            message: error.to_string(),
-        })?;
-        tool_name = Some(name.to_owned());
-        arguments = Some(args);
-    } else if action == DecisionAction::Plan {
-        let calls = object
-            .get("tool_calls")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| AgentError::InvalidDecision {
-                message: "plan is missing `tool_calls`".to_owned(),
-            })?;
-        if calls.is_empty() {
-            return Err(AgentError::InvalidDecision {
-                message: "plan must contain at least one tool call".to_owned(),
-            });
-        }
-        for call in calls {
-            let name = call
+    match action {
+        "respond" => Ok(Decision::response(text)),
+        "ask_user" => Ok(Decision::ask_user(text)),
+        "tool_call" | "final_tool_call" => {
+            let name = object
                 .get("tool_name")
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| AgentError::InvalidDecision {
-                    message: "planned call is missing `tool_name`".to_owned(),
+                    message: "tool call is missing `tool_name`".to_owned(),
                 })?;
-            let args = call
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            validate_tool_call(name, &args).map_err(|error| AgentError::ToolArguments {
-                message: error.to_string(),
-            })?;
-            if is_discovery_tool(name) {
-                return Err(AgentError::InvalidDecision {
-                    message: "discovery tools must run before creating a plan".to_owned(),
-                });
-            }
-            tool_calls.push(ToolCallDraft {
-                tool_name: name.to_owned(),
-                arguments: args,
-            });
+            Ok(Decision {
+                action: DecisionAction::ToolCalls,
+                text,
+                calls: vec![ModelToolCall {
+                    id: "json-tool-call".to_owned(),
+                    name: name.to_owned(),
+                    arguments: object
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                }],
+                continuation: None,
+            })
         }
+        "plan" => Err(AgentError::InvalidDecision {
+            message: "models must call mutating tools directly; plan approval is runtime-owned"
+                .to_owned(),
+        }),
+        other => Err(AgentError::InvalidDecision {
+            message: format!("unsupported agent action `{other}`"),
+        }),
     }
-    Ok(Decision {
-        action,
-        text,
-        tool_name,
-        arguments,
-        tool_calls,
-        native_calls: Vec::new(),
-        native_continuation: None,
-    })
 }

@@ -156,6 +156,19 @@ impl FileGuard {
         })
     }
 
+    /// Replace the complete contents of an existing text file.
+    pub fn replace_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
+        let safe = self.resolve(path)?;
+        let backup = self.backup(&safe)?;
+        self.write_atomically(&safe, content)?;
+        Ok(FileOpResult {
+            action: FileOpAction::Modified,
+            path: safe,
+            backup_path: Some(backup),
+            new_path: None,
+        })
+    }
+
     pub fn rename_path(&self, from: &Path, to: &Path) -> FileGuardResult<FileOpResult> {
         let safe_from = self.resolve(from)?;
         let safe_to = self.resolve(to)?;
@@ -262,24 +275,32 @@ impl FileGuard {
                 path: anchored,
             });
         }
+        self.reject_protected_components(&anchored)?;
 
-        // Canonicalize existing paths; for new files canonicalize the parent.
+        // Canonicalize existing paths. For new nested paths, canonicalize the
+        // nearest existing ancestor so a symlink in any parent component
+        // cannot redirect a later create_dir_all outside the project.
         let safe = if anchored.exists() {
             anchored
                 .canonicalize()
                 .map_err(|e| std::io::Error::other(format!("resolve existing path: {e}")))?
-        } else if let Some(parent) = anchored.parent() {
-            if parent.exists() {
-                let canonical_parent = parent
-                    .canonicalize()
-                    .map_err(|e| std::io::Error::other(format!("resolve parent: {e}")))?;
-                canonical_parent.join(anchored.file_name().unwrap_or_default())
-            } else {
-                // Parent doesn't exist yet — trust the escape check above.
-                anchored
-            }
         } else {
-            anchored
+            let mut ancestor = anchored.as_path();
+            while !ancestor.exists() {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| FileGuardError::PathEscape {
+                        root: root_canon.clone(),
+                        path: anchored.clone(),
+                    })?;
+            }
+            let canonical_ancestor = ancestor
+                .canonicalize()
+                .map_err(|e| std::io::Error::other(format!("resolve ancestor: {e}")))?;
+            let suffix = anchored
+                .strip_prefix(ancestor)
+                .unwrap_or_else(|_| Path::new(""));
+            canonical_ancestor.join(suffix)
         };
 
         if !safe.starts_with(&root_canon) {
@@ -289,19 +310,23 @@ impl FileGuard {
             });
         }
 
-        // Check for protected components (e.g. .git, .subbake).
-        for component in safe.components() {
+        self.reject_protected_components(&safe)?;
+
+        Ok(safe)
+    }
+
+    fn reject_protected_components(&self, path: &Path) -> FileGuardResult<()> {
+        for component in path.components() {
             if let Some(name) = component.as_os_str().to_str()
                 && PROTECTED_PATH_PARTS.contains(&name)
             {
                 return Err(FileGuardError::ProtectedPath {
                     component: name.to_owned(),
-                    path: safe,
+                    path: path.to_path_buf(),
                 });
             }
         }
-
-        Ok(safe)
+        Ok(())
     }
 
     fn search_recursive(

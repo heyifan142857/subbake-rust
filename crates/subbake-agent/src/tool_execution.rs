@@ -327,7 +327,7 @@ pub(crate) fn execute_translation_tool(
                 .collect();
             TranslationToolOutcome {
                 text: format!(
-                    "Translated {} files, skipped {}.",
+                    "batch_translation: processed={}, skipped={}",
                     translated.processed,
                     translated.skipped.len()
                 ),
@@ -657,7 +657,7 @@ mod tests {
         .expect("translate series")
         .expect("translation outcome");
 
-        assert_eq!(outcome.text, "Translated 1 files, skipped 0.");
+        assert_eq!(outcome.text, "batch_translation: processed=1, skipped=0");
         assert!(
             progress
                 .events

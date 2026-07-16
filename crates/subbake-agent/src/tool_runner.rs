@@ -31,6 +31,22 @@ impl ToolRunner {
                 message: format!("unknown agent tool `{name}`"),
             })?;
 
+        if executor == ToolExecutor::ApplyPatch {
+            let patch = args
+                .get("patch")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| AgentError::ToolArguments {
+                    message: "missing required argument `patch`".to_owned(),
+                })?;
+            let outcome = crate::patch::apply_patch(patch, &engine.guard)?;
+            let group_id = (outcome.file_operations.len() > 1)
+                .then(|| format!("apply-patch-{}", crate::session::iso_now()));
+            for operation in &outcome.file_operations {
+                Self::record_file_operation(engine, operation, group_id.clone())?;
+            }
+            return Ok(outcome.text);
+        }
+
         if let Some(outcome) =
             execute_local_tool(executor, args, &engine.guard, &engine.project_root)?
         {

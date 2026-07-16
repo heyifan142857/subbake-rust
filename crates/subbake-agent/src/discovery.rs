@@ -1,41 +1,5 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) fn summarize_observation(tool_name: &str, text: &str) -> String {
-    let lines = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return match tool_name {
-            "candidate_subtitles" => "no subtitle candidates".to_owned(),
-            "recent_translations" => "no recent translations".to_owned(),
-            _ => "no matches".to_owned(),
-        };
-    }
-    match tool_name {
-        "read_file" | "read_file_preview" => {
-            format!(
-                "preview ({} chars): {}",
-                text.chars().count(),
-                truncate(lines[0], 160)
-            )
-        }
-        "list_files" | "search_files" | "candidate_subtitles" => {
-            let top = lines
-                .iter()
-                .take(3)
-                .map(|line| line.trim())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{} item(s), top: {top}", lines.len())
-        }
-        "recent_translations" => {
-            format!("{} recent: {}", lines.len(), truncate(lines[0], 160))
-        }
-        _ => truncate(text, 300),
-    }
-}
-
 pub(crate) fn rank_subtitle_candidates(
     paths: Vec<PathBuf>,
     query: &str,
@@ -76,15 +40,6 @@ pub(crate) fn rank_subtitle_candidates(
         .take(20)
         .map(|(_, _, path)| path)
         .collect()
-}
-
-fn truncate(text: &str, limit: usize) -> String {
-    let truncated = text.chars().take(limit).collect::<String>();
-    if text.chars().count() > limit {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
 }
 
 #[cfg(test)]

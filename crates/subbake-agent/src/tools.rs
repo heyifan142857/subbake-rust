@@ -1,9 +1,11 @@
-// Central registry for agent-callable operations. Each entry owns the tool's
-// schema, policy, category, and executor identity.
+//! Central registry for every agent-callable operation.
+//!
+//! The registry is the single source of truth for schemas, execution,
+//! mutation/approval policy, and whether a compatibility tool is shown to new
+//! model turns.
 
 use thiserror::Error;
 
-/// High-level category used for filtering which tools the LLM can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     Translate,
@@ -16,146 +18,6 @@ pub enum ToolKind {
     ManageWhisper,
 }
 
-/// The user-facing action currently being routed. This is intentionally
-/// separate from [`ToolKind`]: an intent authorizes one business action plus
-/// the safe discovery tools needed to ground that action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolIntent {
-    Browse,
-    Translate,
-    Transcribe,
-    Edit,
-    Diagnose,
-    FileCreate,
-    FileAppend,
-    FileReplace,
-    FileRename,
-    FileDelete,
-    Profile,
-    Whisper,
-}
-
-/// Security domain for intent refinement. Only domains explicitly marked as
-/// refinable may change intent without asking the user again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolDomain {
-    Browse,
-    SubtitleTransform,
-    Transcribe,
-    Diagnose,
-    FileCreate,
-    FileAppend,
-    FileReplace,
-    FileRename,
-    FileDelete,
-    Profile,
-    Whisper,
-}
-
-impl ToolIntent {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "browse" => Self::Browse,
-            "translate" => Self::Translate,
-            "transcribe" => Self::Transcribe,
-            "edit" => Self::Edit,
-            "diagnose" => Self::Diagnose,
-            "file_create" => Self::FileCreate,
-            "file_append" => Self::FileAppend,
-            "file_replace" => Self::FileReplace,
-            "file_rename" => Self::FileRename,
-            "file_delete" => Self::FileDelete,
-            "profile" => Self::Profile,
-            "whisper" => Self::Whisper,
-            _ => return None,
-        })
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Browse => "browse",
-            Self::Translate => "translate",
-            Self::Transcribe => "transcribe",
-            Self::Edit => "edit",
-            Self::Diagnose => "diagnose",
-            Self::FileCreate => "file_create",
-            Self::FileAppend => "file_append",
-            Self::FileReplace => "file_replace",
-            Self::FileRename => "file_rename",
-            Self::FileDelete => "file_delete",
-            Self::Profile => "profile",
-            Self::Whisper => "whisper",
-        }
-    }
-
-    const fn domain(self) -> ToolDomain {
-        match self {
-            Self::Browse => ToolDomain::Browse,
-            Self::Translate | Self::Edit => ToolDomain::SubtitleTransform,
-            Self::Transcribe => ToolDomain::Transcribe,
-            Self::Diagnose => ToolDomain::Diagnose,
-            Self::FileCreate => ToolDomain::FileCreate,
-            Self::FileAppend => ToolDomain::FileAppend,
-            Self::FileReplace => ToolDomain::FileReplace,
-            Self::FileRename => ToolDomain::FileRename,
-            Self::FileDelete => ToolDomain::FileDelete,
-            Self::Profile => ToolDomain::Profile,
-            Self::Whisper => ToolDomain::Whisper,
-        }
-    }
-
-    pub(crate) fn can_transition_to(self, target: Self) -> bool {
-        self != target
-            && matches!(
-                (self.domain(), target.domain()),
-                (ToolDomain::SubtitleTransform, ToolDomain::SubtitleTransform)
-            )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolAuthorization {
-    Allowed,
-    Transition(ToolIntent),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ToolPolicyError {
-    tool: String,
-    current: ToolIntent,
-    required: Option<ToolIntent>,
-}
-
-impl std::fmt::Display for ToolPolicyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.required {
-            Some(required) => write!(
-                formatter,
-                "tool `{}` requires intent `{}`, but this turn is using intent `{}`",
-                self.tool,
-                required.as_str(),
-                self.current.as_str()
-            ),
-            None => write!(
-                formatter,
-                "unknown tool `{}` is not available for intent `{}`",
-                self.tool,
-                self.current.as_str()
-            ),
-        }
-    }
-}
-
-/// Visibility policy declared by each registered tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolAccess {
-    /// A non-mutating, bounded observation that can ground any action.
-    SharedDiscovery,
-    /// A tool available only to the listed routed actions.
-    Intents(&'static [ToolIntent]),
-}
-
-/// Metadata about a registered tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -163,8 +25,7 @@ pub struct ToolSpec {
     pub mutating: bool,
     pub requires_approval: bool,
     pub discovery: bool,
-    pub(crate) default_intent: ToolIntent,
-    pub(crate) access: ToolAccess,
+    pub model_visible: bool,
     pub description: &'static str,
     pub arguments: &'static [ToolArgSpec],
     pub(crate) executor: ToolExecutor,
@@ -185,6 +46,7 @@ pub(crate) enum ToolExecutor {
     CandidateSubtitles,
     ReadFilePreview,
     ReadFile,
+    ApplyPatch,
     CreateFile,
     AppendFile,
     ReplaceInFile,
@@ -225,12 +87,6 @@ pub struct ToolArgSpec {
 }
 
 impl ToolSpec {
-    pub(crate) fn allows(&self, intent: ToolIntent) -> bool {
-        match self.access {
-            ToolAccess::SharedDiscovery => true,
-            ToolAccess::Intents(intents) => intents.contains(&intent),
-        }
-    }
     pub fn arguments(&self) -> &'static [ToolArgSpec] {
         self.arguments
     }
@@ -265,8 +121,8 @@ impl ToolSpec {
     }
 
     pub fn native_definition(&self) -> subbake_core::ports::ToolDefinition {
-        let arguments = self.arguments();
-        let properties = arguments
+        let properties = self
+            .arguments()
             .iter()
             .map(|argument| {
                 let kind = match argument.kind {
@@ -282,7 +138,8 @@ impl ToolSpec {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
-        let required = arguments
+        let required = self
+            .arguments()
             .iter()
             .filter(|argument| argument.required)
             .map(|argument| argument.name)
@@ -313,6 +170,8 @@ const fn arg(
         description,
     }
 }
+
+use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
 
 const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
     arg("path", StringArg, true, "subtitle file path"),
@@ -364,6 +223,12 @@ const CANDIDATE_SUBTITLES_ARGS: &[ToolArgSpec] = &[
     arg("path", StringArg, false, "directory path; defaults to ."),
     arg("query", StringArg, false, "text used to rank candidates"),
 ];
+const APPLY_PATCH_ARGS: &[ToolArgSpec] = &[arg(
+    "patch",
+    StringArg,
+    true,
+    "Codex-style patch bounded by Begin Patch and End Patch markers",
+)];
 const WRITE_FILE_ARGS: &[ToolArgSpec] = &[
     arg("path", StringArg, true, "project-local path"),
     arg("content", StringArg, false, "file content"),
@@ -395,18 +260,15 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
     arg("model", StringArg, false, "model name to download"),
 ];
 
-use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
-
 macro_rules! tool {
-    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $intent:ident, $access:expr, $description:literal, $arguments:expr, $executor:ident) => {
+    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $visible:literal, $description:literal, $arguments:expr, $executor:ident) => {
         ToolSpec {
             name: $name,
             category: ToolKind::$category,
             mutating: $mutating,
             requires_approval: $approval,
             discovery: $discovery,
-            default_intent: ToolIntent::$intent,
-            access: $access,
+            model_visible: $visible,
             description: $description,
             arguments: $arguments,
             executor: ToolExecutor::$executor,
@@ -414,7 +276,6 @@ macro_rules! tool {
     };
 }
 
-/// All tools exposed by the Rust agent, grouped by category.
 pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
     tool!(
         "translate_file",
@@ -422,9 +283,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        Translate,
-        ToolAccess::Intents(&[ToolIntent::Translate]),
-        "Translate a subtitle file.",
+        true,
+        "Translate one subtitle file.",
         TRANSLATE_FILE_ARGS,
         TranslateFile
     ),
@@ -434,9 +294,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        Translate,
-        ToolAccess::Intents(&[ToolIntent::Translate]),
-        "Translate a series of subtitle files in a directory.",
+        true,
+        "Translate all source subtitle files in a directory.",
         TRANSLATE_SERIES_ARGS,
         TranslateSeries
     ),
@@ -446,8 +305,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        Edit,
-        ToolAccess::Intents(&[ToolIntent::Edit]),
+        true,
         "Edit an already translated subtitle file.",
         EDIT_SUBTITLE_ARGS,
         EditSubtitle
@@ -458,8 +316,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        Transcribe,
-        ToolAccess::Intents(&[ToolIntent::Transcribe]),
+        true,
         "Transcribe a media file to subtitles.",
         PATH_ARGS,
         TranscribeAudio
@@ -470,9 +327,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         true,
         false,
-        Whisper,
-        ToolAccess::Intents(&[ToolIntent::Whisper]),
-        "Install, update, or uninstall whisper.cpp.",
+        true,
+        "Install, update, uninstall, inspect, or download whisper.cpp assets.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
     ),
@@ -482,8 +338,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Diagnose,
-        ToolAccess::Intents(&[ToolIntent::Diagnose]),
+        true,
         "Diagnose a translation failure from a run directory.",
         PATH_ARGS,
         DiagnosePath
@@ -494,8 +349,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Diagnose,
-        ToolAccess::Intents(&[ToolIntent::Diagnose]),
+        true,
         "Diagnose a translation failure from text input.",
         DIAGNOSE_TEXT_ARGS,
         DiagnoseText
@@ -506,8 +360,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Browse,
-        ToolAccess::SharedDiscovery,
+        true,
         "List files and directories.",
         LIST_FILES_ARGS,
         ListFiles
@@ -518,8 +371,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Browse,
-        ToolAccess::SharedDiscovery,
+        true,
         "Search files by name glob.",
         SEARCH_FILES_ARGS,
         SearchFiles
@@ -530,8 +382,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Browse,
-        ToolAccess::SharedDiscovery,
+        true,
         "List recent translation outputs from the session.",
         &[],
         RecentTranslations
@@ -542,8 +393,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Browse,
-        ToolAccess::SharedDiscovery,
+        true,
         "Find subtitle files that look relevant.",
         CANDIDATE_SUBTITLES_ARGS,
         CandidateSubtitles
@@ -554,8 +404,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        Browse,
-        ToolAccess::SharedDiscovery,
+        true,
         "Read a short preview of a file.",
         PATH_ARGS,
         ReadFilePreview
@@ -566,20 +415,31 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        FileAppend,
-        ToolAccess::Intents(&[ToolIntent::FileAppend, ToolIntent::FileReplace]),
-        "Read the full content of a file.",
+        true,
+        "Read the full content of a project-local file.",
         PATH_ARGS,
         ReadFile
     ),
+    tool!(
+        "apply_patch",
+        FileOp,
+        true,
+        false,
+        false,
+        true,
+        "Atomically add, update, or delete project-local text files with one patch.",
+        APPLY_PATCH_ARGS,
+        ApplyPatch
+    ),
+    // Hidden compatibility tools remain executable for v1 pending plans and
+    // resumed sessions, but new model turns use apply_patch.
     tool!(
         "create_file",
         FileOp,
         true,
         false,
         false,
-        FileCreate,
-        ToolAccess::Intents(&[ToolIntent::FileCreate]),
+        false,
         "Create a new file.",
         WRITE_FILE_ARGS,
         CreateFile
@@ -590,8 +450,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        FileAppend,
-        ToolAccess::Intents(&[ToolIntent::FileAppend]),
+        false,
         "Append content to a file.",
         WRITE_FILE_ARGS,
         AppendFile
@@ -602,8 +461,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        FileReplace,
-        ToolAccess::Intents(&[ToolIntent::FileReplace]),
+        false,
         "Replace text in a file.",
         REPLACE_IN_FILE_ARGS,
         ReplaceInFile
@@ -614,8 +472,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        FileRename,
-        ToolAccess::Intents(&[ToolIntent::FileRename]),
+        true,
         "Rename or move a file or directory.",
         RENAME_PATH_ARGS,
         RenamePath
@@ -626,9 +483,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         false,
-        FileDelete,
-        ToolAccess::Intents(&[ToolIntent::FileDelete]),
-        "Delete a file or directory.",
+        true,
+        "Delete a project-local file or directory.",
         PATH_ARGS,
         DeleteFile
     ),
@@ -638,9 +494,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         false,
-        Profile,
-        ToolAccess::Intents(&[ToolIntent::Profile]),
-        "Switch the active profile.",
+        true,
+        "Switch the active provider profile after validating it.",
         SWITCH_PROFILE_ARGS,
         SwitchProfile
     ),
@@ -650,8 +505,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         false,
-        Profile,
-        ToolAccess::Intents(&[ToolIntent::Profile]),
+        true,
         "List all available profiles.",
         &[],
         ListProfiles
@@ -662,52 +516,30 @@ pub fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     ALL_TOOL_SPECS.iter().find(|spec| spec.name == name)
 }
 
-/// Filter tool specs by a list of category names.
+pub(crate) fn model_visible_tool_specs() -> Vec<&'static ToolSpec> {
+    ALL_TOOL_SPECS
+        .iter()
+        .filter(|spec| spec.model_visible)
+        .collect()
+}
+
+pub(crate) fn model_visible_tool_names() -> Vec<&'static str> {
+    model_visible_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect()
+}
+
 pub fn tool_specs_for_categories<'a>(
     specs: &'a [ToolSpec],
     categories: &[ToolKind],
 ) -> Vec<&'a ToolSpec> {
-    let mut result: Vec<&ToolSpec> = specs
+    let mut result = specs
         .iter()
         .filter(|spec| categories.contains(&spec.category))
-        .collect();
+        .collect::<Vec<_>>();
     result.sort_by_key(|spec| spec.name);
     result
-}
-
-pub(crate) fn tool_specs_for_intent(intent: ToolIntent) -> Vec<&'static ToolSpec> {
-    ALL_TOOL_SPECS
-        .iter()
-        .filter(|spec| {
-            spec.allows(intent)
-                || (intent.can_transition_to(spec.default_intent)
-                    && spec.allows(spec.default_intent))
-        })
-        .collect()
-}
-
-pub(crate) fn authorize_tool(
-    intent: ToolIntent,
-    name: &str,
-) -> Result<ToolAuthorization, ToolPolicyError> {
-    let Some(spec) = find_tool_spec(name) else {
-        return Err(ToolPolicyError {
-            tool: name.to_owned(),
-            current: intent,
-            required: None,
-        });
-    };
-    if spec.allows(intent) {
-        return Ok(ToolAuthorization::Allowed);
-    }
-    if intent.can_transition_to(spec.default_intent) && spec.allows(spec.default_intent) {
-        return Ok(ToolAuthorization::Transition(spec.default_intent));
-    }
-    Err(ToolPolicyError {
-        tool: name.to_owned(),
-        current: intent,
-        required: Some(spec.default_intent),
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -736,7 +568,7 @@ pub fn validate_tool_call(
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<(), ToolValidationError> {
-    let Some(spec) = ALL_TOOL_SPECS.iter().find(|spec| spec.name == name) else {
+    let Some(spec) = find_tool_spec(name) else {
         return Err(ToolValidationError::UnknownTool {
             name: name.to_owned(),
         });
@@ -781,78 +613,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translation_intent_includes_shared_discovery_and_subtitle_refinements() {
-        let names = tool_specs_for_intent(ToolIntent::Translate)
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"translate_file"));
+    fn model_sees_one_complete_stable_registry_without_legacy_writers() {
+        let names = model_visible_tool_names();
+        assert!(names.contains(&"translate_series"));
         assert!(names.contains(&"candidate_subtitles"));
-        assert!(names.contains(&"read_file_preview"));
-        assert!(names.contains(&"edit_subtitle"));
-        assert!(!names.contains(&"read_file"));
-        assert!(!names.contains(&"manage_whisper"));
-    }
-
-    #[test]
-    fn subtitle_intents_can_transition_without_crossing_domains() {
-        assert_eq!(
-            authorize_tool(ToolIntent::Translate, "edit_subtitle"),
-            Ok(ToolAuthorization::Transition(ToolIntent::Edit))
-        );
-        assert_eq!(
-            authorize_tool(ToolIntent::Edit, "translate_file"),
-            Ok(ToolAuthorization::Transition(ToolIntent::Translate))
-        );
-        let error = authorize_tool(ToolIntent::Translate, "delete_file")
-            .expect_err("delete must remain outside subtitle transforms");
-        assert_eq!(
-            error.to_string(),
-            "tool `delete_file` requires intent `file_delete`, but this turn is using intent `translate`"
-        );
-    }
-
-    #[test]
-    fn file_mutation_intents_expose_only_the_requested_mutation() {
-        let names = tool_specs_for_intent(ToolIntent::FileDelete)
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"delete_file"));
-        assert!(!names.contains(&"rename_path"));
+        assert!(names.contains(&"apply_patch"));
         assert!(!names.contains(&"create_file"));
+        assert!(!names.contains(&"append_file"));
+        assert!(!names.contains(&"replace_in_file"));
     }
 
     #[test]
-    fn shared_discovery_tools_are_bounded_and_non_mutating() {
-        for spec in ALL_TOOL_SPECS {
-            if spec.access == ToolAccess::SharedDiscovery {
-                assert!(spec.discovery, "{} must be a discovery tool", spec.name);
-                assert!(!spec.mutating, "{} must not mutate", spec.name);
-            }
-        }
+    fn compatibility_writers_remain_registered_and_validatable() {
+        assert!(find_tool_spec("create_file").is_some());
+        assert!(
+            validate_tool_call(
+                "create_file",
+                &serde_json::json!({"path": "note.txt", "content": "hello"})
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn validation_rejects_unknown_and_incomplete_calls() {
+    fn validation_rejects_unknown_incomplete_and_extra_arguments() {
         assert!(validate_tool_call("unknown", &serde_json::json!({})).is_err());
         assert!(validate_tool_call("translate_file", &serde_json::json!({})).is_err());
         assert!(
             validate_tool_call("translate_file", &serde_json::json!({"path": "clip.srt"})).is_ok()
-        );
-        assert!(
-            validate_tool_call(
-                "translate_series",
-                &serde_json::json!({"path": ".", "bilingual": true})
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_tool_call(
-                "translate_series",
-                &serde_json::json!({"path": ".", "bilingual": "yes"})
-            )
-            .is_err()
         );
         assert!(
             validate_tool_call(
@@ -864,34 +652,17 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contract_describes_translation_arguments() {
-        let spec = ALL_TOOL_SPECS
-            .iter()
-            .find(|spec| spec.name == "translate_series")
-            .expect("translate series spec");
-        let line = spec.prompt_line();
-        assert!(line.contains("path: string required"));
-        assert!(line.contains("bilingual: boolean optional"));
-    }
-
-    #[test]
     fn native_schema_uses_the_same_arguments_as_local_validation() {
-        let spec = ALL_TOOL_SPECS
-            .iter()
-            .find(|spec| spec.name == "translate_file")
-            .expect("translation tool");
-        let definition = spec.native_definition();
+        let definition = find_tool_spec("apply_patch")
+            .expect("patch tool")
+            .native_definition();
         assert_eq!(
-            definition.input_schema["properties"]["path"]["type"],
+            definition.input_schema["properties"]["patch"]["type"],
             "string"
         );
         assert_eq!(
-            definition.input_schema["properties"]["bilingual"]["type"],
-            "boolean"
-        );
-        assert_eq!(
             definition.input_schema["required"],
-            serde_json::json!(["path"])
+            serde_json::json!(["patch"])
         );
         assert_eq!(definition.input_schema["additionalProperties"], false);
     }
@@ -905,13 +676,5 @@ mod tests {
                 assert_ne!(spec.executor, other.executor, "duplicate tool executor");
             }
         }
-    }
-
-    #[test]
-    fn registry_owns_discovery_and_approval_policy() {
-        assert!(find_tool_spec("read_file").is_some_and(|spec| spec.discovery));
-        assert!(find_tool_spec("manage_whisper").is_some_and(|spec| spec.requires_approval));
-        assert!(find_tool_spec("translate_file").is_some_and(|spec| spec.mutating));
-        assert!(find_tool_spec("missing").is_none());
     }
 }

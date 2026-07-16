@@ -5,6 +5,7 @@ pub mod error;
 pub mod event;
 pub mod guard;
 mod input_editor;
+mod patch;
 mod plan_coordinator;
 mod presentation;
 mod profile_coordinator;
