@@ -29,12 +29,14 @@
 profile 写入复用同一分组序列化模型；翻译命令、provider check 和交互式 Agent 均使用
 相同解析规则。新增配置项只需在所属分组及其覆盖类型中定义。
 
-## 3. 交互式终端的真实 PTY 验证待补
+## 3. 交互式终端的真实 PTY 验证已自动化
 
-单元测试覆盖了新的 `InteractionState` 转换，二进制也可在伪终端启动；但当前自动化
-执行环境不会响应终端 DSR 光标位置查询，因此无法完成一次正常的全交互退出验证。
+`subbake-agent` 现有 Unix PTY 集成测试会启动真实 `SubBakeTui`，并由测试端模拟终端
+响应 Crossterm 的键盘增强能力查询和 DSR 光标位置查询。测试覆盖 Shift+Tab、
+profile picker 与创建表单、typed plan approval、处理中 Esc 协作取消，以及取消后的
+worker 状态恢复。
 
-后续应在支持 DSR 的真实 PTY 中手工或自动验证：启动/退出的 raw-mode 与 alternate
-screen 清理、Shift+Tab、picker/form、处理中的 Esc 取消、以及 worker 退出后的状态恢复。
-
-验收：上述流程正常退出且终端状态恢复，无悬挂 worker 或残留 alternate screen。
+退出时测试比较同一 PTY 的前后 `stty -g`，并检查 keyboard enhancement 与 alternate
+screen 的进入/退出序列成对出现；子进程必须在硬超时内正常退出，以验证 worker 已
+完成 join。该测试随 Unix 上的 `cargo test --workspace` 默认执行；Windows ConPTY
+行为不在本项验收范围内。
