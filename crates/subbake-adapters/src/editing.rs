@@ -4,6 +4,7 @@ use subbake_core::CancellationGuard;
 use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_payload};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
+use subbake_core::languages::{is_language_tag, normalize_language};
 use subbake_core::ports::{GenerationRequest, LlmBackend};
 
 use crate::error::{AdapterError, AdapterResult};
@@ -22,6 +23,8 @@ pub struct SubtitleEditRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleEditOutcome {
     pub target_path: PathBuf,
+    pub target_language: String,
+    pub modified_entries: usize,
     pub edit_notes: String,
 }
 
@@ -30,10 +33,13 @@ pub fn edit_subtitle(request: SubtitleEditRequest) -> AdapterResult<SubtitleEdit
 }
 
 pub fn edit_subtitle_cancellable(
-    request: SubtitleEditRequest,
+    mut request: SubtitleEditRequest,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<SubtitleEditOutcome> {
     cancellation.check().map_err(AdapterError::from)?;
+    request.settings.translation.target_language =
+        normalize_language(&request.settings.translation.target_language, false)
+            .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
     if !request.target_path.exists() {
         return Err(AdapterError::invalid_input(format!(
             "subtitle not found: {}",
@@ -71,6 +77,12 @@ pub fn edit_subtitle_cancellable(
     let payload =
         parse_subtitle_edit_payload(payload, &document.segments).map_err(AdapterError::from)?;
 
+    let modified_entries = document
+        .segments
+        .iter()
+        .zip(&payload.lines)
+        .filter(|(segment, line)| segment.text != line.translation)
+        .count();
     let translations = merge_segments(&document.segments, &payload.lines);
     cancellation.check().map_err(AdapterError::from)?;
     render_and_write_document(
@@ -82,6 +94,8 @@ pub fn edit_subtitle_cancellable(
 
     Ok(SubtitleEditOutcome {
         target_path: request.target_path,
+        target_language: request.settings.translation.target_language,
+        modified_entries,
         edit_notes: payload.edit_notes,
     })
 }
@@ -108,33 +122,39 @@ fn infer_source_document(
     target_path: &Path,
     expected_segments: usize,
 ) -> AdapterResult<Option<subbake_core::entities::SubtitleDocument>> {
-    let Some(source_path) = infer_source_path(target_path) else {
-        return Ok(None);
-    };
-    if !source_path.exists() || !is_supported_subtitle_path(&source_path) {
-        return Ok(None);
+    for source_path in infer_source_paths(target_path) {
+        if !source_path.exists() || !is_supported_subtitle_path(&source_path) {
+            continue;
+        }
+        let source = read_document(&source_path)?;
+        if source.segments.len() == expected_segments {
+            return Ok(Some(source));
+        }
     }
-    let source = read_document(&source_path)?;
-    if source.segments.len() == expected_segments {
-        Ok(Some(source))
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
-fn infer_source_path(target_path: &Path) -> Option<PathBuf> {
-    let file_name = target_path.file_name()?.to_str()?;
-    let source_name = file_name.replace(".translated.", ".");
-    let source_name = if source_name == file_name {
-        file_name.replace(".bilingual.", ".")
-    } else {
-        source_name
+fn infer_source_paths(target_path: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = target_path.file_name().and_then(|value| value.to_str()) else {
+        return Vec::new();
     };
-    if source_name == file_name {
-        None
+    let marker = if file_name.contains(".translated.") {
+        ".translated."
+    } else if file_name.contains(".bilingual.") {
+        ".bilingual."
     } else {
-        Some(target_path.with_file_name(source_name))
+        return Vec::new();
+    };
+    let Some((prefix, extension)) = file_name.split_once(marker) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![target_path.with_file_name(format!("{prefix}.{extension}"))];
+    if let Some((base, possible_language)) = prefix.rsplit_once('.')
+        && is_language_tag(possible_language)
+    {
+        candidates.push(target_path.with_file_name(format!("{base}.{extension}")));
     }
+    candidates
 }
 
 fn is_generated_output(path: &Path) -> bool {
@@ -169,6 +189,7 @@ mod tests {
 
         assert!(content.contains("HELLO"));
         assert!(!outcome.edit_notes.is_empty());
+        assert_eq!(outcome.modified_entries, 1);
     }
 
     #[test]
@@ -188,6 +209,21 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert!(error.to_string().contains("generated"));
+    }
+
+    #[test]
+    fn language_tagged_output_infers_the_original_source() {
+        let root = temp_root("edit-language-output");
+        fs::create_dir_all(&root).expect("create root");
+        let source = root.join("clip.srt");
+        let target = root.join("clip.ja.translated.srt");
+        fs::write(&source, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").expect("write source");
+        fs::write(&target, "1\n00:00:00,000 --> 00:00:01,000\nこんにちは\n").expect("write target");
+
+        let source_document = infer_source_document(&target, 1).expect("infer source document");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(source_document.expect("source document").path, source);
     }
 
     fn temp_root(label: &str) -> PathBuf {

@@ -7,9 +7,10 @@ pub(super) fn build_native_messages(
     input: &str,
     dialogue: Option<&str>,
     legacy_pending: Option<&str>,
+    effective_defaults: &str,
 ) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::system(system_contract(false, false)),
+        ChatMessage::system(system_contract(false, false, effective_defaults)),
         ChatMessage::user(user_context(input, dialogue, legacy_pending, None)),
     ]
 }
@@ -21,9 +22,10 @@ pub(super) fn build_json_messages(
     legacy_pending: Option<&str>,
     tools_enabled: bool,
     repair_error: Option<&str>,
+    effective_defaults: &str,
 ) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::system(system_contract(true, !tools_enabled)),
+        ChatMessage::system(system_contract(true, !tools_enabled, effective_defaults)),
         ChatMessage::user(user_context(
             input,
             dialogue,
@@ -33,10 +35,18 @@ pub(super) fn build_json_messages(
     ]
 }
 
-fn system_contract(json_fallback: bool, tools_disabled: bool) -> String {
+fn system_contract(json_fallback: bool, tools_disabled: bool, effective_defaults: &str) -> String {
     let mut system = String::from(
         "You are SubBake, a subtitle workflow assistant. The registered tool list supplied in this turn is the complete list: never invent tools such as `list_tools`, shell, or unregistered aliases. Use project-reading tools to ground uncertain paths, then continue with the appropriate execution tool. For a request to translate all subtitles in a directory, prefer `translate_series` with `{\"path\":\".\"}` immediately; use `candidate_subtitles` only when the target is genuinely ambiguous. Keep `translate_file` subtitle-only and use `transcribe_audio` explicitly for media. Preserve subtitle IDs and ordering. Use `edit_subtitle` for an existing translated or bilingual subtitle. Reuse exact paths returned by tools. Use `apply_patch` for project text-file edits; its patch format is `*** Begin Patch`, Add/Update/Delete File sections, and `*** End Patch`. Do not produce a plan action: call a mutating tool normally and the runtime will handle any approval. After every successful mutation, use its result to produce a concise natural-language final response instead of echoing raw tool output. Responses are rendered in a terminal: use plain text only, without Markdown headings, tables, bold, code fences, or decorative status icons. For successful translation or transcription, normally respond in one to three short lines with the completed action, output path when available, and processed/skipped counts for a batch. Do not reproduce or summarize individual subtitle entries unless the user explicitly asks for their contents.",
     );
+    system.push_str(
+        "\nA user request expresses intent, not proof that anything happened. When the user explicitly specifies a supported language, provider, model, format, bilingual mode/order, output path/directory, recursion, or overwrite behavior, pass that value in the tool arguments. Optional call arguments override only that call and never change the session profile. If a requested modifier is unsupported by the registered tool schema, say that it cannot be applied or suggest configuring a profile/using the CLI; never silently ignore it.",
+    );
+    system.push_str(
+        "\nTool outcomes are the only execution evidence. Every completion, language, provider, model, format, path, count, saved-file, cache, resume, skip, unchanged, or dry-run statement in the final response must come directly from a successful structured tool outcome. Never infer execution facts from the user request or from a file-read observation. If requested and actual values differ, correct the call or report the difference. A dry run wrote no output and created no undo event; skipped or unchanged work must not be described as newly generated.",
+    );
+    system.push_str("\nCurrent effective defaults (secrets omitted):\n");
+    system.push_str(effective_defaults);
     if tools_disabled {
         system.push_str(
             "\nThe task step limit has been reached. No tools are available now. Give the best final answer from existing results, or ask one specific question if completion is impossible.",
@@ -110,6 +120,7 @@ mod tests {
             None,
             true,
             None,
+            "translation: source=Auto, target=zh-Hans, provider=mock, model=mock-zh, format=source, bilingual=false, bilingual_order=target_first, dry_run=false\ntranscription: provider=whisper_api, model=whisper-1, language=Auto, format=srt",
         );
         let system = &messages[0].content;
         assert!(system.contains("complete list"));
@@ -118,6 +129,8 @@ mod tests {
         assert!(system.contains("never invent tools"));
         assert!(system.contains("plain text only"));
         assert!(system.contains("Do not reproduce or summarize individual subtitle entries"));
+        assert!(system.contains("only execution evidence"));
+        assert!(system.contains("secrets omitted"));
         assert!(!system.contains("- create_file:"));
     }
 }

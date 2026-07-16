@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use subbake_core::formats::RenderOptions;
+use subbake_core::languages::normalize_language;
 use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
@@ -12,8 +13,8 @@ use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, S
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
-    default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
-    stable_runtime_input_path,
+    default_output_path_with_language, is_supported_subtitle_path, read_document,
+    render_and_write_document, stable_runtime_input_path,
 };
 use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
@@ -23,6 +24,8 @@ use crate::settings::TranslationSettings;
 pub struct TranslationRequest {
     pub input_path: PathBuf,
     pub output_path: Option<PathBuf>,
+    pub output_language_tag: Option<String>,
+    pub overwrite: bool,
     pub settings: TranslationSettings,
 }
 
@@ -30,6 +33,7 @@ pub struct TranslationRequest {
 pub struct TranslationOutcome {
     pub result: PipelineResult,
     pub output_path: Option<PathBuf>,
+    pub subtitle_entries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,14 +41,23 @@ pub struct BatchTranslationRequest {
     pub root: PathBuf,
     pub recursive: bool,
     pub overwrite: bool,
+    pub output_dir: Option<PathBuf>,
+    pub output_language_tag: Option<String>,
     pub settings: TranslationSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchTranslationOutcome {
     pub processed: usize,
+    pub inputs: Vec<PathBuf>,
     pub skipped: Vec<PathBuf>,
     pub outputs: Vec<PathBuf>,
+    pub subtitle_entries: usize,
+    pub dry_run: bool,
+    pub cache_hits: usize,
+    pub resumed_translation_batches: usize,
+    pub resumed_review_batches: usize,
+    pub translation_memory_hits: usize,
 }
 
 pub fn translate_subtitle(request: TranslationRequest) -> AdapterResult<TranslationOutcome> {
@@ -63,11 +76,18 @@ pub fn translate_subtitle_cancellable(
 }
 
 pub fn translate_subtitle_cancellable_with_progress(
-    request: TranslationRequest,
+    mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<TranslationOutcome> {
     check_cancelled(cancellation)?;
+    normalize_translation_languages(&mut request.settings)?;
+    request.output_language_tag = request
+        .output_language_tag
+        .as_deref()
+        .map(|value| normalize_language(value, false))
+        .transpose()
+        .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
     if !is_supported_subtitle_path(&request.input_path) {
         return Err(AdapterError::invalid_input(
             "`translate` accepts subtitle files only; use `pipeline` for combined media workflows",
@@ -85,12 +105,19 @@ pub fn translate_subtitle_cancellable_with_progress(
     let document = read_document(&request.input_path)?;
     let output_path = match request.output_path.clone() {
         Some(path) => path,
-        None => default_output_path(
+        None => default_output_path_with_language(
             &request.input_path,
             request.settings.output_format(),
             request.settings.output.bilingual,
+            request.output_language_tag.as_deref(),
         )?,
     };
+    if output_path.exists() && !request.overwrite && !request.settings.translation.dry_run {
+        return Err(AdapterError::invalid_input(format!(
+            "output already exists and overwrite is false: {}",
+            output_path.display()
+        )));
+    }
 
     let options = request
         .settings
@@ -151,6 +178,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         return Ok(TranslationOutcome {
             result: run.result,
             output_path: None,
+            subtitle_entries: document.segments.len(),
         });
     }
 
@@ -183,6 +211,7 @@ pub fn translate_subtitle_cancellable_with_progress(
     Ok(TranslationOutcome {
         result,
         output_path: Some(output_path),
+        subtitle_entries: document.segments.len(),
     })
 }
 
@@ -200,23 +229,32 @@ pub fn translate_subtitle_batch_cancellable(
 }
 
 pub fn translate_subtitle_batch_with_progress(
-    request: BatchTranslationRequest,
+    mut request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<BatchTranslationOutcome> {
+    normalize_translation_languages(&mut request.settings)?;
+    request.output_language_tag = request
+        .output_language_tag
+        .as_deref()
+        .map(|value| normalize_language(value, false))
+        .transpose()
+        .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
     let files = discover_subtitle_files(&request.root, request.recursive)?;
     let total_files = files.len();
     let mut processed = 0usize;
+    let mut processed_inputs = Vec::new();
     let mut skipped = Vec::new();
     let mut outputs = Vec::new();
+    let mut subtitle_entries = 0usize;
+    let mut cache_hits = 0usize;
+    let mut resumed_translation_batches = 0usize;
+    let mut resumed_review_batches = 0usize;
+    let mut translation_memory_hits = 0usize;
 
     for input_path in files {
         check_cancelled(cancellation)?;
-        let output_path = default_output_path(
-            &input_path,
-            request.settings.output_format(),
-            request.settings.output.bilingual,
-        )?;
+        let output_path = batch_translation_output_path(&request, &input_path)?;
         if output_path.exists() && !request.overwrite && !request.settings.translation.dry_run {
             skipped.push(input_path);
             continue;
@@ -231,8 +269,10 @@ pub fn translate_subtitle_batch_with_progress(
         ));
         let outcome = translate_subtitle_cancellable_with_progress(
             TranslationRequest {
-                input_path,
-                output_path: None,
+                input_path: input_path.clone(),
+                output_path: Some(output_path),
+                output_language_tag: request.output_language_tag.clone(),
+                overwrite: request.overwrite,
                 settings: request.settings.clone(),
             },
             cancellation,
@@ -241,6 +281,12 @@ pub fn translate_subtitle_batch_with_progress(
         if let Some(output_path) = outcome.output_path {
             outputs.push(output_path);
         }
+        subtitle_entries += outcome.subtitle_entries;
+        cache_hits += outcome.result.cache_hits;
+        resumed_translation_batches += outcome.result.resumed_translation_batches;
+        resumed_review_batches += outcome.result.resumed_review_batches;
+        translation_memory_hits += outcome.result.translation_memory_hits;
+        processed_inputs.push(input_path);
         processed += 1;
     }
 
@@ -256,9 +302,50 @@ pub fn translate_subtitle_batch_with_progress(
 
     Ok(BatchTranslationOutcome {
         processed,
+        inputs: processed_inputs,
         skipped,
         outputs,
+        subtitle_entries,
+        dry_run: request.settings.translation.dry_run,
+        cache_hits,
+        resumed_translation_batches,
+        resumed_review_batches,
+        translation_memory_hits,
     })
+}
+
+pub fn batch_translation_output_path(
+    request: &BatchTranslationRequest,
+    input_path: &Path,
+) -> AdapterResult<PathBuf> {
+    let output_input = if let Some(output_dir) = &request.output_dir {
+        let relative = input_path.strip_prefix(&request.root).map_err(|_| {
+            AdapterError::invalid_input(format!(
+                "batch input {} is outside root {}",
+                input_path.display(),
+                request.root.display()
+            ))
+        })?;
+        output_dir.join(relative)
+    } else {
+        input_path.to_path_buf()
+    };
+    default_output_path_with_language(
+        &output_input,
+        request.settings.output_format(),
+        request.settings.output.bilingual,
+        request.output_language_tag.as_deref(),
+    )
+}
+
+fn normalize_translation_languages(settings: &mut TranslationSettings) -> AdapterResult<()> {
+    settings.translation.source_language =
+        normalize_language(&settings.translation.source_language, true)
+            .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
+    settings.translation.target_language =
+        normalize_language(&settings.translation.target_language, false)
+            .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
+    Ok(())
 }
 
 fn check_cancelled(cancellation: &CancellationGuard) -> AdapterResult<()> {
@@ -316,6 +403,8 @@ mod tests {
         let outcome = translate_subtitle(TranslationRequest {
             input_path: input_path.clone(),
             output_path: None,
+            output_language_tag: None,
+            overwrite: true,
             settings,
         })
         .expect("translate");
@@ -340,6 +429,8 @@ mod tests {
         let translated = translate_subtitle(TranslationRequest {
             input_path: input_path.clone(),
             output_path: None,
+            output_language_tag: None,
+            overwrite: true,
             settings: translated_settings,
         })
         .expect("translate source subtitle");
@@ -351,6 +442,8 @@ mod tests {
         let bilingual = translate_subtitle(TranslationRequest {
             input_path,
             output_path: None,
+            output_language_tag: None,
+            overwrite: true,
             settings: bilingual_settings,
         })
         .expect("render bilingual subtitle from cache");
@@ -382,6 +475,8 @@ mod tests {
         let outcome = translate_subtitle(TranslationRequest {
             input_path,
             output_path: Some(output_path.clone()),
+            output_language_tag: None,
+            overwrite: true,
             settings,
         })
         .expect("dry run");
@@ -405,6 +500,8 @@ mod tests {
             root: root.clone(),
             recursive: false,
             overwrite: false,
+            output_dir: None,
+            output_language_tag: None,
             settings: TranslationSettings::default(),
         })
         .expect("batch translate");
@@ -431,6 +528,8 @@ mod tests {
             root: root.clone(),
             recursive: false,
             overwrite: false,
+            output_dir: None,
+            output_language_tag: None,
             settings: TranslationSettings::default(),
         })
         .expect_err("malformed subtitle should stop the batch");
@@ -439,6 +538,30 @@ mod tests {
 
         assert!(message.contains(&input_path.display().to_string()));
         assert!(message.contains("Malformed SRT block:\nas a warning."));
+    }
+
+    #[test]
+    fn single_translation_rejects_existing_output_without_overwrite() {
+        let root = temp_root("single-overwrite");
+        fs::create_dir_all(&root).expect("create root");
+        let input = root.join("clip.txt");
+        let output = root.join("clip.translated.txt");
+        fs::write(&input, "hello\n").expect("write input");
+        fs::write(&output, "existing\n").expect("write output");
+
+        let error = translate_subtitle(TranslationRequest {
+            input_path: input,
+            output_path: Some(output.clone()),
+            output_language_tag: None,
+            overwrite: false,
+            settings: TranslationSettings::default(),
+        })
+        .expect_err("existing output must fail");
+        let content = fs::read_to_string(&output).expect("read output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(error.to_string().contains("overwrite is false"));
+        assert_eq!(content, "existing\n");
     }
 
     fn temp_root(label: &str) -> PathBuf {

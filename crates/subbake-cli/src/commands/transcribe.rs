@@ -10,6 +10,7 @@ pub fn run(args: TranscribeArgs) -> CliResult<()> {
         TranscriptionRequest {
             media_path: args.media_path,
             output_path: args.output,
+            overwrite: true,
             settings: args.settings,
         },
         &CancellationGuard::never(),

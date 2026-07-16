@@ -24,8 +24,8 @@ pub use editing::{
 };
 pub use error::{AdapterError, AdapterResult, ConfigError};
 pub use fs::{
-    default_output_path, is_supported_subtitle_path, read_document, render_and_write_document,
-    stable_runtime_input_path,
+    default_output_path, default_output_path_with_language, is_supported_subtitle_path,
+    read_document, render_and_write_document, stable_runtime_input_path,
 };
 pub use mock::MockBackend;
 pub use pipeline::{
@@ -52,9 +52,9 @@ pub use transcription::{
 };
 pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
-    translate_subtitle, translate_subtitle_batch, translate_subtitle_batch_cancellable,
-    translate_subtitle_batch_with_progress, translate_subtitle_cancellable,
-    translate_subtitle_cancellable_with_progress,
+    batch_translation_output_path, translate_subtitle, translate_subtitle_batch,
+    translate_subtitle_batch_cancellable, translate_subtitle_batch_with_progress,
+    translate_subtitle_cancellable, translate_subtitle_cancellable_with_progress,
 };
 pub use whisper::{
     WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,

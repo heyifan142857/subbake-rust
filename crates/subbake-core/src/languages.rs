@@ -1,3 +1,35 @@
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageNormalizationError {
+    value: String,
+    allow_auto: bool,
+}
+
+impl LanguageNormalizationError {
+    pub fn examples(&self) -> &'static str {
+        if self.allow_auto {
+            "Auto, English, en, Japanese, ja, Chinese, zh-Hans"
+        } else {
+            "English, en, Japanese, ja, Chinese, zh-Hans"
+        }
+    }
+}
+
+impl Display for LanguageNormalizationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported or ambiguous language `{}`; use a common language name or BCP-47 tag such as {}",
+            self.value,
+            self.examples()
+        )
+    }
+}
+
+impl Error for LanguageNormalizationError {}
+
 pub fn normalize_language_name(value: &str, allow_auto: bool) -> String {
     let key = normalize_key(value);
     if allow_auto
@@ -16,18 +48,56 @@ pub fn normalize_language_name(value: &str, allow_auto: bool) -> String {
         "zh-hans" | "zh-cn" | "zh-sg" => "zh-Hans",
         "繁体" | "繁体中文" | "繁體" | "繁體中文" => "zh-Hant",
         "zh-hant" | "zh-tw" | "zh-hk" | "zh-mo" => "zh-Hant",
-        "en" | "eng" => "en",
-        "ja" | "jp" | "jpn" | "日本語" => "ja",
-        "ko" | "kor" | "한국어" => "ko",
-        "fr" | "fra" | "fre" => "fr",
-        "es" | "spa" => "es",
-        "de" | "deu" | "ger" => "de",
-        "pt" | "por" | "português" => "pt",
+        "en" | "eng" | "english" | "英语" | "英語" => "en",
+        "ja" | "jp" | "jpn" | "japanese" | "日本語" | "日语" | "日語" => "ja",
+        "ko" | "kor" | "korean" | "한국어" | "韩语" | "韓語" => "ko",
+        "fr" | "fra" | "fre" | "french" | "français" => "fr",
+        "es" | "spa" | "spanish" | "español" => "es",
+        "de" | "deu" | "ger" | "german" | "deutsch" => "de",
+        "pt" | "por" | "portuguese" | "português" => "pt",
         "pt-br" => "pt-BR",
-        "ru" | "rus" => "ru",
+        "ru" | "rus" | "russian" | "русский" => "ru",
+        "it" | "ita" | "italian" | "italiano" => "it",
+        "ar" | "ara" | "arabic" | "العربية" => "ar",
+        "hi" | "hin" | "hindi" | "हिन्दी" => "hi",
+        "nl" | "nld" | "dut" | "dutch" | "nederlands" => "nl",
+        "pl" | "pol" | "polish" | "polski" => "pl",
+        "tr" | "tur" | "turkish" | "türkçe" => "tr",
+        "uk" | "ukr" | "ukrainian" | "українська" => "uk",
+        "vi" | "vie" | "vietnamese" | "tiếng việt" => "vi",
+        "th" | "tha" | "thai" | "ไทย" => "th",
+        "id" | "ind" | "indonesian" | "bahasa indonesia" => "id",
         _ => return canonicalize_unknown(value),
     };
     tag.to_owned()
+}
+
+pub fn normalize_language(
+    value: &str,
+    allow_auto: bool,
+) -> Result<String, LanguageNormalizationError> {
+    let normalized = normalize_language_name(value, allow_auto);
+    if normalized == "und" || (!allow_auto && normalized == "Auto") {
+        Err(LanguageNormalizationError {
+            value: value.to_owned(),
+            allow_auto,
+        })
+    } else {
+        Ok(normalized)
+    }
+}
+
+pub fn is_language_tag(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("und") {
+        return false;
+    }
+    let parts = value.split('-').collect::<Vec<_>>();
+    !parts.is_empty()
+        && parts[0].len() >= 2
+        && parts[0].len() <= 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
 }
 
 pub fn language_short_code(value: &str) -> String {
@@ -113,14 +183,35 @@ mod tests {
         assert_eq!(normalize_language_name("EN", false), "en");
         assert_eq!(normalize_language_name("pt_br", false), "pt-BR");
         assert_eq!(normalize_language_name("auto", true), "Auto");
+        assert_eq!(normalize_language_name("Japanese", false), "ja");
+        assert_eq!(normalize_language_name("English", false), "en");
+        assert_eq!(normalize_language_name("Italian", false), "it");
     }
 
     #[test]
     fn canonicalizes_unknown_bcp_47_tags() {
         assert_eq!(normalize_language_name("sr_latn_rs", false), "sr-Latn-RS");
-        assert_eq!(normalize_language_name("Italian", false), "und");
-        assert_eq!(normalize_language_name("English", false), "und");
+        assert_eq!(normalize_language_name("Klingon", false), "und");
         assert_eq!(normalize_language_name("", false), "und");
+    }
+
+    #[test]
+    fn strict_normalization_rejects_empty_und_and_ambiguous_names() {
+        assert_eq!(
+            normalize_language("Japanese", false).expect("Japanese"),
+            "ja"
+        );
+        assert!(normalize_language("", false).is_err());
+        assert!(normalize_language("und", false).is_err());
+        assert!(normalize_language("Klingon", false).is_err());
+    }
+
+    #[test]
+    fn recognizes_language_tags_used_in_generated_output_names() {
+        assert!(is_language_tag("ja"));
+        assert!(is_language_tag("zh-Hans"));
+        assert!(!is_language_tag("translated"));
+        assert!(!is_language_tag("und"));
     }
 
     #[test]

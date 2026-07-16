@@ -42,6 +42,8 @@ pub fn run_pipeline_cancellable_with_progress(
             TranslationRequest {
                 input_path: request.input_path,
                 output_path: request.output_path,
+                output_language_tag: None,
+                overwrite: true,
                 settings: request.settings,
             },
             cancellation,
@@ -55,6 +57,7 @@ pub fn run_pipeline_cancellable_with_progress(
         TranscriptionRequest {
             media_path: request.input_path.clone(),
             output_path: None,
+            overwrite: true,
             settings: request.transcription_settings,
         },
         cancellation,
@@ -67,6 +70,8 @@ pub fn run_pipeline_cancellable_with_progress(
         TranslationRequest {
             input_path: transcribed_path,
             output_path: request.output_path,
+            output_language_tag: None,
+            overwrite: true,
             settings: request.settings,
         },
         cancellation,

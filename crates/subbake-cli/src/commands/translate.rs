@@ -15,6 +15,8 @@ pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
         TranslationRequest {
             input_path: args.input_path.clone(),
             output_path: args.output.clone(),
+            output_language_tag: None,
+            overwrite: true,
             settings: args.settings.clone(),
         },
         &CancellationGuard::never(),
@@ -29,6 +31,8 @@ pub fn translate_batch(args: BatchArgs) -> CliResult<()> {
             root: args.dir,
             recursive: args.recursive,
             overwrite: args.overwrite,
+            output_dir: None,
+            output_language_tag: None,
             settings: args.translate.settings,
         },
         &CancellationGuard::never(),

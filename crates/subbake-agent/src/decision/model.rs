@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use subbake_core::AgentToolOutcome;
 use subbake_core::ports::{ModelToolCall, ModelToolResult, ToolContinuation};
 
 use crate::error::{AgentError, AgentResult};
@@ -9,7 +10,7 @@ pub(super) struct ToolFeedback {
     pub(super) success: bool,
     pub(super) tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) output: Option<String>,
+    pub(super) outcome: Option<AgentToolOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,11 +20,11 @@ pub(super) struct ToolFeedback {
 }
 
 impl ToolFeedback {
-    pub(super) fn success(tool: &str, output: String) -> Self {
+    pub(super) fn success(tool: &str, outcome: AgentToolOutcome) -> Self {
         Self {
             success: true,
             tool: tool.to_owned(),
-            output: Some(output),
+            outcome: Some(outcome),
             error: None,
             error_category: None,
             available_tools: Vec::new(),
@@ -39,7 +40,7 @@ impl ToolFeedback {
         Self {
             success: false,
             tool: tool.to_owned(),
-            output: None,
+            outcome: None,
             error: Some(error),
             error_category: Some(category.to_owned()),
             available_tools,
@@ -165,5 +166,47 @@ pub(super) fn parse_json_decision(value: &JsonValue) -> AgentResult<Decision> {
         other => Err(AgentError::InvalidDecision {
             message: format!("unsupported agent action `{other}`"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use subbake_core::{
+        AgentToolOutcome, BilingualOrder, ToolExecutionStatus, TranslationToolOutcome,
+    };
+
+    use super::*;
+
+    #[test]
+    fn successful_feedback_serializes_structured_facts_instead_of_free_text() {
+        let feedback = ToolFeedback::success(
+            "translate_file",
+            AgentToolOutcome::Translation(TranslationToolOutcome {
+                status: ToolExecutionStatus::Written,
+                source_language: "Auto".to_owned(),
+                target_language: "ja".to_owned(),
+                provider: "mock".to_owned(),
+                model: "mock-zh".to_owned(),
+                output_format: "srt".to_owned(),
+                bilingual: false,
+                bilingual_order: BilingualOrder::TargetFirst,
+                inputs: vec!["sample.srt".into()],
+                outputs: vec!["sample.ja.translated.srt".into()],
+                processed_files: 1,
+                skipped: Vec::new(),
+                subtitle_entries: 1,
+                dry_run: false,
+                cache_hits: 0,
+                resumed_translation_batches: 0,
+                resumed_review_batches: 0,
+                translation_memory_hits: 0,
+            }),
+        );
+        let json = feedback.json();
+
+        assert!(json.contains(r#""operation":"translation""#));
+        assert!(json.contains(r#""target_language":"ja""#));
+        assert!(json.contains("sample.ja.translated.srt"));
+        assert!(!json.contains(r#""output":"Translated:"#));
     }
 }

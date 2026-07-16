@@ -17,6 +17,7 @@ pub use crate::presentation::{ProfileChoice, SessionChoice};
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::session::{AgentSessionStore, SessionMode};
 use crate::session_controller::SessionController;
+use crate::tool_execution::render_tool_outcome;
 use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
 use crate::undo::UndoService;
 
@@ -286,7 +287,11 @@ impl AgentEngine {
             };
 
             let result = self.run_tool(&call.tool_name, &call.arguments)?;
-            outputs.push(format!("{}: {}", call.tool_name, result));
+            outputs.push(format!(
+                "{}: {}",
+                call.tool_name,
+                render_tool_outcome(&result)
+            ));
 
             let session = self
                 .session
@@ -334,7 +339,9 @@ impl AgentEngine {
     }
 
     pub fn select_profile(&mut self, name: &str) -> AgentResult<String> {
-        let result = self.run_tool("switch_profile", &serde_json::json!({"name": name}))?;
+        let result = render_tool_outcome(
+            &self.run_tool("switch_profile", &serde_json::json!({"name": name}))?,
+        );
         self.record_if_active(EventKind::Assistant {
             text: result.clone(),
         })?;
@@ -482,11 +489,14 @@ impl AgentEngine {
             "/sessions" => self.sessions_summary(20),
             "/clear" => self.clear_session(),
             "/model" => self.active_model_summary(),
-            "/profile" => self.run_tool("list_profiles", &serde_json::json!({})),
+            "/profile" => self
+                .run_tool("list_profiles", &serde_json::json!({}))
+                .map(|outcome| render_tool_outcome(&outcome)),
             command if command.starts_with("/profile ") => {
                 let name = command.trim_start_matches("/profile ").trim();
                 if name.is_empty() {
                     self.run_tool("list_profiles", &serde_json::json!({}))
+                        .map(|outcome| render_tool_outcome(&outcome))
                 } else {
                     return self.select_profile(name);
                 }

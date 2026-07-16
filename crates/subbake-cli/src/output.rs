@@ -336,8 +336,15 @@ mod tests {
     fn batch_text_reports_empty_directory() {
         let outcome = BatchTranslationOutcome {
             processed: 0,
+            inputs: Vec::new(),
             skipped: Vec::new(),
             outputs: Vec::new(),
+            subtitle_entries: 0,
+            dry_run: false,
+            cache_hits: 0,
+            resumed_translation_batches: 0,
+            resumed_review_batches: 0,
+            translation_memory_hits: 0,
         };
 
         assert_eq!(batch_text(&outcome), "No subtitle files found.\n");

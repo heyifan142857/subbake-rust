@@ -11,6 +11,7 @@ pub mod progress;
 mod recovery;
 mod review;
 pub mod storage;
+pub mod tool_outcome;
 pub mod validation;
 
 pub use cancellation::{CancellationGuard, CancellationToken};
@@ -32,5 +33,10 @@ pub use ports::{
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
     TranslationProgress,
+};
+pub use tool_outcome::{
+    AgentToolOutcome, FileToolOutcome, ObservationToolOutcome, ProfileToolOutcome, SkippedPath,
+    SubtitleEditToolOutcome, ToolExecutionStatus, TranscriptionToolOutcome, TranslationToolOutcome,
+    WhisperModelFact, WhisperToolOutcome,
 };
 pub mod cancellation;

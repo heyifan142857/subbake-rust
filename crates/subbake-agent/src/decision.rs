@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value as JsonValue, json};
 use subbake_core::entities::Usage;
 use subbake_core::error::LlmCallError;
+use subbake_core::languages::normalize_language;
 use subbake_core::ports::{
     ChatMessage, GenerationContent, GenerationInput, GenerationRequest, GenerationResponse,
     LlmBackend, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract, ToolChoice,
@@ -18,6 +19,7 @@ use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, ToolCallDraft};
 use crate::profile_coordinator::ProfileCoordinator;
+use crate::tool_execution::render_tool_outcome;
 use crate::tools::{
     ToolValidationError, find_tool_spec, model_visible_tool_names, model_visible_tool_specs,
     validate_tool_call,
@@ -110,6 +112,7 @@ impl AgentEngine {
         self.check_cancelled()?;
         let dialogue = self.dialogue_context_summary(12);
         let legacy_pending = self.take_legacy_pending_action()?;
+        let effective_defaults = self.effective_defaults_summary()?;
         self.record_if_active(EventKind::User {
             text: input.to_owned(),
         })?;
@@ -131,6 +134,7 @@ impl AgentEngine {
                 &mut native_turn,
                 &mut legacy_mode,
                 true,
+                &effective_defaults,
             )?;
             match decision.action {
                 DecisionAction::Respond => {
@@ -177,6 +181,7 @@ impl AgentEngine {
             &mut native_turn,
             &mut legacy_mode,
             false,
+            &effective_defaults,
         )?;
         match final_decision.action {
             DecisionAction::Respond => {
@@ -204,6 +209,7 @@ impl AgentEngine {
         native_turn: &mut Option<NativeTurn>,
         legacy_mode: &mut bool,
         tools_enabled: bool,
+        effective_defaults: &str,
     ) -> AgentResult<Decision> {
         if !*legacy_mode {
             let was_continuation = native_turn.is_some();
@@ -229,8 +235,13 @@ impl AgentEngine {
                     ResponseContract::Text,
                 )
             } else {
-                GenerationRequest::text(build_native_messages(input, dialogue, legacy_pending))
-                    .with_tools(definitions, choice)
+                GenerationRequest::text(build_native_messages(
+                    input,
+                    dialogue,
+                    legacy_pending,
+                    effective_defaults,
+                ))
+                .with_tools(definitions, choice)
             };
             if let Some(observer) = self.observer.as_mut() {
                 observer.on_thinking("Deciding next action…");
@@ -253,8 +264,15 @@ impl AgentEngine {
         if let Some(observer) = self.observer.as_mut() {
             observer.on_thinking("Deciding next action…");
         }
-        let messages =
-            build_json_messages(input, task, dialogue, legacy_pending, tools_enabled, None);
+        let messages = build_json_messages(
+            input,
+            task,
+            dialogue,
+            legacy_pending,
+            tools_enabled,
+            None,
+            effective_defaults,
+        );
         match execute_json(backend, messages, &self.operation_guard) {
             Ok((value, _)) => match parse_json_decision(&value) {
                 Ok(decision) => Ok(decision),
@@ -359,14 +377,15 @@ impl AgentEngine {
                         )
                     }
                     Ok(()) => match self.run_tool(&call.name, &call.arguments) {
-                        Ok(output) => {
+                        Ok(outcome) => {
                             if spec.mutating {
                                 completed_mutations.insert(call_key.clone());
                             }
+                            let observation = render_tool_outcome(&outcome);
                             if let Some(observer) = self.observer.as_mut() {
-                                observer.on_observation(&output);
+                                observer.on_observation(&observation);
                             }
-                            ToolFeedback::success(&call.name, output)
+                            ToolFeedback::success(&call.name, outcome)
                         }
                         Err(error) if error.is_cancelled() => return Err(error),
                         Err(error) => ToolFeedback::failure(
@@ -464,6 +483,31 @@ impl AgentEngine {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
+    fn effective_defaults_summary(&self) -> AgentResult<String> {
+        let settings =
+            ProfileCoordinator::new(&self.project_root, self.session.as_ref()).active_settings()?;
+        let source_language = normalize_language(&settings.translation.source_language, true)
+            .map_err(|error| AgentError::InvalidInput {
+                message: error.to_string(),
+            })?;
+        let target_language = normalize_language(&settings.translation.target_language, false)
+            .map_err(|error| AgentError::InvalidInput {
+                message: error.to_string(),
+            })?;
+        let output_format = settings.output.format.as_deref().unwrap_or("source");
+        Ok(format!(
+            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_api, model=whisper-1, language=Auto, format=srt",
+            source_language,
+            target_language,
+            settings.backend.id,
+            settings.backend.model,
+            output_format,
+            settings.output.bilingual,
+            settings.output.bilingual_order.as_str(),
+            settings.translation.dry_run,
+        ))
+    }
+
     fn is_in_plan_mode(&self) -> bool {
         self.session
             .as_ref()
@@ -477,7 +521,11 @@ impl AgentEngine {
         Ok(())
     }
 
-    pub(crate) fn run_tool(&mut self, name: &str, args: &JsonValue) -> AgentResult<String> {
+    pub(crate) fn run_tool(
+        &mut self,
+        name: &str,
+        args: &JsonValue,
+    ) -> AgentResult<subbake_core::AgentToolOutcome> {
         crate::tool_runner::ToolRunner::run(self, name, args)
     }
 }
@@ -527,7 +575,7 @@ fn validation_category(error: &ToolValidationError) -> &'static str {
 
 fn nonempty_response(text: String) -> String {
     if text.trim().is_empty() {
-        "Done.".to_owned()
+        "The model returned no final response.".to_owned()
     } else {
         text
     }
@@ -739,6 +787,70 @@ mod tests {
     }
 
     #[test]
+    fn japanese_request_is_executed_with_normalized_override_and_structured_facts() {
+        let root = temp_root("japanese-override");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(
+            root.join("sample.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .expect("subtitle");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"translate_file",
+                    "arguments":{"path":"sample.srt","target_language":"Japanese"}
+                }),
+                json!({"action":"respond","text":"Translated to Japanese."}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("translate sample.srt to Japanese", &mut backend)
+            .expect("run");
+
+        assert_eq!(response, "Translated to Japanese.");
+        assert!(root.join("sample.ja.translated.srt").exists());
+        let result_context = &backend.prompts[1][1].content;
+        assert!(result_context.contains(r#""target_language":"ja""#));
+        assert!(result_context.contains("sample.ja.translated.srt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn omitted_override_reports_actual_profile_default_not_user_intent() {
+        let root = temp_root("omitted-override");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("sample.txt"), "hello\n").expect("subtitle");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"translate_file",
+                    "arguments":{"path":"sample.txt"}
+                }),
+                json!({"action":"respond","text":"The tool used the profile default."}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine
+            .run_line("translate sample.txt to Japanese", &mut backend)
+            .expect("run");
+
+        let result_context = &backend.prompts[1][1].content;
+        assert!(result_context.contains(r#""target_language":"zh-Hans""#));
+        assert!(!result_context.contains(r#""target_language":"ja""#));
+        assert!(root.join("sample.translated.txt").exists());
+        assert!(!root.join("sample.ja.translated.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unknown_tool_result_lists_real_tools_and_loop_recovers() {
         let root = temp_root("unknown-recovery");
         std::fs::create_dir_all(&root).expect("root");
@@ -839,6 +951,11 @@ mod tests {
             backend.continued_results[0][0]
                 .output
                 .contains(r#""success":true"#)
+        );
+        assert!(
+            backend.continued_results[0][0]
+                .output
+                .contains(r#""operation":"file""#)
         );
         let _ = std::fs::remove_dir_all(root);
     }

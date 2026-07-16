@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use reqwest::multipart;
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
+use subbake_core::languages::normalize_language;
 use subbake_core::{
     CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, SubtitleDocument,
     TaskKind, TaskState,
@@ -28,6 +29,7 @@ use crate::whisper::default_whisper_binary_path;
 pub struct TranscriptionRequest {
     pub media_path: PathBuf,
     pub output_path: Option<PathBuf>,
+    pub overwrite: bool,
     pub settings: TranscriptionSettings,
 }
 
@@ -45,6 +47,11 @@ pub struct TranscriptionSettings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptionOutcome {
     pub output_path: PathBuf,
+    pub language: String,
+    pub provider: String,
+    pub model: String,
+    pub output_format: TranscriptionFormat,
+    pub subtitle_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,11 +380,41 @@ pub fn transcribe_media_cancellable(
 }
 
 pub fn transcribe_media_cancellable_with_progress(
-    request: TranscriptionRequest,
+    mut request: TranscriptionRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<TranscriptionOutcome> {
     check_cancelled(cancellation)?;
+    let language = match request.settings.language.as_deref() {
+        Some(value) => normalize_language(value, true)
+            .map_err(|error| AdapterError::invalid_input(error.to_string()))?,
+        None => "Auto".to_owned(),
+    };
+    request.settings.language = (language != "Auto").then(|| language.clone());
+    if request.settings.provider.trim().is_empty() {
+        return Err(AdapterError::invalid_input(
+            "transcription provider must not be empty",
+        ));
+    }
+    if !matches!(
+        request.settings.provider.as_str(),
+        "whisper_api" | "whisper_cpp"
+    ) {
+        return Err(AdapterError::invalid_input(format!(
+            "unsupported transcriber `{}`; expected whisper_api or whisper_cpp",
+            request.settings.provider
+        )));
+    }
+    if request
+        .settings
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(AdapterError::invalid_input(
+            "transcription model must not be empty",
+        ));
+    }
     progress.emit(ProgressEvent::running(
         TaskKind::Transcription,
         "PREPARE_AUDIO",
@@ -388,6 +425,12 @@ pub fn transcribe_media_cancellable_with_progress(
     let output_path = request.output_path.unwrap_or_else(|| {
         default_output_path(&request.media_path, request.settings.output_format)
     });
+    if output_path.exists() && !request.overwrite {
+        return Err(AdapterError::invalid_input(format!(
+            "output already exists and overwrite is false: {}",
+            output_path.display()
+        )));
+    }
 
     if let Some(ref sidecar_path) = request.settings.sidecar_path {
         check_cancelled(cancellation)?;
@@ -401,7 +444,15 @@ pub fn transcribe_media_cancellable_with_progress(
         );
         done.state = TaskState::Completed;
         progress.emit(done);
-        return Ok(TranscriptionOutcome { output_path });
+        let document = read_document(sidecar_path)?;
+        return Ok(TranscriptionOutcome {
+            output_path,
+            language,
+            provider: "sidecar".to_owned(),
+            model: "none".to_owned(),
+            output_format: request.settings.output_format,
+            subtitle_entries: document.segments.len(),
+        });
     }
 
     let audio_path = ensure_audio(&request.media_path, cancellation)?;
@@ -414,6 +465,13 @@ pub fn transcribe_media_cancellable_with_progress(
     ));
     let fmt = request.settings.output_format;
 
+    let effective_model = request.settings.model.clone().unwrap_or_else(|| {
+        if request.settings.provider == "whisper_cpp" {
+            "small".to_owned()
+        } else {
+            "whisper-1".to_owned()
+        }
+    });
     let doc = match request.settings.provider.as_str() {
         "whisper_api" => {
             let api_key = request
@@ -432,12 +490,7 @@ pub fn transcribe_media_cancellable_with_progress(
                 .clone()
                 .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
-            let model = request
-                .settings
-                .model
-                .clone()
-                .unwrap_or_else(|| "whisper-1".to_owned());
-            let t = WhisperApiTranscriber::new(api_key, base_url, model, 120.0)?;
+            let t = WhisperApiTranscriber::new(api_key, base_url, effective_model.clone(), 120.0)?;
             t.transcribe_cancellable(
                 &audio_path,
                 request.settings.language.as_deref(),
@@ -446,13 +499,8 @@ pub fn transcribe_media_cancellable_with_progress(
             )?
         }
         "whisper_cpp" => {
-            let model = request
-                .settings
-                .model
-                .clone()
-                .unwrap_or_else(|| "small".to_owned());
             let binary = locate_whisper_binary()?;
-            let model_path = locate_whisper_model(&model)?;
+            let model_path = locate_whisper_model(&effective_model)?;
             let t = WhisperCppTranscriber::new(binary, model_path, Vec::new());
             t.transcribe_cancellable(
                 &audio_path,
@@ -480,7 +528,14 @@ pub fn transcribe_media_cancellable_with_progress(
     );
     done.state = TaskState::Completed;
     progress.emit(done);
-    Ok(TranscriptionOutcome { output_path })
+    Ok(TranscriptionOutcome {
+        output_path,
+        language,
+        provider: request.settings.provider,
+        model: effective_model,
+        output_format: fmt,
+        subtitle_entries: doc.segments.len(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +757,7 @@ mod tests {
         let r = transcribe_media(TranscriptionRequest {
             media_path: root.join("x.mp4"),
             output_path: Some(out.clone()),
+            overwrite: true,
             settings: TranscriptionSettings {
                 sidecar_path: Some(src),
                 ..Default::default()
@@ -709,6 +765,11 @@ mod tests {
         })
         .expect("transcribe");
         assert_eq!(r.output_path, out);
+        assert_eq!(r.provider, "sidecar");
+        assert_eq!(r.model, "none");
+        assert_eq!(r.language, "Auto");
+        assert_eq!(r.output_format, TranscriptionFormat::Srt);
+        assert_eq!(r.subtitle_entries, 1);
         assert!(
             fs::read_to_string(&out)
                 .expect("read out")
@@ -726,6 +787,7 @@ mod tests {
         let e = transcribe_media(TranscriptionRequest {
             media_path: root.join("x.mp4"),
             output_path: None,
+            overwrite: true,
             settings: TranscriptionSettings {
                 sidecar_path: Some(src),
                 ..Default::default()
@@ -741,6 +803,7 @@ mod tests {
         let e = transcribe_media(TranscriptionRequest {
             media_path: PathBuf::from("m.wav"),
             output_path: None,
+            overwrite: true,
             settings: TranscriptionSettings {
                 provider: "whisper_api".to_owned(),
                 api_key: None,
@@ -756,6 +819,7 @@ mod tests {
         let e = transcribe_media(TranscriptionRequest {
             media_path: PathBuf::from("m.wav"),
             output_path: None,
+            overwrite: true,
             settings: TranscriptionSettings {
                 provider: "nope".to_owned(),
                 ..Default::default()
@@ -763,6 +827,32 @@ mod tests {
         })
         .expect_err("unknown provider should error");
         assert!(e.to_string().contains("unsupported transcriber"));
+    }
+
+    #[test]
+    fn existing_output_is_rejected_before_sidecar_render_when_overwrite_is_false() {
+        let root = t("overwrite");
+        fs::create_dir_all(&root).expect("create root");
+        let sidecar = root.join("in.srt");
+        let output = root.join("out.srt");
+        fs::write(&sidecar, "1\n00:00:00,000 --> 00:00:01,000\nnew\n").expect("write sidecar");
+        fs::write(&output, "existing\n").expect("write existing output");
+
+        let error = transcribe_media(TranscriptionRequest {
+            media_path: root.join("media.wav"),
+            output_path: Some(output.clone()),
+            overwrite: false,
+            settings: TranscriptionSettings {
+                sidecar_path: Some(sidecar),
+                ..Default::default()
+            },
+        })
+        .expect_err("existing output must fail");
+        let content = fs::read_to_string(&output).expect("read output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(error.to_string().contains("overwrite is false"));
+        assert_eq!(content, "existing\n");
     }
 
     #[test]

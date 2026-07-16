@@ -85,6 +85,15 @@ pub fn default_output_path(
     output_format: Option<&str>,
     bilingual: bool,
 ) -> AdapterResult<PathBuf> {
+    default_output_path_with_language(input_path, output_format, bilingual, None)
+}
+
+pub fn default_output_path_with_language(
+    input_path: &Path,
+    output_format: Option<&str>,
+    bilingual: bool,
+    language_tag: Option<&str>,
+) -> AdapterResult<PathBuf> {
     let target_format = match output_format {
         Some(value) => normalize_format(value).map_err(AdapterError::from)?,
         None => supported_format_from_path(input_path)
@@ -98,7 +107,11 @@ pub fn default_output_path(
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
-    Ok(input_path.with_file_name(format!("{stem}.{suffix}.{target_format}")))
+    let language = language_tag
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(".{}", value.trim()))
+        .unwrap_or_default();
+    Ok(input_path.with_file_name(format!("{stem}{language}.{suffix}.{target_format}")))
 }
 
 #[cfg(test)]
@@ -144,5 +157,29 @@ mod tests {
         let stable = stable_runtime_input_path(&absolute).expect("stable path");
 
         assert_eq!(stable, absolute);
+    }
+
+    #[test]
+    fn explicit_language_tag_is_included_in_default_output_name() {
+        let path = default_output_path_with_language(
+            Path::new("/work/sample.srt"),
+            Some("srt"),
+            false,
+            Some("ja"),
+        )
+        .expect("output path");
+        assert_eq!(path, PathBuf::from("/work/sample.ja.translated.srt"));
+
+        let bilingual = default_output_path_with_language(
+            Path::new("/work/sample.srt"),
+            Some("vtt"),
+            true,
+            Some("zh-Hans"),
+        )
+        .expect("bilingual output path");
+        assert_eq!(
+            bilingual,
+            PathBuf::from("/work/sample.zh-Hans.bilingual.vtt")
+        );
     }
 }

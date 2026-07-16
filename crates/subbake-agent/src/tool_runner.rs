@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde_json::Value as JsonValue;
+use subbake_core::{AgentToolOutcome, FileToolOutcome, ToolExecutionStatus};
 
 use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
@@ -19,7 +20,7 @@ impl ToolRunner {
         engine: &mut AgentEngine,
         name: &str,
         args: &JsonValue,
-    ) -> AgentResult<String> {
+    ) -> AgentResult<AgentToolOutcome> {
         engine.check_cancelled()?;
         engine.record_if_active(EventKind::ToolCall {
             tool_name: name.to_owned(),
@@ -44,7 +45,20 @@ impl ToolRunner {
             for operation in &outcome.file_operations {
                 Self::record_file_operation(engine, operation, group_id.clone())?;
             }
-            return Ok(outcome.text);
+            return Ok(AgentToolOutcome::File(FileToolOutcome {
+                status: ToolExecutionStatus::Written,
+                action: "apply_patch".to_owned(),
+                paths: outcome
+                    .file_operations
+                    .iter()
+                    .map(|operation| operation.path.clone())
+                    .collect(),
+                destination_paths: outcome
+                    .file_operations
+                    .iter()
+                    .filter_map(|operation| operation.new_path.clone())
+                    .collect(),
+            }));
         }
 
         if let Some(outcome) =
@@ -53,16 +67,19 @@ impl ToolRunner {
             if let Some(operation) = outcome.file_operation {
                 Self::record_file_operation(engine, &operation, None)?;
             }
-            return Ok(outcome.text);
+            return Ok(outcome.outcome);
         }
-        if let Some(text) = execute_adapter_tool(
+        if let Some(outcome) = execute_adapter_tool(
             executor,
             args,
             &engine.guard,
             &engine.operation_guard,
             engine.progress.clone(),
         )? {
-            return Ok(text);
+            if let Some(operation) = outcome.file_operation {
+                Self::record_file_operation(engine, &operation, None)?;
+            }
+            return Ok(outcome.outcome);
         }
         if matches!(
             executor,
@@ -89,7 +106,7 @@ impl ToolRunner {
             for operation in &outcome.file_operations {
                 Self::record_file_operation(engine, operation, group_id.clone())?;
             }
-            return Ok(outcome.text);
+            return Ok(outcome.outcome);
         }
         if matches!(
             executor,
@@ -129,7 +146,7 @@ impl ToolRunner {
                     name: profile_switch.name,
                 })?;
             }
-            return Ok(outcome.text);
+            return Ok(outcome.outcome);
         }
         Err(AgentError::InvalidState {
             message: "tool was not handled by its registered executor".to_owned(),

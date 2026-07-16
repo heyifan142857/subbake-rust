@@ -176,10 +176,46 @@ use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
 const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
     arg("path", StringArg, true, "subtitle file path"),
     arg(
+        "source_language",
+        StringArg,
+        false,
+        "source language name or BCP-47 tag for this call",
+    ),
+    arg(
+        "target_language",
+        StringArg,
+        false,
+        "target language name or BCP-47 tag for this call",
+    ),
+    arg(
         "bilingual",
         BooleanArg,
         false,
         "override bilingual output for this call",
+    ),
+    arg(
+        "bilingual_order",
+        StringArg,
+        false,
+        "source_first or target_first for this call",
+    ),
+    arg(
+        "output_format",
+        StringArg,
+        false,
+        "srt, vtt, or txt output format for this call",
+    ),
+    arg(
+        "output_path",
+        StringArg,
+        false,
+        "explicit project-local output path",
+    ),
+    arg(
+        "overwrite",
+        BooleanArg,
+        false,
+        "replace an existing output; defaults to false",
     ),
 ];
 const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
@@ -192,20 +228,95 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
     arg("recursive", BooleanArg, false, "include nested directories"),
     arg("overwrite", BooleanArg, false, "replace existing outputs"),
     arg(
+        "source_language",
+        StringArg,
+        false,
+        "source language name or BCP-47 tag for this call",
+    ),
+    arg(
+        "target_language",
+        StringArg,
+        false,
+        "target language name or BCP-47 tag for this call",
+    ),
+    arg(
         "bilingual",
         BooleanArg,
         false,
         "override bilingual output for this call",
+    ),
+    arg(
+        "bilingual_order",
+        StringArg,
+        false,
+        "source_first or target_first for this call",
+    ),
+    arg(
+        "output_format",
+        StringArg,
+        false,
+        "srt, vtt, or txt output format for this call",
+    ),
+    arg(
+        "output_dir",
+        StringArg,
+        false,
+        "project-local output directory; recursive calls preserve relative directories",
     ),
 ];
 const EDIT_SUBTITLE_ARGS: &[ToolArgSpec] = &[
     arg("path", StringArg, true, "generated subtitle path"),
     arg("instruction", StringArg, true, "requested edit"),
     arg(
+        "target_language",
+        StringArg,
+        false,
+        "target language name or BCP-47 tag for this edit",
+    ),
+    arg(
         "allow_non_generated",
         BooleanArg,
         false,
         "allow editing a source file",
+    ),
+];
+const TRANSCRIBE_AUDIO_ARGS: &[ToolArgSpec] = &[
+    arg("path", StringArg, true, "project-local media file path"),
+    arg(
+        "language",
+        StringArg,
+        false,
+        "spoken language name or BCP-47 tag; Auto detects it",
+    ),
+    arg(
+        "provider",
+        StringArg,
+        false,
+        "whisper_api or whisper_cpp for this call",
+    ),
+    arg(
+        "model",
+        StringArg,
+        false,
+        "transcription model for this call",
+    ),
+    arg(
+        "output_format",
+        StringArg,
+        false,
+        "srt, vtt, or txt output format for this call",
+    ),
+    arg(
+        "output_path",
+        StringArg,
+        false,
+        "explicit project-local output path",
+    ),
+    arg(
+        "overwrite",
+        BooleanArg,
+        false,
+        "replace an existing output; defaults to false",
     ),
 ];
 const PATH_ARGS: &[ToolArgSpec] = &[arg("path", StringArg, true, "project-local path")];
@@ -318,7 +429,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         true,
         "Transcribe a media file to subtitles.",
-        PATH_ARGS,
+        TRANSCRIBE_AUDIO_ARGS,
         TranscribeAudio
     ),
     tool!(
@@ -665,6 +776,44 @@ mod tests {
             serde_json::json!(["patch"])
         );
         assert_eq!(definition.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn semantic_execution_arguments_are_exposed_in_native_and_fallback_schemas() {
+        let translate = find_tool_spec("translate_file").expect("translate_file");
+        let translate_names = translate
+            .arguments()
+            .iter()
+            .map(|argument| argument.name)
+            .collect::<Vec<_>>();
+        for expected in [
+            "source_language",
+            "target_language",
+            "bilingual",
+            "bilingual_order",
+            "output_format",
+            "output_path",
+            "overwrite",
+        ] {
+            assert!(translate_names.contains(&expected));
+        }
+
+        let transcribe = find_tool_spec("transcribe_audio").expect("transcribe_audio");
+        let transcribe_names = transcribe
+            .arguments()
+            .iter()
+            .map(|argument| argument.name)
+            .collect::<Vec<_>>();
+        for expected in [
+            "language",
+            "provider",
+            "model",
+            "output_format",
+            "output_path",
+            "overwrite",
+        ] {
+            assert!(transcribe_names.contains(&expected));
+        }
     }
 
     #[test]

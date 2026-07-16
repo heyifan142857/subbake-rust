@@ -34,7 +34,6 @@ enum PreparedOperation {
 
 #[derive(Debug)]
 pub(crate) struct PatchOutcome {
-    pub(crate) text: String,
     pub(crate) file_operations: Vec<FileOpResult>,
 }
 
@@ -65,20 +64,7 @@ pub(crate) fn apply_patch(patch: &str, guard: &FileGuard) -> AgentResult<PatchOu
         }
     }
 
-    let changed = completed
-        .iter()
-        .map(|operation| {
-            let action = match operation.action {
-                FileOpAction::Create => "added",
-                FileOpAction::Modified => "updated",
-                FileOpAction::Deleted => "deleted",
-                FileOpAction::Append | FileOpAction::Renamed => "changed",
-            };
-            format!("{action} {}", operation.path.display())
-        })
-        .collect::<Vec<_>>();
     Ok(PatchOutcome {
-        text: format!("Applied patch:\n{}", changed.join("\n")),
         file_operations: completed,
     })
 }
