@@ -21,6 +21,7 @@ pub(super) fn build_translation_messages(
     batch: &[SubtitleSegment],
     memory: &ContextMemory,
     required_glossary: &BTreeMap<String, String>,
+    compact_wire: bool,
 ) -> Vec<ChatMessage> {
     let mut context = serde_json::json!({
         "src": options.source_language,
@@ -85,20 +86,32 @@ pub(super) fn build_translation_messages(
     }
     let lines = batch
         .iter()
-        .map(|segment| serde_json::json!({"id": segment.id, "text": segment.text}))
+        .map(|segment| {
+            if compact_wire {
+                serde_json::json!([segment.id, segment.text])
+            } else {
+                serde_json::json!({"id": segment.id, "text": segment.text})
+            }
+        })
         .collect::<Vec<_>>();
     let context_json = serde_json::to_string(&context).unwrap_or_default();
     let batch_json =
         serde_json::to_string(&serde_json::json!({"lines": lines})).unwrap_or_default();
-    let system = "TASK_START\ntranslate_subtitles\nTASK_END\n\
+    let response_shape = if compact_wire {
+        "{\"lines\":[[\"<source id>\",\"<non-empty target-language text>\"]]}"
+    } else {
+        "{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}"
+    };
+    let system = format!(
+        "TASK_START\ntranslate_subtitles\nTASK_END\n\
 Return JSON only with this shape:\n\
-{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}\n\
+{response_shape}\n\
 Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
-The translated text must be in the translation field; do not return it in text or translated_text.\n\
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context.";
+only when they fit the meaning in the current context."
+    );
     vec![
         if options.mode == crate::entities::TranslationMode::Cinema {
             ChatMessage::cacheable_system(system)

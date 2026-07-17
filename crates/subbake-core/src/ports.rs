@@ -292,6 +292,13 @@ pub trait LlmBackend: Send {
     fn supports_parallel_generation(&self) -> bool {
         false
     }
+
+    /// Whether the backend accepts SubBake's compact `[id, text]` / `[id,
+    /// translation]` JSON wire shape. The normal object contract remains the
+    /// safe fallback for relays with strict prompt schemas.
+    fn supports_compact_translation(&self) -> bool {
+        false
+    }
     fn native_tool_support(&self) -> NativeToolSupport {
         NativeToolSupport::Unsupported
     }
@@ -340,6 +347,9 @@ where
 
     fn supports_parallel_generation(&self) -> bool {
         (**self).supports_parallel_generation()
+    }
+    fn supports_compact_translation(&self) -> bool {
+        (**self).supports_compact_translation()
     }
     fn native_tool_support(&self) -> NativeToolSupport {
         (**self).native_tool_support()

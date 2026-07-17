@@ -436,6 +436,7 @@ where
                 batch,
                 &self.memory,
                 &self.required_glossary,
+                self.options.policy().compact_wire && self.backend.supports_compact_translation(),
             );
             let hash = request_hash(&self.options, CacheStage::Translate, &messages);
             let cached = if self.options.use_cache {
@@ -557,6 +558,7 @@ where
                 batch,
                 &self.memory,
                 &self.required_glossary,
+                self.options.policy().compact_wire && self.backend.supports_compact_translation(),
             );
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
@@ -2531,14 +2533,21 @@ mod tests {
             &prepared[0].pending,
             &memory,
             &BTreeMap::new(),
+            false,
         );
         let advisory_context = translation_context(&advisory_messages);
         assert_eq!(advisory_context["terminology_hints"]["Lord"], "勋爵");
         assert!(advisory_context.get("glossary").is_none());
 
         let required = BTreeMap::from([("Lord".to_owned(), "勋爵".to_owned())]);
-        let required_messages =
-            build_translation_messages(&options, 1, &prepared[0].pending, &memory, &required);
+        let required_messages = build_translation_messages(
+            &options,
+            1,
+            &prepared[0].pending,
+            &memory,
+            &required,
+            false,
+        );
         let required_context = translation_context(&required_messages);
         assert_eq!(required_context["glossary"]["Lord"], "勋爵");
         assert!(required_context.get("terminology_hints").is_none());

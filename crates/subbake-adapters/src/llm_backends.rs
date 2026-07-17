@@ -504,6 +504,9 @@ impl LlmBackend for ProtocolAdapter {
     fn supports_parallel_generation(&self) -> bool {
         true
     }
+    fn supports_compact_translation(&self) -> bool {
+        true
+    }
     fn native_tool_support(&self) -> NativeToolSupport {
         self.native_tool_support
     }

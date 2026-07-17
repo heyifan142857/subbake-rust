@@ -34,6 +34,10 @@ impl LlmBackend for MockBackend {
         true
     }
 
+    fn supports_compact_translation(&self) -> bool {
+        true
+    }
+
     fn provider_name(&self) -> &str {
         "mock"
     }
@@ -157,8 +161,25 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
     let mut lines = Vec::new();
     let mut glossary_updates = Vec::new();
     for entry in entries {
-        let id = entry["id"].as_str().unwrap_or_default().to_owned();
-        let text = entry["text"].as_str().unwrap_or_default().to_owned();
+        let (id, text) = if let Some(values) = entry.as_array() {
+            (
+                values
+                    .first()
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                values
+                    .get(1)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        } else {
+            (
+                entry["id"].as_str().unwrap_or_default().to_owned(),
+                entry["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
         let translation = if text.trim().is_empty() {
             String::new()
         } else {

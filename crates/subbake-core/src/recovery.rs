@@ -115,6 +115,29 @@ pub(crate) fn parse_translation_payload(
 }
 
 fn parse_translation_line(line: &serde_json::Value, index: usize) -> CoreResult<TranslationLine> {
+    if let Some(values) = line.as_array() {
+        let id = values
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CoreError::InvalidTranslation(format!(
+                    "line {} compact entry is missing id",
+                    index + 1
+                ))
+            })?;
+        let translation = values
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                CoreError::InvalidTranslation(format!(
+                    "translation for compact id `{id}` is missing"
+                ))
+            })?;
+        return Ok(TranslationLine {
+            id: id.to_owned(),
+            translation: translation.to_owned(),
+        });
+    }
     let id = line["id"].as_str().ok_or_else(|| {
         CoreError::InvalidTranslation(format!("line {} is missing string field `id`", index + 1))
     })?;
