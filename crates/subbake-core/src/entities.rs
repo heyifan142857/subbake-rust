@@ -201,6 +201,9 @@ pub struct GlossaryEntry {
 #[serde(default)]
 pub struct TerminologyPreflightResult {
     pub entries: Vec<GlossaryEntry>,
+    /// Advisory document-level context. Older cache entries omit it.
+    #[serde(default)]
+    pub document_brief: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]

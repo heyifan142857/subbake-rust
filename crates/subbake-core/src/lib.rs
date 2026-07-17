@@ -2,9 +2,11 @@ pub mod diagnostics;
 pub mod editing;
 pub mod entities;
 pub mod error;
+pub mod evaluation;
 pub mod formats;
 pub mod languages;
 pub mod memory;
+pub mod overnight;
 pub mod pipeline;
 pub mod ports;
 pub mod progress;
@@ -25,6 +27,7 @@ pub use entities::{
     TranslationMode, TranslationPolicy, Usage,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
+pub use evaluation::{EvaluationReport, MqmCounts, evaluate};
 pub use memory::ContextMemory;
 pub use ports::{
     BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,

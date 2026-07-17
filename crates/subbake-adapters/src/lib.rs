@@ -5,6 +5,7 @@ pub mod error;
 pub mod fs;
 pub mod llm_backends;
 pub mod mock;
+pub mod overnight;
 pub mod pipeline;
 pub mod providers;
 pub mod runtime;
@@ -28,6 +29,11 @@ pub use fs::{
     read_document, render_and_write_document, stable_runtime_input_path,
 };
 pub use mock::MockBackend;
+pub use overnight::{
+    OvernightCollectOutcome, OvernightCollectRequest, OvernightStatusOutcome,
+    OvernightStatusRequest, OvernightSubmitOutcome, OvernightSubmitRequest, collect_overnight,
+    overnight_status, submit_overnight,
+};
 pub use pipeline::{
     PipelineOutcome, PipelineRequest, run_pipeline, run_pipeline_cancellable_with_progress,
 };

@@ -148,10 +148,15 @@ pub(crate) fn build_review_messages(
     }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
     let system = format!(
-        "You are performing a targeted subtitle QA review.\n\
+        "You are performing a targeted subtitle QA review.{}\n\
          Return valid JSON only.\n\
          Review {} subtitles.\n\
          Only fix the stated deterministic issues without changing entry structure.",
+        if options.mode == crate::entities::TranslationMode::Cinema {
+            " First form an independent candidate translation for each editable line, then adjudicate it against the supplied candidate; return only the better final replacement when it materially improves fidelity, naturalness, consistency, or subtitle readability."
+        } else {
+            ""
+        },
         options.target_language
     );
     let user = format!(

@@ -726,6 +726,7 @@ mod tests {
                     source: "Axe Gang".to_owned(),
                     target: "斧头帮".to_owned(),
                 }],
+                document_brief: String::new(),
             }),
             usage: Usage {
                 input_tokens: 10,

@@ -1,11 +1,13 @@
 use crate::args::{
-    parse_agent_args, parse_batch_args, parse_pipeline_args, parse_provider_args,
-    parse_resume_args, parse_runtime_args, parse_transcribe_args, parse_translate_args,
-    parse_whisper_args,
+    parse_agent_args, parse_batch_args, parse_evaluate_args, parse_overnight_args,
+    parse_pipeline_args, parse_provider_args, parse_resume_args, parse_runtime_args,
+    parse_transcribe_args, parse_translate_args, parse_whisper_args,
 };
 use crate::{CliError, CliResult};
 
 mod agent;
+mod evaluate;
+mod overnight;
 mod pipeline;
 mod provider;
 mod runtime;
@@ -28,8 +30,10 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
         "resume" => agent::run(parse_resume_args(&args[1..])?),
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
+        "evaluate" => evaluate::run(parse_evaluate_args(&args[1..])?),
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),
         "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
+        "overnight" => overnight::run(parse_overnight_args(&args[1..])?),
         "provider" => provider::run(parse_provider_args(&args[1..])?),
         "runtime" => runtime::run(parse_runtime_args(&args[1..])?),
         "whisper" => whisper::run(parse_whisper_args(&args[1..])?),
@@ -66,8 +70,13 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
         ["resume"] => RESUME_HELP,
         ["translate"] => TRANSLATE_HELP,
         ["batch"] => BATCH_HELP,
+        ["evaluate"] => EVALUATE_HELP,
         ["transcribe"] => TRANSCRIBE_HELP,
         ["pipeline"] => PIPELINE_HELP,
+        ["overnight"]
+        | ["overnight", "submit"]
+        | ["overnight", "status"]
+        | ["overnight", "collect"] => OVERNIGHT_HELP,
         ["provider"] | ["provider", "check"] => PROVIDER_HELP,
         ["runtime"] => RUNTIME_HELP,
         ["runtime", "inspect"] => RUNTIME_INSPECT_HELP,
@@ -87,8 +96,10 @@ Commands:
   resume      Resume the latest or a specified agent session
   translate   Translate a subtitle or text file
   batch       Translate subtitle files in a directory
+  evaluate    Compare a subtitle output with a reference offline
   transcribe  Transcribe audio or video into subtitles
   pipeline    Transcribe media when needed, then translate it
+  overnight   Submit, check, and collect a provider-managed economy batch
   provider    Validate a model provider configuration
   runtime     Inspect or clean runtime artifacts
   whisper     Install and manage whisper.cpp and its models
@@ -102,6 +113,7 @@ Examples:
   sbake
   sbake translate movie.srt --target-lang Chinese
   sbake pipeline movie.mp4 --target-lang English
+  sbake overnight submit movie.srt --mode economy --profile openai
   sbake resume
   sbake provider check
 "#;
@@ -159,6 +171,13 @@ Options:
 Translation provider, model, review, batching, cache, retry, and runtime options
 accepted by `translate` are also available.
 "#;
+const EVALUATE_HELP: &str = r#"Compare a subtitle output with a reference offline
+
+Usage: sbake evaluate <CANDIDATE> <REFERENCE> [--json]
+
+Reports deterministic chrF and mechanical MQM-style structural findings.
+Use it to track regressions; it does not replace human semantic evaluation.
+"#;
 const TRANSCRIBE_HELP: &str = r#"Transcribe audio or video into subtitles
 
 Usage: sbake transcribe <MEDIA> [OPTIONS]
@@ -185,6 +204,18 @@ Accepts all `translate` options plus:
       --transcribe-format <FORMAT>     srt, vtt, or txt
       --sidecar <PATH>                 Use a sidecar transcript
   -h, --help                           Print help
+"#;
+const OVERNIGHT_HELP: &str = r#"Submit, check, and collect a provider-managed asynchronous translation batch
+
+Usage:
+  sbake overnight submit <SUBTITLE> --mode economy [TRANSLATE OPTIONS]
+  sbake overnight status <MANIFEST> [PROVIDER OPTIONS]
+  sbake overnight collect <MANIFEST> [PROVIDER OPTIONS] [--overwrite]
+
+`submit` supports OpenAI Batch with `openai_chat` or `openai_responses`.
+It saves a non-secret manifest under the subtitle runtime directory. Pass that
+manifest path to `status` and `collect`; collection validates that the source
+subtitle has not changed before writing the translated output.
 "#;
 const PROVIDER_HELP: &str = r#"Validate a model provider configuration
 

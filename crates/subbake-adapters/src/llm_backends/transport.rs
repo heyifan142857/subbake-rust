@@ -79,7 +79,7 @@ where
     }
 }
 
-async fn await_http<F, T>(
+pub(super) async fn await_http<F, T>(
     future: F,
     cancellation: &CancellationGuard,
     context: &str,

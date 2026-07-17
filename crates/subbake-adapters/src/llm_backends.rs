@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use reqwest::{Client, RequestBuilder};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use subbake_core::CancellationGuard;
 #[cfg(test)]
 use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationLine};
@@ -26,8 +27,8 @@ use native::{
 };
 use protocols::{authenticate, endpoint, request_body, response_text, usage};
 #[cfg(test)]
-use transport::{classify_status_error, native_tools_unsupported};
-use transport::{client, send_json};
+use transport::native_tools_unsupported;
+use transport::{await_http, classify_status_error, client, send_json};
 const TIMEOUT: f64 = 120.0;
 static BACKEND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -48,6 +49,268 @@ pub type OpenAiChatAdapter = ProtocolAdapter;
 pub type OpenAiResponsesAdapter = ProtocolAdapter;
 pub type AnthropicMessagesAdapter = ProtocolAdapter;
 pub type GeminiGenerateContentAdapter = ProtocolAdapter;
+
+/// Adapter for OpenAI-compatible Batch endpoints. It intentionally supports
+/// only the two OpenAI request formats because the batch JSONL wire contract
+/// is provider-specific.
+pub struct OpenAiBatchClient {
+    config: BackendConfig,
+    format: ApiFormat,
+    key: String,
+    client: Client,
+    runtime: Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiBatchStatus {
+    pub id: String,
+    pub status: String,
+    pub input_file_id: String,
+    pub output_file_id: Option<String>,
+    pub error_file_id: Option<String>,
+    pub total: Option<usize>,
+    pub completed: Option<usize>,
+    pub failed: Option<usize>,
+}
+
+pub fn build_openai_batch_client(
+    config: &BackendConfig,
+    timeout: f64,
+) -> AdapterResult<OpenAiBatchClient> {
+    config.validate()?;
+    let format = config
+        .api_format
+        .ok_or_else(|| AdapterError::invalid_input("api_format is required"))?;
+    if !matches!(format, ApiFormat::OpenaiChat | ApiFormat::OpenaiResponses) {
+        return Err(AdapterError::invalid_input(
+            "overnight batches currently require api_format openai_chat or openai_responses",
+        ));
+    }
+    if config.endpoint_url.is_some() {
+        return Err(AdapterError::invalid_input(
+            "overnight batches require base_url rather than endpoint_url so /files and /batches can be addressed safely",
+        ));
+    }
+    let key = config
+        .resolved_api_key()
+        .ok_or_else(|| AdapterError::Authentication {
+            message: format!(
+                "Missing API key for {} provider. Set --api-key, api_key, or api_key_env.",
+                config.display_name
+            ),
+        })?;
+    if key.contains(['\r', '\n']) {
+        return Err(AdapterError::invalid_input(
+            "authentication header value must not contain CR/LF",
+        ));
+    }
+    Ok(OpenAiBatchClient {
+        config: config.clone(),
+        format,
+        key,
+        client: client(timeout)?,
+        runtime: Runtime::new().map_err(|source| AdapterError::ExternalIo {
+            operation: "start overnight batch runtime",
+            path: None,
+            source,
+        })?,
+    })
+}
+
+impl OpenAiBatchClient {
+    pub fn endpoint_path(&self) -> &'static str {
+        match self.format {
+            ApiFormat::OpenaiChat => "/v1/chat/completions",
+            ApiFormat::OpenaiResponses => "/v1/responses",
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn request_body(&self, messages: &[ChatMessage]) -> Value {
+        request_body(
+            self.format,
+            &self.config.model,
+            messages,
+            ResponseContract::JsonObject,
+        )
+    }
+
+    pub fn submit_jsonl(
+        &self,
+        jsonl: &str,
+        metadata: Value,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<OpenAiBatchStatus> {
+        let input_file_id = self.upload(jsonl, cancellation)?;
+        let payload = json!({
+            "input_file_id": input_file_id,
+            "endpoint": self.endpoint_path(),
+            "completion_window": "24h",
+            "metadata": metadata,
+        });
+        self.json_request(
+            self.authenticated(self.client.post(self.api_url("batches")).json(&payload)),
+            cancellation,
+        )
+        .and_then(parse_batch_status)
+    }
+
+    pub fn status(
+        &self,
+        job_id: &str,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<OpenAiBatchStatus> {
+        self.json_request(
+            self.authenticated(self.client.get(self.api_url(&format!("batches/{job_id}")))),
+            cancellation,
+        )
+        .and_then(parse_batch_status)
+    }
+
+    pub fn download_output(
+        &self,
+        file_id: &str,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<String> {
+        cancellation.check().map_err(AdapterError::from)?;
+        let request = self.authenticated(
+            self.client
+                .get(self.api_url(&format!("files/{file_id}/content"))),
+        );
+        self.runtime
+            .block_on(async {
+                let response = await_http(
+                    request.send(),
+                    cancellation,
+                    "overnight batch download failed",
+                )
+                .await?;
+                let status = response.status();
+                let text = await_http(
+                    response.text(),
+                    cancellation,
+                    "overnight batch output read failed",
+                )
+                .await?;
+                if status.is_success() {
+                    Ok(text)
+                } else {
+                    Err(classify_status_error(status.as_u16(), text, None))
+                }
+            })
+            .map_err(AdapterError::from)
+    }
+
+    pub fn parse_output_json(&self, body: &Value) -> AdapterResult<Value> {
+        let text = response_text(self.format, body)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| AdapterError::invalid_input("batch response missing text output"))?;
+        serde_json::from_str(&text).map_err(|error| {
+            AdapterError::invalid_input(format!(
+                "batch response did not contain a JSON translation payload: {error}"
+            ))
+        })
+    }
+
+    fn upload(&self, jsonl: &str, cancellation: &CancellationGuard) -> AdapterResult<String> {
+        cancellation.check().map_err(AdapterError::from)?;
+        let part = reqwest::multipart::Part::text(jsonl.to_owned())
+            .file_name("subbake-overnight.jsonl")
+            .mime_str("application/jsonl")
+            .map_err(|error| {
+                AdapterError::invalid_input(format!("invalid batch mime type: {error}"))
+            })?;
+        let form = reqwest::multipart::Form::new()
+            .text("purpose", "batch")
+            .part("file", part);
+        let value = self.json_request(
+            self.authenticated(self.client.post(self.api_url("files")).multipart(form)),
+            cancellation,
+        )?;
+        value["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| AdapterError::invalid_input("batch upload response missing file id"))
+    }
+
+    fn api_url(&self, suffix: &str) -> String {
+        format!(
+            "{}/{}",
+            self.config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/'),
+            suffix
+        )
+    }
+
+    fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
+        authenticate(self.format, &self.config, &self.key, request)
+    }
+
+    fn json_request(
+        &self,
+        request: RequestBuilder,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<Value> {
+        cancellation.check().map_err(AdapterError::from)?;
+        self.runtime
+            .block_on(async {
+                let response = await_http(
+                    request.send(),
+                    cancellation,
+                    "overnight batch request failed",
+                )
+                .await?;
+                let status = response.status();
+                let text = await_http(
+                    response.text(),
+                    cancellation,
+                    "overnight batch response read failed",
+                )
+                .await?;
+                if status.is_success() {
+                    serde_json::from_str(&text).map_err(|error| {
+                        LlmCallError::InvalidResponse(format!(
+                            "batch response decode failed: {error}"
+                        ))
+                    })
+                } else {
+                    Err(classify_status_error(status.as_u16(), text, None))
+                }
+            })
+            .map_err(AdapterError::from)
+    }
+}
+
+fn parse_batch_status(value: Value) -> AdapterResult<OpenAiBatchStatus> {
+    let id = value["id"]
+        .as_str()
+        .ok_or_else(|| AdapterError::invalid_input("batch response missing id"))?
+        .to_owned();
+    let status = value["status"].as_str().unwrap_or("unknown").to_owned();
+    let input_file_id = value["input_file_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    Ok(OpenAiBatchStatus {
+        id,
+        status,
+        input_file_id,
+        output_file_id: value["output_file_id"].as_str().map(str::to_owned),
+        error_file_id: value["error_file_id"].as_str().map(str::to_owned),
+        total: value["request_counts"]["total"]
+            .as_u64()
+            .map(|v| v as usize),
+        completed: value["request_counts"]["completed"]
+            .as_u64()
+            .map(|v| v as usize),
+        failed: value["request_counts"]["failed"]
+            .as_u64()
+            .map(|v| v as usize),
+    })
+}
 
 pub fn build_protocol_backend(
     config: &BackendConfig,

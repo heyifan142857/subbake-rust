@@ -105,6 +105,27 @@ sbake translate episode.srt --mode turbo
 sbake translate episode.srt --mode cinema --profile cinema
 ```
 
+提交可等待的异步翻译（`overnight`）：
+
+```bash
+# OpenAI Batch；仅支持 openai_chat / openai_responses，且必须是 Economy 模式
+sbake overnight submit episode.srt --mode economy --profile openai
+# 输出的 Manifest 路径是后续操作的唯一凭据（不含 API key）
+sbake overnight status .subbake/.../overnight/batch_xxx.json --profile openai
+sbake overnight collect .subbake/.../overnight/batch_xxx.json --profile openai
+```
+
+`collect` 会重新校验输入字幕的签名，避免把延迟完成的结果写入已经修改过的文件。
+
+离线对照译文回归：
+
+```bash
+sbake evaluate candidate.zh-Hans.translated.srt reference.srt --json
+```
+
+该命令给出可复现的 chrF 与机械 MQM 结构发现（序号、数字、格式、空译文），用于
+版本回归比较；语义与风格仍应由人工抽检。
+
 批量翻译目录：
 
 ```bash

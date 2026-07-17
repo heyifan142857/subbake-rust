@@ -66,6 +66,28 @@ pub struct WhisperArgs {
     pub models_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub enum OvernightAction {
+    Submit(TranslateArgs),
+    Status(TranslateArgs),
+    Collect {
+        args: TranslateArgs,
+        overwrite: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct OvernightArgs {
+    pub action: OvernightAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvaluateArgs {
+    pub candidate_path: PathBuf,
+    pub reference_path: PathBuf,
+    pub json: bool,
+}
+
 impl TranslateArgs {
     pub fn default_for(input_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -113,6 +135,78 @@ pub fn parse_translate_args(args: &[String]) -> CliResult<TranslateArgs> {
 
 pub fn parse_pipeline_args(args: &[String]) -> CliResult<TranslateArgs> {
     parse_file_translation_args(args, "pipeline requires an input path", "pipeline")
+}
+
+pub fn parse_overnight_args(args: &[String]) -> CliResult<OvernightArgs> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| CliError::usage("overnight requires `submit`, `status`, or `collect`"))?;
+    match action {
+        "submit" => Ok(OvernightArgs {
+            action: OvernightAction::Submit(parse_file_translation_args(
+                &args[1..],
+                "overnight submit requires a subtitle path",
+                "overnight submit",
+            )?),
+        }),
+        "status" => Ok(OvernightArgs {
+            action: OvernightAction::Status(parse_file_translation_args(
+                &args[1..],
+                "overnight status requires a manifest path",
+                "overnight status",
+            )?),
+        }),
+        "collect" => {
+            let mut filtered = Vec::new();
+            let mut overwrite = false;
+            for value in &args[1..] {
+                if value == "--overwrite" {
+                    overwrite = true;
+                } else {
+                    filtered.push(value.clone());
+                }
+            }
+            Ok(OvernightArgs {
+                action: OvernightAction::Collect {
+                    args: parse_file_translation_args(
+                        &filtered,
+                        "overnight collect requires a manifest path",
+                        "overnight collect",
+                    )?,
+                    overwrite,
+                },
+            })
+        }
+        other => Err(CliError::usage(format!(
+            "unknown overnight command `{other}`; expected submit, status, or collect"
+        ))),
+    }
+}
+
+pub fn parse_evaluate_args(args: &[String]) -> CliResult<EvaluateArgs> {
+    let candidate_path = args.first().ok_or_else(|| {
+        CliError::usage("evaluate requires a candidate subtitle and a reference subtitle")
+    })?;
+    let reference_path = args.get(1).ok_or_else(|| {
+        CliError::usage("evaluate requires a candidate subtitle and a reference subtitle")
+    })?;
+    let mut json = false;
+    for option in &args[2..] {
+        match option.as_str() {
+            "--json" => json = true,
+            other => {
+                return Err(CliError::usage(format!(
+                    "unknown evaluate option `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(EvaluateArgs {
+        candidate_path: PathBuf::from(candidate_path),
+        reference_path: PathBuf::from(reference_path),
+        json,
+    })
 }
 
 fn parse_file_translation_args(

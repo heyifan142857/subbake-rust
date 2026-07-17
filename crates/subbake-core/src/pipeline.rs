@@ -73,6 +73,9 @@ pub struct SubtitlePipeline<B, D> {
     agent_repairs: Vec<AgentRepairRecord>,
     cancellation: CancellationGuard,
     progress: Option<Box<dyn ProgressSink>>,
+    /// Turbo starts conservatively and uses additive increase / multiplicative
+    /// decrease when the provider signals pressure.
+    adaptive_translation_concurrency: usize,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -83,6 +86,7 @@ where
     pub fn new(backend: B, dashboard: D, mut options: PipelineOptions) -> Self {
         options.source_language = normalize_language_name(&options.source_language, true);
         options.target_language = normalize_language_name(&options.target_language, false);
+        let adaptive_translation_concurrency = options.translation_concurrency.clamp(1, 2);
         Self {
             backend,
             reviewer: None,
@@ -98,6 +102,7 @@ where
             agent_repairs: Vec::new(),
             cancellation: CancellationGuard::never(),
             progress: None,
+            adaptive_translation_concurrency,
         }
     }
 
@@ -201,6 +206,32 @@ where
     pub fn with_cancellation(mut self, cancellation: CancellationGuard) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    pub(super) fn effective_translation_concurrency(&self) -> usize {
+        if self.options.mode == crate::entities::TranslationMode::Turbo {
+            self.adaptive_translation_concurrency
+        } else {
+            self.options.translation_concurrency.max(1)
+        }
+    }
+
+    pub(super) fn note_translation_window_success(&mut self) {
+        if self.options.mode == crate::entities::TranslationMode::Turbo {
+            self.adaptive_translation_concurrency = self
+                .adaptive_translation_concurrency
+                .saturating_add(1)
+                .min(self.options.translation_concurrency.max(1));
+        }
+    }
+
+    fn note_translation_rate_limit(&mut self) {
+        if self.options.mode == crate::entities::TranslationMode::Turbo {
+            self.adaptive_translation_concurrency = self
+                .adaptive_translation_concurrency
+                .saturating_div(2)
+                .max(1);
+        }
     }
 
     /// Attach a runtime store for glossary/TM persistence.
@@ -442,9 +473,7 @@ where
             .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
         let responses = self
-            .reviewer
-            .as_mut()
-            .unwrap_or(&mut self.backend)
+            .backend
             .execute_many(
                 requests,
                 BatchExecutionOptions::new(self.options.translation_concurrency),
@@ -510,6 +539,12 @@ where
         if let Some(error) = initial_error.as_ref()
             && is_operational_llm_failure(error)
         {
+            if matches!(
+                error,
+                CoreError::Llm(crate::error::LlmCallError::RateLimited { .. })
+            ) {
+                self.note_translation_rate_limit();
+            }
             return Err(error.clone());
         }
         let mut last_error = initial_error;
@@ -534,6 +569,12 @@ where
                         return Err(error);
                     }
                     if is_operational_llm_failure(&error) {
+                        if matches!(
+                            error,
+                            CoreError::Llm(crate::error::LlmCallError::RateLimited { .. })
+                        ) {
+                            self.note_translation_rate_limit();
+                        }
                         return Err(error);
                     }
                     let failure_messages = messages.clone();

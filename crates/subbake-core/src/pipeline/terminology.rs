@@ -77,7 +77,16 @@ where
                 } else {
                     response.usage
                 };
+                let document_brief = payload.document_brief;
                 let accepted = accept_entries(self.memory, payload.entries, &mut stats);
+                if self.options.mode == crate::entities::TranslationMode::Cinema
+                    && !document_brief.trim().is_empty()
+                {
+                    let brief = document_brief.trim().chars().take(800).collect::<String>();
+                    self.memory
+                        .style_rules
+                        .push(format!("Document brief: {brief}"));
+                }
                 stats.entries_added = self.memory.glossary.len().saturating_sub(existing.len());
                 if self.options.use_cache
                     && stats.cache_hits == 0
@@ -89,6 +98,7 @@ where
                         &BackendJsonResult {
                             payload: BackendPayload::Terminology(TerminologyPreflightResult {
                                 entries: accepted,
+                                document_brief,
                             }),
                             usage: response.usage,
                         },
@@ -259,7 +269,7 @@ fn build_messages(
     let payload = serde_json::to_string(&payload).unwrap_or_default();
     vec![
         crate::ports::ChatMessage::system(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {\"entries\":[{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}]}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain entries.",
+            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {\"entries\":[{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain entries. The brief must be short and advisory; never invent plot facts.",
         ),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
@@ -300,7 +310,13 @@ pub(super) fn parse_payload(
             target: target.to_owned(),
         });
     }
-    Ok(TerminologyPreflightResult { entries: parsed })
+    Ok(TerminologyPreflightResult {
+        entries: parsed,
+        document_brief: payload["document_brief"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    })
 }
 
 fn accept_entries(

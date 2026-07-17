@@ -54,7 +54,7 @@ where
     while !stage.is_complete() {
         pipeline.cancellation.check()?;
         let concurrency = if pipeline.backend.supports_parallel_generation() {
-            pipeline.options.translation_concurrency.max(1)
+            pipeline.effective_translation_concurrency()
         } else {
             1
         };
@@ -178,6 +178,7 @@ where
             resume.translation_batches_completed,
             usage,
         );
+        pipeline.note_translation_window_success();
     }
 
     validate_full_alignment(&document.segments, stage.output())?;
