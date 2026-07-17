@@ -58,8 +58,17 @@ where
         } else {
             1
         };
+        // Turbo keeps the transport saturated across a second queued wave;
+        // adapters still enforce the configured in-flight limit.
+        let window_size = if pipeline.options.mode == crate::entities::TranslationMode::Turbo
+            && pipeline.backend.supports_parallel_generation()
+        {
+            concurrency.saturating_mul(2)
+        } else {
+            concurrency
+        };
         let prepared = stage.prepare_window(
-            concurrency,
+            window_size,
             pipeline.options.use_cache,
             &pipeline.translation_memory,
         );

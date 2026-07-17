@@ -546,6 +546,12 @@ fn parse_translation_setting_option(
         }
         "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
         "--bilingual" => overrides.output.bilingual = Some(true),
+        "--mode" => {
+            overrides.translation.mode = Some(
+                subbake_core::TranslationMode::parse(&required_value(args, index, option)?)
+                    .map_err(|error| CliError::usage(error.to_string()))?,
+            )
+        }
         "--fast" => overrides.translation.fast_mode = Some(true),
         "--no-review" => {
             overrides.translation.review_policy = Some(subbake_core::ReviewPolicy::Off)
@@ -678,6 +684,28 @@ mod tests {
         assert_eq!(parsed.settings.translation.translation_concurrency, 3);
         assert_eq!(parsed.settings.translation.review_concurrency, 2);
         assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
+    }
+
+    #[test]
+    fn parse_translate_mode_applies_mode_policy() {
+        let config = empty_config("translation-mode");
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--mode".to_owned(),
+            "cinema".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("translation mode");
+        let _ = std::fs::remove_file(config);
+        assert_eq!(
+            parsed.settings.translation.mode,
+            subbake_core::TranslationMode::Cinema
+        );
+        assert_eq!(
+            parsed.settings.translation.review_policy,
+            subbake_core::ReviewPolicy::Full
+        );
     }
 
     #[test]

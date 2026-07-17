@@ -21,7 +21,8 @@ pub use entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchPlanEntry, BatchTranslationResult,
     BilingualOrder, FailureLog, GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult,
     ReviewChange, ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
-    SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
+    SubtitleSegment, TerminologyPreflightResult, TerminologyStats, TranslationLine,
+    TranslationMode, TranslationPolicy, Usage,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use memory::ContextMemory;

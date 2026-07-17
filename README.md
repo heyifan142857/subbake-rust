@@ -39,24 +39,40 @@ sbake whisper model base
 SubBake 会依次查找 `~/.config/subbake/config.toml` 和项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
 
 ```toml
-version = 1
-default_profile = "openai"
+version = 2
+default_profile = "turbo"
 
-[defaults.translation]
+[backends.fast]
+id = "openai"
+model = "gpt-4.1-mini"
+api_format = "openai_chat"
+api_key_env = "OPENAI_API_KEY"
+
+[backends.reviewer]
+id = "anthropic"
+model = "claude-sonnet-4-5"
+api_format = "anthropic_messages"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[profiles.turbo]
+translator = "fast"
+
+[profiles.turbo.translation]
+mode = "turbo"
 source_language = "English"
 target_language = "Simplified Chinese"
-translation_concurrency = 4
-review_concurrency = 2
+
+[profiles.cinema]
+translator = "fast"
+reviewer = "reviewer"
+
+[profiles.cinema.translation]
+mode = "cinema"
 
 [defaults.output]
 bilingual = true
 bilingual_order = "target_first" # target_first 或 source_first
 
-[profiles.openai.backend]
-id = "openai"
-model = "gpt-4.1-mini"
-api_format = "openai_chat"
-api_key_env = "OPENAI_API_KEY"
 ```
 
 ```bash
@@ -65,8 +81,10 @@ sbake provider check --profile openai
 ```
 
 也可以使用 `--config` 指定配置文件，或使用 `--profile` 切换完整运行档案。
-配置格式版本必须为 `1`；旧的扁平字段不会被读取。可配置分组为
-`backend`、`translation`、`output` 和 `storage`。
+配置格式当前版本为 `2`，并兼容读取既有版本 `1`。v2 将可复用的 provider
+backend 与运行 profile 分开，Cinema profile 可选配置独立 reviewer；未配置时会
+回退到 translator 并在结果中标出。`translation.mode` 可选 `economy`、`turbo`
+或 `cinema`，高级批次、并发、审校设置仍可覆盖模式默认值。
 
 ## 使用
 
@@ -80,6 +98,11 @@ sbake
 
 ```bash
 sbake translate episode.srt
+
+# 最小 token、最低延迟或最高质量
+sbake translate episode.srt --mode economy
+sbake translate episode.srt --mode turbo
+sbake translate episode.srt --mode cinema --profile cinema
 ```
 
 批量翻译目录：

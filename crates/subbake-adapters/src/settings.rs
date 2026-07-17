@@ -5,7 +5,7 @@ use subbake_core::entities::{
     BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET,
     DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY,
     DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, DEFAULT_TRANSLATION_CONCURRENCY,
-    PipelineOptions, ReviewPolicy,
+    PipelineOptions, ReviewPolicy, TranslationMode,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -15,6 +15,7 @@ use crate::providers::{ApiFormat, BackendConfig};
 pub struct ResolvedSettings {
     pub output: OutputSettings,
     pub backend: BackendSettings,
+    pub reviewer_backend: Option<BackendSettings>,
     pub translation: TranslationDomainSettings,
     pub storage: StorageSettings,
 }
@@ -51,7 +52,7 @@ pub struct TranslationDomainSettings {
     pub batch_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
-    pub fast_mode: bool,
+    pub mode: TranslationMode,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
     pub dry_run: bool,
@@ -71,7 +72,11 @@ pub struct StorageSettings {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SettingsOverrides {
+    /// Optional v2 references into the configuration's `[backends]` table.
+    pub translator: Option<String>,
+    pub reviewer: Option<String>,
     pub backend: BackendOverrides,
+    pub reviewer_backend: Option<BackendOverrides>,
     pub translation: TranslationOverrides,
     pub output: OutputOverrides,
     pub storage: StorageOverrides,
@@ -100,6 +105,8 @@ pub struct TranslationOverrides {
     pub batch_token_budget: Option<usize>,
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
+    pub mode: Option<TranslationMode>,
+    /// Legacy v1 input. `true` maps to turbo; `false` keeps the selected mode.
     pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
@@ -128,7 +135,20 @@ pub struct StorageOverrides {
 
 impl SettingsOverrides {
     pub fn merge(&mut self, other: Self) {
+        if other.translator.is_some() {
+            self.translator = other.translator;
+        }
+        if other.reviewer.is_some() {
+            self.reviewer = other.reviewer;
+        }
         self.backend.merge(other.backend);
+        if let Some(other) = other.reviewer_backend {
+            if let Some(current) = &mut self.reviewer_backend {
+                current.merge(other);
+            } else {
+                self.reviewer_backend = Some(other);
+            }
+        }
         self.translation.merge(other.translation);
         self.output.merge(other.output);
         self.storage.merge(other.storage);
@@ -136,6 +156,8 @@ impl SettingsOverrides {
 
     pub fn from_resolved(settings: &ResolvedSettings) -> Self {
         Self {
+            translator: None,
+            reviewer: None,
             backend: BackendOverrides {
                 id: Some(settings.backend.id.clone()),
                 model: Some(settings.backend.model.clone()),
@@ -147,6 +169,7 @@ impl SettingsOverrides {
                 auth_header: settings.backend.auth_header.clone(),
                 auth_prefix: settings.backend.auth_prefix.clone(),
             },
+            reviewer_backend: settings.reviewer_backend.as_ref().map(backend_overrides),
             translation: TranslationOverrides {
                 source_language: Some(settings.translation.source_language.clone()),
                 target_language: Some(settings.translation.target_language.clone()),
@@ -154,7 +177,8 @@ impl SettingsOverrides {
                 batch_token_budget: Some(settings.translation.batch_token_budget),
                 translation_concurrency: Some(settings.translation.translation_concurrency),
                 review_concurrency: Some(settings.translation.review_concurrency),
-                fast_mode: Some(settings.translation.fast_mode),
+                mode: Some(settings.translation.mode),
+                fast_mode: None,
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
                 dry_run: Some(settings.translation.dry_run),
@@ -188,7 +212,7 @@ macro_rules! merge_optional_fields {
 }
 
 impl BackendOverrides {
-    fn merge(&mut self, other: Self) {
+    pub(crate) fn merge(&mut self, other: Self) {
         merge_optional_fields!(
             self,
             other,
@@ -216,6 +240,7 @@ impl TranslationOverrides {
             batch_token_budget,
             translation_concurrency,
             review_concurrency,
+            mode,
             fast_mode,
             review_policy,
             terminology_preflight,
@@ -226,6 +251,20 @@ impl TranslationOverrides {
             agent,
             agent_repair_attempts
         );
+    }
+}
+
+fn backend_overrides(settings: &BackendSettings) -> BackendOverrides {
+    BackendOverrides {
+        id: Some(settings.id.clone()),
+        model: Some(settings.model.clone()),
+        api_key: settings.api_key.clone(),
+        base_url: settings.base_url.clone(),
+        api_format: settings.api_format,
+        endpoint_url: settings.endpoint_url.clone(),
+        api_key_env: settings.api_key_env.clone(),
+        auth_header: settings.auth_header.clone(),
+        auth_prefix: settings.auth_prefix.clone(),
     }
 }
 
@@ -260,6 +299,7 @@ impl Default for ResolvedSettings {
                 auth_header: None,
                 auth_prefix: None,
             },
+            reviewer_backend: None,
             translation: TranslationDomainSettings {
                 source_language: DEFAULT_SOURCE_LANGUAGE.to_owned(),
                 target_language: DEFAULT_TARGET_LANGUAGE.to_owned(),
@@ -267,7 +307,7 @@ impl Default for ResolvedSettings {
                 batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
                 translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
                 review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
-                fast_mode: false,
+                mode: TranslationMode::Turbo,
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: true,
                 dry_run: false,
@@ -331,6 +371,14 @@ impl ResolvedSettings {
         if let Some(value) = auth_prefix {
             self.backend.auth_prefix = Some(value);
         }
+        if let Some(reviewer) = overrides.reviewer_backend {
+            let mut settings = self
+                .reviewer_backend
+                .take()
+                .unwrap_or_else(|| self.backend.clone());
+            apply_backend_overrides(&mut settings, reviewer);
+            self.reviewer_backend = Some(settings);
+        }
 
         let TranslationOverrides {
             source_language,
@@ -339,6 +387,7 @@ impl ResolvedSettings {
             batch_token_budget,
             translation_concurrency,
             review_concurrency,
+            mode,
             fast_mode,
             review_policy,
             terminology_preflight,
@@ -349,6 +398,12 @@ impl ResolvedSettings {
             agent,
             agent_repair_attempts,
         } = overrides.translation;
+        if let Some(value) = mode {
+            self.apply_mode_defaults(value);
+        }
+        if fast_mode == Some(true) {
+            self.apply_mode_defaults(TranslationMode::Turbo);
+        }
         if let Some(value) = source_language {
             self.translation.source_language = value;
         }
@@ -366,9 +421,6 @@ impl ResolvedSettings {
         }
         if let Some(value) = review_concurrency {
             self.translation.review_concurrency = value;
-        }
-        if let Some(value) = fast_mode {
-            self.translation.fast_mode = value;
         }
         if let Some(value) = review_policy {
             self.translation.review_policy = value;
@@ -463,6 +515,9 @@ impl ResolvedSettings {
             }
         }
         self.backend_config().validate()?;
+        if let Some(config) = self.reviewer_backend_config() {
+            config.validate()?;
+        }
         Ok(())
     }
 
@@ -481,6 +536,10 @@ impl ResolvedSettings {
         }
     }
 
+    pub fn reviewer_backend_config(&self) -> Option<BackendConfig> {
+        self.reviewer_backend.as_ref().map(backend_config)
+    }
+
     pub fn to_pipeline_options(
         &self,
         input_path: impl Into<PathBuf>,
@@ -492,6 +551,7 @@ impl ResolvedSettings {
         options.provider = self.backend.id.clone();
         options.model = self.backend.model.clone();
         options.provider_fingerprint = self.provider_fingerprint();
+        options.reviewer_fingerprint = self.reviewer_backend.as_ref().and_then(backend_fingerprint);
         options.source_language = self.translation.source_language.clone();
         options.target_language = self.translation.target_language.clone();
         options.batch_size = self.translation.batch_size;
@@ -500,7 +560,7 @@ impl ResolvedSettings {
         options.review_concurrency = self.translation.review_concurrency;
         options.bilingual = self.output.bilingual;
         options.bilingual_order = self.output.bilingual_order;
-        options.fast_mode = self.translation.fast_mode;
+        options.mode = self.translation.mode;
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
         options.dry_run = self.translation.dry_run;
@@ -527,20 +587,99 @@ impl ResolvedSettings {
     }
 
     fn provider_fingerprint(&self) -> Option<String> {
-        if self.backend.id.eq_ignore_ascii_case("mock") {
-            return None;
-        }
-        let config = self.backend_config();
-        let format = config.api_format?.as_str();
-        let endpoint = config.endpoint_url.or(config.base_url).unwrap_or_default();
-        Some(format!(
-            "{}|{}|{}|{}",
-            config.id,
-            format,
-            endpoint.trim_end_matches('/'),
-            config.model
-        ))
+        backend_fingerprint(&self.backend)
     }
+
+    fn apply_mode_defaults(&mut self, mode: TranslationMode) {
+        self.translation.mode = mode;
+        match mode {
+            TranslationMode::Economy => {
+                self.translation.batch_size = 160;
+                self.translation.batch_token_budget = 6_000;
+                self.translation.translation_concurrency = 3;
+                self.translation.review_concurrency = 1;
+                self.translation.review_policy = ReviewPolicy::Off;
+                self.translation.terminology_preflight = false;
+            }
+            TranslationMode::Turbo => {
+                self.translation.batch_size = 96;
+                self.translation.batch_token_budget = 2_400;
+                self.translation.translation_concurrency = 8;
+                self.translation.review_concurrency = 4;
+                self.translation.review_policy = ReviewPolicy::Off;
+                self.translation.terminology_preflight = false;
+            }
+            TranslationMode::Cinema => {
+                self.translation.batch_size = 48;
+                self.translation.batch_token_budget = 1_600;
+                self.translation.translation_concurrency = 4;
+                self.translation.review_concurrency = 3;
+                self.translation.review_policy = ReviewPolicy::Full;
+                self.translation.terminology_preflight = true;
+            }
+        }
+    }
+}
+
+fn apply_backend_overrides(settings: &mut BackendSettings, overrides: BackendOverrides) {
+    if let Some(value) = overrides.id {
+        settings.id = value;
+    }
+    if let Some(value) = overrides.model {
+        settings.model = value;
+    }
+    if let Some(value) = overrides.api_key {
+        settings.api_key = Some(value);
+    }
+    if let Some(value) = overrides.base_url {
+        settings.base_url = Some(value);
+    }
+    if let Some(value) = overrides.api_format {
+        settings.api_format = Some(value);
+    }
+    if let Some(value) = overrides.endpoint_url {
+        settings.endpoint_url = Some(value);
+    }
+    if let Some(value) = overrides.api_key_env {
+        settings.api_key_env = Some(value);
+    }
+    if let Some(value) = overrides.auth_header {
+        settings.auth_header = Some(value);
+    }
+    if let Some(value) = overrides.auth_prefix {
+        settings.auth_prefix = Some(value);
+    }
+}
+
+fn backend_config(settings: &BackendSettings) -> BackendConfig {
+    BackendConfig {
+        id: settings.id.clone(),
+        display_name: settings.id.clone(),
+        api_format: settings.api_format,
+        model: settings.model.clone(),
+        api_key: settings.api_key.clone(),
+        api_key_env: settings.api_key_env.clone(),
+        base_url: settings.base_url.clone(),
+        endpoint_url: settings.endpoint_url.clone(),
+        auth_header: settings.auth_header.clone(),
+        auth_prefix: settings.auth_prefix.clone(),
+    }
+}
+
+fn backend_fingerprint(settings: &BackendSettings) -> Option<String> {
+    if settings.id.eq_ignore_ascii_case("mock") {
+        return None;
+    }
+    let config = backend_config(settings);
+    let format = config.api_format?.as_str();
+    let endpoint = config.endpoint_url.or(config.base_url).unwrap_or_default();
+    Some(format!(
+        "{}|{}|{}|{}",
+        config.id,
+        format,
+        endpoint.trim_end_matches('/'),
+        config.model
+    ))
 }
 
 #[cfg(test)]
@@ -569,6 +708,7 @@ mod tests {
                     runtime_dir: Some(".runtime".into()),
                     ..StorageOverrides::default()
                 },
+                ..SettingsOverrides::default()
             })
             .expect("valid overrides");
 
@@ -577,6 +717,24 @@ mod tests {
         assert_eq!(settings.translation.batch_size, 12);
         assert!(settings.output.bilingual);
         assert_eq!(settings.storage.runtime_dir, Some(".runtime".into()));
+    }
+
+    #[test]
+    fn cinema_mode_applies_defaults_before_explicit_overrides() {
+        let settings = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                translation: TranslationOverrides {
+                    mode: Some(TranslationMode::Cinema),
+                    translation_concurrency: Some(7),
+                    ..TranslationOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect("valid settings");
+        assert_eq!(settings.translation.mode, TranslationMode::Cinema);
+        assert_eq!(settings.translation.batch_size, 48);
+        assert_eq!(settings.translation.translation_concurrency, 7);
+        assert_eq!(settings.translation.review_policy, ReviewPolicy::Full);
     }
 
     #[test]

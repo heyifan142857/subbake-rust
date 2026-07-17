@@ -132,9 +132,10 @@ Options:
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format
       --bilingual                  Include source and translated text
+      --mode <MODE>               Translation mode: economy, turbo, or cinema
       --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
-      --fast                       Enable fast mode
+      --fast                       Deprecated alias for --mode turbo
       --dry-run                    Prepare work without provider calls
       --json                       Emit structured JSON output
   -h, --help                       Print help

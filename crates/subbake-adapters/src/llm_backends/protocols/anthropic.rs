@@ -27,13 +27,10 @@ pub(super) fn request_body(model: &str, messages: &[ChatMessage]) -> Value {
     let system = messages
         .iter()
         .filter(|message| message.role == "system")
-        .map(|message| message.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    json!({
+        .collect::<Vec<_>>();
+    let mut body = json!({
         "model": model,
         "max_tokens": 4096,
-        "system": system,
         "messages": messages.iter()
             .filter(|message| message.role != "system")
             .map(|message| json!({
@@ -41,7 +38,30 @@ pub(super) fn request_body(model: &str, messages: &[ChatMessage]) -> Value {
                 "content":[{"type":"text","text":message.content}]
             }))
             .collect::<Vec<_>>()
-    })
+    });
+    body["system"] = if system.iter().any(|message| message.cacheable) {
+        json!(
+            system
+                .iter()
+                .map(|message| {
+                    let mut block = json!({"type":"text", "text": message.content});
+                    if message.cacheable {
+                        block["cache_control"] = json!({"type":"ephemeral"});
+                    }
+                    block
+                })
+                .collect::<Vec<_>>()
+        )
+    } else {
+        json!(
+            system
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        )
+    };
+    body
 }
 
 pub(super) fn response_text(body: &Value) -> Option<String> {

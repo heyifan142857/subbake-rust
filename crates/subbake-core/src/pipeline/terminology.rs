@@ -37,7 +37,7 @@ where
             ..TerminologyStats::default()
         };
         if !self.options.terminology_preflight
-            || self.options.fast_mode
+            || !self.options.policy().document_preflight
             || candidates.is_empty()
             || !self.backend.supports_terminology_preflight()
         {

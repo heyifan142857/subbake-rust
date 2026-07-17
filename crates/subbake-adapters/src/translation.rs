@@ -123,6 +123,14 @@ pub fn translate_subtitle_cancellable_with_progress(
         .settings
         .to_pipeline_options(request.input_path.clone(), Some(output_path.clone()));
     let backend = build_backend(&request.settings.backend_config())?;
+    let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
+        || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off
+        || request.settings.translation.terminology_preflight;
+    let reviewer = needs_reviewer
+        .then(|| request.settings.reviewer_backend_config())
+        .flatten()
+        .map(|config| build_backend(&config))
+        .transpose()?;
 
     // Wire runtime store for glossary/TM persistence.
     let stable_input_path = stable_runtime_input_path(&request.input_path)?;
@@ -133,7 +141,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         request.settings.glossary_path(),
         &request.settings.translation.source_language,
         &request.settings.translation.target_language,
-        request.settings.translation.fast_mode,
+        request.settings.translation.mode == subbake_core::TranslationMode::Economy,
     );
     let store = FileRuntimeStore::new(paths);
     store.ensure_layout().map_err(AdapterError::from)?;
@@ -143,6 +151,9 @@ pub fn translate_subtitle_cancellable_with_progress(
         .with_input_signature(input_signature)
         .with_cancellation(cancellation.clone())
         .with_progress(Box::new(progress));
+    if let Some(reviewer) = reviewer {
+        pipeline = pipeline.with_reviewer(reviewer);
+    }
     pipeline = pipeline.with_store(Box::new(store));
     let run = match pipeline.run_document(&document) {
         Ok(run) => run,

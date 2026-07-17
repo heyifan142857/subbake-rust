@@ -69,11 +69,14 @@ fn render_translation_outcome(
 
 fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
     let mut output = format!(
-        "Output: {}\nUsage: {} in / {} out / {} total\nBatches: {} translated\n",
+        "Output: {}\nMode: {}\nUsage: {} in / {} out / {} total ({} billable in, {} cached)\nBatches: {} translated\n",
         output_path.display(),
+        result.mode.as_str(),
         result.usage.input_tokens,
         result.usage.output_tokens,
         result.usage.total_tokens,
+        result.usage.billable_input_tokens(),
+        result.usage.cached_input_tokens,
         result.batches_translated
     );
     let mut reuse = Vec::new();
@@ -97,6 +100,15 @@ fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
             "{} translation-memory hit(s)",
             result.translation_memory_hits
         ));
+    }
+    if result.deduplicated_segments > 0 {
+        reuse.push(format!(
+            "{} duplicate segment(s) coalesced",
+            result.deduplicated_segments
+        ));
+    }
+    if result.reviewer_fallback {
+        output.push_str("Review: reviewer backend unavailable; translator was used as fallback\n");
     }
     if result.terminology.candidates > 0 {
         output.push_str(&format!(
@@ -257,7 +269,14 @@ pub fn result_json(result: &PipelineResult) -> String {
             "input_tokens": result.usage.input_tokens,
             "output_tokens": result.usage.output_tokens,
             "total_tokens": result.usage.total_tokens,
+            "cached_input_tokens": result.usage.cached_input_tokens,
+            "billable_input_tokens": result.usage.billable_input_tokens(),
+            "requests": result.usage.requests,
+            "retries": result.usage.retries,
         },
+        "mode": result.mode.as_str(),
+        "deduplicated_segments": result.deduplicated_segments,
+        "reviewer_fallback": result.reviewer_fallback,
         "dry_run": result.dry_run,
         "planned_batches": planned_batches,
         "cache_hits": result.cache_hits,
@@ -285,6 +304,9 @@ mod tests {
             batches_translated: 0,
             review_batches: 0,
             usage: Usage::default(),
+            mode: subbake_core::TranslationMode::Turbo,
+            deduplicated_segments: 0,
+            reviewer_fallback: false,
             dry_run: true,
             planned_batches: Vec::new(),
             cache_hits: 0,
@@ -308,6 +330,9 @@ mod tests {
             batches_translated: 0,
             review_batches: 0,
             usage: Usage::default(),
+            mode: subbake_core::TranslationMode::Turbo,
+            deduplicated_segments: 0,
+            reviewer_fallback: false,
             dry_run: true,
             planned_batches: vec![BatchPlanEntry {
                 index: 1,

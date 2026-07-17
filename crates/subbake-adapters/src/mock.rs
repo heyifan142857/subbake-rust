@@ -89,6 +89,8 @@ impl LlmBackend for MockBackend {
                 input_tokens,
                 output_tokens,
                 total_tokens: input_tokens + output_tokens,
+                requests: 1,
+                ..Usage::default()
             },
         ))
     }

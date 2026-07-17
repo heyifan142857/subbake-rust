@@ -33,8 +33,8 @@ mod translation_runner;
 mod translation_stage;
 
 use persistence::PipelinePersistence;
-use planning::BatchPlanner;
-use review_runner::ReviewRun;
+use planning::{BatchPlanner, DeduplicationPlan};
+use review_runner::{ReviewBatchInput, ReviewRun};
 pub use support::translation_memory_key;
 use support::{
     build_translation_messages, is_agent_repairable, is_operational_llm_failure,
@@ -57,6 +57,7 @@ use support::validate_window_terminology;
 
 pub struct SubtitlePipeline<B, D> {
     backend: B,
+    reviewer: Option<B>,
     dashboard: D,
     options: PipelineOptions,
     memory: ContextMemory,
@@ -84,6 +85,7 @@ where
         options.target_language = normalize_language_name(&options.target_language, false);
         Self {
             backend,
+            reviewer: None,
             dashboard,
             options,
             memory: ContextMemory::new(),
@@ -104,8 +106,29 @@ where
         self
     }
 
+    pub fn with_reviewer(mut self, reviewer: B) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
     fn execute_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(serde_json::Value, Usage)> {
         self.backend
+            .execute(
+                GenerationRequest::json(messages.to_vec()),
+                &self.cancellation,
+            )
+            .map_err(CoreError::from)?
+            .into_json()
+            .map_err(CoreError::from)
+    }
+
+    fn execute_review_json(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> CoreResult<(serde_json::Value, Usage)> {
+        self.reviewer
+            .as_mut()
+            .unwrap_or(&mut self.backend)
             .execute(
                 GenerationRequest::json(messages.to_vec()),
                 &self.cancellation,
@@ -211,8 +234,15 @@ where
             }
         }
 
+        let deduplication =
+            DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-            .split(&document.segments);
+            .scene_aware(self.options.policy().include_context)
+            .split(deduplication.canonical());
+        let original_batches =
+            BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
+                .scene_aware(self.options.policy().include_context)
+                .split(&document.segments);
         let planned_batches = BatchPlanner::describe(&batches);
         let state_path = self
             .store
@@ -230,6 +260,11 @@ where
                     batches_translated: 0,
                     review_batches: 0,
                     usage: Usage::default(),
+                    mode: self.options.mode,
+                    deduplicated_segments: deduplication.duplicates(),
+                    reviewer_fallback: self.options.mode
+                        == crate::entities::TranslationMode::Cinema
+                        && self.reviewer.is_none(),
                     dry_run: true,
                     planned_batches,
                     cache_hits: 0,
@@ -262,11 +297,14 @@ where
         let terminology = self.run_terminology_preflight(document)?;
 
         let resume = self.load_resume_snapshot(&batches)?;
+        let mut translation_document = document.clone();
+        translation_document.segments = deduplication.canonical().to_vec();
         let TranslationRun {
             batches,
             segments: translated_segments,
             usage,
-        } = translation_runner::run(self, document, batches, &resume, &terminology)?;
+        } = translation_runner::run(self, &translation_document, batches, &resume, &terminology)?;
+        let translated_segments = deduplication.expand(&document.segments, &translated_segments)?;
         let ReviewRun {
             output,
             stats: review,
@@ -276,7 +314,10 @@ where
         } = review_runner::run(
             self,
             document,
-            &batches,
+            ReviewBatchInput {
+                review_batches: &original_batches,
+                translation_batches: batches.len(),
+            },
             &translated_segments,
             &resume,
             &terminology,
@@ -297,6 +338,10 @@ where
                 batches_translated: batches.len(),
                 review_batches,
                 usage,
+                mode: self.options.mode,
+                deduplicated_segments: deduplication.duplicates(),
+                reviewer_fallback: self.options.mode == crate::entities::TranslationMode::Cinema
+                    && self.reviewer.is_none(),
                 dry_run: false,
                 planned_batches,
                 cache_hits: self.cache_hits,
@@ -317,8 +362,9 @@ where
         &mut self,
         document: &SubtitleDocument,
     ) -> CoreResult<TerminologyStats> {
+        let backend = self.reviewer.as_mut().unwrap_or(&mut self.backend);
         TerminologyStage {
-            backend: &mut self.backend,
+            backend,
             dashboard: &mut self.dashboard,
             options: &self.options,
             memory: &mut self.memory,
@@ -396,7 +442,9 @@ where
             .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
         let responses = self
-            .backend
+            .reviewer
+            .as_mut()
+            .unwrap_or(&mut self.backend)
             .execute_many(
                 requests,
                 BatchExecutionOptions::new(self.options.translation_concurrency),
@@ -498,7 +546,7 @@ where
                         split_retry: None,
                     };
                     if matches!(error, CoreError::InvalidTranslation(_))
-                        && !self.options.fast_mode
+                        && self.options.mode != crate::entities::TranslationMode::Economy
                         && batch.len() > 1
                     {
                         let split = split_index(batch);
@@ -721,7 +769,12 @@ where
         &mut self,
         batches: &[(usize, ReviewBatchPlan)],
     ) -> CoreResult<HashMap<usize, ReviewWithUsage>> {
-        if !self.backend.supports_parallel_generation() {
+        if !self
+            .reviewer
+            .as_ref()
+            .unwrap_or(&self.backend)
+            .supports_parallel_generation()
+        {
             let mut output = HashMap::new();
             for (index, batch) in batches {
                 output.insert(*index, self.review_batch(*index, batch)?);
@@ -848,7 +901,7 @@ where
                 response
             }
             None => {
-                let (payload, usage) = self.execute_json(messages)?;
+                let (payload, usage) = self.execute_review_json(messages)?;
                 let mut review = parse_review_payload(&payload)?;
                 validate_review_candidate_ids(batch, &review.lines)?;
                 review.lines = merge_review_patch(&batch.translated, &review.lines)?;
@@ -1038,7 +1091,12 @@ where
                     self.cache_hits += 1;
                     Ok(response)
                 }
-                None => self.execute_json(&messages).and_then(|(payload, usage)| {
+                None => (if stage == "translate" {
+                    self.execute_json(&messages)
+                } else {
+                    self.execute_review_json(&messages)
+                })
+                .and_then(|(payload, usage)| {
                     total_usage.add(usage);
                     let payload = if stage == "translate" {
                         BackendPayload::Translation(parse_translation_payload(&payload)?)
@@ -1325,6 +1383,7 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 1,
                     total_tokens: 2,
+                    ..Usage::default()
                 },
             ))
         }
@@ -1465,6 +1524,7 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 2,
                     total_tokens: 3,
+                    ..Usage::default()
                 },
             ))
         }
@@ -1498,6 +1558,7 @@ mod tests {
                         input_tokens: 5,
                         output_tokens: 1,
                         total_tokens: 6,
+                        ..Usage::default()
                     },
                 ));
             }
@@ -1714,6 +1775,7 @@ mod tests {
                     input_tokens: 3,
                     output_tokens: 4,
                     total_tokens: 7,
+                    ..Usage::default()
                 },
             ))
         }
@@ -1796,6 +1858,7 @@ mod tests {
                     input_tokens: 2,
                     output_tokens: 2,
                     total_tokens: 4,
+                    ..Usage::default()
                 },
             ))
         }
@@ -2451,6 +2514,7 @@ mod tests {
         let mut options = PipelineOptions::new("terms.txt".into());
         options.batch_size = 1;
         options.resume = false;
+        options.mode = crate::entities::TranslationMode::Cinema;
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             PreflightBackend {

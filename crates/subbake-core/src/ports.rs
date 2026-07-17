@@ -16,6 +16,9 @@ use crate::storage::{RunState, RuntimePaths};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// A stable shared prefix that adapters may map to provider prompt caching.
+    #[serde(default)]
+    pub cacheable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +229,15 @@ impl ChatMessage {
         Self {
             role: "system".to_owned(),
             content: content.into(),
+            cacheable: false,
+        }
+    }
+
+    pub fn cacheable_system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_owned(),
+            content: content.into(),
+            cacheable: true,
         }
     }
 
@@ -233,6 +245,7 @@ impl ChatMessage {
         Self {
             role: "user".to_owned(),
             content: content.into(),
+            cacheable: false,
         }
     }
 }

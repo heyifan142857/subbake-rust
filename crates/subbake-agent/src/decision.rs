@@ -93,6 +93,8 @@ impl LlmBackend for EchoDecisionBackend {
                 input_tokens,
                 output_tokens: 1,
                 total_tokens: input_tokens + 1,
+                requests: 1,
+                ..Usage::default()
             },
         ))
     }

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AdapterError, AdapterResult, ConfigError};
-use crate::settings::{ResolvedSettings, SettingsOverrides};
+use crate::settings::{BackendOverrides, ResolvedSettings, SettingsOverrides};
 
-pub const CONFIG_VERSION: u64 = 1;
+pub const CONFIG_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +17,8 @@ pub struct ConfigFile {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub defaults: SettingsOverrides,
+    #[serde(default)]
+    pub backends: HashMap<String, BackendOverrides>,
     #[serde(default)]
     pub profiles: HashMap<String, SettingsOverrides>,
 }
@@ -58,13 +60,16 @@ impl ConfigFile {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.version != CONFIG_VERSION {
+        if !matches!(self.version, 1 | CONFIG_VERSION) {
             return Err(ConfigError::invalid(format!(
-                "unsupported configuration version `{}`; expected `{CONFIG_VERSION}`",
+                "unsupported configuration version `{}`; expected 1 or `{CONFIG_VERSION}`",
                 self.version
             )));
         }
         for name in self.profiles.keys() {
+            validate_profile_name(name)?;
+        }
+        for name in self.backends.keys() {
             validate_profile_name(name)?;
         }
         if let Some(name) = self.default_profile.as_deref()
@@ -73,6 +78,20 @@ impl ConfigFile {
             return Err(ConfigError::invalid(format!(
                 "default profile `{name}` is not defined"
             )));
+        }
+        for (profile, settings) in &self.profiles {
+            for (role, reference) in [
+                ("translator", settings.translator.as_deref()),
+                ("reviewer", settings.reviewer.as_deref()),
+            ] {
+                if let Some(reference) = reference
+                    && !self.backends.contains_key(reference)
+                {
+                    return Err(ConfigError::invalid(format!(
+                        "profile `{profile}` {role} references unknown backend `{reference}`"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -107,6 +126,22 @@ impl ConfigFile {
             overrides.merge(profile.clone());
         }
         overrides.merge(cli_overrides);
+        if let Some(name) = overrides.translator.as_deref() {
+            let mut backend = self.backends.get(name).cloned().ok_or_else(|| {
+                ConfigError::invalid(format!("unknown translator backend `{name}`"))
+            })?;
+            backend.merge(overrides.backend);
+            overrides.backend = backend;
+        }
+        if let Some(name) = overrides.reviewer.as_deref() {
+            let mut backend = self.backends.get(name).cloned().ok_or_else(|| {
+                ConfigError::invalid(format!("unknown reviewer backend `{name}`"))
+            })?;
+            if let Some(role_overrides) = overrides.reviewer_backend.take() {
+                backend.merge(role_overrides);
+            }
+            overrides.reviewer_backend = Some(backend);
+        }
         let settings = ResolvedSettings::default()
             .with_overrides(overrides)
             .map_err(|error| ConfigError::invalid(error.to_string()))?;
@@ -190,6 +225,10 @@ pub fn append_profile_snapshot(
     let mut snapshot = SettingsOverrides::from_resolved(settings);
     snapshot.backend.api_key = None;
     snapshot.backend.auth_header = None;
+    if let Some(reviewer) = &mut snapshot.reviewer_backend {
+        reviewer.api_key = None;
+        reviewer.auth_header = None;
+    }
 
     #[derive(Serialize)]
     struct ProfileAppend {
@@ -355,7 +394,7 @@ mod tests {
     #[test]
     fn rejects_missing_or_invalid_versions_and_profiles() {
         assert!(ConfigFile::parse("[defaults.output]\nbilingual = true").is_err());
-        assert!(ConfigFile::parse("version = 2").is_err());
+        assert!(ConfigFile::parse("version = 3").is_err());
         assert!(ConfigFile::parse("version = 1\ndefault_profile = \"missing\"").is_err());
         let config = ConfigFile::parse("version = 1").expect("empty v1 config");
         assert!(
@@ -381,6 +420,7 @@ mod tests {
                 },
                 ..SettingsOverrides::default()
             },
+            backends: HashMap::new(),
             profiles: HashMap::from([(
                 "test".to_owned(),
                 SettingsOverrides {
@@ -395,6 +435,54 @@ mod tests {
         };
         let text = toml::to_string(&config).expect("serialize config");
         assert_eq!(ConfigFile::parse(&text).expect("parse config"), config);
+    }
+
+    #[test]
+    fn v2_resolves_reusable_translator_and_reviewer_backends() {
+        let config = ConfigFile::parse(
+            r#"
+            version = 2
+            default_profile = "cinema"
+
+            [backends.fast]
+            id = "openai"
+            model = "fast-model"
+            api_format = "openai_chat"
+
+            [backends.judge]
+            id = "anthropic"
+            model = "judge-model"
+            api_format = "anthropic_messages"
+
+            [profiles.cinema]
+            translator = "fast"
+            reviewer = "judge"
+
+            [profiles.cinema.translation]
+            mode = "cinema"
+            "#,
+        )
+        .expect("v2 config");
+        let (settings, profile) = config
+            .resolve(None, SettingsOverrides::default())
+            .expect("resolve");
+        assert_eq!(profile.as_deref(), Some("cinema"));
+        assert_eq!(settings.backend.model, "fast-model");
+        assert_eq!(
+            settings
+                .reviewer_backend
+                .as_ref()
+                .map(|backend| backend.model.as_str()),
+            Some("judge-model")
+        );
+        assert_eq!(
+            settings.translation.mode,
+            subbake_core::TranslationMode::Cinema
+        );
+        assert_eq!(
+            settings.translation.review_policy,
+            subbake_core::ReviewPolicy::Full
+        );
     }
 
     #[test]

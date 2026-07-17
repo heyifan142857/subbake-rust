@@ -94,7 +94,24 @@ pub(super) fn usage(format: ApiFormat, body: &Value, text: &str, payload: &Value
         input_tokens: input,
         output_tokens: output,
         total_tokens: total,
+        cached_input_tokens: cached_input_tokens(format, body),
+        requests: 1,
+        retries: 0,
     }
+}
+
+fn cached_input_tokens(format: ApiFormat, body: &Value) -> usize {
+    let value = match format {
+        ApiFormat::OpenaiChat => body["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64(),
+        ApiFormat::OpenaiResponses => body["usage"]["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .or_else(|| body["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64()),
+        ApiFormat::AnthropicMessages => body["usage"]["cache_read_input_tokens"].as_u64(),
+        ApiFormat::GeminiGenerateContent => {
+            body["usageMetadata"]["cachedContentTokenCount"].as_u64()
+        }
+    };
+    value.unwrap_or(0) as usize
 }
 
 pub(super) fn openai_message(message: &ChatMessage) -> Value {

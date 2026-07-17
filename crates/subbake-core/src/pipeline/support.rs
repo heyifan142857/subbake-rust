@@ -26,9 +26,14 @@ pub(super) fn build_translation_messages(
         "src": options.source_language,
         "tgt": options.target_language,
         "batch_index": batch_index,
-        "fast": options.fast_mode,
+        "mode": options.mode.as_str(),
     });
-    if !options.fast_mode {
+    let batch_texts = batch
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if options.policy().include_context {
         context["rules"] = serde_json::Value::Array(
             memory
                 .style_rules
@@ -47,11 +52,7 @@ pub(super) fn build_translation_messages(
                     .collect(),
             );
         }
-        let batch_texts = batch
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>();
+
         let glossary = memory.select_relevant_glossary(&batch_texts);
         if !glossary.is_empty() {
             let mut required = serde_json::Map::new();
@@ -71,6 +72,16 @@ pub(super) fn build_translation_messages(
                 context["terminology_hints"] = serde_json::Value::Object(advisory);
             }
         }
+    } else if !required_glossary.is_empty() {
+        let glossary = memory.select_relevant_glossary(&batch_texts);
+        let required = glossary
+            .into_iter()
+            .filter(|(source, _)| required_glossary.contains_key(source))
+            .map(|(source, target)| (source, serde_json::Value::String(target)))
+            .collect::<serde_json::Map<_, _>>();
+        if !required.is_empty() {
+            context["glossary"] = serde_json::Value::Object(required);
+        }
     }
     let lines = batch
         .iter()
@@ -79,18 +90,21 @@ pub(super) fn build_translation_messages(
     let context_json = serde_json::to_string(&context).unwrap_or_default();
     let batch_json =
         serde_json::to_string(&serde_json::json!({"lines": lines})).unwrap_or_default();
-    vec![
-        ChatMessage::system(
-            "TASK_START\ntranslate_subtitles\nTASK_END\n\
+    let system = "TASK_START\ntranslate_subtitles\nTASK_END\n\
 Return JSON only with this shape:\n\
-{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}],\"summary\":\"\",\"glossary_updates\":[]}\n\
+{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}\n\
 Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
 The translated text must be in the translation field; do not return it in text or translated_text.\n\
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context.",
-        ),
+only when they fit the meaning in the current context.";
+    vec![
+        if options.mode == crate::entities::TranslationMode::Cinema {
+            ChatMessage::cacheable_system(system)
+        } else {
+            ChatMessage::system(system)
+        },
         ChatMessage::user(format!(
             "CONTEXT_JSON_START{context_json}CONTEXT_JSON_END\nBATCH_JSON_START{batch_json}BATCH_JSON_END"
         )),
@@ -112,11 +126,24 @@ pub(super) fn request_hash(
                         "content".to_owned(),
                         JsonValue::String(message.content.clone()),
                     ),
+                    ("cacheable".to_owned(), JsonValue::Bool(message.cacheable)),
                 ])
             })
             .collect(),
     );
-    if let Some(fingerprint) = &options.provider_fingerprint {
+    let reviewer_stage = matches!(
+        stage,
+        CacheStage::Review | CacheStage::Terminology | CacheStage::AgentReviewRepair
+    );
+    let fingerprint = if reviewer_stage {
+        options
+            .reviewer_fingerprint
+            .as_ref()
+            .or(options.provider_fingerprint.as_ref())
+    } else {
+        options.provider_fingerprint.as_ref()
+    };
+    if let Some(fingerprint) = fingerprint {
         build_request_hash_v2(fingerprint, stage.as_str(), messages)
     } else {
         build_request_hash(&options.provider, &options.model, stage.as_str(), messages)

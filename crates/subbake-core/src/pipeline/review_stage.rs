@@ -35,7 +35,7 @@ impl ReviewStage {
         reviewed_segments: &[SubtitleSegment],
         cache_hits_before: usize,
     ) -> CoreResult<Self> {
-        let plan = if options.fast_mode || translated.is_empty() {
+        let plan = if translated.is_empty() {
             Vec::new()
         } else {
             match options.review_policy {

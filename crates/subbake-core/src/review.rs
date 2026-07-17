@@ -162,7 +162,14 @@ pub(crate) fn build_review_messages(
          Return an empty changes array when every candidate is already good.\n\
          REVIEW_JSON_START{payload_json}REVIEW_JSON_END"
     );
-    vec![ChatMessage::system(system), ChatMessage::user(user)]
+    vec![
+        if options.mode == crate::entities::TranslationMode::Cinema {
+            ChatMessage::cacheable_system(system)
+        } else {
+            ChatMessage::system(system)
+        },
+        ChatMessage::user(user),
+    ]
 }
 
 pub(crate) fn parse_review_payload(payload: &serde_json::Value) -> CoreResult<ReviewResult> {
@@ -237,6 +244,12 @@ fn line_review_reasons(
     if formatting_tokens(&source.text) != formatting_tokens(&translated.text) {
         reasons.push("formatting mismatch".to_owned());
     }
+    if number_tokens(&source.text) != number_tokens(&translated.text) {
+        reasons.push("number mismatch".to_owned());
+    }
+    if has_readability_risk(translated) {
+        reasons.push("subtitle readability risk".to_owned());
+    }
     if translations_by_source
         .get(&normalize_text(&source.text))
         .is_some_and(|translations| translations.len() > 1)
@@ -274,4 +287,54 @@ fn formatting_tokens(text: &str) -> Vec<String> {
     }
     tokens.sort();
     tokens
+}
+
+fn number_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn has_readability_risk(segment: &SubtitleSegment) -> bool {
+    let characters = segment
+        .text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count();
+    if characters > 84 {
+        return true;
+    }
+    let (Some(start), Some(end)) = (segment.start.as_deref(), segment.end.as_deref()) else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (subtitle_timestamp_ms(start), subtitle_timestamp_ms(end))
+    else {
+        return false;
+    };
+    let duration_ms = end.saturating_sub(start);
+    duration_ms > 0 && characters.saturating_mul(1_000) > duration_ms.saturating_mul(20)
+}
+
+fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
+    let value = value.trim().replace(',', ".");
+    let (clock, milliseconds) = value.rsplit_once('.')?;
+    let mut parts = clock.split(':').map(str::parse::<usize>);
+    let hours = parts.next()?.ok()?;
+    let minutes = parts.next()?.ok()?;
+    let seconds = parts.next()?.ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let milliseconds = milliseconds.parse::<usize>().ok()?;
+    Some((((hours * 60 + minutes) * 60 + seconds) * 1_000) + milliseconds)
 }

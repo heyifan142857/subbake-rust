@@ -7,7 +7,7 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 7;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 8;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 5;
 pub const CACHE_VERSION: u64 = 1;
 
@@ -296,7 +296,10 @@ pub fn build_translation_fingerprint(
             "terminology_preflight".to_owned(),
             JsonValue::Bool(options.terminology_preflight),
         ),
-        ("fast_mode".to_owned(), JsonValue::Bool(options.fast_mode)),
+        (
+            "mode".to_owned(),
+            JsonValue::String(options.mode.as_str().to_owned()),
+        ),
         (
             "source_language".to_owned(),
             JsonValue::String(options.source_language.clone()),
@@ -562,7 +565,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "b4e93099b0432c053ef18b23550da6fed6f549e5"
+            "fd13aa8eec6d21dd1714f2904ae4e70b6caa8706"
         );
     }
 

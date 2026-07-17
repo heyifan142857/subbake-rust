@@ -582,6 +582,7 @@ mod tests {
                 input_tokens: 2,
                 output_tokens: 3,
                 total_tokens: 5,
+                ..Usage::default()
             },
             ContextMemory::new(),
             1,
@@ -634,6 +635,7 @@ mod tests {
                 input_tokens: 2,
                 output_tokens: 3,
                 total_tokens: 5,
+                ..Usage::default()
             },
         };
         let hash = "8c13d80251241884e45610d3b6003c103e0421e5";
@@ -682,6 +684,7 @@ mod tests {
                 input_tokens: 3,
                 output_tokens: 2,
                 total_tokens: 5,
+                ..Usage::default()
             },
         };
         let hash = "review-hash";
@@ -728,6 +731,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 4,
                 total_tokens: 14,
+                ..Usage::default()
             },
         };
         store

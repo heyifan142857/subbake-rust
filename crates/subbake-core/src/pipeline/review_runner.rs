@@ -16,10 +16,15 @@ pub(super) struct ReviewRun {
     pub usage: Usage,
 }
 
+pub(super) struct ReviewBatchInput<'a> {
+    pub review_batches: &'a [Vec<SubtitleSegment>],
+    pub translation_batches: usize,
+}
+
 pub(super) fn run<B, D>(
     pipeline: &mut SubtitlePipeline<B, D>,
     document: &SubtitleDocument,
-    batches: &[Vec<SubtitleSegment>],
+    batch_input: ReviewBatchInput<'_>,
     translated: &[SubtitleSegment],
     resume: &ResumeSnapshot,
     terminology: &crate::entities::TerminologyStats,
@@ -29,6 +34,8 @@ where
     B: LlmBackend,
     D: DashboardSink,
 {
+    let batches = batch_input.review_batches;
+    let translation_batches = batch_input.translation_batches;
     let mut stage = ReviewStage::new(
         &pipeline.options,
         batches,
@@ -60,7 +67,18 @@ where
                 resumed,
                 usage,
             );
-            let pending = stage.window(next_review, concurrency);
+            let window_size = if pipeline.options.mode == crate::entities::TranslationMode::Turbo
+                && pipeline
+                    .reviewer
+                    .as_ref()
+                    .unwrap_or(&pipeline.backend)
+                    .supports_parallel_generation()
+            {
+                concurrency.saturating_mul(2)
+            } else {
+                concurrency
+            };
+            let pending = stage.window(next_review, window_size);
             let mut reviewed_window = pipeline.review_window(&pending)?;
             for (review_position, _) in &pending {
                 let reviewed = reviewed_window.remove(review_position).ok_or_else(|| {
@@ -80,7 +98,7 @@ where
                         &reviewed_segments,
                     )?;
                 }
-                pipeline.save_run_state(batches.len(), *review_position, true, usage)?;
+                pipeline.save_run_state(translation_batches, *review_position, true, usage)?;
                 pipeline.report(
                     "FINAL_REVIEW",
                     TaskState::Running,
@@ -115,7 +133,7 @@ where
         })?;
     }
     pipeline.cancellation.check()?;
-    pipeline.save_run_state(batches.len(), review_batches, true, usage)?;
+    pipeline.save_run_state(translation_batches, review_batches, true, usage)?;
     Ok(ReviewRun {
         output: outcome.output,
         stats: outcome.stats,

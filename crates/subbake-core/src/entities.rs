@@ -15,6 +15,77 @@ pub const DEFAULT_SOURCE_LANGUAGE: &str = "Auto";
 pub const DEFAULT_RETRIES: usize = 2;
 pub const DEFAULT_AGENT_REPAIR_ATTEMPTS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationMode {
+    Economy,
+    #[default]
+    Turbo,
+    Cinema,
+}
+
+impl TranslationMode {
+    pub fn parse(value: &str) -> Result<Self, SettingParseError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "economy" | "eco" => Ok(Self::Economy),
+            "turbo" | "fast" => Ok(Self::Turbo),
+            "cinema" | "quality" => Ok(Self::Cinema),
+            _ => Err(SettingParseError {
+                setting: "translation mode",
+                value: value.to_owned(),
+                expected: "economy, turbo, cinema",
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Turbo => "turbo",
+            Self::Cinema => "cinema",
+        }
+    }
+}
+
+/// Fully expanded behavior for a translation mode. Adapters may override the
+/// numeric settings, while the domain keeps the semantic differences here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslationPolicy {
+    pub document_preflight: bool,
+    pub include_context: bool,
+    pub compact_wire: bool,
+    pub deduplicate: bool,
+    pub review_policy: ReviewPolicy,
+}
+
+impl TranslationPolicy {
+    pub const fn for_mode(mode: TranslationMode) -> Self {
+        match mode {
+            TranslationMode::Economy => Self {
+                document_preflight: false,
+                include_context: false,
+                compact_wire: true,
+                deduplicate: true,
+                review_policy: ReviewPolicy::Off,
+            },
+            TranslationMode::Turbo => Self {
+                document_preflight: false,
+                include_context: true,
+                compact_wire: true,
+                deduplicate: true,
+                review_policy: ReviewPolicy::Off,
+            },
+            TranslationMode::Cinema => Self {
+                document_preflight: true,
+                include_context: true,
+                compact_wire: true,
+                deduplicate: true,
+                review_policy: ReviewPolicy::Full,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingParseError {
     pub setting: &'static str,
@@ -181,6 +252,12 @@ pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub cached_input_tokens: usize,
+    #[serde(default)]
+    pub requests: usize,
+    #[serde(default)]
+    pub retries: usize,
 }
 
 impl Usage {
@@ -188,6 +265,13 @@ impl Usage {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
         self.total_tokens += other.total_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.requests += other.requests;
+        self.retries += other.retries;
+    }
+
+    pub fn billable_input_tokens(self) -> usize {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
     }
 }
 
@@ -289,7 +373,7 @@ pub struct PipelineOptions {
     pub batch_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
-    pub fast_mode: bool,
+    pub mode: TranslationMode,
     pub bilingual: bool,
     pub bilingual_order: BilingualOrder,
     pub target_language: String,
@@ -301,6 +385,7 @@ pub struct PipelineOptions {
     /// Non-secret identity of the configured API route, used to isolate v2
     /// cache entries across protocols and relay endpoints.
     pub provider_fingerprint: Option<String>,
+    pub reviewer_fingerprint: Option<String>,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -322,7 +407,7 @@ impl PipelineOptions {
             batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
             translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
             review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
-            fast_mode: false,
+            mode: TranslationMode::Turbo,
             bilingual: false,
             bilingual_order: BilingualOrder::default(),
             target_language: default_target_language(),
@@ -332,6 +417,7 @@ impl PipelineOptions {
             terminology_preflight: true,
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,
+            reviewer_fingerprint: None,
             dry_run: false,
             resume: true,
             use_cache: true,
@@ -341,6 +427,10 @@ impl PipelineOptions {
             glossary_path: None,
         }
     }
+
+    pub const fn policy(&self) -> TranslationPolicy {
+        TranslationPolicy::for_mode(self.mode)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,6 +439,9 @@ pub struct PipelineResult {
     pub batches_translated: usize,
     pub review_batches: usize,
     pub usage: Usage,
+    pub mode: TranslationMode,
+    pub deduplicated_segments: usize,
+    pub reviewer_fallback: bool,
     pub dry_run: bool,
     pub planned_batches: Vec<BatchPlanEntry>,
     pub cache_hits: usize,
