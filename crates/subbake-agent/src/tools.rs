@@ -91,6 +91,23 @@ impl ToolSpec {
         self.arguments
     }
 
+    pub(crate) fn mutates_with(&self, arguments: &serde_json::Value) -> bool {
+        if self.executor != ToolExecutor::ManageWhisper {
+            return self.mutating;
+        }
+        !matches!(
+            arguments
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("status"),
+            "status" | "list-models" | "models" | "list-versions" | "versions"
+        )
+    }
+
+    pub(crate) fn requires_approval_with(&self, arguments: &serde_json::Value) -> bool {
+        self.requires_approval && self.mutates_with(arguments)
+    }
+
     pub fn prompt_line(&self) -> String {
         let arguments = self
             .arguments()
@@ -428,7 +445,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        "Transcribe a media file to subtitles.",
+        "Transcribe a media file to subtitles. When the model is omitted, use the configured model or deterministically select an installed model; explicitly tell the user when the result says model_auto_selected=true.",
         TRANSCRIBE_AUDIO_ARGS,
         TranscribeAudio
     ),
@@ -439,7 +456,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         true,
-        "Manage local whisper.cpp. For an install request: install the CLI first, then call list-models and present the available models to the user; do not choose or download a model until the user selects one. Use list-versions to fetch upstream releases.",
+        "Manage local whisper.cpp. status, list-models, and list-versions are read-only checks and should be followed immediately by the next task action. For an install request: install the CLI first, then call list-models and present the available models to the user; do not choose or download a model until the user selects one. Use list-versions to fetch upstream releases.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
     ),
@@ -760,6 +777,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn whisper_observations_are_read_only_but_asset_changes_require_approval() {
+        let spec = find_tool_spec("manage_whisper").expect("manage_whisper");
+        for action in ["status", "list-models", "list-versions"] {
+            let arguments = serde_json::json!({"action": action});
+            assert!(!spec.mutates_with(&arguments));
+            assert!(!spec.requires_approval_with(&arguments));
+        }
+        for action in ["install", "update", "uninstall", "download"] {
+            let arguments = serde_json::json!({"action": action});
+            assert!(spec.mutates_with(&arguments));
+            assert!(spec.requires_approval_with(&arguments));
+        }
     }
 
     #[test]

@@ -53,6 +53,19 @@ sbake pipeline movie.mp4 --transcribe-model base --target-language zh-Hans
 也可以直接启动 `sbake`，对 Agent 说“安装 Whisper”。Agent 会先请求批准安装
 whisper-cli，安装完成后拉取模型列表并让你选择；只有你明确选择模型后才会继续下载。
 
+转写未指定模型时：唯一已安装模型会自动使用；多个模型中存在完整的 `small` 时优先
+使用它。Agent 在没有完整 `small` 时按 `small* > base* > medium* >
+large-v3-turbo* > large-v3* > large-v2* > large-v1* > tiny*` 自动选择，并明确
+报告所选模型；同一家族按多语言完整版、q8、q5、英文专用版排序。CLI 遇到无法唯一
+决定的多个模型时会列出候选并要求 `--model`。可用
+`[defaults.transcription].model` 固定首选模型。
+
+转写前，除 WAV 外的 MP3、M4A、FLAC、OGG 和视频输入都会先通过 FFmpeg 统一转换为
+16 kHz、单声道、16-bit PCM WAV。`PREPARE_AUDIO` 会按媒体时长显示转换进度；中间
+WAV 存放在运行目录的唯一临时目录中，并在转写成功、失败或取消后自动清理。
+Whisper 推理默认使用可用并行度的一半（最多 16 个线程），并通过 `TRANSCRIBE`
+进度条持续报告 whisper-cli 的实际完成百分比。
+
 ## 配置
 
 SubBake 会依次查找 `~/.config/subbake/config.toml` 和项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
@@ -91,6 +104,9 @@ mode = "cinema"
 [defaults.output]
 bilingual = true
 bilingual_order = "target_first" # target_first 或 source_first
+
+[defaults.transcription]
+model = "small-q8_0" # 可选；未设置时根据已安装模型选择
 
 ```
 

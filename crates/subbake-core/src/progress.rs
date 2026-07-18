@@ -31,6 +31,8 @@ pub enum ProgressUnit {
     Batches,
     Lines,
     Bytes,
+    Duration,
+    Percent,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

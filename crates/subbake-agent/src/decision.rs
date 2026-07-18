@@ -316,7 +316,9 @@ impl AgentEngine {
                 find_tool_spec(&call.name)
                     .filter(|spec| spec.model_visible)
                     .filter(|spec| {
-                        spec.mutating && (self.is_in_plan_mode() || spec.requires_approval)
+                        spec.mutates_with(&call.arguments)
+                            && (self.is_in_plan_mode()
+                                || spec.requires_approval_with(&call.arguments))
                     })
                     .and_then(|_| {
                         validate_tool_call(&call.name, &call.arguments)
@@ -369,7 +371,10 @@ impl AgentEngine {
                         validation_category(&error),
                         available_tools.clone(),
                     ),
-                    Ok(()) if spec.mutating && completed_mutations.contains(&call_key) => {
+                    Ok(())
+                        if spec.mutates_with(&call.arguments)
+                            && completed_mutations.contains(&call_key) =>
+                    {
                         ToolFeedback::failure(
                             &call.name,
                             "this successful mutating call was already executed in this task"
@@ -380,7 +385,7 @@ impl AgentEngine {
                     }
                     Ok(()) => match self.run_tool(&call.name, &call.arguments) {
                         Ok(outcome) => {
-                            if spec.mutating {
+                            if spec.mutates_with(&call.arguments) {
                                 completed_mutations.insert(call_key.clone());
                             }
                             let observation = render_tool_outcome(&outcome);
@@ -497,8 +502,13 @@ impl AgentEngine {
                 message: error.to_string(),
             })?;
         let output_format = settings.output.format.as_deref().unwrap_or("source");
+        let transcription_model = settings
+            .transcription
+            .model
+            .as_deref()
+            .unwrap_or("auto-select-installed");
         Ok(format!(
-            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_cpp, model=small, language=Auto, format=srt",
+            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_cpp, model={}, language=Auto, format=srt",
             source_language,
             target_language,
             settings.backend.id,
@@ -507,6 +517,7 @@ impl AgentEngine {
             settings.output.bilingual,
             settings.output.bilingual_order.as_str(),
             settings.translation.dry_run,
+            transcription_model,
         ))
     }
 
@@ -785,6 +796,30 @@ mod tests {
             messages[0].content.contains("- translate_series:")
                 && messages[0].content.contains("- candidate_subtitles:")
         }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn whisper_status_is_an_intermediate_observation_not_a_pending_plan() {
+        let root = temp_root("whisper-status-continuation");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"manage_whisper","arguments":{"action":"status"}}),
+                json!({"action":"tool_call","tool_name":"list_files","arguments":{"path":"."}}),
+                json!({"action":"respond","text":"Whisper checked; continued the task."}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("check Whisper, then inspect the directory", &mut backend)
+            .expect("run");
+
+        assert_eq!(response, "Whisper checked; continued the task.");
+        assert!(!engine.has_pending_plan());
+        assert_eq!(backend.prompts.len(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 

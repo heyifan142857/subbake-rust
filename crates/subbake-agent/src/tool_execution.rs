@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use subbake_adapters::{
-    BatchTranslationRequest, ConfigFile, SettingsOverrides, StorageSettings, SubtitleEditRequest,
-    TranscriptionFormat, TranscriptionRequest, TranscriptionSettings, TranslationRequest,
-    TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome, WhisperRequest,
-    apply_whisper_storage, batch_translation_output_path, default_output_path_with_language,
+    BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, SettingsOverrides,
+    SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest, TranscriptionSettings,
+    TranslationRequest, TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome,
+    WhisperRequest, batch_translation_output_path, default_output_path_with_language,
     default_whisper_binary_path_for, default_whisper_models_dir_for, diagnose_failure_path,
     edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_path,
     load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
@@ -147,15 +147,16 @@ pub(crate) fn execute_adapter_tool(
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
-    storage: Option<&StorageSettings>,
+    resolved_settings: Option<&ResolvedSettings>,
 ) -> AgentResult<Option<AdapterToolOutcome>> {
     let outcome = match executor {
         ToolExecutor::TranscribeAudio => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
             let mut settings = TranscriptionSettings::default();
-            if let Some(storage) = storage {
-                apply_whisper_storage(&mut settings, storage);
+            if let Some(resolved) = resolved_settings {
+                subbake_adapters::apply_whisper_configuration(&mut settings, resolved);
             }
+            settings.multiple_model_policy = MultipleModelPolicy::PreferRanked;
             if let Some(language) = optional_argument(args, "language") {
                 let normalized = normalize_language(language, true).map_err(|error| {
                     AgentError::InvalidInput {
@@ -217,6 +218,7 @@ pub(crate) fn execute_adapter_tool(
                         language: outcome.language,
                         provider: outcome.provider,
                         model: outcome.model,
+                        model_auto_selected: outcome.model_auto_selected,
                         output_format: outcome.output_format.extension().to_owned(),
                         subtitle_entries: outcome.subtitle_entries,
                     }),
@@ -243,12 +245,14 @@ pub(crate) fn execute_adapter_tool(
             };
             let request = WhisperRequest {
                 action,
-                binary_path: storage.map(|storage| {
+                binary_path: resolved_settings.map(|settings| {
+                    let storage = &settings.storage;
                     storage.whisper_binary_path.clone().unwrap_or_else(|| {
                         default_whisper_binary_path_for(storage.runtime_dir.as_deref())
                     })
                 }),
-                models_dir: storage.map(|storage| {
+                models_dir: resolved_settings.map(|settings| {
+                    let storage = &settings.storage;
                     storage.whisper_models_dir.clone().unwrap_or_else(|| {
                         default_whisper_models_dir_for(storage.runtime_dir.as_deref())
                     })
@@ -910,7 +914,13 @@ fn format_file_list(files: &[PathBuf]) -> String {
     }
     files
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|path| {
+            if path.is_dir() {
+                format!("{} [directory]", path.display())
+            } else {
+                path.display().to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1131,6 +1141,20 @@ mod tests {
         assert!(matches!(outcome.outcome, AgentToolOutcome::File(_)));
         assert!(outcome.file_operation.is_some());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_list_marks_directories_so_media_discovery_can_descend() {
+        let root = temp_root();
+        let directory = root.join("release.with.dots");
+        fs::create_dir_all(&directory).expect("create directory");
+        fs::write(root.join("movie.mkv"), b"media").expect("write media");
+
+        let rendered = format_file_list(&[directory.clone(), root.join("movie.mkv")]);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(rendered.contains(&format!("{} [directory]", directory.display())));
+        assert!(rendered.contains("movie.mkv"));
     }
 
     #[test]

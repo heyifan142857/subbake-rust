@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use subbake_adapters::{
     ApiFormat, BackendConfig, ConfigurationResolver, ResolveRequest, RuntimeAction,
     SettingsOverrides, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, WhisperBuildVariant, apply_whisper_storage, default_whisper_binary_path_for,
-    default_whisper_models_dir_for,
+    WhisperAction, WhisperBuildVariant, apply_whisper_configuration,
+    default_whisper_binary_path_for, default_whisper_models_dir_for,
 };
 use subbake_agent::{AgentAction, AgentActionKind};
 
@@ -256,10 +256,7 @@ fn parse_file_translation_args(
     }
     let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
     if command_name == "pipeline" {
-        apply_whisper_storage(
-            &mut parsed.transcription_settings,
-            &resolved.settings.storage,
-        );
+        apply_whisper_configuration(&mut parsed.transcription_settings, &resolved.settings);
     }
     parsed.settings = resolved.settings;
     parsed.config_path = resolved.config_path;
@@ -407,7 +404,7 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
     }
 
     let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
-    apply_whisper_storage(&mut parsed.settings, &resolved.settings.storage);
+    apply_whisper_configuration(&mut parsed.settings, &resolved.settings);
     Ok(parsed)
 }
 
@@ -1092,6 +1089,39 @@ mod tests {
             parsed.settings.sidecar_path,
             Some(PathBuf::from("movie.srt"))
         );
+    }
+
+    #[test]
+    fn transcription_model_resolves_from_config_and_cli_overrides_it() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-transcription-model.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "version = 2\n[defaults.transcription]\nmodel = \"small-q8_0\"\n",
+        )
+        .expect("write config");
+        let config = path.to_string_lossy().into_owned();
+
+        let configured = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config.clone(),
+        ])
+        .expect("parse configured model");
+        let overridden = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config,
+            "--model".to_owned(),
+            "medium".to_owned(),
+        ])
+        .expect("parse CLI model override");
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(configured.settings.model.as_deref(), Some("small-q8_0"));
+        assert_eq!(overridden.settings.model.as_deref(), Some("medium"));
     }
 
     #[test]

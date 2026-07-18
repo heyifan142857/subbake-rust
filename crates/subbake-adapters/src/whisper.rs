@@ -1346,8 +1346,20 @@ fn list_models(
         });
     }
 
+    let models = installed_models_in(&models_dir)?;
+
+    Ok(WhisperModelList {
+        models_dir,
+        models_dir_exists: true,
+        models,
+        available_models: available_models.unwrap_or_default(),
+        refresh_warning,
+    })
+}
+
+pub(crate) fn installed_models_in(models_dir: &Path) -> io::Result<Vec<WhisperModel>> {
     let mut models = Vec::new();
-    for entry in fs::read_dir(&models_dir)? {
+    for entry in fs::read_dir(models_dir)? {
         let path = entry?.path();
         if !path.is_file() || !is_whisper_model_file(&path) {
             continue;
@@ -1362,14 +1374,7 @@ fn list_models(
         models.push(WhisperModel { name, path });
     }
     models.sort_by(|left, right| left.path.cmp(&right.path));
-
-    Ok(WhisperModelList {
-        models_dir,
-        models_dir_exists: true,
-        models,
-        available_models: available_models.unwrap_or_default(),
-        refresh_warning,
-    })
+    Ok(models)
 }
 
 fn inspect_status(
@@ -1437,6 +1442,9 @@ pub(crate) fn verify_whisper_cli(
         "--output-file",
         "--output-srt",
         "--output-vtt",
+        "--threads",
+        "--print-progress",
+        "--no-prints",
     ]
     .into_iter()
     .filter(|flag| !help.contains(flag))

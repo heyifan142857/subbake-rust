@@ -2,9 +2,9 @@
 //
 // Orchestration: ffmpeg audio extraction (video-only) → backend transcribe → render.
 
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{fs, io};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::normalize_language;
@@ -15,10 +15,14 @@ use subbake_core::{
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{read_document, render_and_write_document};
-use crate::process::run_command_cancellable;
-use crate::settings::StorageSettings;
+use crate::process::{
+    run_command_cancellable, run_command_cancellable_with_stderr_lines,
+    run_command_cancellable_with_stdout_lines,
+};
+use crate::settings::{ResolvedSettings, StorageSettings};
 use crate::whisper::{
-    default_whisper_binary_path_for, default_whisper_models_dir_for, verify_whisper_cli,
+    default_whisper_binary_path_for, default_whisper_models_dir_for, installed_models_in,
+    verify_whisper_cli,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +45,15 @@ pub struct TranscriptionSettings {
     pub sidecar_path: Option<PathBuf>,
     pub whisper_binary_path: Option<PathBuf>,
     pub whisper_models_dir: Option<PathBuf>,
+    pub runtime_dir: Option<PathBuf>,
+    pub multiple_model_policy: MultipleModelPolicy,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MultipleModelPolicy {
+    #[default]
+    RequireExplicit,
+    PreferRanked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +62,7 @@ pub struct TranscriptionOutcome {
     pub language: String,
     pub provider: String,
     pub model: String,
+    pub model_auto_selected: bool,
     pub output_format: TranscriptionFormat,
     pub subtitle_entries: usize,
 }
@@ -88,6 +102,8 @@ impl Default for TranscriptionSettings {
             sidecar_path: None,
             whisper_binary_path: None,
             whisper_models_dir: None,
+            runtime_dir: None,
+            multiple_model_policy: MultipleModelPolicy::RequireExplicit,
         }
     }
 }
@@ -123,6 +139,8 @@ pub struct WhisperCppTranscriber {
     binary: PathBuf,
     model_path: PathBuf,
     extra_args: Vec<String>,
+    progress: SharedProgress,
+    threads: usize,
 }
 
 impl WhisperCppTranscriber {
@@ -131,7 +149,14 @@ impl WhisperCppTranscriber {
             binary,
             model_path,
             extra_args,
+            progress: std::sync::Arc::new(NoopProgress),
+            threads: default_whisper_threads(),
         }
+    }
+
+    fn with_progress(mut self, progress: SharedProgress) -> Self {
+        self.progress = progress;
+        self
     }
 }
 
@@ -164,6 +189,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
             .and_then(|s| s.to_str())
             .unwrap_or("audio");
         let output_base = output_dir.join(base_name);
+        let threads = self.threads.to_string();
 
         let mut cmd = Command::new(&self.binary);
         cmd.args([
@@ -173,6 +199,8 @@ impl TranscriberBackend for WhisperCppTranscriber {
             &audio_path.to_string_lossy(),
             "--output-file",
             &output_base.to_string_lossy(),
+            "--threads",
+            &threads,
         ]);
         match output_format {
             TranscriptionFormat::Srt | TranscriptionFormat::Txt => {
@@ -188,15 +216,45 @@ impl TranscriberBackend for WhisperCppTranscriber {
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
-        cmd.arg("--no-prints");
+        cmd.args(["--print-progress", "--no-prints"]);
 
-        let out = run_command_cancellable(&mut cmd, cancellation, "whisper.cpp execution")?;
+        let mut last_progress = 0_u64;
+        let out = run_command_cancellable_with_stderr_lines(
+            &mut cmd,
+            cancellation,
+            "whisper.cpp execution",
+            |line| {
+                let Some(current) = parse_whisper_progress(line) else {
+                    return;
+                };
+                if current <= last_progress {
+                    return;
+                }
+                last_progress = current;
+                self.progress.emit(ProgressEvent::running(
+                    TaskKind::Transcription,
+                    "TRANSCRIBE",
+                    current,
+                    Some(100),
+                    ProgressUnit::Percent,
+                ));
+            },
+        )?;
         if !out.status.success() {
             return Err(AdapterError::ChildProcess {
                 program: "whisper.cpp",
                 status: out.status.code(),
                 message: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
+        }
+        if last_progress < 100 {
+            self.progress.emit(ProgressEvent::running(
+                TaskKind::Transcription,
+                "TRANSCRIBE",
+                100,
+                Some(100),
+                ProgressUnit::Percent,
+            ));
         }
 
         let suffix = match output_format {
@@ -234,6 +292,23 @@ impl TranscriberBackend for WhisperCppTranscriber {
 
 fn whisper_language_code(language: &str) -> &str {
     language.split('-').next().unwrap_or(language)
+}
+
+fn default_whisper_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| recommended_whisper_threads(parallelism.get()))
+        .unwrap_or(4)
+}
+
+fn recommended_whisper_threads(parallelism: usize) -> usize {
+    (parallelism / 2).clamp(1, 16)
+}
+
+fn parse_whisper_progress(line: &str) -> Option<u64> {
+    line.split_once("progress =")
+        .and_then(|(_, value)| value.trim().strip_suffix('%'))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(100))
 }
 
 // ---------------------------------------------------------------------------
@@ -277,13 +352,6 @@ pub fn transcribe_media_cancellable_with_progress(
             "transcription model must not be empty",
         ));
     }
-    progress.emit(ProgressEvent::running(
-        TaskKind::Transcription,
-        "PREPARE_AUDIO",
-        0,
-        None,
-        ProgressUnit::Steps,
-    ));
     let output_path = request.output_path.unwrap_or_else(|| {
         default_output_path(&request.media_path, request.settings.output_format)
     });
@@ -312,32 +380,38 @@ pub fn transcribe_media_cancellable_with_progress(
             language,
             provider: "sidecar".to_owned(),
             model: "none".to_owned(),
+            model_auto_selected: false,
             output_format: request.settings.output_format,
             subtitle_entries: document.segments.len(),
         });
     }
 
-    let audio_path = ensure_audio(&request.media_path, cancellation)?;
+    let prepared_audio = prepare_audio(
+        &request.media_path,
+        &request.settings,
+        cancellation,
+        &progress,
+    )?;
     progress.emit(ProgressEvent::running(
         TaskKind::Transcription,
         "TRANSCRIBE",
         0,
-        None,
-        ProgressUnit::Steps,
+        Some(100),
+        ProgressUnit::Percent,
     ));
     let fmt = request.settings.output_format;
 
-    let effective_model = request
-        .settings
-        .model
-        .clone()
-        .unwrap_or_else(|| "small".to_owned());
+    let ResolvedWhisperModel {
+        name: effective_model,
+        path: model_path,
+        auto_selected: model_auto_selected,
+    } = resolve_whisper_model(&request.settings)?;
     let binary = locate_whisper_binary(&request.settings)?;
     verify_whisper_cli(&binary, cancellation)?;
-    let model_path = locate_whisper_model(&request.settings, &effective_model)?;
-    let transcriber = WhisperCppTranscriber::new(binary, model_path, Vec::new());
+    let transcriber =
+        WhisperCppTranscriber::new(binary, model_path, Vec::new()).with_progress(progress.clone());
     let doc = transcriber.transcribe_cancellable(
-        &audio_path,
+        prepared_audio.path(),
         request.settings.language.as_deref(),
         fmt,
         cancellation,
@@ -360,6 +434,7 @@ pub fn transcribe_media_cancellable_with_progress(
         language,
         provider: "whisper_cpp".to_owned(),
         model: effective_model,
+        model_auto_selected,
         output_format: fmt,
         subtitle_entries: doc.segments.len(),
     })
@@ -369,53 +444,311 @@ pub fn transcribe_media_cancellable_with_progress(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ensure_audio(media_path: &Path, cancellation: &CancellationGuard) -> AdapterResult<PathBuf> {
-    check_cancelled(cancellation)?;
-    if is_audio_ext(media_path) {
-        return Ok(media_path.to_path_buf());
+#[derive(Debug)]
+struct PreparedAudio {
+    path: PathBuf,
+    _temporary_dir: Option<AudioTempDirectory>,
+}
+
+impl PreparedAudio {
+    fn borrowed(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            _temporary_dir: None,
+        }
     }
 
-    let parent = media_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = media_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("audio");
-    let tmp_dir = parent.join(".subbake").join("tmp");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| io::Error::other(format!("create tmp dir: {e}")))?;
-    let output = tmp_dir.join(format!("{stem}_audio.wav"));
+    fn temporary(path: PathBuf, directory: AudioTempDirectory) -> Self {
+        Self {
+            path,
+            _temporary_dir: Some(directory),
+        }
+    }
 
-    let mut command = Command::new("ffmpeg");
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug)]
+struct AudioTempDirectory(PathBuf);
+
+impl AudioTempDirectory {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for AudioTempDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn prepare_audio(
+    media_path: &Path,
+    settings: &TranscriptionSettings,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<PreparedAudio> {
+    prepare_audio_with_programs(
+        media_path,
+        settings,
+        cancellation,
+        progress,
+        Path::new("ffmpeg"),
+        Path::new("ffprobe"),
+    )
+}
+
+fn prepare_audio_with_programs(
+    media_path: &Path,
+    settings: &TranscriptionSettings,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+) -> AdapterResult<PreparedAudio> {
+    check_cancelled(cancellation)?;
+    if is_wav_ext(media_path) {
+        let mut done = ProgressEvent::running(
+            TaskKind::Transcription,
+            "PREPARE_AUDIO",
+            1,
+            Some(1),
+            ProgressUnit::Steps,
+        );
+        done.state = TaskState::Completed;
+        progress.emit(done);
+        return Ok(PreparedAudio::borrowed(media_path));
+    }
+
+    let audio_info = probe_audio_info(ffprobe, media_path, cancellation)?;
+    validate_audio_decodable(ffmpeg, media_path, &audio_info.codec, cancellation)?;
+    let runtime_dir = settings
+        .runtime_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".subbake"));
+    let temp_root = runtime_dir.join("tmp").join("transcription");
+    fs::create_dir_all(&temp_root).map_err(|source| {
+        AdapterError::external_io(
+            "create transcription temp root",
+            Some(temp_root.clone()),
+            source,
+        )
+    })?;
+    let temp_dir = unique_audio_temp_dir(&temp_root)?;
+    let output = temp_dir.path().join("audio.wav");
+    let duration_ms = audio_info.duration_ms;
+    progress.emit(ProgressEvent::running(
+        TaskKind::Transcription,
+        "PREPARE_AUDIO",
+        0,
+        duration_ms,
+        ProgressUnit::Duration,
+    ));
+
+    let mut command = Command::new(ffmpeg);
     command.args([
+        "-nostdin",
+        "-hide_banner",
         "-y",
+        "-nostats",
+        "-loglevel",
+        "error",
         "-i",
         &media_path.to_string_lossy(),
+        "-map",
+        "0:a:0",
         "-vn",
+        "-sn",
+        "-dn",
         "-acodec",
         "pcm_s16le",
         "-ar",
         "16000",
         "-ac",
         "1",
+        "-progress",
+        "pipe:1",
         &output.to_string_lossy(),
     ]);
-    let result = run_command_cancellable(&mut command, cancellation, "ffmpeg execution");
-    if result.is_err() {
-        let _ = std::fs::remove_file(&output);
-    }
-    let out = result?;
+    let mut processed_ms = 0_u64;
+    let out = run_command_cancellable_with_stdout_lines(
+        &mut command,
+        cancellation,
+        "ffmpeg audio preparation",
+        |line| {
+            if let Some(current) = parse_ffmpeg_progress_ms(line) {
+                processed_ms = current;
+                progress.emit(ProgressEvent::running(
+                    TaskKind::Transcription,
+                    "PREPARE_AUDIO",
+                    duration_ms.map_or(current, |total| current.min(total)),
+                    duration_ms,
+                    ProgressUnit::Duration,
+                ));
+            }
+        },
+    )?;
     if !out.status.success() {
-        let _ = std::fs::remove_file(&output);
         return Err(AdapterError::ChildProcess {
             program: "ffmpeg",
             status: out.status.code(),
-            message: String::from_utf8_lossy(&out.stderr).into_owned(),
+            message: child_diagnostics(&out, "ffmpeg audio preparation failed"),
         });
     }
-    check_cancelled(cancellation).inspect_err(|_| {
-        let _ = std::fs::remove_file(&output);
-    })?;
-    Ok(output)
+    check_cancelled(cancellation)?;
+    if !output.is_file() {
+        return Err(AdapterError::ChildProcess {
+            program: "ffmpeg",
+            status: out.status.code(),
+            message: "ffmpeg did not create the prepared WAV file".to_owned(),
+        });
+    }
+    let mut done = ProgressEvent::running(
+        TaskKind::Transcription,
+        "PREPARE_AUDIO",
+        duration_ms.unwrap_or(processed_ms),
+        duration_ms,
+        ProgressUnit::Duration,
+    );
+    done.state = TaskState::Completed;
+    progress.emit(done);
+    Ok(PreparedAudio::temporary(output, temp_dir))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaAudioInfo {
+    codec: String,
+    duration_ms: Option<u64>,
+}
+
+fn probe_audio_info(
+    ffprobe: &Path,
+    media_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<MediaAudioInfo> {
+    let output = run_command_cancellable(
+        Command::new(ffprobe).args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name:format=duration",
+            "-of",
+            "json",
+            &media_path.to_string_lossy(),
+        ]),
+        cancellation,
+        "ffprobe media audio streams",
+    )?;
+    if !output.status.success() {
+        return Err(AdapterError::ChildProcess {
+            program: "ffprobe",
+            status: output.status.code(),
+            message: child_diagnostics(&output, "failed to inspect media audio streams"),
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|source| AdapterError::Serialization {
+            context: "parse ffprobe audio stream response",
+            source,
+        })?;
+    let codec = value
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| streams.first())
+        .and_then(|stream| stream.get("codec_name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            AdapterError::invalid_input(format!(
+                "media contains no audio stream: {}",
+                media_path.display()
+            ))
+        })?
+        .to_owned();
+    let duration_ms = value
+        .pointer("/format/duration")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| (seconds * 1_000.0).round() as u64);
+    Ok(MediaAudioInfo { codec, duration_ms })
+}
+
+fn validate_audio_decodable(
+    ffmpeg: &Path,
+    media_path: &Path,
+    codec: &str,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
+    let output = run_command_cancellable(
+        Command::new(ffmpeg).args([
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-i",
+            &media_path.to_string_lossy(),
+            "-map",
+            "0:a:0",
+            "-t",
+            "0.1",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-f",
+            "null",
+            "-",
+        ]),
+        cancellation,
+        "ffmpeg audio decoder check",
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let diagnostics = child_diagnostics(&output, "audio decoder check failed");
+    let message = if diagnostics.contains("no decoder found")
+        || diagnostics.contains("Unknown decoder")
+        || diagnostics.contains("Decoder not found")
+    {
+        format!(
+            "audio stream uses `{codec}`, but this FFmpeg build cannot decode it; install an FFmpeg build with `{codec}` decoder support"
+        )
+    } else {
+        format!("cannot decode the first audio stream (`{codec}`): {diagnostics}")
+    };
+    Err(AdapterError::ChildProcess {
+        program: "ffmpeg",
+        status: output.status.code(),
+        message,
+    })
+}
+
+fn parse_ffmpeg_progress_ms(line: &str) -> Option<u64> {
+    line.strip_prefix("out_time_us=")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|microseconds| microseconds / 1_000)
+}
+
+fn unique_audio_temp_dir(root: &Path) -> AdapterResult<AudioTempDirectory> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = root.join(format!("{}-{nonce}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(AudioTempDirectory(path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate transcription temp directory",
+    )
+    .into())
 }
 
 fn check_cancelled(cancellation: &CancellationGuard) -> AdapterResult<()> {
@@ -437,10 +770,10 @@ fn child_diagnostics(output: &std::process::Output, fallback: &str) -> String {
     }
 }
 
-fn is_audio_ext(path: &Path) -> bool {
+fn is_wav_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| matches!(ext, "wav" | "mp3" | "ogg" | "m4a" | "flac"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
 }
 
 fn locate_whisper_binary(settings: &TranscriptionSettings) -> AdapterResult<PathBuf> {
@@ -457,23 +790,121 @@ fn locate_whisper_binary(settings: &TranscriptionSettings) -> AdapterResult<Path
     }
 }
 
-fn locate_whisper_model(settings: &TranscriptionSettings, name: &str) -> AdapterResult<PathBuf> {
-    let p = settings
+#[derive(Debug)]
+struct ResolvedWhisperModel {
+    name: String,
+    path: PathBuf,
+    auto_selected: bool,
+}
+
+fn resolve_whisper_model(settings: &TranscriptionSettings) -> AdapterResult<ResolvedWhisperModel> {
+    let models_dir = settings
         .whisper_models_dir
         .clone()
-        .unwrap_or_else(|| default_whisper_models_dir_for(None))
-        .join(format!("ggml-{name}.bin"));
-    if p.exists() {
-        Ok(p)
+        .unwrap_or_else(|| default_whisper_models_dir_for(None));
+    let mut installed = if models_dir.is_dir() {
+        installed_models_in(&models_dir).map_err(|source| {
+            AdapterError::external_io("list installed whisper models", Some(models_dir), source)
+        })?
     } else {
-        Err(AdapterError::invalid_input(format!(
-            "model `{name}` not found at {}. Run `sbake whisper model {name}`.",
-            p.display()
-        )))
+        Vec::new()
+    };
+    installed.sort_by(|left, right| model_rank(&left.name).cmp(&model_rank(&right.name)));
+    let installed_names = installed
+        .iter()
+        .map(|model| model.name.clone())
+        .collect::<Vec<_>>();
+
+    if let Some(requested) = settings.model.as_deref() {
+        return installed
+            .into_iter()
+            .find(|model| model.name == requested)
+            .map(|model| ResolvedWhisperModel {
+                name: model.name,
+                path: model.path,
+                auto_selected: false,
+            })
+            .ok_or_else(|| {
+                AdapterError::invalid_input(format!(
+                    "model `{requested}` is not installed; installed models: {}. Run `sbake whisper model {requested}`.",
+                    display_model_names(&installed_names)
+                ))
+            });
+    }
+
+    let selected = match installed.as_slice() {
+        [] => {
+            return Err(AdapterError::invalid_input(
+                "no whisper.cpp models are installed. Run `sbake whisper model list`, then `sbake whisper model <NAME>`.",
+            ));
+        }
+        [only] => only,
+        many => {
+            if let Some(small) = many.iter().find(|model| model.name == "small") {
+                small
+            } else if settings.multiple_model_policy == MultipleModelPolicy::PreferRanked {
+                &many[0]
+            } else {
+                return Err(AdapterError::invalid_input(format!(
+                    "multiple whisper.cpp models are installed; specify `--model <NAME>`. Available: {}",
+                    display_model_names(&installed_names)
+                )));
+            }
+        }
+    };
+    Ok(ResolvedWhisperModel {
+        name: selected.name.clone(),
+        path: selected.path.clone(),
+        auto_selected: true,
+    })
+}
+
+fn display_model_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
     }
 }
 
+fn model_rank(name: &str) -> (usize, usize, usize, &str) {
+    const FAMILIES: &[&str] = &[
+        "small",
+        "base",
+        "medium",
+        "large-v3-turbo",
+        "large-v3",
+        "large-v2",
+        "large-v1",
+        "tiny",
+    ];
+    let family = FAMILIES
+        .iter()
+        .position(|family| {
+            name == *family
+                || name
+                    .strip_prefix(*family)
+                    .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('.'))
+        })
+        .unwrap_or(FAMILIES.len());
+    let english_only = usize::from(name.contains(".en"));
+    let quantization = if name.contains("q8_") {
+        1
+    } else if name.contains("q5_") {
+        2
+    } else {
+        0
+    };
+    (family, english_only, quantization, name)
+}
+
 pub fn apply_whisper_storage(transcription: &mut TranscriptionSettings, storage: &StorageSettings) {
+    transcription.runtime_dir = Some(
+        storage
+            .runtime_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".subbake")),
+    );
     transcription.whisper_binary_path = Some(
         storage
             .whisper_binary_path
@@ -486,6 +917,16 @@ pub fn apply_whisper_storage(transcription: &mut TranscriptionSettings, storage:
             .clone()
             .unwrap_or_else(|| default_whisper_models_dir_for(storage.runtime_dir.as_deref())),
     );
+}
+
+pub fn apply_whisper_configuration(
+    transcription: &mut TranscriptionSettings,
+    settings: &ResolvedSettings,
+) {
+    apply_whisper_storage(transcription, &settings.storage);
+    if transcription.model.is_none() {
+        transcription.model = settings.transcription.model.clone();
+    }
 }
 
 fn default_output_path(media_path: &Path, fmt: TranscriptionFormat) -> PathBuf {
@@ -602,15 +1043,350 @@ mod tests {
     }
 
     #[test]
-    fn audio_extension_check() {
-        assert!(is_audio_ext(Path::new("x.wav")));
-        assert!(!is_audio_ext(Path::new("x.mp4")));
+    fn wav_extension_check() {
+        assert!(is_wav_ext(Path::new("x.wav")));
+        assert!(is_wav_ext(Path::new("x.WAV")));
+        assert!(!is_wav_ext(Path::new("x.mp3")));
+        assert!(!is_wav_ext(Path::new("x.mp4")));
+    }
+
+    #[test]
+    fn whisper_progress_parser_accepts_cli_callback_lines() {
+        assert_eq!(
+            parse_whisper_progress("whisper_print_progress_callback: progress =  42%"),
+            Some(42)
+        );
+        assert_eq!(parse_whisper_progress("progress = 100%"), Some(100));
+        assert_eq!(parse_whisper_progress("system_info: threads = 16"), None);
+    }
+
+    #[test]
+    fn whisper_thread_default_uses_half_the_parallelism_with_a_safe_cap() {
+        assert_eq!(recommended_whisper_threads(1), 1);
+        assert_eq!(recommended_whisper_threads(8), 4);
+        assert_eq!(recommended_whisper_threads(32), 16);
+        assert_eq!(recommended_whisper_threads(128), 16);
+    }
+
+    #[test]
+    fn explicit_model_wins_over_automatic_selection() {
+        let root = model_dir("explicit", &["small", "medium-q8_0"]);
+        let settings = TranscriptionSettings {
+            model: Some("medium-q8_0".to_owned()),
+            whisper_models_dir: Some(root.clone()),
+            ..TranscriptionSettings::default()
+        };
+
+        let selected = resolve_whisper_model(&settings).expect("resolve explicit model");
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(selected.name, "medium-q8_0");
+        assert!(!selected.auto_selected);
+    }
+
+    #[test]
+    fn one_installed_model_is_selected_automatically() {
+        let root = model_dir("single", &["large-v3-turbo-q8_0"]);
+        let settings = TranscriptionSettings {
+            whisper_models_dir: Some(root.clone()),
+            ..TranscriptionSettings::default()
+        };
+
+        let selected = resolve_whisper_model(&settings).expect("resolve only model");
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(selected.name, "large-v3-turbo-q8_0");
+        assert!(selected.auto_selected);
+    }
+
+    #[test]
+    fn exact_small_is_preferred_when_multiple_models_are_installed() {
+        let root = model_dir("small-default", &["medium", "small", "base"]);
+        let settings = TranscriptionSettings {
+            whisper_models_dir: Some(root.clone()),
+            ..TranscriptionSettings::default()
+        };
+
+        let selected = resolve_whisper_model(&settings).expect("resolve small default");
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(selected.name, "small");
+        assert!(selected.auto_selected);
+    }
+
+    #[test]
+    fn agent_policy_ranks_families_and_variants_deterministically() {
+        let root = model_dir(
+            "ranked",
+            &["medium", "base", "small-q5_1", "small-q8_0", "small.en"],
+        );
+        let settings = TranscriptionSettings {
+            whisper_models_dir: Some(root.clone()),
+            multiple_model_policy: MultipleModelPolicy::PreferRanked,
+            ..TranscriptionSettings::default()
+        };
+
+        let selected = resolve_whisper_model(&settings).expect("resolve ranked model");
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(selected.name, "small-q8_0");
+        assert!(selected.auto_selected);
+    }
+
+    #[test]
+    fn cli_policy_lists_installed_models_when_multiple_need_a_choice() {
+        let root = model_dir("multiple", &["medium", "base-q8_0"]);
+        let settings = TranscriptionSettings {
+            whisper_models_dir: Some(root.clone()),
+            ..TranscriptionSettings::default()
+        };
+
+        let error = resolve_whisper_model(&settings).expect_err("CLI should require a choice");
+        let _ = fs::remove_dir_all(root);
+        let message = error.to_string();
+
+        assert!(message.contains("multiple whisper.cpp models"));
+        assert!(message.contains("base-q8_0"));
+        assert!(message.contains("medium"));
+    }
+
+    #[test]
+    fn no_installed_models_explains_how_to_download_one() {
+        let root = t("no-models");
+        let settings = TranscriptionSettings {
+            whisper_models_dir: Some(root),
+            ..TranscriptionSettings::default()
+        };
+
+        let error = resolve_whisper_model(&settings).expect_err("missing models should fail");
+
+        assert!(error.to_string().contains("whisper model list"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compressed_audio_is_normalized_with_progress_and_cleaned_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<ProgressEvent>>);
+        impl subbake_core::ProgressSink for Recorder {
+            fn emit(&self, event: ProgressEvent) {
+                self.0.lock().expect("progress lock").push(event);
+            }
+        }
+
+        let root = t("prepare-audio");
+        fs::create_dir_all(&root).expect("create root");
+        let input = root.join("input.mp3");
+        fs::write(&input, b"compressed audio").expect("write input");
+        let ffprobe = root.join("ffprobe");
+        let ffmpeg = root.join("ffmpeg");
+        fs::write(
+            &ffprobe,
+            "#!/bin/sh\nprintf '{\"streams\":[{\"codec_name\":\"mp3\"}],\"format\":{\"duration\":\"10.0\"}}\\n'\n",
+        )
+        .expect("write ffprobe");
+        fs::write(
+            &ffmpeg,
+            "#!/bin/sh\ncase \" $* \" in *\" -f null - \"*) exit 0;; esac\nfor output in \"$@\"; do :; done\necho out_time_us=2500000\necho out_time_us=7500000\nprintf RIFF > \"$output\"\n",
+        )
+        .expect("write ffmpeg");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).expect("chmod ffprobe");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).expect("chmod ffmpeg");
+        let runtime_dir = root.join("runtime");
+        let settings = TranscriptionSettings {
+            runtime_dir: Some(runtime_dir.clone()),
+            ..TranscriptionSettings::default()
+        };
+        let recorder = Arc::new(Recorder::default());
+        let progress: SharedProgress = recorder.clone();
+
+        let prepared = prepare_audio_with_programs(
+            &input,
+            &settings,
+            &CancellationGuard::never(),
+            &progress,
+            &ffmpeg,
+            &ffprobe,
+        )
+        .expect("prepare audio");
+        let temporary_dir = prepared
+            .path()
+            .parent()
+            .expect("temporary parent")
+            .to_path_buf();
+        assert!(prepared.path().is_file());
+        assert!(temporary_dir.starts_with(runtime_dir.join("tmp/transcription")));
+        let events = recorder.0.lock().expect("progress lock");
+        assert!(events.iter().any(|event| {
+            event.stage == "PREPARE_AUDIO"
+                && event.unit == ProgressUnit::Duration
+                && event.current == 7_500
+                && event.total == Some(10_000)
+        }));
+        drop(events);
+        drop(prepared);
+        assert!(!temporary_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_audio_preparation_removes_its_unique_temp_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = t("prepare-audio-failure");
+        fs::create_dir_all(&root).expect("create root");
+        let input = root.join("input.flac");
+        fs::write(&input, b"compressed audio").expect("write input");
+        let ffprobe = root.join("ffprobe");
+        let ffmpeg = root.join("ffmpeg");
+        fs::write(
+            &ffprobe,
+            "#!/bin/sh\nprintf '{\"streams\":[{\"codec_name\":\"flac\"}],\"format\":{\"duration\":\"10.0\"}}\\n'\n",
+        )
+        .expect("write ffprobe");
+        fs::write(
+            &ffmpeg,
+            "#!/bin/sh\ncase \" $* \" in *\" -f null - \"*) exit 0;; esac\necho conversion-failed >&2\nexit 2\n",
+        )
+        .expect("write ffmpeg");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).expect("chmod ffprobe");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).expect("chmod ffmpeg");
+        let runtime_dir = root.join("runtime");
+        let settings = TranscriptionSettings {
+            runtime_dir: Some(runtime_dir.clone()),
+            ..TranscriptionSettings::default()
+        };
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+
+        let error = prepare_audio_with_programs(
+            &input,
+            &settings,
+            &CancellationGuard::never(),
+            &progress,
+            &ffmpeg,
+            &ffprobe,
+        )
+        .expect_err("preparation should fail");
+        let temp_root = runtime_dir.join("tmp/transcription");
+        let remaining = fs::read_dir(&temp_root).expect("read temp root").count();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(error.to_string().contains("conversion-failed"));
+        assert_eq!(remaining, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_without_an_audio_stream_fails_before_ffmpeg_or_temp_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = t("prepare-audio-no-stream");
+        fs::create_dir_all(&root).expect("create root");
+        let input = root.join("input.mp4");
+        fs::write(&input, b"video only").expect("write input");
+        let ffprobe = root.join("ffprobe");
+        let ffmpeg = root.join("ffmpeg");
+        let marker = root.join("ffmpeg-was-called");
+        fs::write(
+            &ffprobe,
+            "#!/bin/sh\nprintf '{\"streams\":[],\"format\":{\"duration\":\"10.0\"}}\\n'\n",
+        )
+        .expect("write ffprobe");
+        fs::write(
+            &ffmpeg,
+            format!("#!/bin/sh\nprintf called > '{}'\n", marker.display()),
+        )
+        .expect("write ffmpeg");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).expect("chmod ffprobe");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).expect("chmod ffmpeg");
+        let runtime_dir = root.join("runtime");
+        let settings = TranscriptionSettings {
+            runtime_dir: Some(runtime_dir.clone()),
+            ..TranscriptionSettings::default()
+        };
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+
+        let error = prepare_audio_with_programs(
+            &input,
+            &settings,
+            &CancellationGuard::never(),
+            &progress,
+            &ffmpeg,
+            &ffprobe,
+        )
+        .expect_err("media without audio must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("contains no audio stream"));
+        assert!(!marker.exists());
+        assert!(!runtime_dir.join("tmp/transcription").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_audio_decoder_reports_codec_before_temp_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = t("prepare-audio-no-decoder");
+        fs::create_dir_all(&root).expect("create root");
+        let input = root.join("input.mp4");
+        fs::write(&input, b"eac3 audio").expect("write input");
+        let ffprobe = root.join("ffprobe");
+        let ffmpeg = root.join("ffmpeg");
+        fs::write(
+            &ffprobe,
+            "#!/bin/sh\nprintf '{\"streams\":[{\"codec_name\":\"eac3\"}],\"format\":{\"duration\":\"6533.216\"}}\\n'\n",
+        )
+        .expect("write ffprobe");
+        fs::write(
+            &ffmpeg,
+            "#!/bin/sh\necho 'Decoding requested, but no decoder found for: eac3' >&2\nexit 234\n",
+        )
+        .expect("write ffmpeg");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).expect("chmod ffprobe");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).expect("chmod ffmpeg");
+        let runtime_dir = root.join("runtime");
+        let settings = TranscriptionSettings {
+            runtime_dir: Some(runtime_dir.clone()),
+            ..TranscriptionSettings::default()
+        };
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+
+        let error = prepare_audio_with_programs(
+            &input,
+            &settings,
+            &CancellationGuard::never(),
+            &progress,
+            &ffmpeg,
+            &ffprobe,
+        )
+        .expect_err("unsupported decoder must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("audio stream uses `eac3`"));
+        assert!(message.contains("cannot decode it"));
+        assert!(!runtime_dir.join("tmp/transcription").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
     #[test]
     fn whisper_cpp_fake_cli_uses_supported_arguments_and_drains_output() {
         use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<ProgressEvent>>);
+        impl subbake_core::ProgressSink for Recorder {
+            fn emit(&self, event: ProgressEvent) {
+                self.0.lock().expect("progress lock").push(event);
+            }
+        }
 
         let root = t("fake-whisper-cli");
         fs::create_dir_all(&root).expect("create root");
@@ -618,22 +1394,30 @@ mod tests {
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp version: fake-1"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt" >&2
+  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints" >&2
   exit 0
 fi
 output=""
 format=""
+threads=""
+print_progress=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -os) echo "unexpected legacy -os" >&2; exit 17 ;;
     --output-file) shift; output="$1" ;;
     --output-srt) format="srt" ;;
     --output-vtt) format="vtt" ;;
+    --threads) shift; threads="$1" ;;
+    --print-progress) print_progress=1 ;;
   esac
   shift
 done
+if [ -z "$threads" ]; then echo "missing --threads" >&2; exit 18; fi
+if [ "$print_progress" -ne 1 ]; then echo "missing --print-progress" >&2; exit 19; fi
 i=0
 while [ "$i" -lt 20000 ]; do echo "diagnostic-$i" >&2; i=$((i + 1)); done
+echo "whisper_print_progress_callback: progress =  25%" >&2
+echo "whisper_print_progress_callback: progress = 100%" >&2
 if [ "$format" = "srt" ]; then
   printf '1\n00:00:00,000 --> 00:00:01,000\nhello\n' > "${output}.srt"
 else
@@ -648,24 +1432,41 @@ fi
         fs::write(&model, b"fake model").expect("write model");
 
         let output = root.join("result.srt");
-        let outcome = transcribe_media(TranscriptionRequest {
-            media_path: audio,
-            output_path: Some(output.clone()),
-            overwrite: true,
-            settings: TranscriptionSettings {
-                language: Some("en".to_owned()),
-                model: Some("fake".to_owned()),
-                whisper_binary_path: Some(binary),
-                whisper_models_dir: Some(root.clone()),
-                ..TranscriptionSettings::default()
+        let recorder = Arc::new(Recorder::default());
+        let progress: SharedProgress = recorder.clone();
+        let outcome = transcribe_media_cancellable_with_progress(
+            TranscriptionRequest {
+                media_path: audio,
+                output_path: Some(output.clone()),
+                overwrite: true,
+                settings: TranscriptionSettings {
+                    language: Some("en".to_owned()),
+                    model: Some("fake".to_owned()),
+                    whisper_binary_path: Some(binary),
+                    whisper_models_dir: Some(root.clone()),
+                    ..TranscriptionSettings::default()
+                },
             },
-        })
+            &CancellationGuard::never(),
+            progress,
+        )
         .expect("fake CLI transcription");
         let content = fs::read_to_string(&output).expect("read rendered output");
-        let _ = fs::remove_dir_all(&root);
 
         assert_eq!(outcome.subtitle_entries, 1);
         assert!(content.contains("hello"));
+        assert!(
+            recorder
+                .0
+                .lock()
+                .expect("progress lock")
+                .iter()
+                .any(|event| event.stage == "TRANSCRIBE"
+                    && event.current == 25
+                    && event.total == Some(100)
+                    && event.unit == ProgressUnit::Percent)
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn t(l: &str) -> PathBuf {
@@ -674,5 +1475,14 @@ fi
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("subbake-transcription-{l}-{n}"))
+    }
+
+    fn model_dir(label: &str, models: &[&str]) -> PathBuf {
+        let root = t(label);
+        fs::create_dir_all(&root).expect("create model directory");
+        for model in models {
+            fs::write(root.join(format!("ggml-{model}.bin")), b"model").expect("write model");
+        }
+        root
     }
 }

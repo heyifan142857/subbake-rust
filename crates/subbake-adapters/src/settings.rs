@@ -17,7 +17,13 @@ pub struct ResolvedSettings {
     pub backend: BackendSettings,
     pub reviewer_backend: Option<BackendSettings>,
     pub translation: TranslationDomainSettings,
+    pub transcription: TranscriptionDomainSettings,
     pub storage: StorageSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptionDomainSettings {
+    pub model: Option<String>,
 }
 
 /// Compatibility alias for service request types. New configuration code
@@ -80,6 +86,7 @@ pub struct SettingsOverrides {
     pub backend: BackendOverrides,
     pub reviewer_backend: Option<BackendOverrides>,
     pub translation: TranslationOverrides,
+    pub transcription: TranscriptionOverrides,
     pub output: OutputOverrides,
     pub storage: StorageOverrides,
 }
@@ -122,6 +129,12 @@ pub struct TranslationOverrides {
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct TranscriptionOverrides {
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct OutputOverrides {
     pub format: Option<String>,
     pub bilingual: Option<bool>,
@@ -154,6 +167,7 @@ impl SettingsOverrides {
             }
         }
         self.translation.merge(other.translation);
+        self.transcription.merge(other.transcription);
         self.output.merge(other.output);
         self.storage.merge(other.storage);
     }
@@ -191,6 +205,9 @@ impl SettingsOverrides {
                 retries: Some(settings.translation.retries),
                 agent: Some(settings.translation.agent),
                 agent_repair_attempts: Some(settings.translation.agent_repair_attempts),
+            },
+            transcription: TranscriptionOverrides {
+                model: settings.transcription.model.clone(),
             },
             output: OutputOverrides {
                 format: settings.output.format.clone(),
@@ -257,6 +274,12 @@ impl TranslationOverrides {
             agent,
             agent_repair_attempts
         );
+    }
+}
+
+impl TranscriptionOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(self, other, model);
     }
 }
 
@@ -330,6 +353,7 @@ impl Default for ResolvedSettings {
                 agent: true,
                 agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
             },
+            transcription: TranscriptionDomainSettings { model: None },
             storage: StorageSettings {
                 runtime_dir: None,
                 glossary_path: None,
@@ -413,6 +437,9 @@ impl ResolvedSettings {
             agent,
             agent_repair_attempts,
         } = overrides.translation;
+        if let Some(model) = overrides.transcription.model {
+            self.transcription.model = Some(model);
+        }
         if let Some(value) = mode {
             self.apply_mode_defaults(value);
         }
@@ -515,6 +542,16 @@ impl ResolvedSettings {
                     "configuration field `{name}` must not be empty"
                 )));
             }
+        }
+        if self
+            .transcription
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(AdapterError::invalid_input(
+                "configuration field `transcription.model` must not be empty",
+            ));
         }
         for (name, value) in [
             ("translation.batch_size", self.translation.batch_size),

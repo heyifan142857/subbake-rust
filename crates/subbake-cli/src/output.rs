@@ -30,6 +30,9 @@ pub fn print_pipeline_outcome(
 }
 
 pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
+    if outcome.model_auto_selected {
+        println!("Model: {} (automatically selected)", outcome.model);
+    }
     println!("Output: {}", outcome.output_path.display());
 }
 

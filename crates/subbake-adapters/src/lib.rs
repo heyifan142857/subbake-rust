@@ -49,14 +49,14 @@ pub use runtime::{
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{
     BackendOverrides, BackendSettings, OutputOverrides, OutputSettings, ResolvedSettings,
-    SettingsOverrides, StorageOverrides, StorageSettings, TranslationDomainSettings,
-    TranslationOverrides, TranslationSettings,
+    SettingsOverrides, StorageOverrides, StorageSettings, TranscriptionDomainSettings,
+    TranscriptionOverrides, TranslationDomainSettings, TranslationOverrides, TranslationSettings,
 };
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{
-    TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest, TranscriptionSettings,
-    apply_whisper_storage, transcribe_media, transcribe_media_cancellable,
-    transcribe_media_cancellable_with_progress,
+    MultipleModelPolicy, TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest,
+    TranscriptionSettings, apply_whisper_configuration, apply_whisper_storage, transcribe_media,
+    transcribe_media_cancellable, transcribe_media_cancellable_with_progress,
 };
 pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,

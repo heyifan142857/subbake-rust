@@ -43,6 +43,10 @@ pub struct TranslationToolOutcome {
     pub translation_memory_hits: usize,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptionToolOutcome {
     pub status: ToolExecutionStatus,
@@ -51,6 +55,8 @@ pub struct TranscriptionToolOutcome {
     pub language: String,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub model_auto_selected: bool,
     pub output_format: String,
     pub subtitle_entries: usize,
 }

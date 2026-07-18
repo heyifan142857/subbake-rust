@@ -86,7 +86,7 @@ impl ToolRunner {
             &engine.guard,
             &engine.operation_guard,
             engine.progress.clone(),
-            adapter_settings.as_ref().map(|settings| &settings.storage),
+            adapter_settings.as_ref(),
         )? {
             if let Some(operation) = outcome.file_operation {
                 Self::record_file_operation(engine, &operation, None)?;

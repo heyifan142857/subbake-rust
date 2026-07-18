@@ -1,4 +1,4 @@
-use subbake_core::{ProgressEvent, TaskState};
+use subbake_core::{ProgressEvent, ProgressUnit, TaskState};
 
 pub(super) fn format_progress(event: &ProgressEvent, elapsed: std::time::Duration) -> String {
     let state = match event.state {
@@ -6,22 +6,40 @@ pub(super) fn format_progress(event: &ProgressEvent, elapsed: std::time::Duratio
         TaskState::Resuming => "Resuming",
         _ => event.stage.as_str(),
     };
-    let counts = event
-        .total
-        .map(|total| {
-            let width = 10u64;
-            let filled = (event.current.min(total) * width)
-                .checked_div(total)
-                .unwrap_or(width);
+    let counts = match (event.unit, event.total) {
+        (ProgressUnit::Duration, Some(total)) if total > 0 => {
+            let current = event.current.min(total);
             format!(
-                "[{}{}] {}/{}",
-                "█".repeat(filled as usize),
-                "─".repeat((width - filled) as usize),
-                event.current,
-                total
+                "{} {:>5.1}% · {}/{}",
+                progress_bar(current, total),
+                current as f64 / total as f64 * 100.0,
+                format_duration(current),
+                format_duration(total)
             )
-        })
-        .unwrap_or_else(|| format!("{} {}", spinner_frame(elapsed), event.current));
+        }
+        (ProgressUnit::Percent, Some(total)) if total > 0 => {
+            let current = event.current.min(total);
+            format!(
+                "{} {:>5.1}%",
+                progress_bar(current, total),
+                current as f64 / total as f64 * 100.0
+            )
+        }
+        (_, Some(total)) if total > 0 => format!(
+            "{} {}/{}",
+            progress_bar(event.current.min(total), total),
+            event.current,
+            total
+        ),
+        (ProgressUnit::Duration, _) => {
+            format!(
+                "{} {}",
+                spinner_frame(elapsed),
+                format_duration(event.current)
+            )
+        }
+        _ => format!("{} {}", spinner_frame(elapsed), event.current),
+    };
     let resumed = if event.resumed > 0 {
         format!(" · resumed {}", event.resumed)
     } else {
@@ -58,6 +76,28 @@ pub(super) fn format_progress(event: &ProgressEvent, elapsed: std::time::Duratio
         event.usage.input_tokens,
         event.usage.output_tokens
     )
+}
+
+fn progress_bar(current: u64, total: u64) -> String {
+    let width = 10_u64;
+    let filled = current.saturating_mul(width) / total;
+    format!(
+        "[{}{}]",
+        "█".repeat(filled as usize),
+        "─".repeat((width - filled) as usize)
+    )
+}
+
+fn format_duration(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 pub(super) fn spinner_frame(elapsed: std::time::Duration) -> char {

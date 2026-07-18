@@ -949,4 +949,32 @@ mod tests {
         assert!(line.contains("20/10 tok"));
         assert!(line.contains("resumed 1"));
     }
+
+    #[test]
+    fn duration_progress_line_reports_percentage_and_media_time() {
+        let event = subbake_core::ProgressEvent::running(
+            subbake_core::TaskKind::Transcription,
+            "PREPARE_AUDIO",
+            90_000,
+            Some(180_000),
+            subbake_core::ProgressUnit::Duration,
+        );
+        let line = super::format_progress(&event, std::time::Duration::from_secs(3));
+        assert!(line.contains("50.0%"));
+        assert!(line.contains("1:30/3:00"));
+    }
+
+    #[test]
+    fn percent_progress_line_reports_a_percentage() {
+        let event = subbake_core::ProgressEvent::running(
+            subbake_core::TaskKind::Transcription,
+            "TRANSCRIBE",
+            25,
+            Some(100),
+            subbake_core::ProgressUnit::Percent,
+        );
+        let line = super::format_progress(&event, std::time::Duration::from_secs(3));
+        assert!(line.contains("25.0%"));
+        assert!(line.contains("[██────────]"));
+    }
 }
