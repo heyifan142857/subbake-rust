@@ -5,10 +5,11 @@ use subbake_adapters::{
     BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, SettingsOverrides,
     SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest, TranscriptionSettings,
     TranslationRequest, TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome,
-    WhisperRequest, batch_translation_output_path, default_output_path_with_language,
+    WhisperRequest, batch_translation_output_path, default_translation_output_path,
     default_whisper_binary_path_for, default_whisper_models_dir_for, diagnose_failure_path,
-    edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_path,
-    load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
+    edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_container_path,
+    is_supported_subtitle_path, load_diagnostic_reports, transcribe_media_cancellable,
+    translate_input_cancellable,
 };
 use subbake_core::diagnostics::diagnose_text;
 use subbake_core::formats::{normalize_format, supported_format_from_path};
@@ -21,7 +22,7 @@ use subbake_core::{
 
 use crate::discovery::rank_subtitle_candidates;
 use crate::error::{AgentError, AgentResult};
-use crate::guard::{FileGuard, FileOpResult};
+use crate::guard::{FileGuard, FileOpAction, FileOpResult, SemanticUndo};
 use crate::session::AgentEvent;
 use crate::session::EventTag;
 use crate::tools::ToolExecutor;
@@ -416,6 +417,15 @@ pub(crate) fn execute_translation_tool(
     if let Some(bilingual) = args.get("bilingual").and_then(JsonValue::as_bool) {
         settings.output.bilingual = bilingual;
     }
+    if let Some(preserve_names) = args.get("preserve_names").and_then(JsonValue::as_bool) {
+        settings.translation.preserve_names = preserve_names;
+    }
+    if let Some(preserve_source) = args
+        .get("preserve_source_container")
+        .and_then(JsonValue::as_bool)
+    {
+        settings.output.preserve_source_container = preserve_source;
+    }
     if let Some(order) = optional_argument(args, "bilingual_order") {
         settings.output.bilingual_order =
             BilingualOrder::parse(order).map_err(|error| AgentError::InvalidInput {
@@ -440,15 +450,22 @@ pub(crate) fn execute_translation_tool(
             let output_path = if let Some(path) = optional_argument(args, "output_path") {
                 guard.resolve_path(Path::new(path))?
             } else {
-                default_output_path_with_language(
+                default_translation_output_path(
                     &input,
                     settings.output_format(),
                     settings.output.bilingual,
                     language_tag.as_deref(),
+                    settings.output.preserve_source_container,
                 )?
             };
             let overwrite = optional_bool(args, "overwrite", false);
-            if output_path.exists() && !overwrite && !settings.translation.dry_run {
+            let in_place_container =
+                is_supported_subtitle_container_path(&input) && output_path == input;
+            if output_path.exists()
+                && !in_place_container
+                && !overwrite
+                && !settings.translation.dry_run
+            {
                 return Err(AgentError::InvalidInput {
                     message: format!(
                         "output already exists and overwrite is false: {}",
@@ -456,7 +473,7 @@ pub(crate) fn execute_translation_tool(
                     ),
                 });
             }
-            let undo_snapshot = (!settings.translation.dry_run)
+            let undo_snapshot = (!settings.translation.dry_run && !in_place_container)
                 .then(|| guard.snapshot_write(&output_path))
                 .transpose()?;
             let output_format = resolved_translation_format(&input, &settings)?;
@@ -468,15 +485,39 @@ pub(crate) fn execute_translation_tool(
                 settings: settings.clone(),
             };
             let translated = if let Some(progress) = progress {
-                subbake_adapters::translate_subtitle_cancellable_with_progress(
+                subbake_adapters::translate_input_cancellable_with_progress(
                     request,
                     cancellation,
                     progress,
                 )?
             } else {
-                translate_subtitle_cancellable(request, cancellation)?
+                translate_input_cancellable(request, cancellation)?
             };
-            let file_operations = undo_snapshot.into_iter().collect();
+            let file_operations = if let Some(change) = &translated.container_change
+                && change.in_place
+                && !translated.result.dry_run
+            {
+                let semantic_undo = if let Some(previous) = &change.previous_subtitle {
+                    SemanticUndo::RestoreEmbeddedSubtitle {
+                        title: change.subtitle_title.clone(),
+                        subtitle_backup_path: guard
+                            .store_embedded_subtitle_undo(&input, previous)?,
+                    }
+                } else {
+                    SemanticUndo::RemoveEmbeddedSubtitle {
+                        title: change.subtitle_title.clone(),
+                    }
+                };
+                vec![FileOpResult {
+                    action: FileOpAction::Modified,
+                    path: input.clone(),
+                    backup_path: None,
+                    new_path: None,
+                    semantic_undo: Some(semantic_undo),
+                }]
+            } else {
+                undo_snapshot.into_iter().collect()
+            };
             TranslationExecutionOutcome {
                 outcome: AgentToolOutcome::Translation(TranslationToolOutcome {
                     status: if translated.result.dry_run {
@@ -855,6 +896,15 @@ fn resolved_translation_format(
     input: &Path,
     settings: &TranslationSettings,
 ) -> AgentResult<String> {
+    if is_supported_subtitle_container_path(input) {
+        return input
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AgentError::InvalidInput {
+                message: format!("container has no usable extension: {}", input.display()),
+            });
+    }
     match settings.output_format() {
         Some(format) => normalize_format(format).map_err(|error| AgentError::InvalidInput {
             message: error.to_string(),

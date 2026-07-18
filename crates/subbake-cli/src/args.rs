@@ -695,6 +695,10 @@ fn parse_translation_setting_option(
         }
         "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
         "--bilingual" => overrides.output.bilingual = Some(true),
+        "--preserve-names" => overrides.translation.preserve_names = Some(true),
+        "--transliterate-names" => overrides.translation.preserve_names = Some(false),
+        "--preserve-source-container" => overrides.output.preserve_source_container = Some(true),
+        "--in-place-container" => overrides.output.preserve_source_container = Some(false),
         "--mode" => {
             overrides.translation.mode = Some(
                 subbake_core::TranslationMode::parse(&required_value(args, index, option)?)
@@ -887,6 +891,23 @@ mod tests {
 
         assert!(parsed.recursive);
         assert!(parsed.translate.settings.output.bilingual);
+    }
+
+    #[test]
+    fn parse_translate_overrides_name_and_container_policies() {
+        let config = empty_config("translation-retention-policies");
+        let args = vec![
+            "movie.mkv".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--preserve-names".to_owned(),
+            "--preserve-source-container".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("retention policy options");
+        let _ = std::fs::remove_file(config);
+
+        assert!(parsed.settings.translation.preserve_names);
+        assert!(parsed.settings.output.preserve_source_container);
     }
 
     #[test]

@@ -508,7 +508,7 @@ impl AgentEngine {
             .as_deref()
             .unwrap_or("auto-select-installed");
         Ok(format!(
-            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_cpp, model={}, language=Auto, format=srt",
+            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, preserve_names={}, preserve_source_container={}, dry_run={}\ntranscription: provider=whisper_cpp, model={}, language=Auto, format=srt",
             source_language,
             target_language,
             settings.backend.id,
@@ -516,6 +516,8 @@ impl AgentEngine {
             output_format,
             settings.output.bilingual,
             settings.output.bilingual_order.as_str(),
+            settings.translation.preserve_names,
+            settings.output.preserve_source_container,
             settings.translation.dry_run,
             transcription_model,
         ))

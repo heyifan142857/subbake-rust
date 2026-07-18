@@ -35,6 +35,7 @@ pub struct OutputSettings {
     pub format: Option<String>,
     pub bilingual: bool,
     pub bilingual_order: BilingualOrder,
+    pub preserve_source_container: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +62,7 @@ pub struct TranslationDomainSettings {
     pub mode: TranslationMode,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
+    pub preserve_names: bool,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -119,6 +121,7 @@ pub struct TranslationOverrides {
     pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
+    pub preserve_names: Option<bool>,
     pub dry_run: Option<bool>,
     pub resume: Option<bool>,
     pub use_cache: Option<bool>,
@@ -139,6 +142,7 @@ pub struct OutputOverrides {
     pub format: Option<String>,
     pub bilingual: Option<bool>,
     pub bilingual_order: Option<BilingualOrder>,
+    pub preserve_source_container: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -199,6 +203,7 @@ impl SettingsOverrides {
                 fast_mode: None,
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
+                preserve_names: Some(settings.translation.preserve_names),
                 dry_run: Some(settings.translation.dry_run),
                 resume: Some(settings.translation.resume),
                 use_cache: Some(settings.translation.use_cache),
@@ -213,6 +218,7 @@ impl SettingsOverrides {
                 format: settings.output.format.clone(),
                 bilingual: Some(settings.output.bilingual),
                 bilingual_order: Some(settings.output.bilingual_order),
+                preserve_source_container: Some(settings.output.preserve_source_container),
             },
             storage: StorageOverrides {
                 runtime_dir: settings.storage.runtime_dir.clone(),
@@ -267,6 +273,7 @@ impl TranslationOverrides {
             fast_mode,
             review_policy,
             terminology_preflight,
+            preserve_names,
             dry_run,
             resume,
             use_cache,
@@ -299,7 +306,14 @@ fn backend_overrides(settings: &BackendSettings) -> BackendOverrides {
 
 impl OutputOverrides {
     fn merge(&mut self, other: Self) {
-        merge_optional_fields!(self, other, format, bilingual, bilingual_order);
+        merge_optional_fields!(
+            self,
+            other,
+            format,
+            bilingual,
+            bilingual_order,
+            preserve_source_container
+        );
     }
 }
 
@@ -323,6 +337,7 @@ impl Default for ResolvedSettings {
                 format: None,
                 bilingual: false,
                 bilingual_order: BilingualOrder::default(),
+                preserve_source_container: false,
             },
             backend: BackendSettings {
                 id: DEFAULT_PROVIDER.to_owned(),
@@ -346,6 +361,7 @@ impl Default for ResolvedSettings {
                 mode: TranslationMode::Turbo,
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: true,
+                preserve_names: false,
                 dry_run: false,
                 resume: true,
                 use_cache: true,
@@ -430,6 +446,7 @@ impl ResolvedSettings {
             fast_mode,
             review_policy,
             terminology_preflight,
+            preserve_names,
             dry_run,
             resume,
             use_cache,
@@ -470,6 +487,9 @@ impl ResolvedSettings {
         if let Some(value) = terminology_preflight {
             self.translation.terminology_preflight = value;
         }
+        if let Some(value) = preserve_names {
+            self.translation.preserve_names = value;
+        }
         if let Some(value) = dry_run {
             self.translation.dry_run = value;
         }
@@ -493,6 +513,7 @@ impl ResolvedSettings {
             format,
             bilingual,
             bilingual_order,
+            preserve_source_container,
         } = overrides.output;
         if let Some(value) = format {
             self.output.format = Some(value);
@@ -502,6 +523,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = bilingual_order {
             self.output.bilingual_order = value;
+        }
+        if let Some(value) = preserve_source_container {
+            self.output.preserve_source_container = value;
         }
 
         let StorageOverrides {
@@ -623,6 +647,7 @@ impl ResolvedSettings {
         options.mode = self.translation.mode;
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
+        options.preserve_names = self.translation.preserve_names;
         options.dry_run = self.translation.dry_run;
         options.resume = self.translation.resume;
         options.use_cache = self.translation.use_cache;

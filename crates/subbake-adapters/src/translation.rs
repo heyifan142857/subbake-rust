@@ -8,9 +8,13 @@ use subbake_core::languages::normalize_language;
 use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
-use subbake_core::storage::{build_runtime_paths, input_signature_from_bytes};
+use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
 use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, SharedProgress};
 
+use crate::embedded_subtitles::{
+    default_embedded_translation_output_path, is_supported_subtitle_container_path,
+    translate_embedded_subtitle_cancellable_with_progress,
+};
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
@@ -34,6 +38,24 @@ pub struct TranslationOutcome {
     pub result: PipelineResult,
     pub output_path: Option<PathBuf>,
     pub subtitle_entries: usize,
+    pub container_change: Option<ContainerTranslationChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerTranslationChange {
+    pub in_place: bool,
+    pub subtitle_title: String,
+    /// Previous SubBake-managed subtitle contents when this translation
+    /// replaced a track for the same target language. Interactive undo can
+    /// persist this small payload instead of copying the media container.
+    pub previous_subtitle: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranslationInputIdentity {
+    pub path: PathBuf,
+    pub signature: InputSignature,
+    pub output_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +86,62 @@ pub fn translate_subtitle(request: TranslationRequest) -> AdapterResult<Translat
     translate_subtitle_cancellable(request, &CancellationGuard::never())
 }
 
+/// Translate a standalone subtitle or a text subtitle stream embedded in a
+/// supported container. Container inputs never fall back to transcription.
+pub fn translate_input(request: TranslationRequest) -> AdapterResult<TranslationOutcome> {
+    translate_input_cancellable_with_progress(
+        request,
+        &CancellationGuard::never(),
+        std::sync::Arc::new(NoopProgress),
+    )
+}
+
+pub fn translate_input_cancellable(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<TranslationOutcome> {
+    translate_input_cancellable_with_progress(
+        request,
+        cancellation,
+        std::sync::Arc::new(NoopProgress),
+    )
+}
+
+pub fn translate_input_cancellable_with_progress(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<TranslationOutcome> {
+    if is_supported_subtitle_path(&request.input_path) {
+        translate_subtitle_cancellable_with_progress(request, cancellation, progress)
+    } else if is_supported_subtitle_container_path(&request.input_path) {
+        translate_embedded_subtitle_cancellable_with_progress(request, cancellation, progress)
+    } else {
+        Err(AdapterError::invalid_input(
+            "`translate` accepts subtitle files or MKV, MP4/M4V/MOV, and WebM containers with text subtitle streams; use `pipeline` when transcription is required",
+        ))
+    }
+}
+
+pub fn default_translation_output_path(
+    input_path: &Path,
+    output_format: Option<&str>,
+    bilingual: bool,
+    language_tag: Option<&str>,
+    preserve_source_container: bool,
+) -> AdapterResult<PathBuf> {
+    if is_supported_subtitle_container_path(input_path) {
+        default_embedded_translation_output_path(
+            input_path,
+            bilingual,
+            language_tag,
+            preserve_source_container,
+        )
+    } else {
+        default_output_path_with_language(input_path, output_format, bilingual, language_tag)
+    }
+}
+
 pub fn translate_subtitle_cancellable(
     request: TranslationRequest,
     cancellation: &CancellationGuard,
@@ -76,9 +154,18 @@ pub fn translate_subtitle_cancellable(
 }
 
 pub fn translate_subtitle_cancellable_with_progress(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<TranslationOutcome> {
+    translate_subtitle_cancellable_with_progress_and_identity(request, cancellation, progress, None)
+}
+
+pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    identity: Option<TranslationInputIdentity>,
 ) -> AdapterResult<TranslationOutcome> {
     check_cancelled(cancellation)?;
     normalize_translation_languages(&mut request.settings)?;
@@ -101,7 +188,10 @@ pub fn translate_subtitle_cancellable_with_progress(
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
-    let input_signature = input_signature_from_bytes(&input_bytes, mtime_ns);
+    let input_signature = identity
+        .as_ref()
+        .map(|identity| identity.signature.clone())
+        .unwrap_or_else(|| input_signature_from_bytes(&input_bytes, mtime_ns));
     let document = read_document(&request.input_path)?;
     let output_path = match request.output_path.clone() {
         Some(path) => path,
@@ -119,9 +209,17 @@ pub fn translate_subtitle_cancellable_with_progress(
         )));
     }
 
+    let runtime_input_path = identity
+        .as_ref()
+        .map(|identity| identity.path.as_path())
+        .unwrap_or(&request.input_path);
+    let runtime_output_path = identity
+        .as_ref()
+        .map(|identity| identity.output_path.clone())
+        .unwrap_or_else(|| output_path.clone());
     let options = request
         .settings
-        .to_pipeline_options(request.input_path.clone(), Some(output_path.clone()));
+        .to_pipeline_options(runtime_input_path.to_path_buf(), Some(runtime_output_path));
     let backend = build_backend(&request.settings.backend_config())?;
     let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
         || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off
@@ -133,9 +231,9 @@ pub fn translate_subtitle_cancellable_with_progress(
         .transpose()?;
 
     // Wire runtime store for glossary/TM persistence.
-    let stable_input_path = stable_runtime_input_path(&request.input_path)?;
+    let stable_input_path = stable_runtime_input_path(runtime_input_path)?;
     let paths = build_runtime_paths(
-        &request.input_path,
+        runtime_input_path,
         &stable_input_path,
         request.settings.runtime_dir(),
         request.settings.glossary_path(),
@@ -190,6 +288,7 @@ pub fn translate_subtitle_cancellable_with_progress(
             result: run.result,
             output_path: None,
             subtitle_entries: document.segments.len(),
+            container_change: None,
         });
     }
 
@@ -223,6 +322,7 @@ pub fn translate_subtitle_cancellable_with_progress(
         result,
         output_path: Some(output_path),
         subtitle_entries: document.segments.len(),
+        container_change: None,
     })
 }
 
@@ -349,7 +449,9 @@ pub fn batch_translation_output_path(
     )
 }
 
-fn normalize_translation_languages(settings: &mut TranslationSettings) -> AdapterResult<()> {
+pub(crate) fn normalize_translation_languages(
+    settings: &mut TranslationSettings,
+) -> AdapterResult<()> {
     settings.translation.source_language =
         normalize_language(&settings.translation.source_language, true)
             .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
@@ -496,6 +598,20 @@ mod tests {
 
         assert!(outcome.result.dry_run);
         assert!(!output_exists);
+    }
+
+    #[test]
+    fn unified_translation_does_not_treat_arbitrary_media_as_subtitles() {
+        let error = translate_input(TranslationRequest {
+            input_path: PathBuf::from("movie.avi"),
+            output_path: None,
+            output_language_tag: None,
+            overwrite: true,
+            settings: TranslationSettings::default(),
+        })
+        .expect_err("unsupported media translation must require the explicit pipeline");
+
+        assert!(error.to_string().contains("when transcription is required"));
     }
 
     #[test]

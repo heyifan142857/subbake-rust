@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::AgentResult;
-use crate::guard::FileGuard;
+use crate::guard::{FileGuard, SemanticUndo};
 use crate::session::{AgentSession, AgentSessionStore, EventTag};
 
 pub(crate) struct UndoService;
@@ -81,6 +81,36 @@ fn restore_event(project_root: &Path, event: &crate::session::AgentEvent) -> Age
         .get("backup_path")
         .and_then(|value| value.as_str());
     let target_path = project_root.join(path);
+
+    if let Some(semantic) = event.data.get("semantic_undo")
+        && !semantic.is_null()
+    {
+        let semantic: SemanticUndo = serde_json::from_value(semantic.clone()).map_err(|error| {
+            std::io::Error::other(format!("invalid semantic undo data: {error}"))
+        })?;
+        match semantic {
+            SemanticUndo::RemoveEmbeddedSubtitle { title } => {
+                subbake_adapters::remove_embedded_subtitle_by_title(
+                    &target_path,
+                    &title,
+                    &subbake_core::CancellationGuard::never(),
+                )?;
+                return Ok(());
+            }
+            SemanticUndo::RestoreEmbeddedSubtitle {
+                title,
+                subtitle_backup_path,
+            } => {
+                subbake_adapters::restore_embedded_subtitle_from_srt(
+                    &target_path,
+                    &title,
+                    &subtitle_backup_path,
+                    &subbake_core::CancellationGuard::never(),
+                )?;
+                return Ok(());
+            }
+        }
+    }
 
     match action {
         "created" => {

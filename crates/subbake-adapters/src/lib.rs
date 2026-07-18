@@ -1,6 +1,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod editing;
+pub mod embedded_subtitles;
 pub mod error;
 pub mod fs;
 pub mod llm_backends;
@@ -23,6 +24,12 @@ pub use config::{
 pub use diagnostics::{diagnose_failure_path, format_diagnostic_report, load_diagnostic_reports};
 pub use editing::{
     SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle, edit_subtitle_cancellable,
+};
+pub use embedded_subtitles::{
+    default_embedded_translation_output_path, is_supported_subtitle_container_path,
+    remove_embedded_subtitle_by_title, restore_embedded_subtitle_from_srt,
+    translate_embedded_subtitle, translate_embedded_subtitle_cancellable,
+    translate_embedded_subtitle_cancellable_with_progress,
 };
 pub use error::{AdapterError, AdapterResult, ConfigError};
 pub use fs::{
@@ -59,8 +66,10 @@ pub use transcription::{
     transcribe_media_cancellable, transcribe_media_cancellable_with_progress,
 };
 pub use translation::{
-    BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
-    batch_translation_output_path, translate_subtitle, translate_subtitle_batch,
+    BatchTranslationOutcome, BatchTranslationRequest, ContainerTranslationChange,
+    TranslationOutcome, TranslationRequest, batch_translation_output_path,
+    default_translation_output_path, translate_input, translate_input_cancellable,
+    translate_input_cancellable_with_progress, translate_subtitle, translate_subtitle_batch,
     translate_subtitle_batch_cancellable, translate_subtitle_batch_with_progress,
     translate_subtitle_cancellable, translate_subtitle_cancellable_with_progress,
 };

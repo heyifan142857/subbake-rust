@@ -384,6 +384,9 @@ pub struct PipelineOptions {
     pub retries: usize,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
+    /// Keep personal names in their source spelling instead of translating or
+    /// transliterating them into the target language.
+    pub preserve_names: bool,
     pub timeout_seconds: f64,
     /// Non-secret identity of the configured API route, used to isolate v2
     /// cache entries across protocols and relay endpoints.
@@ -418,6 +421,7 @@ impl PipelineOptions {
             retries: DEFAULT_RETRIES,
             review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
+            preserve_names: false,
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,
             reviewer_fingerprint: None,

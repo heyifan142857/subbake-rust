@@ -191,7 +191,12 @@ const fn arg(
 use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
 
 const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
-    arg("path", StringArg, true, "subtitle file path"),
+    arg(
+        "path",
+        StringArg,
+        true,
+        "subtitle file or MKV, MP4/M4V/MOV, or WebM container with embedded text subtitles",
+    ),
     arg(
         "source_language",
         StringArg,
@@ -215,6 +220,18 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         StringArg,
         false,
         "source_first or target_first for this call",
+    ),
+    arg(
+        "preserve_names",
+        BooleanArg,
+        false,
+        "keep personal names in source spelling; false transliterates them",
+    ),
+    arg(
+        "preserve_source_container",
+        BooleanArg,
+        false,
+        "write a separate translated media container instead of replacing the source",
     ),
     arg(
         "output_format",
@@ -267,6 +284,12 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
         StringArg,
         false,
         "source_first or target_first for this call",
+    ),
+    arg(
+        "preserve_names",
+        BooleanArg,
+        false,
+        "keep personal names in source spelling; false transliterates them",
     ),
     arg(
         "output_format",
@@ -412,7 +435,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         false,
         false,
         true,
-        "Translate one subtitle file.",
+        "Translate one subtitle file, or translate and append a matching text subtitle stream in an MKV, MP4/M4V/MOV, or WebM container without transcribing it.",
         TRANSLATE_FILE_ARGS,
         TranslateFile
     ),

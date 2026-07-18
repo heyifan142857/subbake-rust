@@ -181,6 +181,7 @@ impl ToolRunner {
                 .backup_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
+            semantic_undo: result.semantic_undo.clone(),
             group_id,
             undone: false,
         }))

@@ -94,7 +94,7 @@ Usage: sbake [OPTIONS] [COMMAND]
 Commands:
   agent       Start the interactive agent (also the default with no command)
   resume      Resume the latest or a specified agent session
-  translate   Translate a subtitle or text file
+  translate   Translate a subtitle file or an embedded container subtitle
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
   transcribe  Transcribe audio or video into subtitles
@@ -130,9 +130,9 @@ Usage: sbake resume [SESSION_ID]
 
 Omit SESSION_ID to resume the latest session.
 "#;
-const TRANSLATE_HELP: &str = r#"Translate a subtitle or text file
+const TRANSLATE_HELP: &str = r#"Translate a subtitle file or an embedded container subtitle
 
-Usage: sbake translate <SUBTITLE> [OPTIONS]
+Usage: sbake translate <SUBTITLE_OR_MEDIA> [OPTIONS]
 
 Options:
   -o, --output <PATH>              Output file path
@@ -144,6 +144,10 @@ Options:
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format
       --bilingual                  Include source and translated text
+      --preserve-names             Keep personal names in source spelling
+      --transliterate-names        Transliterate personal names (default)
+      --preserve-source-container  Write a separate translated media file
+      --in-place-container         Atomically replace the source media (default)
       --mode <MODE>               Translation mode: economy, turbo, or cinema
       --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
@@ -153,7 +157,10 @@ Options:
   -h, --help                       Print help
 
 Additional provider, batching, concurrency, cache, retry, glossary, and runtime
-options are accepted. Media input is not transcribed; use `sbake pipeline`.
+options are accepted. MKV, MP4/M4V/MOV, and WebM inputs select a matching text
+subtitle stream and add the translation while copying existing streams. By
+default the source container is atomically replaced after verification. Media
+input is never transcribed; use `sbake pipeline` when transcription is needed.
 "#;
 const BATCH_HELP: &str = r#"Translate subtitle files in a directory
 

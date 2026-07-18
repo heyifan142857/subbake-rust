@@ -13,6 +13,8 @@ pub struct FileOpEventData {
     pub path: String,
     pub new_path: Option<String>,
     pub backup_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_undo: Option<crate::guard::SemanticUndo>,
     pub group_id: Option<String>,
     #[serde(default)]
     pub undone: bool,

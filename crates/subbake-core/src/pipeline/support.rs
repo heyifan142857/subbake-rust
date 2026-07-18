@@ -110,7 +110,12 @@ Return exactly one line for every input line, in the same order. Copy each id ex
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context."
+only when they fit the meaning in the current context.\n{}",
+        if options.preserve_names {
+            "Preserve personal names exactly in their source spelling unless CONTEXT_JSON.glossary explicitly requires another form."
+        } else {
+            "Translate or transliterate every clearly identified personal name into the target language's conventional script and keep it consistent. Do not leave a personal name unchanged merely because it is absent from the glossary."
+        }
     );
     vec![
         if options.mode == crate::entities::TranslationMode::Cinema {
@@ -352,5 +357,29 @@ pub(super) fn update_translation_memory(
         if !key.is_empty() && !translated.text.trim().is_empty() {
             memory.insert(key, translated.text.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_prompt_makes_the_name_policy_explicit() {
+        let mut options = PipelineOptions::new("episode.srt".into());
+        let memory = ContextMemory::default();
+
+        let transliterated =
+            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+        assert!(
+            transliterated[0]
+                .content
+                .contains("Do not leave a personal name unchanged")
+        );
+
+        options.preserve_names = true;
+        let preserved =
+            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+        assert!(preserved[0].content.contains("source spelling"));
     }
 }

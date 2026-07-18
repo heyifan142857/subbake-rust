@@ -297,6 +297,10 @@ pub fn build_translation_fingerprint(
             JsonValue::Bool(options.terminology_preflight),
         ),
         (
+            "preserve_names".to_owned(),
+            JsonValue::Bool(options.preserve_names),
+        ),
+        (
             "mode".to_owned(),
             JsonValue::String(options.mode.as_str().to_owned()),
         ),
@@ -565,7 +569,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "fd13aa8eec6d21dd1714f2904ae4e70b6caa8706"
+            "b032ff2f89e92ad63e51453727c7da71b067ad08"
         );
     }
 

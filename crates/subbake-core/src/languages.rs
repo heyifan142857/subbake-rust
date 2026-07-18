@@ -43,10 +43,10 @@ pub fn normalize_language_name(value: &str, allow_auto: bool) -> String {
 
     let tag = match key.as_str() {
         // Bare Chinese is kept deterministic for translation and cache keys.
-        "zh" | "zho" | "chi" | "cn" | "中文" | "汉语" | "漢語" | "简体" | "简体中文" | "簡體"
-        | "簡體中文" => "zh-Hans",
+        "zh" | "zho" | "chi" | "cn" | "chinese" | "simplified chinese" | "中文" | "汉语"
+        | "漢語" | "简体" | "简体中文" | "簡體" | "簡體中文" => "zh-Hans",
         "zh-hans" | "zh-cn" | "zh-sg" => "zh-Hans",
-        "繁体" | "繁体中文" | "繁體" | "繁體中文" => "zh-Hant",
+        "traditional chinese" | "繁体" | "繁体中文" | "繁體" | "繁體中文" => "zh-Hant",
         "zh-hant" | "zh-tw" | "zh-hk" | "zh-mo" => "zh-Hant",
         "en" | "eng" | "english" | "英语" | "英語" => "en",
         "ja" | "jp" | "jpn" | "japanese" | "日本語" | "日语" | "日語" => "ja",
@@ -177,6 +177,11 @@ mod tests {
     #[test]
     fn normalizes_common_languages_to_bcp_47() {
         assert_eq!(normalize_language_name("zh", false), "zh-Hans");
+        assert_eq!(normalize_language_name("Chinese", false), "zh-Hans");
+        assert_eq!(
+            normalize_language_name("Traditional Chinese", false),
+            "zh-Hant"
+        );
         assert_eq!(normalize_language_name("繁體中文", false), "zh-Hant");
         assert_eq!(normalize_language_name("zh_TW", false), "zh-Hant");
         assert_eq!(normalize_language_name("jp", false), "ja");

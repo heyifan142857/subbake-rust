@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub type FileGuardResult<T> = Result<T, FileGuardError>;
@@ -60,6 +61,19 @@ pub struct FileOpResult {
     pub path: PathBuf,
     pub backup_path: Option<PathBuf>,
     pub new_path: Option<PathBuf>,
+    pub semantic_undo: Option<SemanticUndo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticUndo {
+    RemoveEmbeddedSubtitle {
+        title: String,
+    },
+    RestoreEmbeddedSubtitle {
+        title: String,
+        subtitle_backup_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +130,7 @@ impl FileGuard {
             path: safe,
             backup_path: None,
             new_path: None,
+            semantic_undo: None,
         })
     }
 
@@ -134,6 +149,7 @@ impl FileGuard {
             path: safe,
             backup_path: Some(backup),
             new_path: None,
+            semantic_undo: None,
         })
     }
 
@@ -153,6 +169,7 @@ impl FileGuard {
             path: safe,
             backup_path: Some(backup),
             new_path: None,
+            semantic_undo: None,
         })
     }
 
@@ -166,6 +183,7 @@ impl FileGuard {
             path: safe,
             backup_path: Some(backup),
             new_path: None,
+            semantic_undo: None,
         })
     }
 
@@ -186,6 +204,7 @@ impl FileGuard {
             path: safe_from,
             backup_path: Some(backup),
             new_path: Some(safe_to),
+            semantic_undo: None,
         })
     }
 
@@ -202,6 +221,7 @@ impl FileGuard {
             path: safe,
             backup_path: Some(backup),
             new_path: None,
+            semantic_undo: None,
         })
     }
 
@@ -215,6 +235,7 @@ impl FileGuard {
                 path: safe.clone(),
                 backup_path: Some(self.backup(&safe)?),
                 new_path: None,
+                semantic_undo: None,
             })
         } else {
             Ok(FileOpResult {
@@ -222,8 +243,35 @@ impl FileGuard {
                 path: safe,
                 backup_path: None,
                 new_path: None,
+                semantic_undo: None,
             })
         }
+    }
+
+    /// Persist only the previous text subtitle when an in-place media remux
+    /// replaces a SubBake-managed track. This keeps undo proportional to the
+    /// subtitle size instead of duplicating the entire media file.
+    pub fn store_embedded_subtitle_undo(
+        &self,
+        container_path: &Path,
+        contents: &[u8],
+    ) -> FileGuardResult<PathBuf> {
+        let safe = self.resolve(container_path)?;
+        let relative = safe.strip_prefix(&self.project_root).unwrap_or(&safe);
+        let mut payload_path = self
+            .backup_root
+            .join(format!("{}", nanos_since_epoch()))
+            .join(relative);
+        let name = payload_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("container");
+        payload_path.set_file_name(format!("{name}.previous.srt"));
+        if let Some(parent) = payload_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&payload_path, contents)?;
+        Ok(payload_path)
     }
 
     pub fn list_files(&self, dir: &Path) -> FileGuardResult<Vec<PathBuf>> {
@@ -506,6 +554,26 @@ mod tests {
         assert_eq!(result.action, FileOpAction::Append);
         assert!(result.backup_path.is_some());
         assert_eq!(guard.read_file(path).expect("read"), "line1\nline2\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn embedded_subtitle_undo_stores_only_the_small_payload() {
+        let (root, guard) = setup();
+        std::fs::create_dir_all(&root).expect("create project root");
+        let container = root.join("movie.mkv");
+        std::fs::write(&container, b"media bytes").expect("write container placeholder");
+
+        let payload = guard
+            .store_embedded_subtitle_undo(&container, b"previous subtitle")
+            .expect("store subtitle undo");
+
+        assert!(payload.starts_with(root.join(".subbake/agent/backups")));
+        assert_eq!(
+            std::fs::read(&payload).expect("read undo payload"),
+            b"previous subtitle"
+        );
+        assert_ne!(payload, container);
         let _ = std::fs::remove_dir_all(&root);
     }
 

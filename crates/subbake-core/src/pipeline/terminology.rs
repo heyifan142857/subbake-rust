@@ -267,10 +267,15 @@ fn build_messages(
         })).collect::<Vec<_>>(),
     });
     let payload = serde_json::to_string(&payload).unwrap_or_default();
+    let name_policy = if options.preserve_names {
+        "For personal names, use the exact source spelling as target."
+    } else {
+        "Include every clearly identified personal name and translate or transliterate it into the target language's conventional script; do not omit a clear personal name merely because its canonical spelling is uncertain."
+    };
     vec![
-        crate::ports::ChatMessage::system(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {\"entries\":[{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain entries. The brief must be short and advisory; never invent plot facts.",
-        ),
+        crate::ports::ChatMessage::system(format!(
+            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. {name_policy} Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain non-name entries. The brief must be short and advisory; never invent plot facts."
+        )),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
         )),

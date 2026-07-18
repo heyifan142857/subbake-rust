@@ -378,6 +378,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_name_and_container_retention_policies() {
+        let config = ConfigFile::parse(
+            r#"
+            version = 2
+
+            [defaults.translation]
+            preserve_names = true
+
+            [defaults.output]
+            preserve_source_container = true
+            "#,
+        )
+        .expect("configuration with optional policies");
+
+        let (settings, _) = config
+            .resolve(None, SettingsOverrides::default())
+            .expect("resolved policies");
+
+        assert!(settings.translation.preserve_names);
+        assert!(settings.output.preserve_source_container);
+        assert!(!ResolvedSettings::default().translation.preserve_names);
+        assert!(!ResolvedSettings::default().output.preserve_source_container);
+    }
+
+    #[test]
     fn rejects_old_flat_configuration() {
         let error = ConfigFile::parse(
             r#"
