@@ -11,6 +11,7 @@ pub fn run(args: WhisperArgs) -> CliResult<()> {
             action: args.action,
             binary_path: args.binary_path,
             models_dir: args.models_dir,
+            build_variant: args.build_variant,
         },
         &CancellationGuard::never(),
         std::sync::Arc::new(crate::progress::CliProgress::new()),

@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use subbake_adapters::{
     ApiFormat, BackendConfig, ConfigurationResolver, ResolveRequest, RuntimeAction,
     SettingsOverrides, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction,
+    WhisperAction, WhisperBuildVariant, apply_whisper_storage, default_whisper_binary_path_for,
+    default_whisper_models_dir_for,
 };
 use subbake_agent::{AgentAction, AgentActionKind};
 
@@ -64,6 +65,7 @@ pub struct WhisperArgs {
     pub action: WhisperAction,
     pub binary_path: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
+    pub build_variant: WhisperBuildVariant,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +255,12 @@ fn parse_file_translation_args(
         index += 1;
     }
     let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    if command_name == "pipeline" {
+        apply_whisper_storage(
+            &mut parsed.transcription_settings,
+            &resolved.settings.storage,
+        );
+    }
     parsed.settings = resolved.settings;
     parsed.config_path = resolved.config_path;
     parsed.profile = resolved.profile;
@@ -357,25 +365,30 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
         output: None,
         settings: TranscriptionSettings::default(),
     };
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
+    let mut overrides = SettingsOverrides::default();
 
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
+            "--config" | "--profile" => skip_two(args, &mut index)?,
+            "--runtime-dir" => {
+                overrides.storage.runtime_dir =
+                    Some(required_path(args, &mut index, "--runtime-dir")?)
+            }
+            "--whisper-bin" => {
+                overrides.storage.whisper_binary_path =
+                    Some(required_path(args, &mut index, "--whisper-bin")?)
+            }
+            "--whisper-models-dir" => {
+                overrides.storage.whisper_models_dir =
+                    Some(required_path(args, &mut index, "--whisper-models-dir")?)
+            }
             "--language" => {
                 parsed.settings.language = Some(required_value(args, &mut index, "--language")?)
             }
-            "--provider" | "--transcriber" => {
-                let flag = args[index].clone();
-                parsed.settings.provider = required_value(args, &mut index, &flag)?
-            }
             "--model" => parsed.settings.model = Some(required_value(args, &mut index, "--model")?),
-            "--api-key" => {
-                parsed.settings.api_key = Some(required_value(args, &mut index, "--api-key")?)
-            }
-            "--base-url" => {
-                parsed.settings.base_url = Some(required_value(args, &mut index, "--base-url")?)
-            }
             "--sidecar" => {
                 parsed.settings.sidecar_path = Some(required_path(args, &mut index, "--sidecar")?)
             }
@@ -393,6 +406,8 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
         index += 1;
     }
 
+    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    apply_whisper_storage(&mut parsed.settings, &resolved.settings.storage);
     Ok(parsed)
 }
 
@@ -403,17 +418,12 @@ fn parse_pipeline_transcription_option(
     settings: &mut TranscriptionSettings,
 ) -> CliResult<bool> {
     match option {
-        "--transcriber" | "--transcriber-provider" => {
-            settings.provider = required_value(args, index, option)?
-        }
         "--transcribe-language" | "--language" => {
             settings.language = Some(required_value(args, index, option)?)
         }
         "--transcribe-model" | "--transcriber-model" => {
             settings.model = Some(required_value(args, index, option)?)
         }
-        "--transcribe-api-key" => settings.api_key = Some(required_value(args, index, option)?),
-        "--transcribe-base-url" => settings.base_url = Some(required_value(args, index, option)?),
         "--sidecar" => settings.sidecar_path = Some(required_path(args, index, option)?),
         "--transcribe-format" => {
             let value = required_value(args, index, option)?;
@@ -538,9 +548,11 @@ pub fn parse_runtime_args(args: &[String]) -> CliResult<RuntimeArgs> {
 }
 
 pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
     let command = args.first().map(String::as_str).unwrap_or("status");
     let (action, mut index) = match command {
         "status" => (WhisperAction::Status, 1usize),
+        "versions" | "list-versions" => (WhisperAction::ListVersions, 1usize),
         "install" => (WhisperAction::Install, 1usize),
         "update" => (WhisperAction::Update, 1usize),
         "uninstall" => (WhisperAction::Uninstall { keep_models: false }, 1usize),
@@ -565,7 +577,9 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
         action,
         binary_path: None,
         models_dir: None,
+        build_variant: WhisperBuildVariant::Cpu,
     };
+    let mut overrides = SettingsOverrides::default();
 
     while index < args.len() {
         match args[index].as_str() {
@@ -576,6 +590,17 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
             "--keep-models" => {
                 parsed.action = WhisperAction::Uninstall { keep_models: true };
             }
+            "--variant" => {
+                let value = required_value(args, &mut index, "--variant")?;
+                parsed.build_variant = WhisperBuildVariant::parse(&value).ok_or_else(|| {
+                    CliError::usage("--variant must be one of: cpu, cuda, metal, vulkan, openblas")
+                })?;
+            }
+            "--runtime-dir" => {
+                overrides.storage.runtime_dir =
+                    Some(required_path(args, &mut index, "--runtime-dir")?)
+            }
+            "--config" | "--profile" => skip_two(args, &mut index)?,
             other => {
                 return Err(CliError::usage(format!("unknown whisper option `{other}`")));
             }
@@ -583,6 +608,33 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
         index += 1;
     }
 
+    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    if parsed.binary_path.is_none() {
+        parsed.binary_path = Some(
+            resolved
+                .settings
+                .storage
+                .whisper_binary_path
+                .clone()
+                .unwrap_or_else(|| {
+                    default_whisper_binary_path_for(
+                        resolved.settings.storage.runtime_dir.as_deref(),
+                    )
+                }),
+        );
+    }
+    if parsed.models_dir.is_none() {
+        parsed.models_dir = Some(
+            resolved
+                .settings
+                .storage
+                .whisper_models_dir
+                .clone()
+                .unwrap_or_else(|| {
+                    default_whisper_models_dir_for(resolved.settings.storage.runtime_dir.as_deref())
+                }),
+        );
+    }
     Ok(parsed)
 }
 
@@ -637,6 +689,12 @@ fn parse_translation_setting_option(
         }
         "--runtime-dir" => {
             overrides.storage.runtime_dir = Some(required_path(args, index, option)?)
+        }
+        "--whisper-bin" => {
+            overrides.storage.whisper_binary_path = Some(required_path(args, index, option)?)
+        }
+        "--whisper-models-dir" => {
+            overrides.storage.whisper_models_dir = Some(required_path(args, index, option)?)
         }
         "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
         "--bilingual" => overrides.output.bilingual = Some(true),
@@ -987,8 +1045,6 @@ mod tests {
             "movie.zh.srt".to_owned(),
             "--json".to_owned(),
             "--no-review".to_owned(),
-            "--transcriber".to_owned(),
-            "whisper_cpp".to_owned(),
             "--transcribe-model".to_owned(),
             "base".to_owned(),
             "--language".to_owned(),
@@ -1005,7 +1061,6 @@ mod tests {
             parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Off
         );
-        assert_eq!(parsed.transcription_settings.provider, "whisper_cpp");
         assert_eq!(parsed.transcription_settings.model.as_deref(), Some("base"));
         assert_eq!(
             parsed.transcription_settings.language.as_deref(),
@@ -1014,19 +1069,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_transcribe_accepts_backend_options() {
+    fn parse_transcribe_accepts_local_whisper_options() {
         let args = vec![
             "movie.mp4".to_owned(),
             "--language".to_owned(),
             "en".to_owned(),
-            "--provider".to_owned(),
-            "whisper_cpp".to_owned(),
             "--model".to_owned(),
             "base".to_owned(),
-            "--api-key".to_owned(),
-            "sk-test".to_owned(),
-            "--base-url".to_owned(),
-            "https://example.test/v1".to_owned(),
             "--format".to_owned(),
             "vtt".to_owned(),
             "--sidecar".to_owned(),
@@ -1037,13 +1086,7 @@ mod tests {
 
         assert_eq!(parsed.media_path, PathBuf::from("movie.mp4"));
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
-        assert_eq!(parsed.settings.provider, "whisper_cpp");
         assert_eq!(parsed.settings.model.as_deref(), Some("base"));
-        assert_eq!(parsed.settings.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(
-            parsed.settings.base_url.as_deref(),
-            Some("https://example.test/v1")
-        );
         assert_eq!(parsed.settings.output_format, TranscriptionFormat::Vtt);
         assert_eq!(
             parsed.settings.sidecar_path,
@@ -1220,5 +1263,65 @@ mod tests {
         let parsed = parse_whisper_args(&args).expect("whisper args should parse");
 
         assert_eq!(parsed.action, WhisperAction::Update);
+    }
+
+    #[test]
+    fn parse_whisper_versions_is_supported() {
+        let parsed =
+            parse_whisper_args(&["versions".to_owned()]).expect("whisper versions should parse");
+
+        assert_eq!(parsed.action, WhisperAction::ListVersions);
+    }
+
+    #[test]
+    fn whisper_paths_resolve_consistently_from_runtime_configuration() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-whisper-storage.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "version = 2\n[defaults.storage]\nruntime_dir = \"runtime-data\"\n",
+        )
+        .expect("write config");
+        let config = path.to_string_lossy().into_owned();
+
+        let transcribe = parse_transcribe_args(&[
+            "audio.wav".to_owned(),
+            "--config".to_owned(),
+            config.clone(),
+        ])
+        .expect("parse transcribe");
+        let pipeline = parse_pipeline_args(&[
+            "video.mp4".to_owned(),
+            "--config".to_owned(),
+            config.clone(),
+        ])
+        .expect("parse pipeline");
+        let whisper = parse_whisper_args(&["status".to_owned(), "--config".to_owned(), config])
+            .expect("parse whisper");
+        let _ = std::fs::remove_file(path);
+
+        let binary = PathBuf::from("runtime-data/whisper/bin").join(if cfg!(windows) {
+            "whisper-cli.exe"
+        } else {
+            "whisper-cli"
+        });
+        let models = PathBuf::from("runtime-data/whisper/models");
+        assert_eq!(
+            transcribe.settings.whisper_binary_path,
+            Some(binary.clone())
+        );
+        assert_eq!(
+            pipeline.transcription_settings.whisper_binary_path,
+            Some(binary.clone())
+        );
+        assert_eq!(whisper.binary_path, Some(binary));
+        assert_eq!(transcribe.settings.whisper_models_dir, Some(models.clone()));
+        assert_eq!(
+            pipeline.transcription_settings.whisper_models_dir,
+            Some(models.clone())
+        );
+        assert_eq!(whisper.models_dir, Some(models));
     }
 }

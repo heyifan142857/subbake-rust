@@ -498,7 +498,7 @@ impl AgentEngine {
             })?;
         let output_format = settings.output.format.as_deref().unwrap_or("source");
         Ok(format!(
-            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_api, model=whisper-1, language=Auto, format=srt",
+            "translation: source={}, target={}, provider={}, model={}, format={}, bilingual={}, bilingual_order={}, dry_run={}\ntranscription: provider=whisper_cpp, model=small, language=Auto, format=srt",
             source_language,
             target_language,
             settings.backend.id,

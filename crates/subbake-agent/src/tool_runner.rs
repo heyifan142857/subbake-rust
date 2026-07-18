@@ -69,12 +69,24 @@ impl ToolRunner {
             }
             return Ok(outcome.outcome);
         }
+        let adapter_settings = if matches!(
+            executor,
+            ToolExecutor::TranscribeAudio | ToolExecutor::ManageWhisper
+        ) {
+            Some(
+                ProfileCoordinator::new(&engine.project_root, engine.session.as_ref())
+                    .active_settings()?,
+            )
+        } else {
+            None
+        };
         if let Some(outcome) = execute_adapter_tool(
             executor,
             args,
             &engine.guard,
             &engine.operation_guard,
             engine.progress.clone(),
+            adapter_settings.as_ref().map(|settings| &settings.storage),
         )? {
             if let Some(operation) = outcome.file_operation {
                 Self::record_file_operation(engine, &operation, None)?;

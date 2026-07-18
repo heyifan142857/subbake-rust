@@ -185,12 +185,14 @@ Usage: sbake transcribe <MEDIA> [OPTIONS]
 Options:
   -o, --output <PATH>          Output file path
       --language <LANGUAGE>    Spoken language
-      --provider <NAME>        Transcription provider
       --model <NAME>           Transcription model
       --format <FORMAT>        Output format: srt, vtt, or txt
       --sidecar <PATH>         Use a sidecar transcript
-      --base-url <URL>         Provider base URL
-      --api-key <KEY>          Provider API key
+      --config <PATH>          Configuration file
+      --profile <NAME>         Named profile
+      --runtime-dir <DIR>      Runtime storage root
+      --whisper-bin <PATH>     Override whisper-cli path
+      --whisper-models-dir <DIR> Override whisper model directory
   -h, --help                   Print help
 "#;
 const PIPELINE_HELP: &str = r#"Transcribe media when needed, then translate it
@@ -198,11 +200,12 @@ const PIPELINE_HELP: &str = r#"Transcribe media when needed, then translate it
 Usage: sbake pipeline <MEDIA_OR_SUBTITLE> [OPTIONS]
 
 Accepts all `translate` options plus:
-      --transcriber <NAME>             Transcription provider
       --transcribe-language <LANGUAGE> Spoken language
       --transcribe-model <NAME>        Transcription model
       --transcribe-format <FORMAT>     srt, vtt, or txt
       --sidecar <PATH>                 Use a sidecar transcript
+      --whisper-bin <PATH>             Override whisper-cli path
+      --whisper-models-dir <DIR>       Override whisper model directory
   -h, --help                           Print help
 "#;
 const OVERNIGHT_HELP: &str = r#"Submit, check, and collect a provider-managed asynchronous translation batch
@@ -268,6 +271,7 @@ Usage: sbake whisper [COMMAND] [OPTIONS]
 
 Commands:
   status              Report installation status (default)
+  versions            Fetch whisper.cpp release versions
   install             Install whisper.cpp
   update              Update whisper.cpp
   uninstall           Uninstall whisper.cpp
@@ -277,6 +281,10 @@ Commands:
 Options:
       --bin <PATH>         Override the whisper binary path
       --models-dir <DIR>   Override the models directory
+      --runtime-dir <DIR>  Runtime storage root
+      --variant <VARIANT>  cpu, cuda, metal, vulkan, or openblas
+      --config <PATH>      Configuration file
+      --profile <NAME>     Named profile
       --keep-models        Keep models when uninstalling
   -h, --help               Print help
 "#;

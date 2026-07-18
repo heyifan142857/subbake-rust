@@ -1,10 +1,12 @@
 use std::fs;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subbake_core::{
     CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, TaskKind,
     TaskState,
@@ -12,17 +14,43 @@ use subbake_core::{
 use tokio::runtime::Runtime;
 
 use crate::error::{AdapterError, AdapterResult};
+use crate::process::run_command_cancellable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhisperRequest {
     pub action: WhisperAction,
     pub binary_path: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
+    pub build_variant: WhisperBuildVariant,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WhisperBuildVariant {
+    #[default]
+    Cpu,
+    Cuda,
+    Metal,
+    Vulkan,
+    OpenBlas,
+}
+
+impl WhisperBuildVariant {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" => Some(Self::Cpu),
+            "cuda" => Some(Self::Cuda),
+            "metal" => Some(Self::Metal),
+            "vulkan" => Some(Self::Vulkan),
+            "openblas" | "blas" => Some(Self::OpenBlas),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhisperAction {
     Status,
+    ListVersions,
     Install,
     Update,
     Uninstall { keep_models: bool },
@@ -33,7 +61,23 @@ pub enum WhisperAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WhisperOutcome {
     Status(WhisperStatus),
+    VersionList(WhisperVersionList),
     ModelList(WhisperModelList),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhisperVersionList {
+    pub pinned_version: String,
+    pub versions: Vec<WhisperVersion>,
+    pub refresh_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhisperVersion {
+    pub tag: String,
+    pub prerelease: bool,
+    pub published_at: Option<String>,
+    pub installable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +86,8 @@ pub struct WhisperStatus {
     pub binary_exists: bool,
     pub models_dir: PathBuf,
     pub models_dir_exists: bool,
+    pub version: Option<String>,
+    pub capability_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +95,8 @@ pub struct WhisperModelList {
     pub models_dir: PathBuf,
     pub models_dir_exists: bool,
     pub models: Vec<WhisperModel>,
+    pub available_models: Vec<String>,
+    pub refresh_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,24 +136,48 @@ pub fn run_whisper_cancellable_with_progress(
         ProgressUnit::Steps,
     ));
     let outcome: AdapterResult<WhisperOutcome> = match request.action {
-        WhisperAction::Status => Ok(WhisperOutcome::Status(inspect_status(&request))),
-        WhisperAction::ListModels => Ok(WhisperOutcome::ModelList(list_models(&request)?)),
+        WhisperAction::Status => Ok(WhisperOutcome::Status(inspect_status(
+            &request,
+            cancellation,
+        )?)),
+        WhisperAction::ListVersions => {
+            Ok(WhisperOutcome::VersionList(list_versions(cancellation)?))
+        }
+        WhisperAction::ListModels => {
+            let (models, warning) = fetch_available_models(cancellation)?;
+            Ok(WhisperOutcome::ModelList(list_models(
+                &request,
+                Some(models),
+                warning,
+            )?))
+        }
         WhisperAction::Install => {
-            install_binary(&request)?;
-            Ok(WhisperOutcome::Status(inspect_status(&request)))
+            install_binary(&request, cancellation, &progress)?;
+            Ok(WhisperOutcome::Status(inspect_status(
+                &request,
+                cancellation,
+            )?))
         }
         WhisperAction::Update => {
-            install_binary(&request)?;
-            Ok(WhisperOutcome::Status(inspect_status(&request)))
+            install_binary(&request, cancellation, &progress)?;
+            Ok(WhisperOutcome::Status(inspect_status(
+                &request,
+                cancellation,
+            )?))
         }
         WhisperAction::Uninstall { keep_models } => {
             uninstall_whisper(&request, keep_models)?;
-            Ok(WhisperOutcome::Status(inspect_status(&request)))
+            Ok(WhisperOutcome::Status(inspect_status(
+                &request,
+                cancellation,
+            )?))
         }
         WhisperAction::DownloadModel { ref name } => {
-            download_model(&request, name)?;
+            download_model(&request, name, cancellation, &progress)?;
             // Re-list models so the caller can see the new file.
-            Ok(WhisperOutcome::ModelList(list_models(&request)?))
+            Ok(WhisperOutcome::ModelList(list_models(
+                &request, None, None,
+            )?))
         }
     };
     let outcome = outcome?;
@@ -134,9 +206,66 @@ fn runtime() -> &'static Runtime {
 
 const GITHUB_REPO_OWNER: &str = "ggml-org";
 const GITHUB_REPO_NAME: &str = "whisper.cpp";
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/ggml-org/whisper.cpp/releases";
 const HF_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 const INSTALL_MANIFEST_NAME: &str = "install-manifest.json";
+const WHISPER_VERSION_TAG: &str = "v1.9.1";
+const WHISPER_SOURCE_SHA256: &str =
+    "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447";
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=100";
+const HF_MODEL_TREE_URL: &str = "https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main?recursive=false&expand=false&limit=1000";
+const FALLBACK_MODELS: &[&str] = &[
+    "tiny",
+    "tiny.en",
+    "tiny-q5_1",
+    "tiny.en-q5_1",
+    "tiny-q8_0",
+    "tiny.en-q8_0",
+    "base",
+    "base.en",
+    "base-q5_1",
+    "base.en-q5_1",
+    "base-q8_0",
+    "base.en-q8_0",
+    "small",
+    "small.en",
+    "small-q5_1",
+    "small.en-q5_1",
+    "small-q8_0",
+    "small.en-q8_0",
+    "medium",
+    "medium.en",
+    "medium-q5_0",
+    "medium.en-q5_0",
+    "medium-q8_0",
+    "medium.en-q8_0",
+    "large-v1",
+    "large-v2",
+    "large-v2-q5_0",
+    "large-v2-q8_0",
+    "large-v3",
+    "large-v3-q5_0",
+    "large-v3-turbo",
+    "large-v3-turbo-q5_0",
+    "large-v3-turbo-q8_0",
+];
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    published_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct InstallManifest {
@@ -179,13 +308,17 @@ fn detect_platform() -> Option<PlatformAssets> {
     }
 }
 
-fn install_binary(request: &WhisperRequest) -> AdapterResult<()> {
+fn install_binary(
+    request: &WhisperRequest,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<()> {
     let binary_path = whisper_binary_path(request);
     let bin_dir = binary_path
         .parent()
         .unwrap_or_else(|| Path::new(".subbake/whisper/bin"))
         .to_path_buf();
-    let version_tag = "latest";
+    let version_tag = WHISPER_VERSION_TAG;
     let target_dir = bin_dir.clone();
     std::fs::create_dir_all(&target_dir).map_err(|source| {
         AdapterError::external_io(
@@ -196,10 +329,9 @@ fn install_binary(request: &WhisperRequest) -> AdapterResult<()> {
     })?;
 
     if let Some(platform) = detect_platform()
-        && let Some(asset) =
-            runtime().block_on(async { find_latest_release_asset(&platform).await })?
+        && let Some(asset) = pinned_release_asset(&platform, request.build_variant)
     {
-        let download_dir = std::env::temp_dir().join("subbake-whisper-install");
+        let download_dir = unique_temp_dir("subbake-whisper-install")?;
         let extract_dir = download_dir.join("extract");
         std::fs::create_dir_all(&download_dir)
             .map_err(|e| io::Error::other(format!("create download dir: {e}")))?;
@@ -208,146 +340,123 @@ fn install_binary(request: &WhisperRequest) -> AdapterResult<()> {
         let archive_path = download_dir.join(&asset.name);
 
         // Download the archive using reqwest.
-        runtime().block_on(async { download_file(&asset.url, &archive_path).await })?;
+        runtime().block_on(async {
+            download_file(
+                &asset.url,
+                &archive_path,
+                Some(&asset.sha256),
+                cancellation,
+                progress,
+                "DOWNLOAD_BINARY",
+            )
+            .await
+        })?;
 
         // Extract archive.
+        emit_install_stage(progress, "EXTRACT");
         if asset.name.ends_with(".tar.gz") || asset.name.ends_with(".tgz") {
-            extract_tar_gz(&archive_path, &extract_dir)?;
+            extract_tar_gz(&archive_path, &extract_dir, cancellation)?;
         } else if asset.name.ends_with(".zip") {
-            extract_zip_system(&archive_path, &extract_dir)?;
+            extract_zip_system(&archive_path, &extract_dir, cancellation)?;
         } else {
             let direct_path = extract_dir.join(platform.executable_names[0]);
             std::fs::copy(&archive_path, &direct_path)
                 .map_err(|e| io::Error::other(format!("copy direct binary: {e}")))?;
         }
 
-        // Promote binary to final location.
-        remove_managed_install_files(&target_dir)?;
-        let runtime_libraries = promote_runtime_libraries(&extract_dir, &target_dir)?;
-        promote_binary(&extract_dir, &binary_path, platform.executable_names)?;
-        write_version_file(&target_dir, &asset.tag)?;
-        write_install_manifest(&target_dir, &binary_path, runtime_libraries)?;
-        let _ = std::fs::remove_dir_all(&download_dir);
+        // Assemble and validate a complete installation before touching the
+        // currently installed files.
+        emit_install_stage(progress, "VERIFY");
+        let staged_dir = download_dir.join("staged");
+        fs::create_dir_all(&staged_dir)?;
+        let staged_binary = staged_dir.join(
+            binary_path
+                .file_name()
+                .ok_or_else(|| io::Error::other("whisper binary has no file name"))?,
+        );
+        let runtime_libraries = promote_runtime_libraries(&extract_dir, &staged_dir)?;
+        promote_binary(&extract_dir, &staged_binary, platform.executable_names)?;
+        write_version_file(&staged_dir, &asset.tag)?;
+        write_install_manifest(&staged_dir, &staged_binary, runtime_libraries)?;
+        verify_whisper_cli(&staged_binary, cancellation)?;
+        emit_install_stage(progress, "COMMIT");
+        commit_staged_install(&staged_dir, &target_dir)?;
         return Ok(());
     }
 
     // Fallback: cmake from source
-    build_from_source(&target_dir, &binary_path, version_tag)
+    build_from_source(
+        &target_dir,
+        &binary_path,
+        version_tag,
+        request.build_variant,
+        cancellation,
+        progress,
+    )
 }
 
 struct ReleaseAsset {
     name: String,
     url: String,
     tag: String,
+    sha256: String,
 }
 
-async fn find_latest_release_asset(
+fn pinned_release_asset(
     platform: &PlatformAssets,
-) -> AdapterResult<Option<ReleaseAsset>> {
-    let client = reqwest::Client::builder()
-        .user_agent("subbake/0.1")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| AdapterError::from_http("GitHub release client", error))?;
-
-    let response = client
-        .get(format!("{GITHUB_RELEASES_API}/latest"))
-        .send()
-        .await
-        .map_err(|error| AdapterError::from_http("GitHub release lookup", error))?;
-    let status = response.status();
-    let retry_after_ms = retry_after_ms(response.headers());
-    let body = response
-        .text()
-        .await
-        .map_err(|error| AdapterError::from_http("GitHub release response", error))?;
-    if !status.is_success() {
-        return Err(AdapterError::from_http_status(
-            "GitHub release API",
-            status.as_u16(),
-            body,
-            retry_after_ms,
-        ));
-    }
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&body).map_err(|source| AdapterError::Serialization {
-            context: "parse GitHub release metadata",
-            source,
-        })?;
-    let tag = payload["tag_name"].as_str().unwrap_or("latest").to_owned();
-    let assets = payload["assets"].as_array().ok_or_else(|| {
-        AdapterError::Core(subbake_core::CoreError::InvalidBackendResponse(
-            "release metadata does not contain an assets array".to_owned(),
-        ))
-    })?;
-
-    Ok(assets
-        .iter()
-        .filter_map(|asset| {
-            let name = asset["name"].as_str()?;
-            let url = asset["browser_download_url"].as_str()?;
-            let score = asset_match_score(name, platform)?;
-            Some((score, name.to_owned(), url.to_owned()))
-        })
-        .max_by_key(|(score, _, _)| *score)
-        .map(|(_, name, url)| ReleaseAsset { name, url, tag }))
+    variant: WhisperBuildVariant,
+) -> Option<ReleaseAsset> {
+    let is_x64 = platform.arch_terms.contains(&"x64");
+    let (name, sha256) = match (platform.release_platform, is_x64, variant) {
+        (ReleasePlatform::Linux, true, WhisperBuildVariant::Cpu) => (
+            "whisper-bin-ubuntu-x64.tar.gz",
+            "f3bf3b4369a99b54665b0f19b88483b30de27f25963b0414235dea03198515c5",
+        ),
+        (ReleasePlatform::Linux, false, WhisperBuildVariant::Cpu) => (
+            "whisper-bin-ubuntu-arm64.tar.gz",
+            "e0b66cd551ff6f2a28fabe3c6e89691eea037bb76833493abb9a71ca788994b3",
+        ),
+        (ReleasePlatform::Windows, true, WhisperBuildVariant::Cpu) => (
+            "whisper-bin-x64.zip",
+            "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539",
+        ),
+        (ReleasePlatform::Windows, true, WhisperBuildVariant::OpenBlas) => (
+            "whisper-blas-bin-x64.zip",
+            "3c319eab3e87f85883e1ff3d14426c0a1986c661c5eb5985e8af431ed9c4f71f",
+        ),
+        (ReleasePlatform::Windows, true, WhisperBuildVariant::Cuda) => (
+            "whisper-cublas-12.4.0-bin-x64.zip",
+            "106a2030eff8998e4ef320fe72e263a78449e9040386ee27c41ea80b001b601b",
+        ),
+        _ => return None,
+    };
+    Some(ReleaseAsset {
+        name: name.to_owned(),
+        url: format!(
+            "https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/download/{WHISPER_VERSION_TAG}/{name}"
+        ),
+        tag: WHISPER_VERSION_TAG.to_owned(),
+        sha256: sha256.to_owned(),
+    })
 }
 
-fn asset_match_score(name: &str, platform: &PlatformAssets) -> Option<usize> {
-    let lower = name.to_lowercase();
-    let supported_archive =
-        lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip");
-    let direct_binary = platform
-        .executable_names
-        .iter()
-        .any(|binary_name| lower.ends_with(binary_name));
-    if !supported_archive && !direct_binary {
-        return None;
-    }
-    if !lower.contains("whisper-bin") {
-        return None;
-    }
-    if !platform.arch_terms.iter().any(|term| lower.contains(term)) {
-        return None;
-    }
-    if ["blas", "cublas", "cuda", "metal", "vulkan", "opencl"]
-        .iter()
-        .any(|term| lower.contains(term))
-    {
-        return None;
-    }
-    match platform.release_platform {
-        ReleasePlatform::Linux
-            if !["ubuntu", "linux", "debian", "manylinux"]
-                .iter()
-                .any(|term| lower.contains(term)) =>
-        {
-            None
-        }
-        ReleasePlatform::Windows
-            if ["ubuntu", "linux", "debian", "macos", "darwin", "osx"]
-                .iter()
-                .any(|term| lower.contains(term)) =>
-        {
-            None
-        }
-        _ => Some(1),
-    }
-}
-
-async fn download_file(url: &str, dest: &Path) -> AdapterResult<()> {
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+    stage: &str,
+) -> AdapterResult<String> {
+    cancellation.check().map_err(AdapterError::from)?;
     let client = reqwest::Client::builder()
         .user_agent("subbake/0.1")
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| AdapterError::from_http("download client", error))?;
 
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| AdapterError::from_http("download request", error))?;
+    let mut response =
+        await_http_cancellable(client.get(url).send(), cancellation, "download request").await?;
     let status = response.status();
 
     if !status.is_success() {
@@ -368,26 +477,200 @@ async fn download_file(url: &str, dest: &Path) -> AdapterResult<()> {
             )
         })?;
     }
-    let tmp = dest.with_extension("download.tmp");
+    let tmp = temporary_sibling(dest, "download");
+    let mut cleanup = TemporaryFile::new(tmp.clone());
     let mut file = std::fs::File::create(&tmp).map_err(|source| {
         AdapterError::external_io("create temporary download", Some(tmp.clone()), source)
     })?;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| AdapterError::from_http("download response", error))?
-    {
+    let header_sha256 = response
+        .headers()
+        .get("x-linked-etag")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_matches('"'))
+        .filter(|value| value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(str::to_owned);
+    let expected_sha256 = expected_sha256.map(str::to_owned).or(header_sha256);
+    let total = response.content_length();
+    let mut downloaded = 0_u64;
+    let progress_step = total
+        .map(|bytes| (bytes / 100).max(1024 * 1024))
+        .unwrap_or(1024 * 1024);
+    let mut last_progress = 0_u64;
+    let mut hasher = Sha256::new();
+    loop {
+        cancellation.check().map_err(AdapterError::from)?;
+        let Some(chunk) =
+            await_http_cancellable(response.chunk(), cancellation, "download response").await?
+        else {
+            break;
+        };
+        hasher.update(&chunk);
         file.write_all(&chunk).map_err(|source| {
             AdapterError::external_io("write temporary download", Some(tmp.clone()), source)
         })?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded.saturating_sub(last_progress) >= progress_step
+            || total.is_some_and(|total| downloaded >= total)
+        {
+            progress.emit(ProgressEvent::running(
+                TaskKind::Download,
+                stage,
+                downloaded,
+                total,
+                ProgressUnit::Bytes,
+            ));
+            last_progress = downloaded;
+        }
     }
     file.flush().map_err(|source| {
         AdapterError::external_io("flush temporary download", Some(tmp.clone()), source)
     })?;
-    std::fs::rename(&tmp, dest).map_err(|source| {
-        AdapterError::external_io("finalize download", Some(dest.to_path_buf()), source)
-    })?;
-    Ok(())
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if let Some(expected) = expected_sha256
+        && !actual_sha256.eq_ignore_ascii_case(&expected)
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AdapterError::invalid_input(format!(
+            "SHA-256 mismatch for {url}: expected {expected}, got {actual_sha256}"
+        )));
+    }
+    replace_file(&tmp, dest)?;
+    cleanup.disarm();
+    Ok(actual_sha256)
+}
+
+async fn await_http_cancellable<T>(
+    future: impl Future<Output = Result<T, reqwest::Error>>,
+    cancellation: &CancellationGuard,
+    context: &'static str,
+) -> AdapterResult<T> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                return result.map_err(|error| AdapterError::from_http(context, error));
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if cancellation.is_cancelled() {
+                    return Err(AdapterError::Cancelled);
+                }
+            }
+        }
+    }
+}
+
+fn list_versions(cancellation: &CancellationGuard) -> AdapterResult<WhisperVersionList> {
+    let fetched: AdapterResult<Vec<GithubRelease>> = runtime().block_on(fetch_json(
+        GITHUB_RELEASES_URL,
+        cancellation,
+        "fetch whisper.cpp versions",
+    ));
+    let (releases, refresh_warning) = match fetched {
+        Ok(releases) => (releases, None),
+        Err(AdapterError::Cancelled) => return Err(AdapterError::Cancelled),
+        Err(error) => (
+            vec![GithubRelease {
+                tag_name: WHISPER_VERSION_TAG.to_owned(),
+                draft: false,
+                prerelease: false,
+                published_at: None,
+            }],
+            Some(format!("could not refresh upstream versions: {error}")),
+        ),
+    };
+    let versions = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .map(|release| WhisperVersion {
+            installable: release.tag_name == WHISPER_VERSION_TAG,
+            tag: release.tag_name,
+            prerelease: release.prerelease,
+            published_at: release.published_at,
+        })
+        .collect();
+    Ok(WhisperVersionList {
+        pinned_version: WHISPER_VERSION_TAG.to_owned(),
+        versions,
+        refresh_warning,
+    })
+}
+
+fn fetch_available_models(
+    cancellation: &CancellationGuard,
+) -> AdapterResult<(Vec<String>, Option<String>)> {
+    let fetched: AdapterResult<Vec<HuggingFaceEntry>> = runtime().block_on(fetch_json(
+        HF_MODEL_TREE_URL,
+        cancellation,
+        "fetch whisper.cpp model catalog",
+    ));
+    match fetched {
+        Ok(entries) => Ok((parse_available_models(entries), None)),
+        Err(AdapterError::Cancelled) => Err(AdapterError::Cancelled),
+        Err(error) => Ok((
+            FALLBACK_MODELS
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+            Some(format!("could not refresh upstream models: {error}")),
+        )),
+    }
+}
+
+fn parse_available_models(entries: Vec<HuggingFaceEntry>) -> Vec<String> {
+    let mut models = entries
+        .into_iter()
+        .filter(|entry| entry.entry_type == "file")
+        .filter_map(|entry| {
+            entry
+                .path
+                .strip_prefix("ggml-")
+                .and_then(|name| name.strip_suffix(".bin"))
+                .map(str::to_owned)
+        })
+        .filter(|name| !name.starts_with("for-tests-"))
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    cancellation: &CancellationGuard,
+    context: &'static str,
+) -> AdapterResult<T> {
+    cancellation.check().map_err(AdapterError::from)?;
+    let client = reqwest::Client::builder()
+        .user_agent("subbake/0.1")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| AdapterError::from_http(context, error))?;
+    let response = await_http_cancellable(client.get(url).send(), cancellation, context).await?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = retry_after_ms(response.headers());
+        let body = await_http_cancellable(response.text(), cancellation, context).await?;
+        return Err(AdapterError::from_http_status(
+            context,
+            status.as_u16(),
+            body,
+            retry_after,
+        ));
+    }
+    await_http_cancellable(response.json(), cancellation, context).await
+}
+
+fn temporary_sibling(path: &Path, label: &str) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    path.with_file_name(format!(
+        ".{name}.{}.{nonce}.{label}.tmp",
+        std::process::id()
+    ))
 }
 
 fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -398,25 +681,38 @@ fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .map(|seconds| seconds.saturating_mul(1_000))
 }
 
-fn extract_tar_gz(archive: &Path, target: &Path) -> io::Result<()> {
+fn extract_tar_gz(
+    archive: &Path,
+    target: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
     std::fs::create_dir_all(target)
         .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
-    let status = Command::new("tar")
-        .args([
+    let output = run_command_cancellable(
+        Command::new("tar").args([
             "-xzf",
             &archive.to_string_lossy(),
             "-C",
             &target.to_string_lossy(),
-        ])
-        .status()
-        .map_err(|e| io::Error::other(format!("tar not found: {e}")))?;
-    if !status.success() {
-        return Err(io::Error::other("tar extraction failed"));
+        ]),
+        cancellation,
+        "extract whisper.cpp archive",
+    )?;
+    if !output.status.success() {
+        return Err(AdapterError::ChildProcess {
+            program: "tar",
+            status: output.status.code(),
+            message: process_diagnostics(&output, "tar extraction failed"),
+        });
     }
     Ok(())
 }
 
-fn extract_zip_system(archive: &Path, target: &Path) -> io::Result<()> {
+fn extract_zip_system(
+    archive: &Path,
+    target: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
     std::fs::create_dir_all(target)
         .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
     #[cfg(windows)]
@@ -441,13 +737,25 @@ fn extract_zip_system(archive: &Path, target: &Path) -> io::Result<()> {
         ]);
         command
     };
-    let status = command
-        .status()
-        .map_err(|e| io::Error::other(format!("zip extractor not found: {e}")))?;
-    if !status.success() {
-        return Err(io::Error::other("unzip extraction failed"));
+    let output = run_command_cancellable(&mut command, cancellation, "extract whisper.cpp zip")?;
+    if !output.status.success() {
+        return Err(AdapterError::ChildProcess {
+            program: "archive extractor",
+            status: output.status.code(),
+            message: process_diagnostics(&output, "zip extraction failed"),
+        });
     }
     Ok(())
+}
+
+fn emit_install_stage(progress: &SharedProgress, stage: &str) {
+    progress.emit(ProgressEvent::running(
+        TaskKind::Installation,
+        stage,
+        0,
+        None,
+        ProgressUnit::Steps,
+    ));
 }
 
 fn promote_binary(
@@ -550,9 +858,114 @@ fn write_install_manifest(
         .map_err(|e| io::Error::other(format!("write install manifest: {e}")))
 }
 
-fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> AdapterResult<()> {
+fn commit_staged_install(staged_dir: &Path, target_dir: &Path) -> AdapterResult<()> {
+    fs::create_dir_all(target_dir).map_err(|source| {
+        AdapterError::external_io(
+            "create whisper installation directory",
+            Some(target_dir.to_path_buf()),
+            source,
+        )
+    })?;
+    let staged_manifest = read_install_manifest(staged_dir)?;
+    let old_files = if target_dir.join(INSTALL_MANIFEST_NAME).is_file() {
+        read_install_manifest(target_dir)?.files
+    } else {
+        Vec::new()
+    };
+    let mut names = staged_manifest.files.clone();
+    names.push(INSTALL_MANIFEST_NAME.to_owned());
+
+    let mut prepared = Vec::new();
+    for name in &names {
+        let temporary = temporary_sibling(&target_dir.join(name), "install");
+        let cleanup = TemporaryFile::new(temporary.clone());
+        fs::copy(staged_dir.join(name), &temporary).map_err(|source| {
+            AdapterError::external_io(
+                "stage whisper installation",
+                Some(temporary.clone()),
+                source,
+            )
+        })?;
+        prepared.push((name.clone(), cleanup));
+    }
+
+    let mut committed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for (name, mut temporary) in prepared {
+        let destination = target_dir.join(&name);
+        let backup = if destination.exists() {
+            let backup = temporary_sibling(&destination, "install-backup");
+            if let Err(source) = fs::rename(&destination, &backup) {
+                rollback_install(&committed);
+                return Err(AdapterError::external_io(
+                    "back up whisper installation file",
+                    Some(destination),
+                    source,
+                ));
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(source) = fs::rename(&temporary.path, &destination) {
+            if let Some(backup) = &backup {
+                let _ = fs::rename(backup, &destination);
+            }
+            rollback_install(&committed);
+            return Err(AdapterError::external_io(
+                "commit whisper installation file",
+                Some(destination),
+                source,
+            ));
+        }
+        temporary.disarm();
+        committed.push((destination, backup));
+    }
+    for (_, backup) in &committed {
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    for name in old_files {
+        if !staged_manifest.files.contains(&name) {
+            let _ = fs::remove_file(target_dir.join(name));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_install(committed: &[(PathBuf, Option<PathBuf>)]) {
+    for (destination, backup) in committed.iter().rev() {
+        let _ = fs::remove_file(destination);
+        if let Some(backup) = backup {
+            let _ = fs::rename(backup, destination);
+        }
+    }
+}
+
+fn read_install_manifest(directory: &Path) -> io::Result<InstallManifest> {
+    let content = fs::read(directory.join(INSTALL_MANIFEST_NAME))?;
+    let manifest: InstallManifest = serde_json::from_slice(&content)
+        .map_err(|error| io::Error::other(format!("parse install manifest: {error}")))?;
+    for name in &manifest.files {
+        if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name.as_str()) {
+            return Err(io::Error::other(format!(
+                "invalid file name in install manifest: {name}"
+            )));
+        }
+    }
+    Ok(manifest)
+}
+
+fn build_from_source(
+    target_dir: &Path,
+    binary_path: &Path,
+    version: &str,
+    variant: WhisperBuildVariant,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<()> {
     // cmake source build: clone/download source, cmake + make.
-    let build_dir = std::env::temp_dir().join("subbake-whisper-build");
+    let build_dir = unique_temp_dir("subbake-whisper-build")?;
     let src_dir = build_dir.join("source");
     let build_out_dir = build_dir.join("build");
 
@@ -560,46 +973,78 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> Ad
         .map_err(|e| io::Error::other(format!("create src dir: {e}")))?;
 
     // Download source tarball from GitHub.
-    let tarball_url =
-        format!("https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/tarball/HEAD");
+    let tarball_url = format!(
+        "https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/archive/refs/tags/{WHISPER_VERSION_TAG}.tar.gz"
+    );
     let tarball_path = build_dir.join("source.tar.gz");
-    runtime().block_on(async { download_file(&tarball_url, &tarball_path).await })?;
+    runtime().block_on(async {
+        download_file(
+            &tarball_url,
+            &tarball_path,
+            Some(WHISPER_SOURCE_SHA256),
+            cancellation,
+            progress,
+            "DOWNLOAD_SOURCE",
+        )
+        .await
+    })?;
 
     // Extract with tar.
+    emit_install_stage(progress, "EXTRACT_SOURCE");
     std::fs::create_dir_all(&src_dir).map_err(|e| io::Error::other(format!("create src: {e}")))?;
-    let status = Command::new("tar")
-        .args([
+    let status = run_command_cancellable(
+        Command::new("tar").args([
             "-xzf",
             &tarball_path.to_string_lossy(),
             "-C",
             &src_dir.to_string_lossy(),
             "--strip-components=1",
-        ])
-        .status()
-        .map_err(|e| io::Error::other(format!("tar source: {e}")))?;
-    if !status.success() {
+        ]),
+        cancellation,
+        "extract whisper.cpp source",
+    )?;
+    if !status.status.success() {
         return Err(AdapterError::ChildProcess {
             program: "tar",
-            status: status.code(),
+            status: status.status.code(),
             message: "source extraction failed".to_owned(),
         });
     }
 
     // cmake configure & build
+    emit_install_stage(progress, "CONFIGURE");
     std::fs::create_dir_all(&build_out_dir)
         .map_err(|e| io::Error::other(format!("create build dir: {e}")))?;
 
-    let cmake = Command::new("cmake")
-        .args([
-            "-S",
-            &src_dir.to_string_lossy(),
-            "-B",
-            &build_out_dir.to_string_lossy(),
-            "-DWHISPER_BUILD_TESTS=OFF",
-            "-DWHISPER_BUILD_EXAMPLES=ON",
-        ])
-        .output()
-        .map_err(|e| io::Error::other(format!("cmake configure: {e}")))?;
+    let mut configure = Command::new("cmake");
+    configure.args([
+        "-S",
+        &src_dir.to_string_lossy(),
+        "-B",
+        &build_out_dir.to_string_lossy(),
+        "-DWHISPER_BUILD_TESTS=OFF",
+        "-DWHISPER_BUILD_EXAMPLES=ON",
+        "-DGGML_CUDA=OFF",
+        "-DGGML_METAL=OFF",
+        "-DGGML_VULKAN=OFF",
+        "-DGGML_BLAS=OFF",
+    ]);
+    match variant {
+        WhisperBuildVariant::Cpu => {}
+        WhisperBuildVariant::Cuda => {
+            configure.arg("-DGGML_CUDA=ON");
+        }
+        WhisperBuildVariant::Metal => {
+            configure.arg("-DGGML_METAL=ON");
+        }
+        WhisperBuildVariant::Vulkan => {
+            configure.arg("-DGGML_VULKAN=ON");
+        }
+        WhisperBuildVariant::OpenBlas => {
+            configure.args(["-DGGML_BLAS=ON", "-DGGML_BLAS_VENDOR=OpenBLAS"]);
+        }
+    }
+    let cmake = run_command_cancellable(&mut configure, cancellation, "configure whisper.cpp")?;
     if !cmake.status.success() {
         let stderr = String::from_utf8_lossy(&cmake.stderr);
         return Err(AdapterError::ChildProcess {
@@ -609,35 +1054,40 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> Ad
         });
     }
 
-    let make = Command::new("cmake")
-        .args([
-            "--build",
-            &build_out_dir.to_string_lossy(),
-            "--config",
-            "Release",
-            "--target",
-            "whisper-cli",
-            "-j",
-        ])
-        .arg(num_cpus().to_string())
-        .output()
-        .map_err(|e| io::Error::other(format!("cmake build: {e}")))?;
-    if !make.status.success() {
-        let stderr = String::from_utf8_lossy(&make.stderr);
-        // Retry with target "main" (older whisper.cpp releases).
-        let make2 = Command::new("cmake")
+    emit_install_stage(progress, "BUILD");
+    let make = run_command_cancellable(
+        Command::new("cmake")
             .args([
                 "--build",
                 &build_out_dir.to_string_lossy(),
                 "--config",
                 "Release",
                 "--target",
-                "main",
+                "whisper-cli",
                 "-j",
             ])
-            .arg(num_cpus().to_string())
-            .output()
-            .map_err(|e| io::Error::other(format!("cmake build main: {e}")))?;
+            .arg(num_cpus().to_string()),
+        cancellation,
+        "build whisper.cpp",
+    )?;
+    if !make.status.success() {
+        let stderr = String::from_utf8_lossy(&make.stderr);
+        // Retry with target "main" (older whisper.cpp releases).
+        let make2 = run_command_cancellable(
+            Command::new("cmake")
+                .args([
+                    "--build",
+                    &build_out_dir.to_string_lossy(),
+                    "--config",
+                    "Release",
+                    "--target",
+                    "main",
+                    "-j",
+                ])
+                .arg(num_cpus().to_string()),
+            cancellation,
+            "build legacy whisper.cpp CLI",
+        )?;
         if !make2.status.success() {
             let stderr2 = String::from_utf8_lossy(&make2.stderr);
             return Err(AdapterError::ChildProcess {
@@ -657,27 +1107,97 @@ fn build_from_source(target_dir: &Path, binary_path: &Path, version: &str) -> Ad
             .and_then(|n| n.to_str())
             .is_some_and(|n| n == "whisper-cli" || n == "main" || n == "whisper-cli.exe")
         {
-            remove_managed_install_files(target_dir)?;
-            let runtime_libraries = promote_runtime_libraries(&build_out_dir, target_dir)?;
-            std::fs::copy(&entry, binary_path)
+            let staged_dir = build_dir.join("staged");
+            fs::create_dir_all(&staged_dir)?;
+            let staged_binary = staged_dir.join(
+                binary_path
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("whisper binary has no file name"))?,
+            );
+            let runtime_libraries = promote_runtime_libraries(&build_out_dir, &staged_dir)?;
+            std::fs::copy(&entry, &staged_binary)
                 .map_err(|e| io::Error::other(format!("copy built binary: {e}")))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(binary_path, std::fs::Permissions::from_mode(0o755))
+                std::fs::set_permissions(&staged_binary, std::fs::Permissions::from_mode(0o755))
                     .map_err(|e| io::Error::other(format!("chmod binary: {e}")))?;
             }
-            let _ = std::fs::remove_dir_all(&build_dir);
-            write_version_file(target_dir, version)?;
-            write_install_manifest(target_dir, binary_path, runtime_libraries)?;
+            write_version_file(&staged_dir, version)?;
+            write_install_manifest(&staged_dir, &staged_binary, runtime_libraries)?;
+            emit_install_stage(progress, "VERIFY");
+            verify_whisper_cli(&staged_binary, cancellation)?;
+            emit_install_stage(progress, "COMMIT");
+            commit_staged_install(&staged_dir, target_dir)?;
             return Ok(());
         }
     }
 
-    let _ = std::fs::remove_dir_all(&build_dir);
     Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
         "built binary not found after cmake build".to_owned(),
     )))
+}
+
+fn unique_temp_dir(prefix: &str) -> io::Result<TemporaryDirectory> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..100 {
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(TemporaryDirectory(path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate a unique temporary directory",
+    ))
+}
+
+struct TemporaryDirectory(PathBuf);
+
+impl std::ops::Deref for TemporaryDirectory {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TemporaryDirectory {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct TemporaryFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn num_cpus() -> usize {
@@ -692,7 +1212,12 @@ fn num_cpus() -> usize {
 
 pub const SUPPORTED_MODELS: &[&str] = &["tiny", "base", "small", "medium", "large-v3"];
 
-fn download_model(request: &WhisperRequest, name: &str) -> AdapterResult<()> {
+fn download_model(
+    request: &WhisperRequest,
+    name: &str,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<()> {
     if !SUPPORTED_MODELS.contains(&name) {
         return Err(AdapterError::invalid_input(format!(
             "unknown model `{name}`; supported: {}",
@@ -713,17 +1238,83 @@ fn download_model(request: &WhisperRequest, name: &str) -> AdapterResult<()> {
     })?;
 
     let dest = models_dir.join(format!("ggml-{name}.bin"));
-    if dest.exists() {
-        return Ok(()); // Already downloaded.
+    let checksum_path = dest.with_extension("bin.sha256");
+    if dest.is_file() && checksum_path.is_file() {
+        let expected = fs::read_to_string(&checksum_path).map_err(|source| {
+            AdapterError::external_io("read model checksum", Some(checksum_path.clone()), source)
+        })?;
+        if hash_file(&dest, cancellation)?.eq_ignore_ascii_case(expected.trim()) {
+            return Ok(());
+        }
     }
 
     let url = format!("{HF_MODEL_BASE}/ggml-{name}.bin");
-    runtime().block_on(async { download_file(&url, &dest).await })?;
+    let checksum = runtime().block_on(async {
+        download_file(&url, &dest, None, cancellation, progress, "DOWNLOAD_MODEL").await
+    })?;
+    write_atomic(&checksum_path, format!("{checksum}\n").as_bytes())?;
 
     Ok(())
 }
 
-fn list_models(request: &WhisperRequest) -> io::Result<WhisperModelList> {
+fn hash_file(path: &Path, cancellation: &CancellationGuard) -> AdapterResult<String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|source| {
+        AdapterError::external_io("open file for checksum", Some(path.to_path_buf()), source)
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        cancellation.check().map_err(AdapterError::from)?;
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_atomic(path: &Path, content: &[u8]) -> AdapterResult<()> {
+    let temporary = temporary_sibling(path, "write");
+    fs::write(&temporary, content).map_err(|source| {
+        AdapterError::external_io("write temporary file", Some(temporary.clone()), source)
+    })?;
+    replace_file(&temporary, path)
+}
+
+fn replace_file(source: &Path, destination: &Path) -> AdapterResult<()> {
+    if !destination.exists() {
+        return fs::rename(source, destination).map_err(|error| {
+            AdapterError::external_io("finalize file", Some(destination.to_path_buf()), error)
+        });
+    }
+    let backup = temporary_sibling(destination, "backup");
+    fs::rename(destination, &backup).map_err(|error| {
+        AdapterError::external_io(
+            "back up existing file",
+            Some(destination.to_path_buf()),
+            error,
+        )
+    })?;
+    if let Err(error) = fs::rename(source, destination) {
+        let _ = fs::rename(&backup, destination);
+        return Err(AdapterError::external_io(
+            "replace file",
+            Some(destination.to_path_buf()),
+            error,
+        ));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+fn list_models(
+    request: &WhisperRequest,
+    available_models: Option<Vec<String>>,
+    refresh_warning: Option<String>,
+) -> io::Result<WhisperModelList> {
     let models_dir = request
         .models_dir
         .clone()
@@ -733,6 +1324,8 @@ fn list_models(request: &WhisperRequest) -> io::Result<WhisperModelList> {
             models_dir,
             models_dir_exists: false,
             models: Vec::new(),
+            available_models: available_models.unwrap_or_default(),
+            refresh_warning,
         });
     }
 
@@ -746,6 +1339,8 @@ fn list_models(request: &WhisperRequest) -> io::Result<WhisperModelList> {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("model")
+            .strip_prefix("ggml-")
+            .unwrap_or("model")
             .to_owned();
         models.push(WhisperModel { name, path });
     }
@@ -755,10 +1350,15 @@ fn list_models(request: &WhisperRequest) -> io::Result<WhisperModelList> {
         models_dir,
         models_dir_exists: true,
         models,
+        available_models: available_models.unwrap_or_default(),
+        refresh_warning,
     })
 }
 
-fn inspect_status(request: &WhisperRequest) -> WhisperStatus {
+fn inspect_status(
+    request: &WhisperRequest,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<WhisperStatus> {
     let binary_path = request
         .binary_path
         .clone()
@@ -768,11 +1368,88 @@ fn inspect_status(request: &WhisperRequest) -> WhisperStatus {
         .clone()
         .unwrap_or_else(default_whisper_models_dir);
 
-    WhisperStatus {
+    let (version, capability_error) = if binary_path.is_file() {
+        match verify_whisper_cli(&binary_path, cancellation) {
+            Ok(version) => (Some(version), None),
+            Err(AdapterError::Cancelled) => return Err(AdapterError::Cancelled),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    Ok(WhisperStatus {
         binary_exists: binary_path.is_file(),
         models_dir_exists: models_dir.is_dir(),
         binary_path,
         models_dir,
+        version,
+        capability_error,
+    })
+}
+
+pub(crate) fn verify_whisper_cli(
+    binary_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<String> {
+    let version_output = run_command_cancellable(
+        Command::new(binary_path).arg("--version"),
+        cancellation,
+        "inspect whisper.cpp version",
+    )?;
+    if !version_output.status.success() {
+        return Err(AdapterError::ChildProcess {
+            program: "whisper.cpp",
+            status: version_output.status.code(),
+            message: process_diagnostics(&version_output, "`--version` failed"),
+        });
+    }
+    let version = process_diagnostics(&version_output, "unknown whisper.cpp version");
+    let help_output = run_command_cancellable(
+        Command::new(binary_path).arg("--help"),
+        cancellation,
+        "inspect whisper.cpp capabilities",
+    )?;
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help_output.stdout),
+        String::from_utf8_lossy(&help_output.stderr)
+    );
+    let missing = [
+        "--model",
+        "--file",
+        "--output-file",
+        "--output-srt",
+        "--output-vtt",
+    ]
+    .into_iter()
+    .filter(|flag| !help.contains(flag))
+    .collect::<Vec<_>>();
+    if !help_output.status.success() || !missing.is_empty() {
+        let detail = if missing.is_empty() {
+            process_diagnostics(&help_output, "`--help` failed")
+        } else {
+            format!("missing required options: {}", missing.join(", "))
+        };
+        return Err(AdapterError::invalid_input(format!(
+            "incompatible whisper.cpp CLI at {}: {detail}",
+            binary_path.display()
+        )));
+    }
+    Ok(version.lines().next().unwrap_or(&version).trim().to_owned())
+}
+
+fn process_diagnostics(output: &std::process::Output, fallback: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if message.is_empty() {
+        fallback.to_owned()
+    } else {
+        message
     }
 }
 
@@ -853,7 +1530,13 @@ fn is_whisper_model_file(path: &std::path::Path) -> bool {
 }
 
 pub fn default_whisper_binary_path() -> PathBuf {
-    PathBuf::from(".subbake/whisper/bin").join(default_whisper_binary_name())
+    default_whisper_binary_path_for(None)
+}
+
+pub fn default_whisper_binary_path_for(runtime_dir: Option<&Path>) -> PathBuf {
+    whisper_runtime_root(runtime_dir)
+        .join("bin")
+        .join(default_whisper_binary_name())
 }
 
 const fn default_whisper_binary_name() -> &'static str {
@@ -871,8 +1554,19 @@ fn whisper_binary_path(request: &WhisperRequest) -> PathBuf {
         .unwrap_or_else(default_whisper_binary_path)
 }
 
-fn default_whisper_models_dir() -> PathBuf {
-    PathBuf::from(".subbake/whisper/models")
+pub fn default_whisper_models_dir() -> PathBuf {
+    default_whisper_models_dir_for(None)
+}
+
+pub fn default_whisper_models_dir_for(runtime_dir: Option<&Path>) -> PathBuf {
+    whisper_runtime_root(runtime_dir).join("models")
+}
+
+fn whisper_runtime_root(runtime_dir: Option<&Path>) -> PathBuf {
+    runtime_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".subbake"))
+        .join("whisper")
 }
 
 #[cfg(test)]
@@ -888,6 +1582,7 @@ mod tests {
             action: WhisperAction::Status,
             binary_path: Some(PathBuf::from("/tmp/whisper-cli")),
             models_dir: Some(PathBuf::from("/tmp/models")),
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect("status should not require installed whisper");
 
@@ -916,12 +1611,38 @@ mod tests {
             executable_names: &["whisper-whisper-cli.exe", "whisper-cli.exe", "main.exe"],
         };
 
-        assert!(asset_match_score("whisper-bin-ubuntu-x64.tar.gz", &linux_x64).is_some());
-        assert!(asset_match_score("whisper-bin-ubuntu-arm64.tar.gz", &linux_arm64).is_some());
-        assert!(asset_match_score("whisper-bin-x64.zip", &windows_x64).is_some());
-        assert!(asset_match_score("whisper-blas-bin-x64.zip", &windows_x64).is_none());
-        assert!(asset_match_score("whisper-cublas-12.4.0-bin-x64.zip", &windows_x64).is_none());
-        assert!(asset_match_score("whisper-bin-ubuntu-x64.tar.gz", &windows_x64).is_none());
+        assert_eq!(
+            pinned_release_asset(&linux_x64, WhisperBuildVariant::Cpu)
+                .expect("linux x64 CPU asset")
+                .name,
+            "whisper-bin-ubuntu-x64.tar.gz"
+        );
+        assert_eq!(
+            pinned_release_asset(&linux_arm64, WhisperBuildVariant::Cpu)
+                .expect("linux arm64 CPU asset")
+                .name,
+            "whisper-bin-ubuntu-arm64.tar.gz"
+        );
+        assert_eq!(
+            pinned_release_asset(&windows_x64, WhisperBuildVariant::Cpu)
+                .expect("windows CPU asset")
+                .name,
+            "whisper-bin-x64.zip"
+        );
+        assert_eq!(
+            pinned_release_asset(&windows_x64, WhisperBuildVariant::OpenBlas)
+                .expect("windows OpenBLAS asset")
+                .name,
+            "whisper-blas-bin-x64.zip"
+        );
+        assert_eq!(
+            pinned_release_asset(&windows_x64, WhisperBuildVariant::Cuda)
+                .expect("windows CUDA asset")
+                .name,
+            "whisper-cublas-12.4.0-bin-x64.zip"
+        );
+        assert!(pinned_release_asset(&linux_x64, WhisperBuildVariant::Cuda).is_none());
+        assert!(pinned_release_asset(&windows_x64, WhisperBuildVariant::Metal).is_none());
     }
 
     #[test]
@@ -988,6 +1709,7 @@ mod tests {
             action: WhisperAction::Uninstall { keep_models: true },
             binary_path: Some(binary_path),
             models_dir: Some(root.join("models")),
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect("uninstall whisper");
         let user_file_exists = bin_dir.join("keep.txt").is_file();
@@ -1001,6 +1723,40 @@ mod tests {
     }
 
     #[test]
+    fn staged_install_replaces_managed_files_and_preserves_user_files() {
+        let root = temp_root("staged-install");
+        let target = root.join("target");
+        let staged = root.join("staged");
+        fs::create_dir_all(&target).expect("create target");
+        fs::create_dir_all(&staged).expect("create staged");
+        let old_binary = target.join("whisper-cli");
+        fs::write(&old_binary, b"old").expect("write old binary");
+        fs::write(target.join("old-library.so"), b"old library").expect("write old library");
+        fs::write(target.join("user.txt"), b"keep").expect("write user file");
+        write_install_manifest(&target, &old_binary, vec!["old-library.so".to_owned()])
+            .expect("write old manifest");
+
+        let staged_binary = staged.join("whisper-cli");
+        fs::write(&staged_binary, b"new").expect("write staged binary");
+        fs::write(staged.join("new-library.so"), b"new library").expect("write new library");
+        write_version_file(&staged, "v2").expect("write staged version");
+        write_install_manifest(&staged, &staged_binary, vec!["new-library.so".to_owned()])
+            .expect("write staged manifest");
+
+        commit_staged_install(&staged, &target).expect("commit staged install");
+        let binary = fs::read(target.join("whisper-cli")).expect("read installed binary");
+        let user = fs::read(target.join("user.txt")).expect("read user file");
+        let old_exists = target.join("old-library.so").exists();
+        let new_exists = target.join("new-library.so").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(binary, b"new");
+        assert_eq!(user, b"keep");
+        assert!(!old_exists);
+        assert!(new_exists);
+    }
+
+    #[test]
     fn list_models_returns_sorted_model_files() {
         let root = temp_root("models");
         let models_dir = root.join("models");
@@ -1009,24 +1765,22 @@ mod tests {
         fs::write(models_dir.join("ggml-base.gguf"), b"model").expect("write model");
         fs::write(models_dir.join("notes.txt"), b"ignore").expect("write note");
 
-        let outcome = run_whisper(WhisperRequest {
+        let request = WhisperRequest {
             action: WhisperAction::ListModels,
             binary_path: None,
             models_dir: Some(models_dir),
-        })
-        .expect("list models");
+            build_variant: WhisperBuildVariant::Cpu,
+        };
+        let list = list_models(&request, None, None).expect("list models");
         let _ = fs::remove_dir_all(&root);
 
-        let WhisperOutcome::ModelList(list) = outcome else {
-            panic!("expected model list");
-        };
         assert!(list.models_dir_exists);
         assert_eq!(
             list.models
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ggml-base", "ggml-small"]
+            vec!["base", "small"]
         );
     }
 
@@ -1039,6 +1793,7 @@ mod tests {
             },
             binary_path: None,
             models_dir: None,
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect_err("model download should reject unknown names");
 
@@ -1052,11 +1807,40 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_download_stops_before_network_or_file_creation() {
+        let root = temp_root("cancelled-download");
+        let destination = root.join("artifact.bin");
+        let token = subbake_core::CancellationToken::default();
+        let guard = token.guard();
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+        token.cancel();
+
+        let error = runtime()
+            .block_on(download_file(
+                "https://invalid.example/artifact",
+                &destination,
+                None,
+                &guard,
+                &progress,
+                "TEST",
+            ))
+            .expect_err("cancelled download must stop");
+        let exists = destination.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(error.is_cancelled());
+        assert!(!exists);
+    }
+
+    #[test]
     fn model_download_succeeds_when_file_exists() {
         let root = temp_root("exists");
         let models_dir = root.join("models");
         std::fs::create_dir_all(&models_dir).expect("create models dir");
-        std::fs::write(models_dir.join("ggml-base.bin"), b"fake").expect("write fake model");
+        let model_path = models_dir.join("ggml-base.bin");
+        std::fs::write(&model_path, b"fake").expect("write fake model");
+        let checksum = hash_file(&model_path, &CancellationGuard::never()).expect("hash model");
+        std::fs::write(models_dir.join("ggml-base.bin.sha256"), checksum).expect("write checksum");
 
         let outcome = run_whisper(WhisperRequest {
             action: WhisperAction::DownloadModel {
@@ -1064,11 +1848,36 @@ mod tests {
             },
             binary_path: None,
             models_dir: Some(models_dir),
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect("existing file should succeed");
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(matches!(outcome, WhisperOutcome::ModelList(_)));
+    }
+
+    #[test]
+    fn available_model_catalog_keeps_downloadable_ggml_files() {
+        let models = parse_available_models(vec![
+            HuggingFaceEntry {
+                path: "ggml-small.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+            HuggingFaceEntry {
+                path: "ggml-base.en.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+            HuggingFaceEntry {
+                path: "ggml-for-tests-tiny.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+            HuggingFaceEntry {
+                path: "README.md".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+        ]);
+
+        assert_eq!(models, vec!["base.en", "small"]);
     }
 
     #[test]
@@ -1085,6 +1894,7 @@ mod tests {
             action: WhisperAction::Uninstall { keep_models: false },
             binary_path: Some(bin_dir.join("whisper-cli")),
             models_dir: Some(models_dir),
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect("uninstall whisper");
         let _ = fs::remove_dir_all(&root);
@@ -1110,6 +1920,7 @@ mod tests {
             action: WhisperAction::Uninstall { keep_models: true },
             binary_path: Some(bin_dir.join("whisper-cli")),
             models_dir: Some(models_dir.clone()),
+            build_variant: WhisperBuildVariant::Cpu,
         })
         .expect("uninstall whisper");
         let kept = models_dir.exists();

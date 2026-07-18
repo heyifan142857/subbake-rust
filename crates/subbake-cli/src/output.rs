@@ -188,21 +188,72 @@ fn batch_text(outcome: &BatchTranslationOutcome) -> String {
 fn whisper_text(outcome: &WhisperOutcome) -> String {
     match outcome {
         WhisperOutcome::Status(status) => format!(
-            "Whisper binary: {} ({})\nModel directory: {} ({})\n",
+            "Whisper binary: {} ({})\nModel directory: {} ({})\n{}{}",
             status.binary_path.display(),
             exists_label(status.binary_exists),
             status.models_dir.display(),
-            exists_label(status.models_dir_exists)
+            exists_label(status.models_dir_exists),
+            status
+                .version
+                .as_ref()
+                .map(|version| format!("Version: {version}\n"))
+                .unwrap_or_default(),
+            status
+                .capability_error
+                .as_ref()
+                .map(|error| format!("Compatibility: {error}\n"))
+                .unwrap_or_default()
         ),
         WhisperOutcome::ModelList(list) => {
             let mut output = format!(
-                "Model directory: {} ({})\nModels: {}\n",
+                "Model directory: {} ({})\nInstalled models: {}\n",
                 list.models_dir.display(),
                 exists_label(list.models_dir_exists),
                 list.models.len()
             );
             for model in &list.models {
                 output.push_str(&format!("  {}: {}\n", model.name, model.path.display()));
+            }
+            output.push_str(&format!(
+                "Available models: {}\n",
+                list.available_models.len()
+            ));
+            for model in &list.available_models {
+                let installed = list.models.iter().any(|item| item.name == *model);
+                output.push_str(&format!(
+                    "  {model}{}\n",
+                    if installed { " (installed)" } else { "" }
+                ));
+            }
+            if let Some(warning) = &list.refresh_warning {
+                output.push_str(&format!("Warning: {warning}\n"));
+            }
+            output
+        }
+        WhisperOutcome::VersionList(list) => {
+            let mut output = format!(
+                "Pinned install version: {}\nAvailable versions: {}\n",
+                list.pinned_version,
+                list.versions.len()
+            );
+            for version in &list.versions {
+                output.push_str(&format!(
+                    "  {}{}{}\n",
+                    version.tag,
+                    if version.prerelease {
+                        " (prerelease)"
+                    } else {
+                        ""
+                    },
+                    if version.installable {
+                        " (installable)"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if let Some(warning) = &list.refresh_warning {
+                output.push_str(&format!("Warning: {warning}\n"));
             }
             output
         }
@@ -382,6 +433,8 @@ mod tests {
             binary_exists: false,
             models_dir: "models".into(),
             models_dir_exists: true,
+            version: None,
+            capability_error: None,
         }));
 
         assert!(output.contains("whisper-cli (missing)"));
@@ -395,14 +448,17 @@ mod tests {
                 models_dir: "models".into(),
                 models_dir_exists: true,
                 models: vec![subbake_adapters::WhisperModel {
-                    name: "ggml-base".to_owned(),
+                    name: "base".to_owned(),
                     path: "models/ggml-base.bin".into(),
                 }],
+                available_models: vec!["base".to_owned(), "small".to_owned()],
+                refresh_warning: None,
             },
         ));
 
-        assert!(output.contains("Models: 1"));
-        assert!(output.contains("ggml-base"));
+        assert!(output.contains("Installed models: 1"));
+        assert!(output.contains("Available models: 2"));
+        assert!(output.contains("base"));
     }
 
     #[test]

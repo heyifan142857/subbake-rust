@@ -7,6 +7,7 @@ pub mod llm_backends;
 pub mod mock;
 pub mod overnight;
 pub mod pipeline;
+mod process;
 pub mod providers;
 pub mod runtime;
 pub mod runtime_store;
@@ -54,7 +55,8 @@ pub use settings::{
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{
     TranscriptionFormat, TranscriptionOutcome, TranscriptionRequest, TranscriptionSettings,
-    transcribe_media, transcribe_media_cancellable, transcribe_media_cancellable_with_progress,
+    apply_whisper_storage, transcribe_media, transcribe_media_cancellable,
+    transcribe_media_cancellable_with_progress,
 };
 pub use translation::{
     BatchTranslationOutcome, BatchTranslationRequest, TranslationOutcome, TranslationRequest,
@@ -63,7 +65,8 @@ pub use translation::{
     translate_subtitle_cancellable, translate_subtitle_cancellable_with_progress,
 };
 pub use whisper::{
-    WhisperAction, WhisperModel, WhisperModelList, WhisperOutcome, WhisperRequest, WhisperStatus,
-    default_whisper_binary_path, run_whisper, run_whisper_cancellable,
-    run_whisper_cancellable_with_progress,
+    WhisperAction, WhisperBuildVariant, WhisperModel, WhisperModelList, WhisperOutcome,
+    WhisperRequest, WhisperStatus, WhisperVersion, WhisperVersionList, default_whisper_binary_path,
+    default_whisper_binary_path_for, default_whisper_models_dir, default_whisper_models_dir_for,
+    run_whisper, run_whisper_cancellable, run_whisper_cancellable_with_progress,
 };

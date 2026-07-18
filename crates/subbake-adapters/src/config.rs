@@ -416,6 +416,8 @@ mod tests {
                 },
                 storage: StorageOverrides {
                     runtime_dir: Some(".runtime".into()),
+                    whisper_binary_path: Some("tools/whisper-cli".into()),
+                    whisper_models_dir: Some("models".into()),
                     ..StorageOverrides::default()
                 },
                 ..SettingsOverrides::default()

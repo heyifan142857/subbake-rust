@@ -67,6 +67,8 @@ pub struct TranslationDomainSettings {
 pub struct StorageSettings {
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
+    pub whisper_binary_path: Option<PathBuf>,
+    pub whisper_models_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +133,8 @@ pub struct OutputOverrides {
 pub struct StorageOverrides {
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
+    pub whisper_binary_path: Option<PathBuf>,
+    pub whisper_models_dir: Option<PathBuf>,
 }
 
 impl SettingsOverrides {
@@ -196,6 +200,8 @@ impl SettingsOverrides {
             storage: StorageOverrides {
                 runtime_dir: settings.storage.runtime_dir.clone(),
                 glossary_path: settings.storage.glossary_path.clone(),
+                whisper_binary_path: settings.storage.whisper_binary_path.clone(),
+                whisper_models_dir: settings.storage.whisper_models_dir.clone(),
             },
         }
     }
@@ -276,7 +282,14 @@ impl OutputOverrides {
 
 impl StorageOverrides {
     fn merge(&mut self, other: Self) {
-        merge_optional_fields!(self, other, runtime_dir, glossary_path);
+        merge_optional_fields!(
+            self,
+            other,
+            runtime_dir,
+            glossary_path,
+            whisper_binary_path,
+            whisper_models_dir
+        );
     }
 }
 
@@ -320,6 +333,8 @@ impl Default for ResolvedSettings {
             storage: StorageSettings {
                 runtime_dir: None,
                 glossary_path: None,
+                whisper_binary_path: None,
+                whisper_models_dir: None,
             },
         }
     }
@@ -465,12 +480,20 @@ impl ResolvedSettings {
         let StorageOverrides {
             runtime_dir,
             glossary_path,
+            whisper_binary_path,
+            whisper_models_dir,
         } = overrides.storage;
         if let Some(value) = runtime_dir {
             self.storage.runtime_dir = Some(value);
         }
         if let Some(value) = glossary_path {
             self.storage.glossary_path = Some(value);
+        }
+        if let Some(value) = whisper_binary_path {
+            self.storage.whisper_binary_path = Some(value);
+        }
+        if let Some(value) = whisper_models_dir {
+            self.storage.whisper_models_dir = Some(value);
         }
     }
 

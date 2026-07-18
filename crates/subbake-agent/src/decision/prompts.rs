@@ -120,7 +120,7 @@ mod tests {
             None,
             true,
             None,
-            "translation: source=Auto, target=zh-Hans, provider=mock, model=mock-zh, format=source, bilingual=false, bilingual_order=target_first, dry_run=false\ntranscription: provider=whisper_api, model=whisper-1, language=Auto, format=srt",
+            "translation: source=Auto, target=zh-Hans, provider=mock, model=mock-zh, format=source, bilingual=false, bilingual_order=target_first, dry_run=false\ntranscription: provider=whisper_cpp, model=small, language=Auto, format=srt",
         );
         let system = &messages[0].content;
         assert!(system.contains("complete list"));

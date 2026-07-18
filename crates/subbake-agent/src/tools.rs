@@ -289,12 +289,6 @@ const TRANSCRIBE_AUDIO_ARGS: &[ToolArgSpec] = &[
         "spoken language name or BCP-47 tag; Auto detects it",
     ),
     arg(
-        "provider",
-        StringArg,
-        false,
-        "whisper_api or whisper_cpp for this call",
-    ),
-    arg(
         "model",
         StringArg,
         false,
@@ -360,7 +354,7 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
         "action",
         StringArg,
         false,
-        "status, install, update, uninstall, list-models, or download",
+        "status, list-versions, install, update, uninstall, list-models, or download",
     ),
     arg(
         "keep_models",
@@ -369,6 +363,12 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
         "keep models when uninstalling",
     ),
     arg("model", StringArg, false, "model name to download"),
+    arg(
+        "variant",
+        StringArg,
+        false,
+        "install variant: cpu, cuda, metal, vulkan, or openblas",
+    ),
 ];
 
 macro_rules! tool {
@@ -439,7 +439,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         true,
-        "Install, update, uninstall, inspect, or download whisper.cpp assets.",
+        "Manage local whisper.cpp. For an install request: install the CLI first, then call list-models and present the available models to the user; do not choose or download a model until the user selects one. Use list-versions to fetch upstream releases.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
     ),
@@ -806,7 +806,6 @@ mod tests {
             .collect::<Vec<_>>();
         for expected in [
             "language",
-            "provider",
             "model",
             "output_format",
             "output_path",

@@ -81,6 +81,12 @@ pub struct WhisperToolOutcome {
     pub models_dir_exists: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<WhisperModelFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_versions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

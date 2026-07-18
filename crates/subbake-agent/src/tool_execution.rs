@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use subbake_adapters::{
-    BatchTranslationRequest, ConfigFile, SettingsOverrides, SubtitleEditRequest,
+    BatchTranslationRequest, ConfigFile, SettingsOverrides, StorageSettings, SubtitleEditRequest,
     TranscriptionFormat, TranscriptionRequest, TranscriptionSettings, TranslationRequest,
-    TranslationSettings, WhisperAction, WhisperOutcome, WhisperRequest,
-    batch_translation_output_path, default_output_path_with_language, diagnose_failure_path,
+    TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome, WhisperRequest,
+    apply_whisper_storage, batch_translation_output_path, default_output_path_with_language,
+    default_whisper_binary_path_for, default_whisper_models_dir_for, diagnose_failure_path,
     edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_path,
     load_diagnostic_reports, transcribe_media_cancellable, translate_subtitle_cancellable,
 };
@@ -146,11 +147,15 @@ pub(crate) fn execute_adapter_tool(
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
+    storage: Option<&StorageSettings>,
 ) -> AgentResult<Option<AdapterToolOutcome>> {
     let outcome = match executor {
         ToolExecutor::TranscribeAudio => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
             let mut settings = TranscriptionSettings::default();
+            if let Some(storage) = storage {
+                apply_whisper_storage(&mut settings, storage);
+            }
             if let Some(language) = optional_argument(args, "language") {
                 let normalized = normalize_language(language, true).map_err(|error| {
                     AgentError::InvalidInput {
@@ -158,17 +163,6 @@ pub(crate) fn execute_adapter_tool(
                     }
                 })?;
                 settings.language = (normalized != "Auto").then_some(normalized);
-            }
-            if let Some(provider) = optional_argument(args, "provider") {
-                settings.provider = nonempty_value("provider", provider)?;
-            }
-            if !matches!(settings.provider.as_str(), "whisper_api" | "whisper_cpp") {
-                return Err(AgentError::InvalidInput {
-                    message: format!(
-                        "unsupported transcriber `{}`; expected whisper_api or whisper_cpp",
-                        settings.provider
-                    ),
-                });
             }
             if let Some(model) = optional_argument(args, "model") {
                 settings.model = Some(nonempty_value("model", model)?);
@@ -233,6 +227,15 @@ pub(crate) fn execute_adapter_tool(
         }
         ToolExecutor::ManageWhisper => {
             let action = whisper_action(args)?;
+            let build_variant = optional_argument(args, "variant")
+                .map(|value| {
+                    WhisperBuildVariant::parse(value).ok_or_else(|| AgentError::InvalidInput {
+                        message: "whisper variant must be cpu, cuda, metal, vulkan, or openblas"
+                            .to_owned(),
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
             let action_name = whisper_action_name(&action).to_owned();
             let requested_model = match &action {
                 WhisperAction::DownloadModel { name } => Some(name.clone()),
@@ -240,8 +243,17 @@ pub(crate) fn execute_adapter_tool(
             };
             let request = WhisperRequest {
                 action,
-                binary_path: None,
-                models_dir: None,
+                binary_path: storage.map(|storage| {
+                    storage.whisper_binary_path.clone().unwrap_or_else(|| {
+                        default_whisper_binary_path_for(storage.runtime_dir.as_deref())
+                    })
+                }),
+                models_dir: storage.map(|storage| {
+                    storage.whisper_models_dir.clone().unwrap_or_else(|| {
+                        default_whisper_models_dir_for(storage.runtime_dir.as_deref())
+                    })
+                }),
+                build_variant,
             };
             let managed = if let Some(progress) = progress {
                 subbake_adapters::run_whisper_cancellable_with_progress(
@@ -255,32 +267,68 @@ pub(crate) fn execute_adapter_tool(
             match managed {
                 Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(managed) => {
-                    let (binary_path, binary_exists, models_dir, models_dir_exists, models) =
-                        match managed {
-                            WhisperOutcome::Status(status) => (
-                                Some(status.binary_path),
-                                Some(status.binary_exists),
-                                Some(status.models_dir),
-                                Some(status.models_dir_exists),
-                                Vec::new(),
-                            ),
-                            WhisperOutcome::ModelList(list) => (
-                                None,
-                                None,
-                                Some(list.models_dir),
-                                Some(list.models_dir_exists),
-                                list.models
-                                    .into_iter()
-                                    .map(|model| WhisperModelFact {
-                                        name: model.name,
-                                        path: model.path,
-                                    })
-                                    .collect(),
-                            ),
-                        };
+                    let (
+                        binary_path,
+                        binary_exists,
+                        models_dir,
+                        models_dir_exists,
+                        models,
+                        available_models,
+                        available_versions,
+                        refresh_warning,
+                    ) = match managed {
+                        WhisperOutcome::Status(status) => (
+                            Some(status.binary_path),
+                            Some(status.binary_exists),
+                            Some(status.models_dir),
+                            Some(status.models_dir_exists),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        ),
+                        WhisperOutcome::ModelList(list) => (
+                            None,
+                            None,
+                            Some(list.models_dir),
+                            Some(list.models_dir_exists),
+                            list.models
+                                .into_iter()
+                                .map(|model| WhisperModelFact {
+                                    name: model.name,
+                                    path: model.path,
+                                })
+                                .collect(),
+                            list.available_models,
+                            Vec::new(),
+                            list.refresh_warning,
+                        ),
+                        WhisperOutcome::VersionList(list) => (
+                            None,
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                            list.versions
+                                .into_iter()
+                                .map(|version| {
+                                    if version.installable {
+                                        format!("{} (installable)", version.tag)
+                                    } else {
+                                        version.tag
+                                    }
+                                })
+                                .collect(),
+                            list.refresh_warning,
+                        ),
+                    };
                     AdapterToolOutcome {
                         outcome: AgentToolOutcome::Whisper(WhisperToolOutcome {
-                            status: if matches!(action_name.as_str(), "status" | "list_models") {
+                            status: if matches!(
+                                action_name.as_str(),
+                                "status" | "list_models" | "list_versions"
+                            ) {
                                 ToolExecutionStatus::Observed
                             } else {
                                 ToolExecutionStatus::Completed
@@ -292,6 +340,9 @@ pub(crate) fn execute_adapter_tool(
                             models_dir,
                             models_dir_exists,
                             models,
+                            available_models,
+                            available_versions,
+                            refresh_warning,
                         }),
                         file_operation: None,
                     }
@@ -768,9 +819,15 @@ fn whisper_action(args: &JsonValue) -> AgentResult<WhisperAction> {
                 .unwrap_or(false),
         }),
         "status" => Ok(WhisperAction::Status),
+        "list-versions" | "versions" => Ok(WhisperAction::ListVersions),
         "list-models" | "models" => Ok(WhisperAction::ListModels),
         "download" | "download_model" => Ok(WhisperAction::DownloadModel {
-            name: optional_string(args, "model", "small").to_owned(),
+            name: optional_argument(args, "model")
+                .map(|model| nonempty_value("model", model))
+                .transpose()?
+                .ok_or_else(|| AgentError::ToolArguments {
+                    message: "download requires an explicitly selected `model`".to_owned(),
+                })?,
         }),
         other => Err(AgentError::InvalidInput {
             message: format!("unknown whisper action `{other}`"),
@@ -781,6 +838,7 @@ fn whisper_action(args: &JsonValue) -> AgentResult<WhisperAction> {
 fn whisper_action_name(action: &WhisperAction) -> &'static str {
     match action {
         WhisperAction::Status => "status",
+        WhisperAction::ListVersions => "list_versions",
         WhisperAction::Install => "install",
         WhisperAction::Update => "update",
         WhisperAction::Uninstall { .. } => "uninstall",
@@ -1094,6 +1152,7 @@ mod tests {
             &guard,
             &CancellationGuard::never(),
             None,
+            None,
         )
         .expect("execute")
         .expect("adapter outcome");
@@ -1110,10 +1169,19 @@ mod tests {
             &guard,
             &CancellationGuard::never(),
             None,
+            None,
         )
         .expect_err("invalid whisper action must fail");
         assert!(matches!(error, AgentError::InvalidInput { .. }));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn whisper_download_requires_an_explicit_model_choice() {
+        let error = whisper_action(&json!({"action": "download"}))
+            .expect_err("download without a selected model must fail");
+
+        assert!(matches!(error, AgentError::ToolArguments { .. }));
     }
 
     #[test]
