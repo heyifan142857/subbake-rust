@@ -1210,18 +1210,15 @@ fn num_cpus() -> usize {
 // Model download from HuggingFace
 // ---------------------------------------------------------------------------
 
-pub const SUPPORTED_MODELS: &[&str] = &["tiny", "base", "small", "medium", "large-v3"];
-
 fn download_model(
     request: &WhisperRequest,
     name: &str,
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
 ) -> AdapterResult<()> {
-    if !SUPPORTED_MODELS.contains(&name) {
+    if !is_safe_model_name(name) {
         return Err(AdapterError::invalid_input(format!(
-            "unknown model `{name}`; supported: {}",
-            SUPPORTED_MODELS.join(", ")
+            "invalid whisper.cpp model name `{name}`"
         )));
     }
 
@@ -1229,14 +1226,6 @@ fn download_model(
         .models_dir
         .clone()
         .unwrap_or_else(default_whisper_models_dir);
-    std::fs::create_dir_all(&models_dir).map_err(|source| {
-        AdapterError::external_io(
-            "create whisper models directory",
-            Some(models_dir.clone()),
-            source,
-        )
-    })?;
-
     let dest = models_dir.join(format!("ggml-{name}.bin"));
     let checksum_path = dest.with_extension("bin.sha256");
     if dest.is_file() && checksum_path.is_file() {
@@ -1248,6 +1237,17 @@ fn download_model(
         }
     }
 
+    let (available_models, _) = fetch_available_models(cancellation)?;
+    validate_available_model(name, &available_models)?;
+
+    std::fs::create_dir_all(&models_dir).map_err(|source| {
+        AdapterError::external_io(
+            "create whisper models directory",
+            Some(models_dir.clone()),
+            source,
+        )
+    })?;
+
     let url = format!("{HF_MODEL_BASE}/ggml-{name}.bin");
     let checksum = runtime().block_on(async {
         download_file(&url, &dest, None, cancellation, progress, "DOWNLOAD_MODEL").await
@@ -1255,6 +1255,23 @@ fn download_model(
     write_atomic(&checksum_path, format!("{checksum}\n").as_bytes())?;
 
     Ok(())
+}
+
+fn is_safe_model_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn validate_available_model(name: &str, available_models: &[String]) -> AdapterResult<()> {
+    if available_models.iter().any(|model| model == name) {
+        return Ok(());
+    }
+    Err(AdapterError::invalid_input(format!(
+        "unknown model `{name}`; run `sbake whisper model list` to see available models"
+    )))
 }
 
 fn hash_file(path: &Path, cancellation: &CancellationGuard) -> AdapterResult<String> {
@@ -1785,25 +1802,25 @@ mod tests {
     }
 
     #[test]
-    fn model_download_attempts_download() {
-        // Use an unsupported model name to avoid hitting a real file on disk.
-        let error = run_whisper(WhisperRequest {
-            action: WhisperAction::DownloadModel {
-                name: "unknown-model-test".to_owned(),
-            },
-            binary_path: None,
-            models_dir: None,
-            build_variant: WhisperBuildVariant::Cpu,
-        })
-        .expect_err("model download should reject unknown names");
+    fn model_download_validation_uses_the_catalog() {
+        let catalog = FALLBACK_MODELS
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect::<Vec<_>>();
 
-        let msg = error.to_string();
-        // The old stub said "pending adapter migration".
-        assert!(
-            !msg.contains("pending"),
-            "should no longer be a stub: {msg}"
-        );
-        assert!(msg.contains("unknown model"));
+        validate_available_model("large-v3-turbo-q8_0", &catalog)
+            .expect("quantized catalog model should be accepted");
+        let error = validate_available_model("unknown-model-test", &catalog)
+            .expect_err("unknown model should be rejected");
+        assert!(error.to_string().contains("unknown model"));
+    }
+
+    #[test]
+    fn model_names_cannot_escape_the_models_directory() {
+        assert!(is_safe_model_name("large-v3-turbo-q8_0"));
+        assert!(is_safe_model_name("base.en-q8_0"));
+        assert!(!is_safe_model_name("../large-v3"));
+        assert!(!is_safe_model_name("large/v3"));
     }
 
     #[test]
