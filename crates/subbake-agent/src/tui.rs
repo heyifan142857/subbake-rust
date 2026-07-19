@@ -27,8 +27,9 @@ use crate::engine::SessionChoice;
 use crate::error::AgentResult;
 use crate::input_editor::InputEditor;
 use crate::tui_state::{
-    APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionState, SessionPicker, TuiPicker,
-    VerticalNavigation, empty_mode_choice, history_down, history_up, vertical_navigation,
+    APPROVAL_OPTIONS, COMMAND_APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionState,
+    SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_up,
+    vertical_navigation,
 };
 use subbake_core::{CancellationGuard, CancellationToken};
 use subbake_core::{ProgressEvent, TaskState};
@@ -124,6 +125,13 @@ impl SubBakeTui {
 
     pub fn set_plan_mode(&mut self, enabled: bool) {
         self.plan_mode = enabled;
+    }
+
+    pub fn set_command_approval_pending(&mut self, pending: bool) {
+        if pending {
+            self.interaction_state
+                .set_input_mode(InputMode::AwaitingCommandDecision);
+        }
     }
 
     pub fn set_has_config_file(&mut self, has_config_file: bool) {
@@ -274,6 +282,12 @@ impl SubBakeTui {
                             self.suggestion_index = 0;
                             self.render_response(message);
                         }
+                        Ok(TuiInteraction::CommandApproval { message }) => {
+                            self.interaction_state
+                                .set_input_mode(InputMode::AwaitingCommandDecision);
+                            self.suggestion_index = 0;
+                            self.render_response(message);
+                        }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
                             self.open_fullscreen_overlay()?;
                             self.interaction_state
@@ -286,9 +300,14 @@ impl SubBakeTui {
                             events,
                             plan_mode,
                             model,
+                            command_approval,
                         }) => {
                             self.input_history = input_history;
-                            self.interaction_state.set_input_mode(InputMode::Editing);
+                            self.interaction_state.set_input_mode(if command_approval {
+                                InputMode::AwaitingCommandDecision
+                            } else {
+                                InputMode::Editing
+                            });
                             self.suggestion_index = 0;
                             self.set_session_replay(events);
                             self.plan_mode = plan_mode;
@@ -598,6 +617,10 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
         InputMode::AwaitingPlanDecision if input.is_empty() => APPROVAL_OPTIONS
             .iter()
             .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
+            .collect(),
+        InputMode::AwaitingCommandDecision if input.is_empty() => COMMAND_APPROVAL_OPTIONS
+            .iter()
+            .map(|(command, description)| ((*command).to_owned(), (*description).to_owned()))
             .collect(),
         InputMode::ChoosingProfile(_) => Vec::new(),
         InputMode::CreatingProfile => Vec::new(),

@@ -106,6 +106,10 @@ impl FileGuard {
         }
     }
 
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
     // ------------------------------------------------------------------
     // Public operations
     // ------------------------------------------------------------------
@@ -246,6 +250,138 @@ impl FileGuard {
                 semantic_undo: None,
             })
         }
+    }
+
+    /// Allocate a private, same-filesystem staging directory for a sandboxed
+    /// command. The child sees this directory only through its private output mount.
+    pub fn create_command_staging(&self) -> FileGuardResult<PathBuf> {
+        let path = self
+            .project_root
+            .join(".subbake/agent/command-runs")
+            .join(format!("{}", nanos_since_epoch()));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    /// Commit regular files produced in a private command staging directory.
+    /// All targets are validated before the first mutation and a failed
+    /// multi-file commit is rolled back to its pre-command state.
+    pub fn commit_staged_files(
+        &self,
+        files: &[(PathBuf, PathBuf)],
+        overwrite: bool,
+    ) -> FileGuardResult<Vec<FileOpResult>> {
+        let mut prepared = Vec::with_capacity(files.len());
+        let mut destinations = std::collections::HashSet::new();
+        for (staged, destination) in files {
+            let metadata =
+                std::fs::symlink_metadata(staged).map_err(|source| FileGuardError::Io {
+                    operation: "inspect staged command output",
+                    path: Some(staged.clone()),
+                    source,
+                })?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(FileGuardError::Io {
+                    operation: "staged command output is not a regular file",
+                    path: Some(staged.clone()),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "only regular file outputs are supported",
+                    ),
+                });
+            }
+            let safe = self.resolve(destination)?;
+            if !destinations.insert(safe.clone()) {
+                return Err(FileGuardError::Io {
+                    operation: "commit staged command outputs",
+                    path: Some(safe),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "duplicate output destination",
+                    ),
+                });
+            }
+            if safe.exists() && !overwrite {
+                return Err(FileGuardError::AlreadyExists { path: safe });
+            }
+            if safe.exists() && !safe.is_file() {
+                return Err(FileGuardError::Io {
+                    operation: "replace command output",
+                    path: Some(safe),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "output destination is not a regular file",
+                    ),
+                });
+            }
+            prepared.push((staged.clone(), safe));
+        }
+
+        let transaction_root = self
+            .backup_root
+            .join(format!("command-{}", nanos_since_epoch()));
+        let backups = prepared
+            .iter()
+            .map(|(staged, destination)| {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if destination.exists() {
+                    let permissions = std::fs::metadata(destination)?.permissions();
+                    std::fs::set_permissions(staged, permissions)?;
+                    let relative = destination
+                        .strip_prefix(&self.project_root)
+                        .unwrap_or(destination);
+                    let backup = transaction_root.join(relative);
+                    if let Some(parent) = backup.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    Ok(Some(backup))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<FileGuardResult<Vec<_>>>()?;
+        let mut committed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        for (index, ((staged, destination), backup)) in prepared.iter().zip(backups).enumerate() {
+            if let Some(backup) = &backup
+                && let Err(source) = std::fs::rename(destination, backup)
+            {
+                rollback_committed_files(&committed);
+                return Err(FileGuardError::Io {
+                    operation: "back up command output destination",
+                    path: Some(destination.clone()),
+                    source,
+                });
+            }
+            if let Err(source) = std::fs::rename(staged, destination) {
+                if let Some(backup) = &backup {
+                    let _ = std::fs::rename(backup, destination);
+                }
+                rollback_committed_files(&committed);
+                return Err(FileGuardError::Io {
+                    operation: "commit staged command output",
+                    path: Some(prepared[index].1.clone()),
+                    source,
+                });
+            }
+            committed.push((destination.clone(), backup));
+        }
+
+        Ok(committed
+            .into_iter()
+            .map(|(path, backup_path)| FileOpResult {
+                action: if backup_path.is_some() {
+                    FileOpAction::Modified
+                } else {
+                    FileOpAction::Create
+                },
+                path,
+                backup_path,
+                new_path: None,
+                semantic_undo: None,
+            })
+            .collect())
     }
 
     /// Persist only the previous text subtitle when an in-place media remux
@@ -452,6 +588,15 @@ impl FileGuard {
     }
 }
 
+fn rollback_committed_files(committed: &[(PathBuf, Option<PathBuf>)]) {
+    for (path, prior) in committed.iter().rev() {
+        let _ = std::fs::remove_file(path);
+        if let Some(prior) = prior {
+            let _ = std::fs::rename(prior, path);
+        }
+    }
+}
+
 fn wildcard_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let value = value.chars().collect::<Vec<_>>();
@@ -511,6 +656,41 @@ mod tests {
         let root = std::env::temp_dir().join(format!("subbake-guard-{ts}"));
         let guard = FileGuard::new(root.clone());
         (root, guard)
+    }
+
+    #[test]
+    fn staged_files_commit_transactionally_and_keep_overwrite_backup() {
+        let (root, guard) = setup();
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("existing.bin"), b"old").expect("old output");
+        let staging = guard.create_command_staging().expect("staging");
+        std::fs::write(staging.join("first"), b"new").expect("staged replacement");
+        std::fs::write(staging.join("second"), b"created").expect("staged creation");
+
+        let operations = guard
+            .commit_staged_files(
+                &[
+                    (staging.join("first"), PathBuf::from("existing.bin")),
+                    (staging.join("second"), PathBuf::from("created.bin")),
+                ],
+                true,
+            )
+            .expect("commit outputs");
+
+        assert_eq!(
+            std::fs::read(root.join("existing.bin")).expect("new"),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(root.join("created.bin")).expect("created"),
+            b"created"
+        );
+        let backup = operations[0]
+            .backup_path
+            .as_ref()
+            .expect("overwrite backup");
+        assert_eq!(std::fs::read(backup).expect("backup"), b"old");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

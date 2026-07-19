@@ -30,7 +30,7 @@ pub(super) fn handle_event(
             KeyCode::Char('q') if app.input.is_empty() => {
                 app.running = false;
             }
-            KeyCode::Esc => handle_escape(app)?,
+            KeyCode::Esc => handle_escape(app, request_tx)?,
             _ if is_insert_newline_key(key)
                 && !matches!(
                     app.interaction_state.input_mode(),
@@ -82,7 +82,7 @@ pub(super) fn handle_event(
     Ok(())
 }
 
-fn handle_escape(app: &mut SubBakeTui) -> io::Result<()> {
+fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) -> io::Result<()> {
     if app.interaction_state.is_processing() {
         if app.interaction_state.request_cancellation() {
             if let Ok(mut progress) = app.progress.lock()
@@ -99,6 +99,12 @@ fn handle_escape(app: &mut SubBakeTui) -> io::Result<()> {
             }
         }
         return Ok(());
+    }
+    if matches!(
+        app.interaction_state.input_mode(),
+        InputMode::AwaitingCommandDecision
+    ) {
+        return submit_action(app, request_tx, TuiAction::RejectCommand);
     }
     let cancel_exits = matches!(
         app.interaction_state.input_mode(),

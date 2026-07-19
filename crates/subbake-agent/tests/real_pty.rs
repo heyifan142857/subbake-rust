@@ -110,6 +110,14 @@ exit "$status"
     wait_for_action(&action_log, "RejectPlan", &transcript);
     wait_for_output(&transcript, b"plan rejected", STEP_TIMEOUT);
 
+    send_text(&writer, "run command");
+    send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "SubmitText:run command", &transcript);
+    wait_for_output(&transcript, b"pending PTY command", STEP_TIMEOUT);
+    send(&writer, ESCAPE_KEY);
+    wait_for_action(&action_log, "RejectCommand", &transcript);
+    wait_for_output(&transcript, b"command rejected", STEP_TIMEOUT);
+
     send_text(&writer, "cancel me");
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:cancel me", &transcript);
@@ -229,6 +237,14 @@ fn scripted_interaction(
         TuiAction::RejectPlan => Ok(TuiInteraction::Message {
             message: "plan rejected".to_owned(),
         }),
+        TuiAction::SubmitText(input) if input == "run command" => {
+            Ok(TuiInteraction::CommandApproval {
+                message: "pending PTY command".to_owned(),
+            })
+        }
+        TuiAction::RejectCommand => Ok(TuiInteraction::Message {
+            message: "command rejected".to_owned(),
+        }),
         TuiAction::SubmitText(input) if input == "cancel me" => {
             while !guard.is_cancelled() {
                 thread::sleep(Duration::from_millis(10));
@@ -250,6 +266,8 @@ fn action_label(action: &TuiAction) -> String {
         TuiAction::SubmitText(input) => format!("SubmitText:{input}"),
         TuiAction::ApprovePlan => "ApprovePlan".to_owned(),
         TuiAction::RejectPlan => "RejectPlan".to_owned(),
+        TuiAction::ApproveCommand => "ApproveCommand".to_owned(),
+        TuiAction::RejectCommand => "RejectCommand".to_owned(),
         TuiAction::SelectProfile(name) => format!("SelectProfile:{name}"),
         TuiAction::CreateProfile(name) => format!("CreateProfile:{name}"),
         TuiAction::SelectSession(id) => format!("SelectSession:{id}"),

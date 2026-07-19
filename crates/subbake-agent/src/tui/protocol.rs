@@ -28,6 +28,9 @@ pub enum TuiInteraction {
     PlanApproval {
         message: String,
     },
+    CommandApproval {
+        message: String,
+    },
     ProfilePicker {
         message: String,
         options: Vec<ProfileChoice>,
@@ -37,6 +40,7 @@ pub enum TuiInteraction {
         events: Vec<crate::session::AgentEvent>,
         plan_mode: bool,
         model: String,
+        command_approval: bool,
     },
     SessionPicker {
         message: String,
@@ -56,6 +60,8 @@ pub enum TuiAction {
     SubmitText(String),
     ApprovePlan,
     RejectPlan,
+    ApproveCommand,
+    RejectCommand,
     SelectProfile(String),
     CreateProfile(String),
     SelectSession(String),

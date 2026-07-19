@@ -9,7 +9,8 @@ use crate::event::{EventKind, FileOpEventData};
 use crate::guard::{FileOpAction, FileOpResult};
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::tool_execution::{
-    execute_adapter_tool, execute_local_tool, execute_session_tool, execute_translation_tool,
+    execute_adapter_tool, execute_command_tool, execute_local_tool, execute_session_tool,
+    execute_translation_tool,
 };
 use crate::tools::ToolExecutor;
 
@@ -31,6 +32,16 @@ impl ToolRunner {
             .ok_or_else(|| AgentError::InvalidInput {
                 message: format!("unknown agent tool `{name}`"),
             })?;
+
+        if executor == ToolExecutor::RunCommand {
+            let outcome = execute_command_tool(args, &engine.guard, &engine.operation_guard)?;
+            let group_id = (outcome.file_operations.len() > 1)
+                .then(|| format!("run-command-{}", crate::session::iso_now()));
+            for operation in &outcome.file_operations {
+                Self::record_file_operation(engine, operation, group_id.clone())?;
+            }
+            return Ok(outcome.outcome);
+        }
 
         if executor == ToolExecutor::ApplyPatch {
             let patch = args

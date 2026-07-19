@@ -46,6 +46,12 @@ pub enum EventKind {
         message: String,
         tool_calls: Vec<ToolCallDraft>,
     },
+    CommandApprovalRequested {
+        tool_call: ToolCallDraft,
+        reason: String,
+    },
+    CommandApproved,
+    CommandRejected,
     Approve,
     Reject,
     Undo,
@@ -70,5 +76,12 @@ pub struct ToolCallDraft {
 pub struct PendingPlan {
     pub message: String,
     pub tool_calls: Vec<ToolCallDraft>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingCommandApproval {
+    pub tool_call: ToolCallDraft,
+    pub reason: String,
     pub created_at: String,
 }

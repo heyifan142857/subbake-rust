@@ -104,6 +104,21 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
         ),
         EventKind::Approve => ("approve".into(), String::new(), serde_json::json!({})),
         EventKind::Reject => ("reject".into(), String::new(), serde_json::json!({})),
+        EventKind::CommandApprovalRequested { tool_call, reason } => (
+            "command_approval_requested".into(),
+            reason.clone(),
+            serde_json::json!({"tool_call": tool_call, "reason": reason}),
+        ),
+        EventKind::CommandApproved => (
+            "command_approved".into(),
+            String::new(),
+            serde_json::json!({}),
+        ),
+        EventKind::CommandRejected => (
+            "command_rejected".into(),
+            String::new(),
+            serde_json::json!({}),
+        ),
         EventKind::Undo => ("undo".into(), String::new(), serde_json::json!({})),
         EventKind::Profile { name } => ("profile".into(), name.clone(), serde_json::json!({})),
         EventKind::Error { text } => ("error".into(), text.clone(), serde_json::json!({})),

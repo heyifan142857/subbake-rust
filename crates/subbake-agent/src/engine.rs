@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, ToolCallDraft};
+use crate::event::{EventKind, PendingCommandApproval, ToolCallDraft};
 use crate::guard::FileGuard;
 use crate::plan_coordinator::PlanCoordinator;
 use crate::presentation::ConversationPresenter;
@@ -54,6 +54,12 @@ pub struct StreamingObserver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandDecision {
     Approve,
     Reject,
 }
@@ -274,6 +280,84 @@ impl AgentEngine {
         Ok(())
     }
 
+    pub fn store_command_approval(
+        &mut self,
+        tool_call: ToolCallDraft,
+        reason: String,
+    ) -> AgentResult<()> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no active session"))?;
+        if session.pending_plan.is_some() || session.pending_command_approval.is_some() {
+            return Err(AgentError::invalid_state(
+                "another plan or command approval is already pending",
+            ));
+        }
+        session.pending_command_approval = Some(PendingCommandApproval {
+            tool_call: tool_call.clone(),
+            reason: reason.clone(),
+            created_at: crate::session::iso_now(),
+        });
+        self.record(EventKind::CommandApprovalRequested { tool_call, reason })
+    }
+
+    pub fn has_pending_command_approval(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.pending_command_approval.is_some())
+    }
+
+    pub fn pending_command_approval_summary(&self) -> String {
+        let Some(pending) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_command_approval.as_ref())
+        else {
+            return "No command awaiting approval.".to_owned();
+        };
+        format!(
+            "Command awaiting approval ({})\n{}",
+            pending.reason, pending.tool_call.arguments
+        )
+    }
+
+    pub fn approve_command(&mut self) -> AgentResult<String> {
+        let call = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_command_approval.as_ref())
+            .map(|pending| pending.tool_call.clone())
+            .ok_or_else(|| AgentError::invalid_state("no command awaiting approval"))?;
+        let result = self.run_tool(&call.tool_name, &call.arguments)?;
+        self.session
+            .as_mut()
+            .ok_or_else(|| AgentError::invalid_state("no active session"))?
+            .pending_command_approval = None;
+        self.record(EventKind::CommandApproved)?;
+        Ok(render_tool_outcome(&result))
+    }
+
+    pub fn reject_command(&mut self) -> AgentResult<String> {
+        self.session
+            .as_mut()
+            .ok_or_else(|| AgentError::invalid_state("no active session"))?
+            .pending_command_approval = None;
+        self.record(EventKind::CommandRejected)?;
+        Ok("Rejected pending command.".to_owned())
+    }
+
+    pub fn handle_command_decision(&mut self, decision: CommandDecision) -> AgentResult<String> {
+        let result = match decision {
+            CommandDecision::Approve => self.approve_command(),
+            CommandDecision::Reject => self.reject_command(),
+        }?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
+    }
+
     pub fn approve_plan(&mut self) -> AgentResult<String> {
         let mut outputs = Vec::new();
         loop {
@@ -483,6 +567,12 @@ impl AgentEngine {
             "/plan" => return self.handle_toggle_plan(),
             "/plan on" => return self.set_plan_mode(true),
             "/plan off" => return self.set_plan_mode(false),
+            "/approve" if self.has_pending_command_approval() => {
+                return self.handle_command_decision(CommandDecision::Approve);
+            }
+            "/reject" if self.has_pending_command_approval() => {
+                return self.handle_command_decision(CommandDecision::Reject);
+            }
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
@@ -566,7 +656,8 @@ impl AgentEngine {
 
 #[cfg(test)]
 mod error_persistence_tests {
-    use super::{AgentEngine, is_known_slash_command};
+    use super::{AgentEngine, CommandDecision, is_known_slash_command};
+    use crate::event::ToolCallDraft;
 
     #[test]
     fn only_registered_slash_commands_take_the_command_path() {
@@ -577,6 +668,34 @@ mod error_persistence_tests {
             "/home/azote/Downloads/Braveheart.fixed.translated.srt改为中英双语"
         ));
         assert!(!is_known_slash_command("/plan 改为中英双语"));
+    }
+
+    #[test]
+    fn command_approval_is_persisted_and_rejected_independently_from_plans() {
+        let root = std::env::temp_dir().join(format!(
+            "subbake-agent-command-approval-{}",
+            crate::session::iso_now().replace([':', '.'], "-")
+        ));
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine
+            .store_command_approval(
+                ToolCallDraft {
+                    tool_name: "run_command".to_owned(),
+                    arguments: serde_json::json!({"command":"printf hello"}),
+                },
+                "unknown command".to_owned(),
+            )
+            .expect("store approval");
+        assert!(engine.has_pending_command_approval());
+        assert!(!engine.has_pending_plan());
+
+        let result = engine
+            .handle_command_decision(CommandDecision::Reject)
+            .expect("reject command");
+        assert_eq!(result, "Rejected pending command.");
+        assert!(!engine.has_pending_command_approval());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -163,6 +163,10 @@ impl AgentEngine {
                         ProcessedCalls::Planned => {
                             return self.finish_response(self.pending_plan_summary(), false);
                         }
+                        ProcessedCalls::AwaitingCommandApproval => {
+                            return self
+                                .finish_response(self.pending_command_approval_summary(), false);
+                        }
                         ProcessedCalls::RepeatedFailure(message) => {
                             return self.finish_response(message, false);
                         }
@@ -308,6 +312,36 @@ impl AgentEngine {
             return Ok(ProcessedCalls::RepeatedFailure(
                 "The model returned an empty tool-call turn. Please retry the request.".to_owned(),
             ));
+        }
+
+        let command_approval = calls.iter().find_map(|call| {
+            if call.name != "run_command"
+                || validate_tool_call(&call.name, &call.arguments).is_err()
+            {
+                return None;
+            }
+            let spec = find_tool_spec(&call.name)?;
+            if self.is_in_plan_mode() && spec.mutates_with(&call.arguments) {
+                return None;
+            }
+            match crate::command_policy::classify(&call.arguments) {
+                crate::command_policy::CommandApproval::AskUser(reason) => Some((call, reason)),
+                crate::command_policy::CommandApproval::AutoRun
+                | crate::command_policy::CommandApproval::Deny(_) => None,
+            }
+        });
+        if let Some((call, reason)) = command_approval {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_tool_call(&call.name, &call.arguments);
+            }
+            self.store_command_approval(
+                ToolCallDraft {
+                    tool_name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+                reason,
+            )?;
+            return Ok(ProcessedCalls::AwaitingCommandApproval);
         }
 
         let planned = calls
@@ -584,7 +618,8 @@ fn validation_category(error: &ToolValidationError) -> &'static str {
         ToolValidationError::ArgumentsNotObject { .. }
         | ToolValidationError::UnexpectedArgument { .. }
         | ToolValidationError::MissingArgument { .. }
-        | ToolValidationError::WrongArgumentType { .. } => "invalid_arguments",
+        | ToolValidationError::WrongArgumentType { .. }
+        | ToolValidationError::InvalidArgument { .. } => "invalid_arguments",
     }
 }
 
@@ -637,6 +672,7 @@ struct FailureKey {
 enum ProcessedCalls {
     Continue(Vec<ModelToolResult>),
     Planned,
+    AwaitingCommandApproval,
     RepeatedFailure(String),
 }
 

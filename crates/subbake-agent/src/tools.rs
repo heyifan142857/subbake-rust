@@ -16,6 +16,7 @@ pub enum ToolKind {
     FileOp,
     Profile,
     ManageWhisper,
+    Command,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,12 +55,15 @@ pub(crate) enum ToolExecutor {
     DeleteFile,
     SwitchProfile,
     ListProfiles,
+    RunCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolArgKind {
     String,
     Boolean,
+    Integer,
+    StringMap,
 }
 
 impl ToolArgKind {
@@ -67,6 +71,8 @@ impl ToolArgKind {
         match self {
             Self::String => "string",
             Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::StringMap => "object<string,string>",
         }
     }
 
@@ -74,6 +80,10 @@ impl ToolArgKind {
         match self {
             Self::String => value.is_string(),
             Self::Boolean => value.is_boolean(),
+            Self::Integer => value.is_i64() || value.is_u64(),
+            Self::StringMap => value
+                .as_object()
+                .is_some_and(|map| map.values().all(serde_json::Value::is_string)),
         }
     }
 }
@@ -92,6 +102,12 @@ impl ToolSpec {
     }
 
     pub(crate) fn mutates_with(&self, arguments: &serde_json::Value) -> bool {
+        if self.executor == ToolExecutor::RunCommand {
+            return arguments
+                .get("outputs")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|outputs| !outputs.is_empty());
+        }
         if self.executor != ToolExecutor::ManageWhisper {
             return self.mutating;
         }
@@ -105,6 +121,12 @@ impl ToolSpec {
     }
 
     pub(crate) fn requires_approval_with(&self, arguments: &serde_json::Value) -> bool {
+        if self.executor == ToolExecutor::RunCommand {
+            return matches!(
+                crate::command_policy::classify(arguments),
+                crate::command_policy::CommandApproval::AskUser(_)
+            );
+        }
         self.requires_approval && self.mutates_with(arguments)
     }
 
@@ -142,17 +164,17 @@ impl ToolSpec {
             .arguments()
             .iter()
             .map(|argument| {
-                let kind = match argument.kind {
-                    ToolArgKind::String => "string",
-                    ToolArgKind::Boolean => "boolean",
-                };
-                (
-                    argument.name.to_owned(),
-                    serde_json::json!({
-                        "type": kind,
-                        "description": argument.description,
+                let mut schema = match argument.kind {
+                    ToolArgKind::String => serde_json::json!({"type":"string"}),
+                    ToolArgKind::Boolean => serde_json::json!({"type":"boolean"}),
+                    ToolArgKind::Integer => serde_json::json!({"type":"integer"}),
+                    ToolArgKind::StringMap => serde_json::json!({
+                        "type":"object",
+                        "additionalProperties":{"type":"string"}
                     }),
-                )
+                };
+                schema["description"] = serde_json::Value::String(argument.description.to_owned());
+                (argument.name.to_owned(), schema)
             })
             .collect::<serde_json::Map<_, _>>();
         let required = self
@@ -188,7 +210,9 @@ const fn arg(
     }
 }
 
-use ToolArgKind::{Boolean as BooleanArg, String as StringArg};
+use ToolArgKind::{
+    Boolean as BooleanArg, Integer as IntegerArg, String as StringArg, StringMap as StringMapArg,
+};
 
 const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
     arg(
@@ -422,6 +446,44 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
         "install variant: cpu, cuda, metal, vulkan, or openblas",
     ),
 ];
+const RUN_COMMAND_ARGS: &[ToolArgSpec] = &[
+    arg(
+        "command",
+        StringArg,
+        true,
+        "bash command to execute in the Linux sandbox",
+    ),
+    arg(
+        "cwd",
+        StringArg,
+        false,
+        "project-local working directory; defaults to .",
+    ),
+    arg(
+        "outputs",
+        StringMapArg,
+        false,
+        "output alias to final project-local file path; write each artifact to $SUBBAKE_OUTPUT_<ALIAS>",
+    ),
+    arg(
+        "overwrite",
+        BooleanArg,
+        false,
+        "replace existing declared outputs",
+    ),
+    arg(
+        "network",
+        BooleanArg,
+        false,
+        "request network access; defaults to false",
+    ),
+    arg(
+        "timeout_seconds",
+        IntegerArg,
+        false,
+        "command timeout from 1 to 1800 seconds; defaults to 120",
+    ),
+];
 
 macro_rules! tool {
     ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $visible:literal, $description:literal, $arguments:expr, $executor:ident) => {
@@ -440,6 +502,17 @@ macro_rules! tool {
 }
 
 pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
+    tool!(
+        "run_command",
+        Command,
+        false,
+        true,
+        false,
+        true,
+        "Run a sandboxed Linux command. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits.",
+        RUN_COMMAND_ARGS,
+        RunCommand
+    ),
     tool!(
         "translate_file",
         Translate,
@@ -725,6 +798,12 @@ pub enum ToolValidationError {
         argument: String,
         expected: &'static str,
     },
+    #[error("invalid argument `{argument}` for tool `{name}`: {message}")]
+    InvalidArgument {
+        name: String,
+        argument: String,
+        message: String,
+    },
 }
 
 pub fn validate_tool_call(
@@ -768,6 +847,61 @@ pub fn validate_tool_call(
             _ => {}
         }
     }
+    if name == "run_command" {
+        if object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| command.trim().is_empty())
+        {
+            return Err(ToolValidationError::InvalidArgument {
+                name: name.to_owned(),
+                argument: "command".to_owned(),
+                message: "command must not be empty".to_owned(),
+            });
+        }
+        if let Some(value) = object.get("timeout_seconds") {
+            let timeout = value.as_u64().unwrap_or_default();
+            if !(1..=1800).contains(&timeout) {
+                return Err(ToolValidationError::InvalidArgument {
+                    name: name.to_owned(),
+                    argument: "timeout_seconds".to_owned(),
+                    message: "expected an integer from 1 through 1800".to_owned(),
+                });
+            }
+        }
+        if let Some(outputs) = object.get("outputs").and_then(|value| value.as_object()) {
+            let mut environment_names = std::collections::HashSet::new();
+            for alias in outputs.keys() {
+                let valid = !alias.is_empty()
+                    && alias.len() <= 32
+                    && alias
+                        .chars()
+                        .next()
+                        .is_some_and(|value| value.is_ascii_alphabetic())
+                    && alias
+                        .chars()
+                        .all(|value| value.is_ascii_alphanumeric() || value == '_');
+                if !valid {
+                    return Err(ToolValidationError::InvalidArgument {
+                        name: name.to_owned(),
+                        argument: "outputs".to_owned(),
+                        message: format!(
+                            "output alias `{alias}` must be an ASCII identifier up to 32 characters"
+                        ),
+                    });
+                }
+                if !environment_names.insert(alias.to_ascii_uppercase()) {
+                    return Err(ToolValidationError::InvalidArgument {
+                        name: name.to_owned(),
+                        argument: "outputs".to_owned(),
+                        message: format!(
+                            "output alias `{alias}` collides case-insensitively with another alias"
+                        ),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -781,6 +915,7 @@ mod tests {
         assert!(names.contains(&"translate_series"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
+        assert!(names.contains(&"run_command"));
         assert!(!names.contains(&"create_file"));
         assert!(!names.contains(&"append_file"));
         assert!(!names.contains(&"replace_in_file"));
@@ -809,6 +944,35 @@ mod tests {
             validate_tool_call(
                 "translate_file",
                 &serde_json::json!({"path": "clip.srt", "unexpected": true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_schema_validates_timeout_and_output_aliases() {
+        assert!(
+            validate_tool_call(
+                "run_command",
+                &serde_json::json!({
+                    "command":"printf ok > \"$SUBBAKE_OUTPUT_RESULT\"",
+                    "outputs":{"result":"artifact.bin"},
+                    "timeout_seconds":30
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_call(
+                "run_command",
+                &serde_json::json!({"command":"true","outputs":{"bad-name":"x"}})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_call(
+                "run_command",
+                &serde_json::json!({"command":"true","timeout_seconds":1801})
             )
             .is_err()
         );

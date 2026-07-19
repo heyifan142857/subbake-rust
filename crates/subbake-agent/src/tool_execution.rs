@@ -15,9 +15,10 @@ use subbake_core::diagnostics::diagnose_text;
 use subbake_core::formats::{normalize_format, supported_format_from_path};
 use subbake_core::languages::normalize_language;
 use subbake_core::{
-    AgentToolOutcome, BilingualOrder, CancellationGuard, FileToolOutcome, ObservationToolOutcome,
-    ProfileToolOutcome, SharedProgress, SkippedPath, SubtitleEditToolOutcome, ToolExecutionStatus,
-    TranscriptionToolOutcome, TranslationToolOutcome, WhisperModelFact, WhisperToolOutcome,
+    AgentToolOutcome, BilingualOrder, CancellationGuard, CommandToolOutcome, FileToolOutcome,
+    ObservationToolOutcome, ProfileToolOutcome, SharedProgress, SkippedPath,
+    SubtitleEditToolOutcome, ToolExecutionStatus, TranscriptionToolOutcome, TranslationToolOutcome,
+    WhisperModelFact, WhisperToolOutcome,
 };
 
 use crate::discovery::rank_subtitle_candidates;
@@ -44,6 +45,119 @@ pub(crate) struct TranslationExecutionOutcome {
 pub(crate) struct AdapterToolOutcome {
     pub outcome: AgentToolOutcome,
     pub file_operation: Option<FileOpResult>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CommandExecutionOutcome {
+    pub outcome: AgentToolOutcome,
+    pub file_operations: Vec<FileOpResult>,
+}
+
+pub(crate) fn execute_command_tool(
+    args: &JsonValue,
+    guard: &FileGuard,
+    cancellation: &CancellationGuard,
+) -> AgentResult<CommandExecutionOutcome> {
+    if let crate::command_policy::CommandApproval::Deny(message) =
+        crate::command_policy::classify(args)
+    {
+        return Err(AgentError::ToolPolicy { message });
+    }
+    let command = required_string(args, "command")?;
+    let cwd = guard.resolve_path(Path::new(optional_string(args, "cwd", ".")))?;
+    if !cwd.is_dir() {
+        return Err(AgentError::InvalidInput {
+            message: format!("command cwd is not a directory: {}", cwd.display()),
+        });
+    }
+    let timeout_seconds = args
+        .get("timeout_seconds")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(120);
+    if !(1..=1800).contains(&timeout_seconds) {
+        return Err(AgentError::ToolArguments {
+            message: "timeout_seconds must be from 1 through 1800".to_owned(),
+        });
+    }
+    let outputs = args
+        .get("outputs")
+        .and_then(JsonValue::as_object)
+        .map(|outputs| {
+            outputs
+                .iter()
+                .map(|(alias, destination)| {
+                    destination
+                        .as_str()
+                        .map(|destination| (alias.clone(), PathBuf::from(destination)))
+                        .ok_or_else(|| AgentError::ToolArguments {
+                            message: format!("output `{alias}` path must be a string"),
+                        })
+                })
+                .collect::<AgentResult<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    for (_, destination) in &outputs {
+        let resolved = guard.resolve_path(destination)?;
+        if resolved.exists() && !optional_bool(args, "overwrite", false) {
+            return Err(AgentError::InvalidInput {
+                message: format!(
+                    "output already exists and overwrite is false: {}",
+                    resolved.display()
+                ),
+            });
+        }
+    }
+
+    let staging = guard.create_command_staging()?;
+    let cleanup = CommandStagingCleanup(staging.clone());
+    let request = subbake_adapters::SandboxedCommandRequest {
+        command: command.clone(),
+        project_root: guard.project_root().to_path_buf(),
+        cwd: cwd.clone(),
+        staging_root: staging.clone(),
+        output_aliases: outputs.iter().map(|(alias, _)| alias.clone()).collect(),
+        network: optional_bool(args, "network", false),
+        timeout: std::time::Duration::from_secs(timeout_seconds),
+    };
+    let executed = subbake_adapters::run_sandboxed_command(&request, cancellation)?;
+    let file_operations = if executed.exit_code == 0 {
+        let staged = outputs
+            .iter()
+            .map(|(alias, destination)| (staging.join(alias), destination.clone()))
+            .collect::<Vec<_>>();
+        guard.commit_staged_files(&staged, optional_bool(args, "overwrite", false))?
+    } else {
+        Vec::new()
+    };
+    let output_paths = file_operations
+        .iter()
+        .map(|operation| operation.path.clone())
+        .collect::<Vec<_>>();
+    drop(cleanup);
+    Ok(CommandExecutionOutcome {
+        outcome: AgentToolOutcome::Command(CommandToolOutcome {
+            status: ToolExecutionStatus::Completed,
+            command,
+            cwd,
+            exit_code: executed.exit_code,
+            stdout: executed.stdout,
+            stderr: executed.stderr,
+            stdout_truncated: executed.stdout_truncated,
+            stderr_truncated: executed.stderr_truncated,
+            duration_ms: u64::try_from(executed.duration.as_millis()).unwrap_or(u64::MAX),
+            outputs: output_paths,
+        }),
+        file_operations,
+    })
+}
+
+struct CommandStagingCleanup(PathBuf);
+
+impl Drop for CommandStagingCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[derive(Debug)]
@@ -1133,6 +1247,32 @@ pub(crate) fn render_tool_outcome(outcome: &AgentToolOutcome) -> String {
         }
         AgentToolOutcome::Profile(facts) => facts.message.clone(),
         AgentToolOutcome::Observation(facts) => facts.content.clone(),
+        AgentToolOutcome::Command(facts) => {
+            let mut lines = vec![format!(
+                "Command exited with code {} in {} ms (cwd {}).",
+                facts.exit_code,
+                facts.duration_ms,
+                facts.cwd.display()
+            )];
+            if !facts.stdout.is_empty() {
+                lines.push(format!("stdout:\n{}", facts.stdout));
+            }
+            if !facts.stderr.is_empty() {
+                lines.push(format!("stderr:\n{}", facts.stderr));
+            }
+            if !facts.outputs.is_empty() {
+                lines.push(format!(
+                    "Outputs: {}",
+                    facts
+                        .outputs
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.join("\n")
+        }
     }
 }
 
@@ -1193,6 +1333,65 @@ mod tests {
 
         assert!(matches!(outcome.outcome, AgentToolOutcome::File(_)));
         assert!(outcome.file_operation.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_command_commits_declared_output_without_direct_workspace_writes() {
+        if !Path::new("/usr/bin/bwrap").is_file() {
+            return;
+        }
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("source.txt"), b"original").expect("source");
+        let guard = FileGuard::new(root.clone());
+
+        let outcome = match execute_command_tool(
+            &json!({
+                "command":"printf artifact > \"$SUBBAKE_OUTPUT_RESULT\"; printf changed > source.txt",
+                "outputs":{"result":"artifact.bin"}
+            }),
+            &guard,
+            &CancellationGuard::never(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) if error.to_string().contains("Operation not permitted") => {
+                let _ = fs::remove_dir_all(root);
+                return;
+            }
+            Err(error) => panic!("run command: {error}"),
+        };
+        let AgentToolOutcome::Command(facts) = outcome.outcome else {
+            panic!("expected command facts");
+        };
+
+        assert_ne!(facts.exit_code, 0);
+        assert!(!root.join("artifact.bin").exists());
+        assert_eq!(
+            fs::read(root.join("source.txt")).expect("source"),
+            b"original"
+        );
+
+        let outcome = execute_command_tool(
+            &json!({
+                "command":"printf artifact > \"$SUBBAKE_OUTPUT_RESULT\"",
+                "outputs":{"result":"artifact.bin"}
+            }),
+            &guard,
+            &CancellationGuard::never(),
+        )
+        .expect("run output command");
+        assert_eq!(
+            outcome.file_operations.len(),
+            1,
+            "{}",
+            render_tool_outcome(&outcome.outcome)
+        );
+        assert_eq!(
+            fs::read(root.join("artifact.bin")).expect("artifact"),
+            b"artifact"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

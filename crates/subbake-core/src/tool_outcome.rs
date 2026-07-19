@@ -133,6 +133,21 @@ pub struct ObservationToolOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandToolOutcome {
+    pub status: ToolExecutionStatus,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "facts", rename_all = "snake_case")]
 pub enum AgentToolOutcome {
     Translation(TranslationToolOutcome),
@@ -142,4 +157,5 @@ pub enum AgentToolOutcome {
     File(FileToolOutcome),
     Profile(ProfileToolOutcome),
     Observation(ObservationToolOutcome),
+    Command(CommandToolOutcome),
 }

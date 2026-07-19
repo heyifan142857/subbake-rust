@@ -39,8 +39,8 @@ pub use progress::{
     TranslationProgress,
 };
 pub use tool_outcome::{
-    AgentToolOutcome, FileToolOutcome, ObservationToolOutcome, ProfileToolOutcome, SkippedPath,
-    SubtitleEditToolOutcome, ToolExecutionStatus, TranscriptionToolOutcome, TranslationToolOutcome,
-    WhisperModelFact, WhisperToolOutcome,
+    AgentToolOutcome, CommandToolOutcome, FileToolOutcome, ObservationToolOutcome,
+    ProfileToolOutcome, SkippedPath, SubtitleEditToolOutcome, ToolExecutionStatus,
+    TranscriptionToolOutcome, TranslationToolOutcome, WhisperModelFact, WhisperToolOutcome,
 };
 pub mod cancellation;

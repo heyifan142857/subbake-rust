@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::PendingPlan;
+use crate::event::{PendingCommandApproval, PendingPlan};
 
 pub const SESSION_VERSION: u64 = 1;
 
@@ -39,6 +39,9 @@ pub enum EventTag {
     Profile,
     Error,
     Cancelled,
+    CommandApprovalRequested,
+    CommandApproved,
+    CommandRejected,
     Unknown,
 }
 
@@ -58,6 +61,9 @@ impl EventTag {
             "profile" => Self::Profile,
             "error" => Self::Error,
             "cancelled" => Self::Cancelled,
+            "command_approval_requested" => Self::CommandApprovalRequested,
+            "command_approved" => Self::CommandApproved,
+            "command_rejected" => Self::CommandRejected,
             _ => Self::Unknown,
         }
     }
@@ -111,6 +117,8 @@ pub struct AgentSession {
     pub mode: SessionMode,
     pub pending_plan: Option<PendingPlan>,
     #[serde(default)]
+    pub pending_command_approval: Option<PendingCommandApproval>,
+    #[serde(default)]
     pub pending_action: Option<PendingAction>,
     pub events: Vec<AgentEvent>,
 }
@@ -130,6 +138,7 @@ impl AgentSession {
             config_path: None,
             mode: SessionMode::Chat,
             pending_plan: None,
+            pending_command_approval: None,
             pending_action: None,
             events: Vec::new(),
         }
@@ -378,6 +387,20 @@ mod tests {
         let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
 
         assert!(loaded.pending_action.is_none());
+    }
+
+    #[test]
+    fn reads_v1_session_without_pending_command_approval() {
+        let session = AgentSession::new("old-session".to_owned());
+        let mut value = serde_json::to_value(session).expect("serialize session");
+        value
+            .as_object_mut()
+            .expect("session object")
+            .remove("pending_command_approval");
+
+        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
+
+        assert!(loaded.pending_command_approval.is_none());
     }
 
     #[test]

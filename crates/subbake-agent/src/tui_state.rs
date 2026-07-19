@@ -9,6 +9,10 @@ pub(crate) const APPROVAL_OPTIONS: &[(&str, &str)] = &[
         "revise the plan with your instructions",
     ),
 ];
+pub(crate) const COMMAND_APPROVAL_OPTIONS: &[(&str, &str)] = &[
+    ("approve", "run the exact sandboxed command"),
+    ("reject", "discard the pending command"),
+];
 
 pub(crate) struct TuiPicker {
     pub options: Vec<ProfileChoice>,
@@ -26,6 +30,7 @@ pub(crate) enum InputMode {
     CreatingProfile,
     ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
+    AwaitingCommandDecision,
 }
 
 pub(crate) enum InteractionState {
@@ -149,6 +154,9 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         InputMode::AwaitingPlanDecision if suggestion_count > 0 => {
             VerticalNavigation::Selection(suggestion_count)
         }
+        InputMode::AwaitingCommandDecision if suggestion_count > 0 => {
+            VerticalNavigation::Selection(suggestion_count)
+        }
         InputMode::Editing if suggestion_count > 0 => {
             VerticalNavigation::Selection(suggestion_count)
         }
@@ -156,6 +164,7 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         InputMode::ChoosingProfile(_)
         | InputMode::ChoosingSession(_)
         | InputMode::AwaitingPlanDecision
+        | InputMode::AwaitingCommandDecision
         | InputMode::CreatingProfile => VerticalNavigation::Disabled,
     }
 }
@@ -166,6 +175,11 @@ pub(crate) fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyM
             ApprovalChoice::Submit(action) => Some(EmptyModeChoice::Submit(action)),
             ApprovalChoice::Revise => Some(EmptyModeChoice::RevisePlan),
         },
+        InputMode::AwaitingCommandDecision => Some(EmptyModeChoice::Submit(if index == 0 {
+            TuiAction::ApproveCommand
+        } else {
+            TuiAction::RejectCommand
+        })),
         InputMode::ChoosingProfile(picker) => match profile_picker_choice(picker, index)? {
             ProfilePickerChoice::Select(name) => {
                 Some(EmptyModeChoice::Submit(TuiAction::SelectProfile(name)))
@@ -242,5 +256,17 @@ mod tests {
         assert!(!phase.request_cancellation());
         assert_eq!(phase.finish(), Some(false));
         assert!(matches!(phase, InteractionState::Idle { .. }));
+    }
+
+    #[test]
+    fn command_approval_picker_is_typed_and_has_no_plan_revision_action() {
+        assert_eq!(
+            empty_mode_choice(&InputMode::AwaitingCommandDecision, 0),
+            Some(EmptyModeChoice::Submit(TuiAction::ApproveCommand))
+        );
+        assert_eq!(
+            empty_mode_choice(&InputMode::AwaitingCommandDecision, 1),
+            Some(EmptyModeChoice::Submit(TuiAction::RejectCommand))
+        );
     }
 }

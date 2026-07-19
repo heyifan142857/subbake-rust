@@ -5,8 +5,8 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentActionKind, AgentEngine, AgentError, AgentResult, EchoDecisionBackend, PlanDecision,
-    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
+    AgentActionKind, AgentEngine, AgentError, AgentResult, CommandDecision, EchoDecisionBackend,
+    PlanDecision, StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
 };
 
 use crate::CliResult;
@@ -75,6 +75,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
         tui.set_session_replay(session_events);
     }
     tui.set_plan_mode(initial_plan_mode);
+    tui.set_command_approval_pending(engine.has_pending_command_approval());
     if open_session_picker {
         tui.open_session_picker(engine.session_choices(20)?)?;
     }
@@ -139,6 +140,12 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
                 TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
                 TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
+                TuiAction::ApproveCommand => {
+                    engine.handle_command_decision(CommandDecision::Approve)?
+                }
+                TuiAction::RejectCommand => {
+                    engine.handle_command_decision(CommandDecision::Reject)?
+                }
                 TuiAction::SelectProfile(name) => engine.select_profile(name)?,
                 TuiAction::CreateProfile(name) => engine.create_profile(name)?,
                 TuiAction::SelectSession(id) => engine.select_session(id)?,
@@ -213,6 +220,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 events: engine.session_events(),
                 plan_mode: engine.is_plan_mode(),
                 model,
+                command_approval: engine.has_pending_command_approval(),
             })
         } else if changed_plan_mode {
             Ok(TuiInteraction::PlanModeChanged {
@@ -236,6 +244,8 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             })
         } else if engine.has_pending_plan() {
             Ok(TuiInteraction::PlanApproval { message: result })
+        } else if engine.has_pending_command_approval() {
+            Ok(TuiInteraction::CommandApproval { message: result })
         } else if let Some(options) = profile_options {
             Ok(TuiInteraction::ProfilePicker {
                 message: result,

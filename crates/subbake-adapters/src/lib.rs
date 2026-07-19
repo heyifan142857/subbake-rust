@@ -1,3 +1,4 @@
+pub mod command;
 pub mod config;
 pub mod diagnostics;
 pub mod editing;
@@ -17,6 +18,9 @@ pub mod transcription;
 pub mod translation;
 pub mod whisper;
 
+pub use command::{
+    SandboxedCommandOutput, SandboxedCommandRequest, output_environment, run_sandboxed_command,
+};
 pub use config::{
     CONFIG_VERSION, ConfigFile, ConfigurationResolver, ResolveRequest, ResolvedConfiguration,
     append_profile_snapshot, discover_config_path,
