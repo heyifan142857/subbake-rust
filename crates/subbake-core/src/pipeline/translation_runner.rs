@@ -93,6 +93,7 @@ where
             usage,
         );
         let mut generated = pipeline.translate_window(&pending)?;
+        pipeline.reconcile_translation_window(&prepared, &mut generated)?;
         validate_window_terminology(
             &prepared,
             &generated,
@@ -114,6 +115,9 @@ where
                         })?,
                 )
             };
+            if let Some(result) = result.as_ref() {
+                pipeline.save_reconciled_translation_cache(result)?;
+            }
             let applied = stage.apply(prepared_batch, result)?;
             if let Some(result) = applied.result.as_ref() {
                 usage.add(result.usage);
@@ -121,6 +125,7 @@ where
                 pipeline
                     .memory
                     .update(&result.summary, &result.glossary_updates);
+                pipeline.commit_terminology_updates(&result.terminology_updates);
             }
             pipeline.translation_memory_hits = stage.memory_hits();
             if pipeline.options.use_cache {

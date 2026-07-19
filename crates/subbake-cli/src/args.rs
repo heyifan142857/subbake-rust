@@ -695,6 +695,8 @@ fn parse_translation_setting_option(
         }
         "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
         "--bilingual" => overrides.output.bilingual = Some(true),
+        "--online-terminology" => overrides.translation.online_terminology = Some(true),
+        "--no-online-terminology" => overrides.translation.online_terminology = Some(false),
         "--preserve-names" => overrides.translation.preserve_names = Some(true),
         "--transliterate-names" => overrides.translation.preserve_names = Some(false),
         "--preserve-source-container" => overrides.output.preserve_source_container = Some(true),
@@ -834,6 +836,7 @@ mod tests {
             parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Full
         );
+        assert!(parsed.settings.translation.online_terminology);
         assert_eq!(parsed.settings.translation.translation_concurrency, 3);
         assert_eq!(parsed.settings.translation.review_concurrency, 2);
         assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
@@ -908,6 +911,23 @@ mod tests {
 
         assert!(parsed.settings.translation.preserve_names);
         assert!(parsed.settings.output.preserve_source_container);
+    }
+
+    #[test]
+    fn parse_translate_can_disable_online_terminology() {
+        let config = empty_config("translation-online-terminology");
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--mode".to_owned(),
+            "turbo".to_owned(),
+            "--no-online-terminology".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("online terminology option");
+        let _ = std::fs::remove_file(config);
+
+        assert!(!parsed.settings.translation.online_terminology);
     }
 
     #[test]

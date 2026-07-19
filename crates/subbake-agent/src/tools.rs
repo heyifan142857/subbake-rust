@@ -228,6 +228,12 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         "keep personal names in source spelling; false transliterates them",
     ),
     arg(
+        "online_terminology",
+        BooleanArg,
+        false,
+        "merge entity-aware terminology while translating",
+    ),
+    arg(
         "preserve_source_container",
         BooleanArg,
         false,
@@ -290,6 +296,12 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
         BooleanArg,
         false,
         "keep personal names in source spelling; false transliterates them",
+    ),
+    arg(
+        "online_terminology",
+        BooleanArg,
+        false,
+        "merge entity-aware terminology while translating",
     ),
     arg(
         "output_format",
@@ -846,6 +858,7 @@ mod tests {
             "target_language",
             "bilingual",
             "bilingual_order",
+            "online_terminology",
             "output_format",
             "output_path",
             "overwrite",

@@ -145,6 +145,10 @@ sbake translate episode.srt --mode turbo
 sbake translate episode.srt --mode cinema --profile cinema
 ```
 
+Turbo 和 Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、
+组织、地点等专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。可用
+`--no-online-terminology` 关闭这一行为，Economy 默认关闭以保持最小输出。
+
 MKV、MP4/M4V/MOV 或 WebM 含有文本字幕轨时，可以直接翻译并追加译文轨。
 默认通过同目录临时文件安全重封装，再原子替换源容器，因此完成后不会额外保留一份
 完整媒体副本；原有视频、音频及其他流仍会复制到更新后的容器：

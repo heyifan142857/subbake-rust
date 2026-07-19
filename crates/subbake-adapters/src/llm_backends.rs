@@ -690,6 +690,7 @@ pub(crate) fn parse_translation_payload(v: &Value) -> CoreResult<BatchTranslatio
         lines,
         summary: v["summary"].as_str().unwrap_or_default().to_owned(),
         glossary_updates,
+        terminology_updates: Vec::new(),
     })
 }
 #[cfg(test)]

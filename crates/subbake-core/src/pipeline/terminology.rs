@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    GlossaryEntry, PipelineOptions, SubtitleDocument, SubtitleSegment, TerminologyPreflightResult,
-    TerminologyStats, Usage,
+    GlossaryEntry, PipelineOptions, SubtitleDocument, SubtitleSegment, TerminologyEntity,
+    TerminologyPreflightResult, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::memory::{ContextMemory, english_possessive_base};
@@ -32,6 +32,10 @@ where
     pub(super) fn run(&mut self, document: &SubtitleDocument) -> CoreResult<TerminologyStats> {
         let started = Instant::now();
         let candidates = extract_candidates(&document.segments);
+        self.memory.terminology_candidates = candidates
+            .iter()
+            .map(|candidate| candidate.source.clone())
+            .collect();
         let mut stats = TerminologyStats {
             candidates: candidates.len(),
             ..TerminologyStats::default()
@@ -79,6 +83,7 @@ where
                 };
                 let document_brief = payload.document_brief;
                 let accepted = accept_entries(self.memory, payload.entries, &mut stats);
+                let accepted_entities = accept_entities(self.memory, payload.entities, &mut stats);
                 if self.options.mode == crate::entities::TranslationMode::Cinema
                     && !document_brief.trim().is_empty()
                 {
@@ -98,6 +103,7 @@ where
                         &BackendJsonResult {
                             payload: BackendPayload::Terminology(TerminologyPreflightResult {
                                 entries: accepted,
+                                entities: accepted_entities,
                                 document_brief,
                             }),
                             usage: response.usage,
@@ -235,23 +241,52 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
             }
             candidates
                 .entry(word.to_ascii_lowercase())
-                .or_insert_with(|| TerminologyCandidate {
-                    source: word.to_owned(),
-                    context: segment.text.chars().take(240).collect(),
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert_with(|| {
+                    (
+                        TerminologyCandidate {
+                            source: word.to_owned(),
+                            context: segment.text.chars().take(240).collect(),
+                        },
+                        1usize,
+                    )
                 });
             let source = words[index..end].join(" ");
             if end > index + 1 {
                 candidates
                     .entry(source.to_ascii_lowercase())
-                    .or_insert_with(|| TerminologyCandidate {
-                        source,
-                        context: segment.text.chars().take(240).collect(),
+                    .and_modify(|(_, count)| *count += 1)
+                    .or_insert_with(|| {
+                        (
+                            TerminologyCandidate {
+                                source,
+                                context: segment.text.chars().take(240).collect(),
+                            },
+                            1usize,
+                        )
                     });
             }
             index = end;
         }
     }
-    candidates.into_values().take(256).collect()
+    let mut ranked = candidates.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|(left, left_count), (right, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| {
+                right
+                    .source
+                    .split_whitespace()
+                    .count()
+                    .cmp(&left.source.split_whitespace().count())
+            })
+            .then_with(|| left.source.to_lowercase().cmp(&right.source.to_lowercase()))
+    });
+    ranked
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .take(256)
+        .collect()
 }
 
 fn build_messages(
@@ -274,7 +309,7 @@ fn build_messages(
     };
     vec![
         crate::ports::ChatMessage::system(format!(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. {name_policy} Copy source exactly from a candidate. Omit ordinary sentence-initial words and uncertain non-name entries. The brief must be short and advisory; never invent plot facts."
+            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}}],\"entities\":[{{\"canonical_source\":\"canonical entity name\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact candidate\",\"target\":\"natural translation of that source form\"}}]}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Group aliases of one entity while preserving the natural granularity of each source form. {name_policy} Copy every source form exactly from a candidate. Omit ordinary sentence-initial words and uncertain non-name entries. The brief must be short and advisory; never invent plot facts."
         )),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
@@ -290,9 +325,8 @@ pub(super) fn parse_payload(
         .get("entries")
         .or_else(|| payload.get("glossary"))
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            CoreError::InvalidTranslation("terminology response missing entries array".to_owned())
-        })?;
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let mut parsed = Vec::new();
     for entry in entries {
         let source = entry["source"].as_str().unwrap_or_default().trim();
@@ -315,13 +349,65 @@ pub(super) fn parse_payload(
             target: target.to_owned(),
         });
     }
+    let entities = serde_json::from_value::<Vec<TerminologyEntity>>(payload["entities"].clone())
+        .unwrap_or_default();
+    for entity in &entities {
+        if entity.canonical_source.trim().is_empty() || entity.variants.is_empty() {
+            return Err(CoreError::InvalidTranslation(
+                "terminology entity is missing a canonical source or variants".to_owned(),
+            ));
+        }
+        for variant in &entity.variants {
+            if variant.target.trim().is_empty()
+                || !candidates
+                    .iter()
+                    .any(|candidate| candidate.source.eq_ignore_ascii_case(variant.source.trim()))
+            {
+                return Err(CoreError::InvalidTranslation(format!(
+                    "terminology entity contains unknown or empty variant `{}`",
+                    variant.source
+                )));
+            }
+        }
+    }
     Ok(TerminologyPreflightResult {
         entries: parsed,
+        entities,
         document_brief: payload["document_brief"]
             .as_str()
             .unwrap_or_default()
             .to_owned(),
     })
+}
+
+fn accept_entities(
+    memory: &mut ContextMemory,
+    entities: Vec<TerminologyEntity>,
+    stats: &mut TerminologyStats,
+) -> Vec<TerminologyEntity> {
+    let mut accepted = Vec::new();
+    for mut entity in entities {
+        let mut variants = Vec::new();
+        for variant in std::mem::take(&mut entity.variants) {
+            match memory.glossary.get(&variant.source) {
+                Some(current) if current.eq_ignore_ascii_case(&variant.target) => {
+                    variants.push(variant);
+                }
+                Some(_) => stats.conflicts_omitted += 1,
+                None => {
+                    memory.update("", std::slice::from_ref(&variant));
+                    variants.push(variant);
+                }
+            }
+        }
+        if variants.is_empty() {
+            continue;
+        }
+        entity.variants = variants;
+        memory.add_terminology_entity(entity.clone());
+        accepted.push(entity);
+    }
+    accepted
 }
 
 fn accept_entries(

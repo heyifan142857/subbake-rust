@@ -420,6 +420,9 @@ pub(crate) fn execute_translation_tool(
     if let Some(preserve_names) = args.get("preserve_names").and_then(JsonValue::as_bool) {
         settings.translation.preserve_names = preserve_names;
     }
+    if let Some(online_terminology) = args.get("online_terminology").and_then(JsonValue::as_bool) {
+        settings.translation.online_terminology = online_terminology;
+    }
     if let Some(preserve_source) = args
         .get("preserve_source_container")
         .and_then(JsonValue::as_bool)

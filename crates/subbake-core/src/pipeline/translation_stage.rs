@@ -189,7 +189,9 @@ mod tests {
                     }],
                     summary: String::new(),
                     glossary_updates: Vec::new(),
+                    terminology_updates: Vec::new(),
                     usage: Default::default(),
+                    cache_key: None,
                 }),
             )
             .expect("apply");

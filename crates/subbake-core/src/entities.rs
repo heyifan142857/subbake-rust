@@ -197,10 +197,37 @@ pub struct GlossaryEntry {
     pub target: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminologyKind {
+    Person,
+    Organization,
+    Place,
+    ProperName,
+    DomainTerm,
+}
+
+impl TerminologyKind {
+    pub const fn is_enforced(self) -> bool {
+        !matches!(self, Self::DomainTerm)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminologyEntity {
+    pub canonical_source: String,
+    pub kind: TerminologyKind,
+    #[serde(default)]
+    pub variants: Vec<GlossaryEntry>,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminologyPreflightResult {
     pub entries: Vec<GlossaryEntry>,
+    /// Entity-aware terminology. Older caches only contain flat `entries`.
+    #[serde(default)]
+    pub entities: Vec<TerminologyEntity>,
     /// Advisory document-level context. Older cache entries omit it.
     #[serde(default)]
     pub document_brief: String,
@@ -291,6 +318,9 @@ pub struct BatchTranslationResult {
     pub summary: String,
     #[serde(default)]
     pub glossary_updates: Vec<GlossaryEntry>,
+    /// Entity-aware incremental terminology emitted alongside a translation.
+    #[serde(default)]
+    pub terminology_updates: Vec<TerminologyEntity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +414,8 @@ pub struct PipelineOptions {
     pub retries: usize,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
+    /// Ask translation batches to emit and consume incremental terminology.
+    pub online_terminology: bool,
     /// Keep personal names in their source spelling instead of translating or
     /// transliterating them into the target language.
     pub preserve_names: bool,
@@ -421,6 +453,7 @@ impl PipelineOptions {
             retries: DEFAULT_RETRIES,
             review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
+            online_terminology: true,
             preserve_names: false,
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,

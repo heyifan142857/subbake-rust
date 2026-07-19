@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entities::GlossaryEntry;
+use crate::entities::{GlossaryEntry, TerminologyEntity};
 
 pub const DEFAULT_MAX_SUMMARIES: usize = 2;
 pub const GLOSSARY_RELEVANCE_LIMIT: usize = 24;
@@ -48,6 +48,10 @@ pub struct ContextMemory {
     pub recent_summaries: Vec<String>,
     #[serde(default)]
     pub glossary: BTreeMap<String, String>,
+    #[serde(default)]
+    pub terminology_entities: Vec<TerminologyEntity>,
+    #[serde(default)]
+    pub terminology_candidates: Vec<String>,
     #[serde(default = "default_max_summaries")]
     pub max_summaries: usize,
 }
@@ -75,6 +79,8 @@ impl ContextMemory {
             style_rules: default_style_rules(),
             recent_summaries: Vec::new(),
             glossary: BTreeMap::new(),
+            terminology_entities: Vec::new(),
+            terminology_candidates: Vec::new(),
             max_summaries: DEFAULT_MAX_SUMMARIES,
         }
     }
@@ -107,6 +113,27 @@ impl ContextMemory {
             }
             self.glossary
                 .insert(entry.source.clone(), entry.target.clone());
+        }
+    }
+
+    pub fn add_terminology_entity(&mut self, entity: TerminologyEntity) {
+        if let Some(current) = self.terminology_entities.iter_mut().find(|current| {
+            current
+                .canonical_source
+                .eq_ignore_ascii_case(&entity.canonical_source)
+                && current.kind == entity.kind
+        }) {
+            for variant in entity.variants {
+                if !current
+                    .variants
+                    .iter()
+                    .any(|item| item.source.eq_ignore_ascii_case(&variant.source))
+                {
+                    current.variants.push(variant);
+                }
+            }
+        } else {
+            self.terminology_entities.push(entity);
         }
     }
 

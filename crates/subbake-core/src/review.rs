@@ -146,6 +146,10 @@ pub(crate) fn build_review_messages(
                 .collect(),
         );
     }
+    if !memory.terminology_entities.is_empty() {
+        payload["terminology_entities"] =
+            serde_json::to_value(&memory.terminology_entities).unwrap_or_default();
+    }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
     let system = format!(
         "You are performing a targeted subtitle QA review.{}\n\

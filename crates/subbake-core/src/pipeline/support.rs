@@ -34,6 +34,7 @@ pub(super) fn build_translation_messages(
         .map(|segment| segment.text.as_str())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
+    let batch_haystack = batch_texts.join("\n").to_lowercase();
     if options.policy().include_context {
         context["rules"] = serde_json::Value::Array(
             memory
@@ -73,6 +74,28 @@ pub(super) fn build_translation_messages(
                 context["terminology_hints"] = serde_json::Value::Object(advisory);
             }
         }
+        if options.online_terminology {
+            let alias_candidates =
+                relevant_alias_candidates(&memory.terminology_candidates, &batch_haystack);
+            if !alias_candidates.is_empty() {
+                context["terminology_candidates"] = serde_json::json!(alias_candidates);
+            }
+            let entities = memory
+                .terminology_entities
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .variants
+                        .iter()
+                        .any(|variant| batch_haystack.contains(&variant.source.to_lowercase()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !entities.is_empty() {
+                context["terminology_entities"] =
+                    serde_json::to_value(entities).unwrap_or_default();
+            }
+        }
     } else if !required_glossary.is_empty() {
         let glossary = memory.select_relevant_glossary(&batch_texts);
         let required = glossary
@@ -98,9 +121,22 @@ pub(super) fn build_translation_messages(
     let batch_json =
         serde_json::to_string(&serde_json::json!({"lines": lines})).unwrap_or_default();
     let response_shape = if compact_wire {
-        "{\"lines\":[[\"<source id>\",\"<non-empty target-language text>\"]]}"
+        if options.online_terminology {
+            "{\"lines\":[[\"<source id>\",\"<non-empty target-language text>\"]],\"terminology_updates\":[{\"canonical_source\":\"<entity>\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{\"source\":\"<exact source form>\",\"target\":\"<exact translated form>\"}]}]}"
+        } else {
+            "{\"lines\":[[\"<source id>\",\"<non-empty target-language text>\"]]}"
+        }
     } else {
-        "{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}"
+        if options.online_terminology {
+            "{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}],\"terminology_updates\":[{\"canonical_source\":\"<entity>\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{\"source\":\"<exact source form>\",\"target\":\"<exact translated form>\"}]}]}"
+        } else {
+            "{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}"
+        }
+    };
+    let terminology_rule = if options.online_terminology {
+        "For every clearly identified person, organization, place, other proper name, or recurring domain term translated in this batch, return a terminology_updates entity. Group aliases under one canonical_source while preserving each source form's natural granularity. Every variant source must occur in the input and every variant target must occur verbatim in its corresponding translation. Do not emit ordinary words or guesses."
+    } else {
+        "Do not return terminology_updates."
     };
     let system = format!(
         "TASK_START\ntranslate_subtitles\nTASK_END\n\
@@ -110,7 +146,7 @@ Return exactly one line for every input line, in the same order. Copy each id ex
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context.\n{}",
+only when they fit the meaning in the current context.\n{}\n{terminology_rule}",
         if options.preserve_names {
             "Preserve personal names exactly in their source spelling unless CONTEXT_JSON.glossary explicitly requires another form."
         } else {
@@ -127,6 +163,43 @@ only when they fit the meaning in the current context.\n{}",
             "CONTEXT_JSON_START{context_json}CONTEXT_JSON_END\nBATCH_JSON_START{batch_json}BATCH_JSON_END"
         )),
     ]
+}
+
+fn relevant_alias_candidates(candidates: &[String], batch_haystack: &str) -> Vec<String> {
+    let mut tokens = batch_haystack
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| word.chars().count() >= 3)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selected = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for candidate in candidates {
+            if selected.len() >= 24 {
+                break;
+            }
+            let words = candidate
+                .split_whitespace()
+                .map(|word| {
+                    word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                        .to_lowercase()
+                })
+                .filter(|word| word.chars().count() >= 3)
+                .collect::<Vec<_>>();
+            if !selected.contains(candidate) && words.iter().any(|word| tokens.contains(word)) {
+                selected.insert(candidate.clone());
+                tokens.extend(words);
+                changed = true;
+            }
+        }
+        if !changed || selected.len() >= 24 {
+            break;
+        }
+    }
+    selected.into_iter().collect()
 }
 
 pub(super) fn request_hash(
@@ -376,10 +449,20 @@ mod tests {
                 .content
                 .contains("Do not leave a personal name unchanged")
         );
+        assert!(transliterated[0].content.contains("terminology_updates"));
 
         options.preserve_names = true;
         let preserved =
             build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
         assert!(preserved[0].content.contains("source spelling"));
+
+        options.online_terminology = false;
+        let minimal =
+            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+        assert!(
+            minimal[0]
+                .content
+                .contains("Do not return terminology_updates")
+        );
     }
 }

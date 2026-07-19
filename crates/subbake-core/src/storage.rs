@@ -7,9 +7,9 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 8;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 9;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 5;
-pub const CACHE_VERSION: u64 = 1;
+pub const CACHE_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -224,7 +224,7 @@ pub fn build_runtime_paths(
         translated_batches_dir: run_dir.join("translated_batches"),
         reviewed_batches_dir: run_dir.join("reviewed_batches"),
         translation_memory_path: root_dir.join(format!(
-            "translation_memory.v2.{language_pair}.{translation_memory_mode}.json"
+            "translation_memory.v3.{language_pair}.{translation_memory_mode}.json"
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
         review_report_path: run_dir.join("review_report.json"),
@@ -295,6 +295,10 @@ pub fn build_translation_fingerprint(
         (
             "terminology_preflight".to_owned(),
             JsonValue::Bool(options.terminology_preflight),
+        ),
+        (
+            "online_terminology".to_owned(),
+            JsonValue::Bool(options.online_terminology),
         ),
         (
             "preserve_names".to_owned(),
@@ -569,7 +573,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "b032ff2f89e92ad63e51453727c7da71b067ad08"
+            "a7fea53f2ec91379e1916acc17407a97337e1508"
         );
     }
 
@@ -606,7 +610,7 @@ mod tests {
 
         assert_eq!(
             build_request_hash("OpenAI", "gpt-test", "translate", messages),
-            "8c13d80251241884e45610d3b6003c103e0421e5"
+            "6a07ce8a1b85c5fa5c9702e7fa2c0c1bf555e77b"
         );
     }
 
@@ -631,7 +635,7 @@ mod tests {
             paths
                 .translation_memory_path
                 .to_string_lossy()
-                .contains("translation_memory.v2.auto-zh-hans.standard.json")
+                .contains("translation_memory.v3.auto-zh-hans.standard.json")
         );
     }
 

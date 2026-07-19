@@ -5,7 +5,7 @@ use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, FailureLog, GlossaryEntry, PipelineOptions,
     PipelineResult, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
-    TerminologyStats, TranslationLine, Usage,
+    TerminologyEntity, TerminologyStats, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::languages::normalize_language_name;
@@ -23,6 +23,7 @@ use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload
 use crate::storage::{InputSignature, ResumeSnapshot};
 use crate::validation::validate_translation_batch;
 
+mod online_terminology;
 mod persistence;
 mod planning;
 mod review_runner;
@@ -47,6 +48,7 @@ use terminology::{
     parse_payload as parse_terminology_payload,
 };
 use translation_runner::TranslationRun;
+use translation_stage::PreparedBatch;
 
 #[cfg(test)]
 use crate::entities::{ReviewPolicy, ReviewReport};
@@ -61,8 +63,8 @@ pub struct SubtitlePipeline<B, D> {
     dashboard: D,
     options: PipelineOptions,
     memory: ContextMemory,
-    /// Only a user-supplied glossary is authoritative enough to reject a
-    /// translation. Automatically extracted terminology remains advisory.
+    /// User glossary entries and accepted proper-name entities are enforced;
+    /// automatically learned domain terms remain advisory.
     required_glossary: BTreeMap<String, String>,
     store: Option<Box<dyn RuntimeStore>>,
     input_signature: Option<InputSignature>,
@@ -326,8 +328,10 @@ where
         }
 
         let terminology = self.run_terminology_preflight(document)?;
+        self.sync_enforced_entities();
 
         let resume = self.load_resume_snapshot(&batches)?;
+        self.sync_enforced_entities();
         let mut translation_document = document.clone();
         translation_document.segments = deduplication.canonical().to_vec();
         let TranslationRun {
@@ -407,6 +411,118 @@ where
         .run(document)
     }
 
+    fn sync_enforced_entities(&mut self) {
+        for entity in &self.memory.terminology_entities {
+            if entity.kind.is_enforced() {
+                for variant in &entity.variants {
+                    self.required_glossary
+                        .entry(variant.source.to_lowercase())
+                        .or_insert_with(|| variant.target.clone());
+                }
+            }
+        }
+    }
+
+    fn reconcile_translation_window(
+        &mut self,
+        prepared: &[PreparedBatch],
+        generated: &mut HashMap<usize, BatchWithUsage>,
+    ) -> CoreResult<()> {
+        if !self.options.online_terminology {
+            return Ok(());
+        }
+        let mut canonical = self
+            .memory
+            .glossary
+            .iter()
+            .map(|(source, target)| (source.to_lowercase(), target.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut enforced = self
+            .required_glossary
+            .iter()
+            .map(|(source, target)| (source.to_lowercase(), target.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        for batch in prepared.iter().filter(|batch| !batch.pending.is_empty()) {
+            let index = batch.index + 1;
+            let result = generated.get_mut(&index).ok_or_else(|| {
+                CoreError::DataInvariant(format!("translation window omitted batch {index}"))
+            })?;
+            let expected_terminology = !result.terminology_updates.is_empty();
+            if let Err(error) = online_terminology::reconcile_batch(
+                &batch.pending,
+                result,
+                &mut canonical,
+                &mut enforced,
+                &self.options.target_language,
+                self.options.preserve_names,
+            ) {
+                for (source, target) in &enforced {
+                    self.required_glossary
+                        .entry(source.clone())
+                        .or_insert_with(|| target.clone());
+                }
+                let mut retried =
+                    self.translate_batch_impl(index, &batch.pending, true, Some(error.clone()))?;
+                if expected_terminology && retried.terminology_updates.is_empty() {
+                    return Err(CoreError::InvalidTranslation(format!(
+                        "batch {index} omitted terminology updates after correction"
+                    )));
+                }
+                online_terminology::reconcile_batch(
+                    &batch.pending,
+                    &mut retried,
+                    &mut canonical,
+                    &mut enforced,
+                    &self.options.target_language,
+                    self.options.preserve_names,
+                )
+                .map_err(|retry_error| {
+                    CoreError::InvalidTranslation(format!(
+                        "batch {index} terminology reconciliation failed after retry: {retry_error}"
+                    ))
+                })?;
+                *result = retried;
+            }
+        }
+        self.required_glossary.extend(enforced);
+        Ok(())
+    }
+
+    fn commit_terminology_updates(&mut self, entities: &[TerminologyEntity]) {
+        for entity in entities {
+            self.memory.update("", &entity.variants);
+            self.memory.add_terminology_entity(entity.clone());
+            if entity.kind.is_enforced() {
+                for variant in &entity.variants {
+                    self.required_glossary
+                        .entry(variant.source.to_lowercase())
+                        .or_insert_with(|| variant.target.clone());
+                }
+            }
+        }
+    }
+
+    fn save_reconciled_translation_cache(&self, result: &BatchWithUsage) -> CoreResult<()> {
+        let (Some(key), Some(store)) = (&result.cache_key, self.store.as_ref()) else {
+            return Ok(());
+        };
+        self.cancellation.check()?;
+        store.save_cached_response(
+            CacheStage::Translate,
+            key,
+            &BackendJsonResult {
+                payload: BackendPayload::Translation(crate::entities::BatchTranslationResult {
+                    lines: result.lines.clone(),
+                    summary: result.summary.clone(),
+                    glossary_updates: result.glossary_updates.clone(),
+                    terminology_updates: result.terminology_updates.clone(),
+                }),
+                usage: result.usage,
+            },
+        )
+    }
+
     fn translate_batch(
         &mut self,
         batch_index: usize,
@@ -462,7 +578,9 @@ where
                         lines: payload.lines,
                         summary: payload.summary,
                         glossary_updates: payload.glossary_updates,
+                        terminology_updates: payload.terminology_updates,
                         usage: Usage::default(),
+                        cache_key: None,
                     },
                 );
             } else {
@@ -496,26 +614,15 @@ where
                 Ok((payload, usage))
             }) {
                 Ok((payload, response_usage)) => {
-                    let backend_result = BackendJsonResult {
-                        payload: BackendPayload::Translation(payload.clone()),
-                        usage: response_usage,
-                    };
-                    if self.options.use_cache
-                        && let Some(store) = self.store.as_ref()
-                    {
-                        store.save_cached_response(
-                            CacheStage::Translate,
-                            &hash,
-                            &backend_result,
-                        )?;
-                    }
                     results.insert(
                         batch_index,
                         BatchWithUsage {
                             lines: payload.lines,
                             summary: payload.summary,
                             glossary_updates: payload.glossary_updates,
+                            terminology_updates: payload.terminology_updates,
                             usage: response_usage,
+                            cache_key: self.options.use_cache.then_some(hash),
                         },
                     );
                 }
@@ -685,13 +792,6 @@ where
             ));
         };
         validate_translation_batch(batch, &result.lines)?;
-        if self.options.use_cache
-            && !cached
-            && let Some(store) = self.store.as_ref()
-        {
-            self.cancellation.check()?;
-            store.save_cached_response(CacheStage::Translate, request_hash, &backend_result)?;
-        }
         let BackendPayload::Translation(result) = backend_result.payload else {
             return Err(CoreError::DataInvariant(
                 "translation backend returned a review payload".to_owned(),
@@ -701,11 +801,13 @@ where
             lines: result.lines,
             summary: result.summary,
             glossary_updates: result.glossary_updates,
+            terminology_updates: result.terminology_updates,
             usage: if cached {
                 Usage::default()
             } else {
                 backend_result.usage
             },
+            cache_key: (!cached && self.options.use_cache).then(|| request_hash.to_owned()),
         })
     }
 
@@ -723,7 +825,13 @@ where
             lines: left.lines.into_iter().chain(right.lines).collect(),
             summary: combine_summaries(&left.summary, &right.summary, self.memory.max_summaries),
             glossary_updates: combine_glossary(left.glossary_updates, right.glossary_updates),
+            terminology_updates: left
+                .terminology_updates
+                .into_iter()
+                .chain(right.terminology_updates)
+                .collect(),
             usage,
+            cache_key: None,
         })
     }
 
@@ -1004,7 +1112,9 @@ where
                 lines: result.lines,
                 summary: result.summary,
                 glossary_updates: result.glossary_updates,
+                terminology_updates: result.terminology_updates,
                 usage: outcome.usage,
+                cache_key: None,
             });
         }
         let agent_attempts = repair
@@ -1301,7 +1411,9 @@ struct BatchWithUsage {
     lines: Vec<TranslationLine>,
     summary: String,
     glossary_updates: Vec<GlossaryEntry>,
+    terminology_updates: Vec<TerminologyEntity>,
     usage: Usage,
+    cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1352,7 +1464,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::entities::{BatchTranslationResult, GlossaryEntry};
+    use crate::entities::{BatchTranslationResult, GlossaryEntry, TerminologyKind};
     use crate::error::LlmCallError;
     use crate::ports::{GenerationInput, GenerationResponse, NoopDashboard};
     use crate::review::build_review_plan;
@@ -1418,6 +1530,7 @@ mod tests {
                 lines,
                 summary: "ok".to_owned(),
                 glossary_updates: Vec::<GlossaryEntry>::new(),
+                terminology_updates: Vec::new(),
             })
             .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
             Ok(GenerationResponse::json(
@@ -1428,6 +1541,39 @@ mod tests {
                     total_tokens: 2,
                     ..Usage::default()
                 },
+            ))
+        }
+    }
+
+    struct CorrectedTerminologyBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for CorrectedTerminologyBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "terminology-correction"
+        }
+
+        fn execute(
+            &mut self,
+            _request: GenerationRequest,
+            _cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(GenerationResponse::json(
+                serde_json::json!({
+                    "lines": [{"id": "1", "translation": "扎萨来了。"}],
+                    "terminology_updates": [{
+                        "canonical_source": "Joey Zasa",
+                        "kind": "person",
+                        "variants": [{"source": "Zasa", "target": "扎萨"}]
+                    }]
+                }),
+                Usage::default(),
             ))
         }
     }
@@ -1698,6 +1844,7 @@ mod tests {
                 lines,
                 summary: String::new(),
                 glossary_updates: Vec::new(),
+                terminology_updates: Vec::new(),
             })
             .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
             Ok(GenerationResponse::json(payload, Usage::default()))
@@ -2469,6 +2616,38 @@ mod tests {
         .expect("valid terminology");
         assert_eq!(parsed.entries[0].target, "斧头帮");
 
+        let alias_candidates = vec![
+            TerminologyCandidate {
+                source: "Joey Zasa".to_owned(),
+                context: "Joey Zasa arrived.".to_owned(),
+            },
+            TerminologyCandidate {
+                source: "Joey".to_owned(),
+                context: "Joey!".to_owned(),
+            },
+            TerminologyCandidate {
+                source: "Zasa".to_owned(),
+                context: "Zasa sent them.".to_owned(),
+            },
+        ];
+        let aliases = parse_terminology_payload(
+            &serde_json::json!({
+                "entities": [{
+                    "canonical_source": "Joey Zasa",
+                    "kind": "person",
+                    "variants": [
+                        {"source": "Joey Zasa", "target": "乔伊·扎萨"},
+                        {"source": "Joey", "target": "乔伊"},
+                        {"source": "Zasa", "target": "扎萨"}
+                    ]
+                }]
+            }),
+            &alias_candidates,
+        )
+        .expect("entity aliases");
+        assert_eq!(aliases.entities[0].variants[1].target, "乔伊");
+        assert_eq!(aliases.entities[0].variants[2].target, "扎萨");
+
         let error = parse_terminology_payload(
             &serde_json::json!({
                 "entries": [{"source": "Unknown", "target": "未知"}]
@@ -2499,6 +2678,23 @@ mod tests {
     }
 
     #[test]
+    fn terminology_candidate_limit_prioritizes_recurring_names() {
+        let mut segments = (0..300)
+            .map(|index| segment(&index.to_string(), &format!("Candidate{index} arrived.")))
+            .collect::<Vec<_>>();
+        segments.push(segment("301", "Zasa arrived."));
+        segments.push(segment("302", "Zasa returned."));
+
+        let sources = extract_terminology_candidates(&segments)
+            .into_iter()
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources.len(), 256);
+        assert!(sources.contains(&"Zasa".to_owned()));
+    }
+
+    #[test]
     fn auto_terminology_is_advisory_but_explicit_glossary_is_required() {
         let prepared = vec![translation_stage::PreparedBatch {
             index: 0,
@@ -2517,7 +2713,9 @@ mod tests {
                     source: "Lord".to_owned(),
                     target: "勋爵".to_owned(),
                 }],
+                terminology_updates: Vec::new(),
                 usage: Usage::default(),
+                cache_key: None,
             },
         )]);
 
@@ -2585,6 +2783,124 @@ mod tests {
                 .is_some_and(|map| !map.is_empty())
                 && context.get("glossary").is_none()
         }));
+    }
+
+    #[test]
+    fn turbo_reconciles_parallel_terminology_in_subtitle_order() {
+        let mut options = PipelineOptions::new("terms.srt".into());
+        options.mode = crate::entities::TranslationMode::Turbo;
+        options.online_terminology = true;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        let prepared = vec![
+            translation_stage::PreparedBatch {
+                index: 0,
+                memory_hits: HashMap::new(),
+                pending: vec![segment("1", "Zasa arrived.")],
+            },
+            translation_stage::PreparedBatch {
+                index: 1,
+                memory_hits: HashMap::new(),
+                pending: vec![segment("2", "Zasa sent them.")],
+            },
+        ];
+        let entity = |canonical: &str, source: &str, target: &str| TerminologyEntity {
+            canonical_source: canonical.to_owned(),
+            kind: TerminologyKind::Person,
+            variants: vec![GlossaryEntry {
+                source: source.to_owned(),
+                target: target.to_owned(),
+            }],
+        };
+        let mut generated = HashMap::from([
+            (
+                2,
+                BatchWithUsage {
+                    lines: vec![TranslationLine {
+                        id: "2".to_owned(),
+                        translation: "萨萨派他们来的。".to_owned(),
+                    }],
+                    summary: String::new(),
+                    glossary_updates: Vec::new(),
+                    terminology_updates: vec![entity("Joey Zasa", "Zasa", "萨萨")],
+                    usage: Usage::default(),
+                    cache_key: None,
+                },
+            ),
+            (
+                1,
+                BatchWithUsage {
+                    lines: vec![TranslationLine {
+                        id: "1".to_owned(),
+                        translation: "扎萨到了。".to_owned(),
+                    }],
+                    summary: String::new(),
+                    glossary_updates: Vec::new(),
+                    terminology_updates: vec![entity("Joey Zasa", "Zasa", "扎萨")],
+                    usage: Usage::default(),
+                    cache_key: None,
+                },
+            ),
+        ]);
+        pipeline
+            .reconcile_translation_window(&prepared, &mut generated)
+            .expect("reconcile parallel window");
+
+        assert_eq!(generated[&2].lines[0].translation, "扎萨派他们来的。");
+        assert_eq!(
+            generated[&1].terminology_updates[0].variants[0].target,
+            "扎萨"
+        );
+    }
+
+    #[test]
+    fn unsafe_terminology_conflict_retries_only_that_batch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut options = PipelineOptions::new("terms.srt".into());
+        options.online_terminology = true;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(
+            CorrectedTerminologyBackend {
+                calls: Arc::clone(&calls),
+            },
+            NoopDashboard,
+            options,
+        );
+        pipeline
+            .required_glossary
+            .insert("zasa".to_owned(), "扎萨".to_owned());
+        let prepared = vec![translation_stage::PreparedBatch {
+            index: 0,
+            memory_hits: HashMap::new(),
+            pending: vec![segment("1", "Zasa arrived.")],
+        }];
+        let mut generated = HashMap::from([(
+            1,
+            BatchWithUsage {
+                lines: vec![TranslationLine {
+                    id: "1".to_owned(),
+                    translation: "那个家伙来了。".to_owned(),
+                }],
+                summary: String::new(),
+                glossary_updates: Vec::new(),
+                terminology_updates: vec![TerminologyEntity {
+                    canonical_source: "Joey Zasa".to_owned(),
+                    kind: TerminologyKind::Person,
+                    variants: vec![GlossaryEntry {
+                        source: "Zasa".to_owned(),
+                        target: "萨萨".to_owned(),
+                    }],
+                }],
+                usage: Usage::default(),
+                cache_key: None,
+            },
+        )]);
+
+        pipeline
+            .reconcile_translation_window(&prepared, &mut generated)
+            .expect("targeted retry");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(generated[&1].lines[0].translation, "扎萨来了。");
     }
 
     #[test]

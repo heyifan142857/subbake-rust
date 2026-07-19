@@ -1,5 +1,6 @@
 use crate::entities::{
-    AttemptLog, BatchTranslationResult, GlossaryEntry, SubtitleSegment, TranslationLine,
+    AttemptLog, BatchTranslationResult, GlossaryEntry, SubtitleSegment, TerminologyEntity,
+    TranslationLine,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ports::{BackendPayload, ChatMessage};
@@ -111,6 +112,10 @@ pub(crate) fn parse_translation_payload(
         lines,
         summary: payload["summary"].as_str().unwrap_or_default().to_owned(),
         glossary_updates,
+        terminology_updates: serde_json::from_value::<Vec<TerminologyEntity>>(
+            payload["terminology_updates"].clone(),
+        )
+        .unwrap_or_default(),
     })
 }
 

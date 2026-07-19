@@ -144,6 +144,8 @@ Options:
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format
       --bilingual                  Include source and translated text
+      --online-terminology         Merge terminology while translating (default in turbo/cinema)
+      --no-online-terminology      Disable incremental terminology responses
       --preserve-names             Keep personal names in source spelling
       --transliterate-names        Transliterate personal names (default)
       --preserve-source-container  Write a separate translated media file

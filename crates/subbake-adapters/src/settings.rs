@@ -62,6 +62,7 @@ pub struct TranslationDomainSettings {
     pub mode: TranslationMode,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
+    pub online_terminology: bool,
     pub preserve_names: bool,
     pub dry_run: bool,
     pub resume: bool,
@@ -121,6 +122,7 @@ pub struct TranslationOverrides {
     pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
+    pub online_terminology: Option<bool>,
     pub preserve_names: Option<bool>,
     pub dry_run: Option<bool>,
     pub resume: Option<bool>,
@@ -203,6 +205,7 @@ impl SettingsOverrides {
                 fast_mode: None,
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
+                online_terminology: Some(settings.translation.online_terminology),
                 preserve_names: Some(settings.translation.preserve_names),
                 dry_run: Some(settings.translation.dry_run),
                 resume: Some(settings.translation.resume),
@@ -273,6 +276,7 @@ impl TranslationOverrides {
             fast_mode,
             review_policy,
             terminology_preflight,
+            online_terminology,
             preserve_names,
             dry_run,
             resume,
@@ -361,6 +365,7 @@ impl Default for ResolvedSettings {
                 mode: TranslationMode::Turbo,
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: true,
+                online_terminology: true,
                 preserve_names: false,
                 dry_run: false,
                 resume: true,
@@ -446,6 +451,7 @@ impl ResolvedSettings {
             fast_mode,
             review_policy,
             terminology_preflight,
+            online_terminology,
             preserve_names,
             dry_run,
             resume,
@@ -486,6 +492,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = terminology_preflight {
             self.translation.terminology_preflight = value;
+        }
+        if let Some(value) = online_terminology {
+            self.translation.online_terminology = value;
         }
         if let Some(value) = preserve_names {
             self.translation.preserve_names = value;
@@ -647,6 +656,7 @@ impl ResolvedSettings {
         options.mode = self.translation.mode;
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
+        options.online_terminology = self.translation.online_terminology;
         options.preserve_names = self.translation.preserve_names;
         options.dry_run = self.translation.dry_run;
         options.resume = self.translation.resume;
@@ -685,6 +695,7 @@ impl ResolvedSettings {
                 self.translation.review_concurrency = 1;
                 self.translation.review_policy = ReviewPolicy::Off;
                 self.translation.terminology_preflight = false;
+                self.translation.online_terminology = false;
             }
             TranslationMode::Turbo => {
                 self.translation.batch_size = 96;
@@ -693,6 +704,7 @@ impl ResolvedSettings {
                 self.translation.review_concurrency = 4;
                 self.translation.review_policy = ReviewPolicy::Off;
                 self.translation.terminology_preflight = false;
+                self.translation.online_terminology = true;
             }
             TranslationMode::Cinema => {
                 self.translation.batch_size = 48;
@@ -701,6 +713,7 @@ impl ResolvedSettings {
                 self.translation.review_concurrency = 3;
                 self.translation.review_policy = ReviewPolicy::Full;
                 self.translation.terminology_preflight = true;
+                self.translation.online_terminology = true;
             }
         }
     }
@@ -820,6 +833,32 @@ mod tests {
         assert_eq!(settings.translation.batch_size, 48);
         assert_eq!(settings.translation.translation_concurrency, 7);
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Full);
+        assert!(settings.translation.online_terminology);
+    }
+
+    #[test]
+    fn economy_disables_online_terminology_unless_explicitly_enabled() {
+        let defaults = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                translation: TranslationOverrides {
+                    mode: Some(TranslationMode::Economy),
+                    ..TranslationOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect("economy defaults");
+        assert!(!defaults.translation.online_terminology);
+
+        let enabled = defaults
+            .with_overrides(SettingsOverrides {
+                translation: TranslationOverrides {
+                    online_terminology: Some(true),
+                    ..TranslationOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect("explicit online terminology");
+        assert!(enabled.translation.online_terminology);
     }
 
     #[test]
