@@ -1,16 +1,123 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::entities::SubtitleSegment;
 use crate::entities::TerminologyKind;
+use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 
 use super::BatchWithUsage;
+
+const TERM_MARKER_PREFIX: &str = "⟦T";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TermMarker {
+    index: usize,
+    source: String,
+}
+
+pub(super) fn select_markers(source: &[SubtitleSegment], candidates: &[String]) -> Vec<TermMarker> {
+    let haystack = source
+        .iter()
+        .map(|segment| segment.text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut matched = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            haystack.contains(&candidate.to_lowercase()) && !is_source_stable_acronym(candidate)
+        })
+        .map(|(index, source)| TermMarker {
+            index,
+            source: source.clone(),
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by_key(|marker| std::cmp::Reverse(marker.source.chars().count()));
+    let mut selected = Vec::<TermMarker>::new();
+    for marker in matched {
+        if selected.len() == 12 {
+            break;
+        }
+        if !selected
+            .iter()
+            .any(|existing| existing.source.contains(&marker.source))
+        {
+            selected.push(marker);
+        }
+    }
+    selected
+}
+
+pub(super) fn protect_terms(text: &str, markers: &[TermMarker]) -> String {
+    markers.iter().fold(text.to_owned(), |protected, marker| {
+        if !protected.contains(&marker.source) {
+            return protected;
+        }
+        protected.replace(
+            &marker.source,
+            &format!(
+                "{}{index}⟧{}⟦/T{index}⟧",
+                TERM_MARKER_PREFIX,
+                marker.source,
+                index = marker.index
+            ),
+        )
+    })
+}
+
+pub(super) fn extract_terms(
+    lines: &mut [TranslationLine],
+    markers: &[TermMarker],
+) -> Vec<GlossaryEntry> {
+    let mut updates = Vec::new();
+    for marker in markers {
+        let start = format!("{}{index}⟧", TERM_MARKER_PREFIX, index = marker.index);
+        let end = format!("⟦/T{index}⟧", index = marker.index);
+        let mut accepted = None;
+        for line in &mut *lines {
+            while let Some(start_at) = line.translation.find(&start) {
+                let content_at = start_at + start.len();
+                let Some(relative_end) = line.translation[content_at..].find(&end) else {
+                    line.translation.replace_range(start_at..content_at, "");
+                    break;
+                };
+                let end_at = content_at + relative_end;
+                let target = line.translation[content_at..end_at].trim().to_owned();
+                line.translation
+                    .replace_range(end_at..end_at + end.len(), "");
+                line.translation.replace_range(start_at..content_at, "");
+                if accepted.is_none() && !target.is_empty() {
+                    accepted = Some(target);
+                }
+            }
+            line.translation = line.translation.replace(&start, "").replace(&end, "");
+        }
+        if let Some(target) = accepted {
+            updates.push(GlossaryEntry {
+                source: marker.source.clone(),
+                target,
+            });
+        }
+    }
+    updates
+}
+
+fn is_source_stable_acronym(candidate: &str) -> bool {
+    let letters = candidate
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .collect::<Vec<_>>();
+    letters.len() >= 2
+        && letters
+            .iter()
+            .all(|character| character.is_ascii_uppercase())
+}
 
 pub(super) fn reconcile_batch(
     source: &[SubtitleSegment],
     result: &mut BatchWithUsage,
     canonical: &mut BTreeMap<String, String>,
     enforced: &mut BTreeMap<String, String>,
+    candidates: &[String],
     target_language: &str,
     preserve_names: bool,
 ) -> CoreResult<()> {
@@ -87,6 +194,52 @@ pub(super) fn reconcile_batch(
             variant.target = chosen;
         }
     }
+
+    let mut accepted = Vec::new();
+    for mut entry in std::mem::take(&mut result.glossary_updates) {
+        let source_form = entry.source.trim();
+        let proposed = entry.target.trim();
+        if source_form.is_empty()
+            || proposed.is_empty()
+            || !candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(source_form))
+        {
+            continue;
+        }
+        let matching_ids = source
+            .iter()
+            .filter(|segment| contains_case_insensitive(&segment.text, source_form))
+            .map(|segment| segment.id.as_str())
+            .collect::<Vec<_>>();
+        if matching_ids.is_empty()
+            || !result.lines.iter().any(|line| {
+                matching_ids.contains(&line.id.as_str()) && line.translation.contains(proposed)
+            })
+        {
+            continue;
+        }
+        let key = source_form.to_lowercase();
+        let chosen = canonical
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| proposed.to_owned());
+        if chosen != proposed {
+            for line in &result.lines {
+                if matching_ids.contains(&line.id.as_str()) && line.translation.contains(proposed) {
+                    replacements
+                        .entry(line.id.clone())
+                        .or_default()
+                        .push((proposed.to_owned(), chosen.clone()));
+                }
+            }
+        }
+        canonical.entry(key).or_insert_with(|| chosen.clone());
+        entry.source = source_form.to_owned();
+        entry.target = chosen;
+        accepted.push(entry);
+    }
+    result.glossary_updates = accepted;
 
     for line in &mut result.lines {
         if let Some(items) = replacements.get(&line.id) {
@@ -187,6 +340,7 @@ mod tests {
             &mut result,
             &mut canonical,
             &mut enforced,
+            &["Zasa".to_owned()],
             "zh-Hans",
             false,
         )
@@ -201,5 +355,103 @@ mod tests {
     fn source_matching_does_not_treat_joe_as_joey() {
         assert!(contains_case_insensitive("Mr. Joe Zasa", "Joe"));
         assert!(!contains_case_insensitive("Joey Zasa", "Joe"));
+    }
+
+    #[test]
+    fn lightweight_terms_accept_candidates_and_rewrite_later_conflicts() {
+        let source = vec![segment("1", "Astrophage escaped.")];
+        let mut result = BatchWithUsage {
+            lines: vec![TranslationLine {
+                id: "1".to_owned(),
+                translation: "噬星体逃走了。".to_owned(),
+            }],
+            summary: String::new(),
+            glossary_updates: vec![GlossaryEntry {
+                source: "Astrophage".to_owned(),
+                target: "噬星体".to_owned(),
+            }],
+            terminology_updates: Vec::new(),
+            usage: Usage::default(),
+            cache_key: None,
+        };
+        let mut canonical = BTreeMap::from([("astrophage".to_owned(), "星食体".to_owned())]);
+
+        reconcile_batch(
+            &source,
+            &mut result,
+            &mut canonical,
+            &mut BTreeMap::new(),
+            &["Astrophage".to_owned()],
+            "zh-Hans",
+            false,
+        )
+        .expect("lightweight reconcile");
+
+        assert_eq!(result.lines[0].translation, "星食体逃走了。");
+        assert_eq!(result.glossary_updates[0].target, "星食体");
+    }
+
+    #[test]
+    fn lightweight_terms_silently_drop_unrequested_or_unverifiable_entries() {
+        let source = vec![segment("1", "Astrophage escaped.")];
+        let mut result = BatchWithUsage {
+            lines: vec![TranslationLine {
+                id: "1".to_owned(),
+                translation: "它逃走了。".to_owned(),
+            }],
+            summary: String::new(),
+            glossary_updates: vec![GlossaryEntry {
+                source: "Ordinary".to_owned(),
+                target: "普通".to_owned(),
+            }],
+            terminology_updates: Vec::new(),
+            usage: Usage::default(),
+            cache_key: None,
+        };
+
+        reconcile_batch(
+            &source,
+            &mut result,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &["Astrophage".to_owned()],
+            "zh-Hans",
+            false,
+        )
+        .expect("optional terms never fail translation");
+
+        assert!(result.glossary_updates.is_empty());
+    }
+
+    #[test]
+    fn marker_round_trip_extracts_term_without_a_separate_response_field() {
+        let source = vec![segment("1", "Astrophage escaped.")];
+        let markers = select_markers(&source, &["Astrophage".to_owned()]);
+        assert_eq!(
+            protect_terms(&source[0].text, &markers),
+            "⟦T0⟧Astrophage⟦/T0⟧ escaped."
+        );
+        let mut lines = vec![TranslationLine {
+            id: "1".to_owned(),
+            translation: "⟦T0⟧星食体⟦/T0⟧逃走了。".to_owned(),
+        }];
+
+        let updates = extract_terms(&mut lines, &markers);
+
+        assert_eq!(lines[0].translation, "星食体逃走了。");
+        assert_eq!(
+            updates,
+            vec![GlossaryEntry {
+                source: "Astrophage".to_owned(),
+                target: "星食体".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lightweight_markers_skip_source_stable_acronyms() {
+        let source = vec![segment("1", "YIFY links to YTS.BZ.")];
+        let markers = select_markers(&source, &["YIFY".to_owned(), "YTS.BZ".to_owned()]);
+        assert!(markers.is_empty());
     }
 }

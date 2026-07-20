@@ -7,9 +7,9 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 9;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 10;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 5;
-pub const CACHE_VERSION: u64 = 2;
+pub const CACHE_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -573,7 +573,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "a7fea53f2ec91379e1916acc17407a97337e1508"
+            "1ecb13dcdd63fd2b0d27293c27ecf80cafbf3751"
         );
     }
 
@@ -610,7 +610,7 @@ mod tests {
 
         assert_eq!(
             build_request_hash("OpenAI", "gpt-test", "translate", messages),
-            "6a07ce8a1b85c5fa5c9702e7fa2c0c1bf555e77b"
+            "b8b52e99d044469a98851eadfdaef02aceb4cf9d"
         );
     }
 

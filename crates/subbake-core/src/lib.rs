@@ -4,6 +4,7 @@ pub mod entities;
 pub mod error;
 pub mod evaluation;
 pub mod formats;
+mod formatting;
 pub mod languages;
 pub mod memory;
 pub mod overnight;

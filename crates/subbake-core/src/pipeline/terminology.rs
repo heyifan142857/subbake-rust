@@ -198,7 +198,15 @@ pub(super) struct TerminologyCandidate {
 }
 
 pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<TerminologyCandidate> {
-    let mut candidates = std::collections::BTreeMap::new();
+    #[derive(Clone)]
+    struct RankedCandidate {
+        candidate: TerminologyCandidate,
+        count: usize,
+        words: usize,
+        acronym: bool,
+    }
+
+    let mut candidates = std::collections::BTreeMap::<String, RankedCandidate>::new();
     for segment in segments {
         let words = segment
             .text
@@ -239,54 +247,120 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                 }
                 end += 1;
             }
-            candidates
-                .entry(word.to_ascii_lowercase())
-                .and_modify(|(_, count)| *count += 1)
-                .or_insert_with(|| {
-                    (
-                        TerminologyCandidate {
-                            source: word.to_owned(),
-                            context: segment.text.chars().take(240).collect(),
-                        },
-                        1usize,
-                    )
-                });
             let source = words[index..end].join(" ");
-            if end > index + 1 {
-                candidates
-                    .entry(source.to_ascii_lowercase())
-                    .and_modify(|(_, count)| *count += 1)
-                    .or_insert_with(|| {
-                        (
-                            TerminologyCandidate {
-                                source,
-                                context: segment.text.chars().take(240).collect(),
-                            },
-                            1usize,
-                        )
-                    });
-            }
+            let word_count = end - index;
+            candidates
+                .entry(source.to_ascii_lowercase())
+                .and_modify(|candidate| candidate.count += 1)
+                .or_insert_with(|| RankedCandidate {
+                    candidate: TerminologyCandidate {
+                        source,
+                        context: segment.text.chars().take(240).collect(),
+                    },
+                    count: 1,
+                    words: word_count,
+                    acronym: is_acronym,
+                });
             index = end;
         }
     }
-    let mut ranked = candidates.into_values().collect::<Vec<_>>();
-    ranked.sort_by(|(left, left_count), (right, right_count)| {
-        right_count
-            .cmp(left_count)
+    let mut ranked = candidates
+        .into_values()
+        .filter(|candidate| {
+            candidate.acronym
+                || (candidate.words > 1
+                    && candidate
+                        .candidate
+                        .source
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|word| !is_common_sentence_initial(word)))
+                || (candidate.count > 1 && !is_common_sentence_initial(&candidate.candidate.source))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
             .then_with(|| {
                 right
+                    .candidate
                     .source
                     .split_whitespace()
                     .count()
-                    .cmp(&left.source.split_whitespace().count())
+                    .cmp(&left.candidate.source.split_whitespace().count())
             })
-            .then_with(|| left.source.to_lowercase().cmp(&right.source.to_lowercase()))
+            .then_with(|| {
+                left.candidate
+                    .source
+                    .to_lowercase()
+                    .cmp(&right.candidate.source.to_lowercase())
+            })
     });
     ranked
         .into_iter()
-        .map(|(candidate, _)| candidate)
+        .map(|candidate| candidate.candidate)
         .take(256)
         .collect()
+}
+
+fn is_common_sentence_initial(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "but"
+            | "can"
+            | "do"
+            | "for"
+            | "from"
+            | "he"
+            | "her"
+            | "here"
+            | "his"
+            | "how"
+            | "i"
+            | "if"
+            | "in"
+            | "is"
+            | "it"
+            | "its"
+            | "my"
+            | "no"
+            | "not"
+            | "of"
+            | "official"
+            | "oh"
+            | "on"
+            | "or"
+            | "our"
+            | "she"
+            | "so"
+            | "that"
+            | "the"
+            | "their"
+            | "then"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "those"
+            | "to"
+            | "we"
+            | "what"
+            | "when"
+            | "where"
+            | "who"
+            | "why"
+            | "will"
+            | "with"
+            | "yes"
+            | "you"
+            | "your"
+    )
 }
 
 fn build_messages(

@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, FailureLog, GlossaryEntry, PipelineOptions,
-    PipelineResult, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
+    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry,
+    PipelineOptions, PipelineResult, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
     TerminologyEntity, TerminologyStats, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
+use crate::formatting::restore_batch_formatting;
 use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
@@ -270,11 +271,11 @@ where
         let deduplication =
             DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-            .scene_aware(self.options.policy().include_context)
+            .scene_aware(self.options.policy().scene_aware_batching)
             .split(deduplication.canonical());
         let original_batches =
             BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-                .scene_aware(self.options.policy().include_context)
+                .scene_aware(self.options.policy().scene_aware_batching)
                 .split(&document.segments);
         let planned_batches = BatchPlanner::describe(&batches);
         let state_path = self
@@ -442,6 +443,7 @@ where
             .iter()
             .map(|(source, target)| (source.to_lowercase(), target.clone()))
             .collect::<BTreeMap<_, _>>();
+        let candidates = self.memory.terminology_candidates.clone();
 
         for batch in prepared.iter().filter(|batch| !batch.pending.is_empty()) {
             let index = batch.index + 1;
@@ -454,6 +456,7 @@ where
                 result,
                 &mut canonical,
                 &mut enforced,
+                &candidates,
                 &self.options.target_language,
                 self.options.preserve_names,
             ) {
@@ -474,6 +477,7 @@ where
                     &mut retried,
                     &mut canonical,
                     &mut enforced,
+                    &candidates,
                     &self.options.target_language,
                     self.options.preserve_names,
                 )
@@ -565,11 +569,17 @@ where
                 None
             };
             if let Some(response) = cached {
-                let BackendPayload::Translation(payload) = response.payload else {
+                let BackendPayload::Translation(mut payload) = response.payload else {
                     return Err(CoreError::DataInvariant(
                         "translation cache returned a review payload".to_owned(),
                     ));
                 };
+                prepare_translation_result(
+                    self.options.online_terminology,
+                    &self.memory.terminology_candidates,
+                    batch,
+                    &mut payload,
+                );
                 validate_translation_batch(batch, &payload.lines)?;
                 self.cache_hits += 1;
                 results.insert(
@@ -609,7 +619,13 @@ where
         for ((batch_index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.map_err(CoreError::from).and_then(|response| {
                 let (json, usage) = response.into_json().map_err(CoreError::from)?;
-                let payload = parse_translation_payload(&json)?;
+                let mut payload = parse_translation_payload(&json)?;
+                prepare_translation_result(
+                    self.options.online_terminology,
+                    &self.memory.terminology_candidates,
+                    &batch,
+                    &mut payload,
+                );
                 validate_translation_batch(&batch, &payload.lines)?;
                 Ok((payload, usage))
             }) {
@@ -773,7 +789,7 @@ where
             None
         };
         let cached = cached_response.is_some();
-        let backend_result = match cached_response {
+        let mut backend_result = match cached_response {
             Some(response) => {
                 self.cache_hits += 1;
                 response
@@ -786,11 +802,17 @@ where
                 }
             }
         };
-        let BackendPayload::Translation(result) = &backend_result.payload else {
+        let BackendPayload::Translation(result) = &mut backend_result.payload else {
             return Err(CoreError::DataInvariant(
                 "translation cache returned a review payload".to_owned(),
             ));
         };
+        prepare_translation_result(
+            self.options.online_terminology,
+            &self.memory.terminology_candidates,
+            batch,
+            result,
+        );
         validate_translation_batch(batch, &result.lines)?;
         let BackendPayload::Translation(result) = backend_result.payload else {
             return Err(CoreError::DataInvariant(
@@ -954,11 +976,12 @@ where
                 None
             };
             if let Some(response) = cached {
-                let BackendPayload::Review(result) = response.payload else {
+                let BackendPayload::Review(mut result) = response.payload else {
                     return Err(CoreError::DataInvariant(
                         "review cache returned a translation payload".to_owned(),
                     ));
                 };
+                restore_batch_formatting(&batch.source, &mut result.lines);
                 validate_translation_batch(&batch.source, &result.lines)?;
                 self.cache_hits += 1;
                 output.insert(
@@ -997,6 +1020,7 @@ where
                 let mut result = parse_review_payload(&json)?;
                 validate_review_candidate_ids(&batch, &result.lines)?;
                 result.lines = merge_review_patch(&batch.translated, &result.lines)?;
+                restore_batch_formatting(&batch.source, &mut result.lines);
                 validate_translation_batch(&batch.source, &result.lines)?;
                 Ok((result, usage))
             }) {
@@ -1046,7 +1070,7 @@ where
             None
         };
         let cached = cached_response.is_some();
-        let backend_result = match cached_response {
+        let mut backend_result = match cached_response {
             Some(response) => {
                 self.cache_hits += 1;
                 response
@@ -1062,11 +1086,12 @@ where
                 }
             }
         };
-        let BackendPayload::Review(result) = &backend_result.payload else {
+        let BackendPayload::Review(result) = &mut backend_result.payload else {
             return Err(CoreError::DataInvariant(
                 "review cache returned a translation payload".to_owned(),
             ));
         };
+        restore_batch_formatting(&batch.source, &mut result.lines);
         validate_translation_batch(&batch.source, &result.lines)?;
         if self.options.use_cache
             && !cached
@@ -1260,10 +1285,21 @@ where
                 }),
             };
 
-            match response_result.and_then(|response| {
-                let lines = match &response.payload {
-                    BackendPayload::Translation(result) => &result.lines,
-                    BackendPayload::Review(result) => &result.lines,
+            match response_result.and_then(|mut response| {
+                let lines = match &mut response.payload {
+                    BackendPayload::Translation(result) => {
+                        prepare_translation_result(
+                            self.options.online_terminology,
+                            &self.memory.terminology_candidates,
+                            source,
+                            result,
+                        );
+                        &result.lines
+                    }
+                    BackendPayload::Review(result) => {
+                        restore_batch_formatting(source, &mut result.lines);
+                        &result.lines
+                    }
                     BackendPayload::Terminology(_) => {
                         return Err(CoreError::DataInvariant(
                             "repair cache returned a terminology payload".to_owned(),
@@ -1414,6 +1450,21 @@ struct BatchWithUsage {
     terminology_updates: Vec<TerminologyEntity>,
     usage: Usage,
     cache_key: Option<String>,
+}
+
+fn prepare_translation_result(
+    online_terminology: bool,
+    candidates: &[String],
+    source: &[SubtitleSegment],
+    result: &mut BatchTranslationResult,
+) {
+    if online_terminology {
+        let markers = online_terminology::select_markers(source, candidates);
+        let extracted = online_terminology::extract_terms(&mut result.lines, &markers);
+        result.glossary_updates =
+            combine_glossary(std::mem::take(&mut result.glossary_updates), extracted);
+    }
+    restore_batch_formatting(source, &mut result.lines);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2662,8 +2713,11 @@ mod tests {
     fn terminology_candidates_normalize_english_possessives() {
         let segments = vec![
             segment("18", "MacAndrews'."),
+            segment("18b", "MacAndrews returned."),
             segment("19", "MacClannough's horse."),
+            segment("19b", "MacClannough waited."),
             segment("20", "James’ horse."),
+            segment("20b", "James agreed."),
         ];
 
         let sources = extract_terminology_candidates(&segments)
@@ -2690,8 +2744,20 @@ mod tests {
             .map(|candidate| candidate.source)
             .collect::<Vec<_>>();
 
-        assert_eq!(sources.len(), 256);
-        assert!(sources.contains(&"Zasa".to_owned()));
+        assert_eq!(sources, vec!["Zasa".to_owned()]);
+    }
+
+    #[test]
+    fn terminology_candidates_ignore_sentence_initial_watermark_phrases() {
+        let sources = extract_terminology_candidates(&[
+            segment("1", "Downloaded from YTS.BZ"),
+            segment("2", "Official YIFY movies site"),
+        ])
+        .into_iter()
+        .map(|candidate| candidate.source)
+        .collect::<Vec<_>>();
+
+        assert!(!sources.contains(&"Official YIFY".to_owned()));
     }
 
     #[test]

@@ -53,6 +53,7 @@ impl TranslationMode {
 pub struct TranslationPolicy {
     pub document_preflight: bool,
     pub include_context: bool,
+    pub scene_aware_batching: bool,
     pub compact_wire: bool,
     pub deduplicate: bool,
     pub review_policy: ReviewPolicy,
@@ -64,6 +65,7 @@ impl TranslationPolicy {
             TranslationMode::Economy => Self {
                 document_preflight: false,
                 include_context: false,
+                scene_aware_batching: false,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
@@ -71,6 +73,7 @@ impl TranslationPolicy {
             TranslationMode::Turbo => Self {
                 document_preflight: false,
                 include_context: true,
+                scene_aware_batching: false,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
@@ -78,6 +81,7 @@ impl TranslationPolicy {
             TranslationMode::Cinema => Self {
                 document_preflight: true,
                 include_context: true,
+                scene_aware_batching: true,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Full,
@@ -513,4 +517,16 @@ fn default_source_language() -> String {
 
 fn default_timeout_seconds() -> f64 {
     120.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_cinema_uses_scene_aware_batching() {
+        assert!(!TranslationPolicy::for_mode(TranslationMode::Economy).scene_aware_batching);
+        assert!(!TranslationPolicy::for_mode(TranslationMode::Turbo).scene_aware_batching);
+        assert!(TranslationPolicy::for_mode(TranslationMode::Cinema).scene_aware_batching);
+    }
 }

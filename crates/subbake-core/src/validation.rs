@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+use crate::formatting::formatting_tokens;
 
 pub fn validate_translation_batch(
     source: &[SubtitleSegment],
@@ -39,6 +40,12 @@ pub fn validate_translation_batch(
         if translation.translation.trim().is_empty() {
             return Err(CoreError::InvalidTranslation(format!(
                 "empty translation for id `{}`",
+                segment.id
+            )));
+        }
+        if formatting_tokens(&segment.text) != formatting_tokens(&translation.translation) {
+            return Err(CoreError::InvalidTranslation(format!(
+                "formatting mismatch for id `{}`",
                 segment.id
             )));
         }

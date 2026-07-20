@@ -91,7 +91,7 @@ pub(crate) fn parse_translation_payload(
         .enumerate()
         .map(|(index, line)| parse_translation_line(line, index))
         .collect::<CoreResult<Vec<_>>>()?;
-    let glossary_updates = match &payload["glossary_updates"] {
+    let mut glossary_updates = match &payload["glossary_updates"] {
         serde_json::Value::Array(entries) => entries
             .iter()
             .map(|entry| GlossaryEntry {
@@ -108,6 +108,18 @@ pub(crate) fn parse_translation_payload(
             .collect(),
         _ => Vec::new(),
     };
+    if let Some(terms) = payload["terms"].as_array() {
+        glossary_updates.extend(terms.iter().filter_map(|term| {
+            let values = term.as_array()?;
+            let source = values.first()?.as_str()?.trim();
+            let target = values.get(1)?.as_str()?.trim();
+            (!source.is_empty() && !target.is_empty()).then(|| GlossaryEntry {
+                source: source.to_owned(),
+                target: target.to_owned(),
+            })
+        }));
+    }
+    glossary_updates = combine_glossary(Vec::new(), glossary_updates);
     Ok(BatchTranslationResult {
         lines,
         summary: payload["summary"].as_str().unwrap_or_default().to_owned(),
@@ -219,4 +231,41 @@ pub(crate) fn backend_payload_json(payload: &BackendPayload) -> CoreResult<serde
         BackendPayload::Terminology(result) => serde_json::to_value(result),
     }
     .map_err(|error| CoreError::DataInvariant(format!("serialize backend payload failed: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_terms_are_parsed_as_glossary_updates() {
+        let parsed = parse_translation_payload(&serde_json::json!({
+            "lines": [["1", "星食体来了。"]],
+            "terms": [["Astrophage", "星食体"]]
+        }))
+        .expect("compact response");
+
+        assert_eq!(
+            parsed.glossary_updates,
+            vec![GlossaryEntry {
+                source: "Astrophage".to_owned(),
+                target: "星食体".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_entity_updates_remain_readable() {
+        let parsed = parse_translation_payload(&serde_json::json!({
+            "lines": [["1", "扎萨来了。"]],
+            "terminology_updates": [{
+                "canonical_source": "Joey Zasa",
+                "kind": "person",
+                "variants": [{"source": "Zasa", "target": "扎萨"}]
+            }]
+        }))
+        .expect("legacy response");
+
+        assert_eq!(parsed.terminology_updates.len(), 1);
+    }
 }
