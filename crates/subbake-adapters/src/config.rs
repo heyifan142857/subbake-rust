@@ -301,7 +301,7 @@ fn validate_profile_name(name: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::settings::{
-        BackendOverrides, OutputOverrides, StorageOverrides, TranslationOverrides,
+        AgentOverrides, BackendOverrides, OutputOverrides, StorageOverrides, TranslationOverrides,
     };
 
     fn temporary_config(label: &str) -> PathBuf {
@@ -310,6 +310,40 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("subbake-{label}-{nonce}.toml"))
+    }
+
+    #[test]
+    fn resolves_agent_defaults_profile_and_cli_overrides() {
+        let config = ConfigFile::parse(
+            r#"
+            version = 2
+            default_profile = "automatic"
+
+            [defaults.agent]
+            max_steps = 20
+            auto_approve_commands = false
+
+            [profiles.automatic.agent]
+            auto_approve_commands = true
+            "#,
+        )
+        .expect("agent configuration");
+
+        let (settings, _) = config
+            .resolve(
+                None,
+                SettingsOverrides {
+                    agent: AgentOverrides {
+                        max_steps: Some(40),
+                        ..AgentOverrides::default()
+                    },
+                    ..SettingsOverrides::default()
+                },
+            )
+            .expect("resolved agent configuration");
+
+        assert_eq!(settings.agent.max_steps, 40);
+        assert!(settings.agent.auto_approve_commands);
     }
 
     #[test]

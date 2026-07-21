@@ -36,7 +36,7 @@ use model::{
 };
 use prompts::{build_json_messages, build_native_messages};
 
-pub const AGENT_LOOP_MAX_STEPS: usize = 8;
+pub const AGENT_LOOP_MAX_STEPS: usize = 24;
 
 pub struct EchoDecisionBackend {
     model: String,
@@ -141,7 +141,7 @@ impl AgentEngine {
         mut state: AgentTurnState,
         mut native_turn: Option<NativeTurn>,
     ) -> AgentResult<String> {
-        while state.steps_used < AGENT_LOOP_MAX_STEPS {
+        while state.steps_used < self.runtime_policy.max_steps() {
             self.check_cancelled()?;
             let decision = self.call_model(
                 backend,
@@ -358,8 +358,13 @@ impl AgentEngine {
                 return None;
             }
             match crate::command_policy::classify(&call.arguments) {
-                crate::command_policy::CommandApproval::AskUser(reason) => Some((call, reason)),
-                crate::command_policy::CommandApproval::AutoRun
+                crate::command_policy::CommandApproval::AskUser(reason)
+                    if !self.runtime_policy.auto_approve_commands() =>
+                {
+                    Some((call, reason))
+                }
+                crate::command_policy::CommandApproval::AskUser(_)
+                | crate::command_policy::CommandApproval::AutoRun
                 | crate::command_policy::CommandApproval::Deny(_) => None,
             }
         });
@@ -381,7 +386,9 @@ impl AgentEngine {
                     .filter(|spec| {
                         spec.mutates_with(&call.arguments)
                             && (self.is_in_plan_mode()
-                                || spec.requires_approval_with(&call.arguments))
+                                || (spec.requires_approval_with(&call.arguments)
+                                    && !(call.name == "run_command"
+                                        && self.runtime_policy.auto_approve_commands())))
                     })
                     .and_then(|_| {
                         validate_tool_call(&call.name, &call.arguments)
@@ -1171,6 +1178,86 @@ mod tests {
     }
 
     #[test]
+    fn automatic_command_approval_continues_without_opening_a_picker() {
+        let root = temp_root("automatic-command-approval");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        engine.set_runtime_policy(
+            crate::engine::AgentRuntimePolicy::new(24, true).expect("runtime policy"),
+        );
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"run_command",
+                    "arguments":{"command":"printf automatic-output","network":true}
+                }),
+                json!({"action":"respond","text":"continued automatically"}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("inspect automatically", &mut backend)
+            .expect("auto approve and continue");
+
+        assert_eq!(response, "continued automatically");
+        assert!(!engine.has_pending_command_approval());
+        assert!(backend.prompts[1][1].content.contains("automatic-output"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_command_approval_keeps_hard_denials_and_plan_approval() {
+        let root = temp_root("automatic-command-policy-boundaries");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        engine.set_runtime_policy(
+            crate::engine::AgentRuntimePolicy::new(24, true).expect("runtime policy"),
+        );
+        let mut denied_backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"run_command",
+                    "arguments":{"command":"sudo id"}
+                }),
+                json!({"action":"respond","text":"hard denial observed"}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("try a forbidden command", &mut denied_backend)
+            .expect("hard denial is model feedback");
+        assert_eq!(response, "hard denial observed");
+        assert!(
+            denied_backend.prompts[1][1]
+                .content
+                .contains("sandbox boundaries")
+        );
+
+        engine.set_plan_mode(true).expect("plan mode");
+        let mut planned_backend = JsonSequenceBackend {
+            decisions: VecDeque::from([json!({
+                "action":"tool_call",
+                "tool_name":"run_command",
+                "arguments":{
+                    "command":"printf artifact > $SUBBAKE_OUTPUT_ARTIFACT",
+                    "outputs":{"artifact":"artifact.txt"}
+                }
+            })]),
+            prompts: Vec::new(),
+        };
+        engine
+            .run_line("create an artifact", &mut planned_backend)
+            .expect("plan approval");
+        assert!(engine.has_pending_plan());
+        assert!(!root.join("artifact.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn approved_native_command_returns_the_original_call_result_to_the_model() {
         let root = temp_root("native-command-approval-continuation");
         std::fs::create_dir_all(&root).expect("root");
@@ -1506,11 +1593,15 @@ mod tests {
     }
 
     #[test]
-    fn eighth_tool_step_gets_one_tool_disabled_final_turn() {
+    fn configured_tool_step_limit_gets_one_tool_disabled_final_turn() {
         let root = temp_root("step-limit");
         std::fs::create_dir_all(&root).expect("root");
         let mut engine = active_engine(root.clone());
-        let mut decisions = (0..AGENT_LOOP_MAX_STEPS)
+        let max_steps = 3;
+        engine.set_runtime_policy(
+            crate::engine::AgentRuntimePolicy::new(max_steps, false).expect("runtime policy"),
+        );
+        let mut decisions = (0..max_steps)
             .map(
                 |_| json!({"action":"tool_call","tool_name":"list_files","arguments":{"path":"."}}),
             )
@@ -1523,7 +1614,7 @@ mod tests {
 
         let response = engine.run_line("keep checking", &mut backend).expect("run");
         assert_eq!(response, "Reached a safe conclusion.");
-        assert_eq!(backend.prompts.len(), AGENT_LOOP_MAX_STEPS + 1);
+        assert_eq!(backend.prompts.len(), max_steps + 1);
         let final_system = &backend.prompts.last().expect("final prompt")[0].content;
         assert!(final_system.contains("No tools are available now"));
         assert!(!final_system.contains("- list_files:"));

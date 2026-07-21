@@ -21,8 +21,8 @@ mod undo;
 
 pub use decision::EchoDecisionBackend;
 pub use engine::{
-    AgentEngine, CommandDecision, EngineObserver, PlanDecision, StreamingObserver,
-    is_known_slash_command,
+    AgentEngine, AgentRuntimePolicy, CommandDecision, EngineObserver, PlanDecision,
+    StreamingObserver, is_known_slash_command,
 };
 pub use error::{AgentError, AgentResult};
 pub use guard::FileGuard;

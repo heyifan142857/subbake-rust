@@ -157,6 +157,44 @@ pub struct AgentEngine {
     pub(crate) operation_guard: CancellationGuard,
     pub(crate) progress: Option<SharedProgress>,
     pub(crate) pending_native_continuation: Option<ToolContinuation>,
+    pub(crate) runtime_policy: AgentRuntimePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRuntimePolicy {
+    max_steps: usize,
+    auto_approve_commands: bool,
+}
+
+impl AgentRuntimePolicy {
+    pub fn new(max_steps: usize, auto_approve_commands: bool) -> AgentResult<Self> {
+        if !(1..=128).contains(&max_steps) {
+            return Err(AgentError::invalid_input(
+                "agent max steps must be from 1 through 128",
+            ));
+        }
+        Ok(Self {
+            max_steps,
+            auto_approve_commands,
+        })
+    }
+
+    pub fn max_steps(self) -> usize {
+        self.max_steps
+    }
+
+    pub fn auto_approve_commands(self) -> bool {
+        self.auto_approve_commands
+    }
+}
+
+impl Default for AgentRuntimePolicy {
+    fn default() -> Self {
+        Self {
+            max_steps: crate::decision::AGENT_LOOP_MAX_STEPS,
+            auto_approve_commands: false,
+        }
+    }
 }
 
 impl AgentEngine {
@@ -173,7 +211,12 @@ impl AgentEngine {
             operation_guard: CancellationGuard::never(),
             progress: None,
             pending_native_continuation: None,
+            runtime_policy: AgentRuntimePolicy::default(),
         }
+    }
+
+    pub fn set_runtime_policy(&mut self, policy: AgentRuntimePolicy) {
+        self.runtime_policy = policy;
     }
 
     pub fn with_progress(mut self, progress: SharedProgress) -> Self {

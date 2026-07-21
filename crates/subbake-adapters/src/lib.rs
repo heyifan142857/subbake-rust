@@ -59,9 +59,10 @@ pub use runtime::{
 };
 pub use runtime_store::FileRuntimeStore;
 pub use settings::{
-    BackendOverrides, BackendSettings, OutputOverrides, OutputSettings, ResolvedSettings,
-    SettingsOverrides, StorageOverrides, StorageSettings, TranscriptionDomainSettings,
-    TranscriptionOverrides, TranslationDomainSettings, TranslationOverrides, TranslationSettings,
+    AgentDomainSettings, AgentOverrides, BackendOverrides, BackendSettings, OutputOverrides,
+    OutputSettings, ResolvedSettings, SettingsOverrides, StorageOverrides, StorageSettings,
+    TranscriptionDomainSettings, TranscriptionOverrides, TranslationDomainSettings,
+    TranslationOverrides, TranslationSettings,
 };
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{

@@ -5,8 +5,9 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentActionKind, AgentEngine, AgentError, AgentResult, CommandDecision, EchoDecisionBackend,
-    PlanDecision, StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
+    AgentActionKind, AgentEngine, AgentError, AgentResult, AgentRuntimePolicy, CommandDecision,
+    EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui, TuiAction, TuiInteraction,
+    is_known_slash_command,
 };
 
 use crate::CliResult;
@@ -52,6 +53,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
     let mut backend =
         build_agent_decision_backend(config_path.as_deref(), initial_profile.as_deref())?;
     let startup_settings = resolved_settings(config_path.as_deref(), initial_profile.as_deref())?;
+    apply_agent_runtime_policy(&mut engine, &startup_settings)?;
 
     // Create the TUI with an observer attached to the engine.
     let input_history = engine.input_history();
@@ -122,7 +124,14 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 .or_else(discover_config_path);
             let candidate_backend =
                 build_agent_decision_backend(candidate_config_path.as_deref(), profile.as_deref())?;
-            Some((candidate_backend, candidate_config_path, needs_config_pin))
+            let candidate_settings =
+                resolved_settings(candidate_config_path.as_deref(), profile.as_deref())?;
+            Some((
+                candidate_backend,
+                candidate_settings,
+                candidate_config_path,
+                needs_config_pin,
+            ))
         } else {
             None
         };
@@ -174,16 +183,18 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             }
         };
 
-        if let Some(candidate) = candidate_backend {
+        if let Some((candidate, settings)) = candidate_backend {
+            apply_agent_runtime_policy(&mut engine, &settings)?;
             backend = candidate;
         }
-        if let Some((candidate, candidate_config_path, needs_config_pin)) =
+        if let Some((candidate, settings, candidate_config_path, needs_config_pin)) =
             candidate_session_backend
         {
             config_path = candidate_config_path;
             if needs_config_pin {
                 engine.set_config_path(config_path.as_deref())?;
             }
+            apply_agent_runtime_policy(&mut engine, &settings)?;
             backend = candidate;
         }
 
@@ -194,6 +205,8 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             engine.set_config_path(config_path.as_deref())?;
             let profile = engine.active_profile();
             backend = build_agent_decision_backend(config_path.as_deref(), profile)?;
+            let settings = resolved_settings(config_path.as_deref(), profile)?;
+            apply_agent_runtime_policy(&mut engine, &settings)?;
         }
 
         // Save session after each interaction.
@@ -261,11 +274,30 @@ fn prepare_profile_backend(
     engine: &AgentEngine,
     config_path: Option<&Path>,
     profile: &str,
-) -> AgentResult<Option<Box<dyn subbake_core::ports::LlmBackend>>> {
+) -> AgentResult<
+    Option<(
+        Box<dyn subbake_core::ports::LlmBackend>,
+        TranslationSettings,
+    )>,
+> {
     if !engine.profile_choices()?.iter().any(|name| name == profile) {
         return Ok(None);
     }
-    build_agent_decision_backend(config_path, Some(profile)).map(Some)
+    let settings = resolved_settings(config_path, Some(profile))?;
+    let backend = build_agent_decision_backend(config_path, Some(profile))?;
+    Ok(Some((backend, settings)))
+}
+
+fn apply_agent_runtime_policy(
+    engine: &mut AgentEngine,
+    settings: &TranslationSettings,
+) -> AgentResult<()> {
+    let policy = AgentRuntimePolicy::new(
+        settings.agent.max_steps,
+        settings.agent.auto_approve_commands,
+    )?;
+    engine.set_runtime_policy(policy);
+    Ok(())
 }
 
 fn session_config_path(engine: &AgentEngine) -> (Option<PathBuf>, bool) {

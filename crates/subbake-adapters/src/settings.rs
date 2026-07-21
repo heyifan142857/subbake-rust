@@ -16,9 +16,16 @@ pub struct ResolvedSettings {
     pub output: OutputSettings,
     pub backend: BackendSettings,
     pub reviewer_backend: Option<BackendSettings>,
+    pub agent: AgentDomainSettings,
     pub translation: TranslationDomainSettings,
     pub transcription: TranscriptionDomainSettings,
     pub storage: StorageSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentDomainSettings {
+    pub max_steps: usize,
+    pub auto_approve_commands: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,10 +95,18 @@ pub struct SettingsOverrides {
     pub reviewer: Option<String>,
     pub backend: BackendOverrides,
     pub reviewer_backend: Option<BackendOverrides>,
+    pub agent: AgentOverrides,
     pub translation: TranslationOverrides,
     pub transcription: TranscriptionOverrides,
     pub output: OutputOverrides,
     pub storage: StorageOverrides,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentOverrides {
+    pub max_steps: Option<usize>,
+    pub auto_approve_commands: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +187,7 @@ impl SettingsOverrides {
                 self.reviewer_backend = Some(other);
             }
         }
+        self.agent.merge(other.agent);
         self.translation.merge(other.translation);
         self.transcription.merge(other.transcription);
         self.output.merge(other.output);
@@ -194,6 +210,10 @@ impl SettingsOverrides {
                 auth_prefix: settings.backend.auth_prefix.clone(),
             },
             reviewer_backend: settings.reviewer_backend.as_ref().map(backend_overrides),
+            agent: AgentOverrides {
+                max_steps: Some(settings.agent.max_steps),
+                auto_approve_commands: Some(settings.agent.auto_approve_commands),
+            },
             translation: TranslationOverrides {
                 source_language: Some(settings.translation.source_language.clone()),
                 target_language: Some(settings.translation.target_language.clone()),
@@ -288,6 +308,12 @@ impl TranslationOverrides {
     }
 }
 
+impl AgentOverrides {
+    fn merge(&mut self, other: Self) {
+        merge_optional_fields!(self, other, max_steps, auto_approve_commands);
+    }
+}
+
 impl TranscriptionOverrides {
     fn merge(&mut self, other: Self) {
         merge_optional_fields!(self, other, model);
@@ -355,6 +381,10 @@ impl Default for ResolvedSettings {
                 auth_prefix: None,
             },
             reviewer_backend: None,
+            agent: AgentDomainSettings {
+                max_steps: 24,
+                auto_approve_commands: false,
+            },
             translation: TranslationDomainSettings {
                 source_language: DEFAULT_SOURCE_LANGUAGE.to_owned(),
                 target_language: DEFAULT_TARGET_LANGUAGE.to_owned(),
@@ -462,6 +492,16 @@ impl ResolvedSettings {
         } = overrides.translation;
         if let Some(model) = overrides.transcription.model {
             self.transcription.model = Some(model);
+        }
+        let AgentOverrides {
+            max_steps,
+            auto_approve_commands,
+        } = overrides.agent;
+        if let Some(value) = max_steps {
+            self.agent.max_steps = value;
+        }
+        if let Some(value) = auto_approve_commands {
+            self.agent.auto_approve_commands = value;
         }
         if let Some(value) = mode {
             self.apply_mode_defaults(value);
@@ -575,6 +615,11 @@ impl ResolvedSettings {
                     "configuration field `{name}` must not be empty"
                 )));
             }
+        }
+        if !(1..=128).contains(&self.agent.max_steps) {
+            return Err(AdapterError::invalid_input(
+                "configuration field `agent.max_steps` must be from 1 through 128",
+            ));
         }
         if self
             .transcription
@@ -813,6 +858,8 @@ mod tests {
         assert_eq!(settings.backend.id, "openai");
         assert_eq!(settings.backend.model, "gpt-test");
         assert_eq!(settings.translation.batch_size, 12);
+        assert_eq!(settings.agent.max_steps, 24);
+        assert!(!settings.agent.auto_approve_commands);
         assert!(settings.output.bilingual);
         assert_eq!(settings.storage.runtime_dir, Some(".runtime".into()));
     }
@@ -873,5 +920,16 @@ mod tests {
             })
             .expect_err("zero batch size");
         assert!(error.to_string().contains("batch_size"));
+
+        let error = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                agent: AgentOverrides {
+                    max_steps: Some(129),
+                    ..AgentOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect_err("excessive agent max steps");
+        assert!(error.to_string().contains("agent.max_steps"));
     }
 }
