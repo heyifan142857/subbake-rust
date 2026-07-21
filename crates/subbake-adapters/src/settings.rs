@@ -365,7 +365,7 @@ impl Default for ResolvedSettings {
                 mode: TranslationMode::Turbo,
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: true,
-                online_terminology: true,
+                online_terminology: false,
                 preserve_names: false,
                 dry_run: false,
                 resume: true,
@@ -704,7 +704,7 @@ impl ResolvedSettings {
                 self.translation.review_concurrency = 4;
                 self.translation.review_policy = ReviewPolicy::Off;
                 self.translation.terminology_preflight = false;
-                self.translation.online_terminology = true;
+                self.translation.online_terminology = false;
             }
             TranslationMode::Cinema => {
                 self.translation.batch_size = 48;
@@ -837,16 +837,16 @@ mod tests {
     }
 
     #[test]
-    fn economy_disables_online_terminology_unless_explicitly_enabled() {
+    fn turbo_disables_online_terminology_unless_explicitly_enabled() {
         let defaults = ResolvedSettings::default()
             .with_overrides(SettingsOverrides {
                 translation: TranslationOverrides {
-                    mode: Some(TranslationMode::Economy),
+                    mode: Some(TranslationMode::Turbo),
                     ..TranslationOverrides::default()
                 },
                 ..SettingsOverrides::default()
             })
-            .expect("economy defaults");
+            .expect("turbo defaults");
         assert!(!defaults.translation.online_terminology);
 
         let enabled = defaults

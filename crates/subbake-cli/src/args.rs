@@ -836,7 +836,7 @@ mod tests {
             parsed.settings.translation.review_policy,
             subbake_core::ReviewPolicy::Full
         );
-        assert!(parsed.settings.translation.online_terminology);
+        assert!(!parsed.settings.translation.online_terminology);
         assert_eq!(parsed.settings.translation.translation_concurrency, 3);
         assert_eq!(parsed.settings.translation.review_concurrency, 2);
         assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
@@ -928,6 +928,23 @@ mod tests {
         let _ = std::fs::remove_file(config);
 
         assert!(!parsed.settings.translation.online_terminology);
+    }
+
+    #[test]
+    fn parse_translate_can_enable_online_terminology_in_turbo_mode() {
+        let config = empty_config("translation-online-terminology-enabled");
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--mode".to_owned(),
+            "turbo".to_owned(),
+            "--online-terminology".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("online terminology option");
+        let _ = std::fs::remove_file(config);
+
+        assert!(parsed.settings.translation.online_terminology);
     }
 
     #[test]

@@ -565,6 +565,9 @@ mod tests {
     fn translation_fingerprint_matches_python_canonical_json() {
         let mut options = PipelineOptions::new("clip.txt".into());
         options.batch_size = 2;
+        // Pin the legacy Python-compatible option value independently of the
+        // current product default.
+        options.online_terminology = true;
         let signature = InputSignature {
             sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
             size: 3,

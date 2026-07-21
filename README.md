@@ -145,9 +145,10 @@ sbake translate episode.srt --mode turbo
 sbake translate episode.srt --mode cinema --profile cinema
 ```
 
-Turbo 和 Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、
-组织、地点等专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。可用
-`--no-online-terminology` 关闭这一行为，Economy 默认关闭以保持最小输出。
+Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、组织、地点等
+专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。Turbo 和 Economy 暂时默认
+关闭这一行为；可用 `--online-terminology` 显式开启，或用
+`--no-online-terminology` 显式关闭。
 
 MKV、MP4/M4V/MOV 或 WebM 含有文本字幕轨时，可以直接翻译并追加译文轨。
 默认通过同目录临时文件安全重封装，再原子替换源容器，因此完成后不会额外保留一份
@@ -225,6 +226,11 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## TODO
+
+- 完善 Turbo 边翻译边生成、消费并按字幕顺序归并术语对照表的正确性，再评估恢复默认开启。
+- 为 whisper.cpp 转写增加静音、音乐和低置信度区间的重复幻觉检测与过滤。
 
 ## License
 

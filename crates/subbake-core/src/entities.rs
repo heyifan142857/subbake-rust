@@ -457,7 +457,7 @@ impl PipelineOptions {
             retries: DEFAULT_RETRIES,
             review_policy: ReviewPolicy::Off,
             terminology_preflight: true,
-            online_terminology: true,
+            online_terminology: false,
             preserve_names: false,
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,
@@ -528,5 +528,13 @@ mod tests {
         assert!(!TranslationPolicy::for_mode(TranslationMode::Economy).scene_aware_batching);
         assert!(!TranslationPolicy::for_mode(TranslationMode::Turbo).scene_aware_batching);
         assert!(TranslationPolicy::for_mode(TranslationMode::Cinema).scene_aware_batching);
+    }
+
+    #[test]
+    fn pipeline_defaults_disable_online_terminology() {
+        let options = PipelineOptions::new("sample.srt".into());
+
+        assert_eq!(options.mode, TranslationMode::Turbo);
+        assert!(!options.online_terminology);
     }
 }
