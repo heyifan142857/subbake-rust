@@ -6,10 +6,11 @@
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
 use std::path::PathBuf;
+use subbake_core::ports::ToolContinuation;
 use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, PendingCommandApproval, ToolCallDraft};
+use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, ToolCallDraft};
 use crate::guard::FileGuard;
 use crate::plan_coordinator::PlanCoordinator;
 use crate::presentation::ConversationPresenter;
@@ -155,6 +156,7 @@ pub struct AgentEngine {
     cancellation: CancellationToken,
     pub(crate) operation_guard: CancellationGuard,
     pub(crate) progress: Option<SharedProgress>,
+    pub(crate) pending_native_continuation: Option<ToolContinuation>,
 }
 
 impl AgentEngine {
@@ -170,6 +172,7 @@ impl AgentEngine {
             cancellation: CancellationToken::default(),
             operation_guard: CancellationGuard::never(),
             progress: None,
+            pending_native_continuation: None,
         }
     }
 
@@ -228,11 +231,13 @@ impl AgentEngine {
 
     /// Create a new session and mark it active.
     pub fn start_session(&mut self) -> AgentResult<()> {
+        self.pending_native_continuation = None;
         SessionController::new(&self.session_store, &mut self.session).start()
     }
 
     /// Resume an existing session by id (or the latest if `None`).
     pub fn resume_session(&mut self, id: Option<&str>) -> AgentResult<()> {
+        self.pending_native_continuation = None;
         SessionController::new(&self.session_store, &mut self.session).resume(id)
     }
 
@@ -283,7 +288,9 @@ impl AgentEngine {
     pub fn store_command_approval(
         &mut self,
         tool_call: ToolCallDraft,
+        call_id: String,
         reason: String,
+        turn: PendingAgentTurn,
     ) -> AgentResult<()> {
         let session = self
             .session
@@ -296,9 +303,11 @@ impl AgentEngine {
         }
         session.pending_command_approval = Some(PendingCommandApproval {
             tool_call: tool_call.clone(),
+            call_id,
             reason: reason.clone(),
             created_at: crate::session::iso_now(),
         });
+        session.pending_agent_turn = Some(turn);
         self.record(EventKind::CommandApprovalRequested { tool_call, reason })
     }
 
@@ -320,42 +329,6 @@ impl AgentEngine {
             "Command awaiting approval ({})\n{}",
             pending.reason, pending.tool_call.arguments
         )
-    }
-
-    pub fn approve_command(&mut self) -> AgentResult<String> {
-        let call = self
-            .session
-            .as_ref()
-            .and_then(|session| session.pending_command_approval.as_ref())
-            .map(|pending| pending.tool_call.clone())
-            .ok_or_else(|| AgentError::invalid_state("no command awaiting approval"))?;
-        let result = self.run_tool(&call.tool_name, &call.arguments)?;
-        self.session
-            .as_mut()
-            .ok_or_else(|| AgentError::invalid_state("no active session"))?
-            .pending_command_approval = None;
-        self.record(EventKind::CommandApproved)?;
-        Ok(render_tool_outcome(&result))
-    }
-
-    pub fn reject_command(&mut self) -> AgentResult<String> {
-        self.session
-            .as_mut()
-            .ok_or_else(|| AgentError::invalid_state("no active session"))?
-            .pending_command_approval = None;
-        self.record(EventKind::CommandRejected)?;
-        Ok("Rejected pending command.".to_owned())
-    }
-
-    pub fn handle_command_decision(&mut self, decision: CommandDecision) -> AgentResult<String> {
-        let result = match decision {
-            CommandDecision::Approve => self.approve_command(),
-            CommandDecision::Reject => self.reject_command(),
-        }?;
-        self.record_if_active(EventKind::Assistant {
-            text: result.clone(),
-        })?;
-        Ok(result)
     }
 
     pub fn approve_plan(&mut self) -> AgentResult<String> {
@@ -567,12 +540,6 @@ impl AgentEngine {
             "/plan" => return self.handle_toggle_plan(),
             "/plan on" => return self.set_plan_mode(true),
             "/plan off" => return self.set_plan_mode(false),
-            "/approve" if self.has_pending_command_approval() => {
-                return self.handle_command_decision(CommandDecision::Approve);
-            }
-            "/reject" if self.has_pending_command_approval() => {
-                return self.handle_command_decision(CommandDecision::Reject);
-            }
             "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
             "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
@@ -657,7 +624,8 @@ impl AgentEngine {
 #[cfg(test)]
 mod error_persistence_tests {
     use super::{AgentEngine, CommandDecision, is_known_slash_command};
-    use crate::event::ToolCallDraft;
+    use crate::decision::EchoDecisionBackend;
+    use crate::event::{PendingCommandApproval, ToolCallDraft};
 
     #[test]
     fn only_registered_slash_commands_take_the_command_path() {
@@ -679,19 +647,24 @@ mod error_persistence_tests {
         let mut engine = AgentEngine::new(root.clone());
         engine.start_session().expect("start session");
         engine
-            .store_command_approval(
-                ToolCallDraft {
-                    tool_name: "run_command".to_owned(),
-                    arguments: serde_json::json!({"command":"printf hello"}),
-                },
-                "unknown command".to_owned(),
-            )
-            .expect("store approval");
+            .session
+            .as_mut()
+            .expect("session")
+            .pending_command_approval = Some(PendingCommandApproval {
+            tool_call: ToolCallDraft {
+                tool_name: "run_command".to_owned(),
+                arguments: serde_json::json!({"command":"printf hello"}),
+            },
+            call_id: String::new(),
+            reason: "unknown command".to_owned(),
+            created_at: crate::session::iso_now(),
+        });
         assert!(engine.has_pending_command_approval());
         assert!(!engine.has_pending_plan());
 
+        let mut backend = EchoDecisionBackend::new("test");
         let result = engine
-            .handle_command_decision(CommandDecision::Reject)
+            .handle_command_decision(CommandDecision::Reject, &mut backend)
             .expect("reject command");
         assert_eq!(result, "Rejected pending command.");
         assert!(!engine.has_pending_command_approval());

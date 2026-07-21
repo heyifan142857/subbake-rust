@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{PendingCommandApproval, PendingPlan};
+use crate::event::{PendingAgentTurn, PendingCommandApproval, PendingPlan};
 
 pub const SESSION_VERSION: u64 = 1;
 
@@ -119,6 +119,8 @@ pub struct AgentSession {
     #[serde(default)]
     pub pending_command_approval: Option<PendingCommandApproval>,
     #[serde(default)]
+    pub pending_agent_turn: Option<PendingAgentTurn>,
+    #[serde(default)]
     pub pending_action: Option<PendingAction>,
     pub events: Vec<AgentEvent>,
 }
@@ -139,6 +141,7 @@ impl AgentSession {
             mode: SessionMode::Chat,
             pending_plan: None,
             pending_command_approval: None,
+            pending_agent_turn: None,
             pending_action: None,
             events: Vec::new(),
         }
@@ -401,6 +404,49 @@ mod tests {
         let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
 
         assert!(loaded.pending_command_approval.is_none());
+    }
+
+    #[test]
+    fn reads_v1_session_without_pending_agent_turn() {
+        let session = AgentSession::new("old-session".to_owned());
+        let mut value = serde_json::to_value(session).expect("serialize session");
+        value
+            .as_object_mut()
+            .expect("session object")
+            .remove("pending_agent_turn");
+
+        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
+
+        assert!(loaded.pending_agent_turn.is_none());
+    }
+
+    #[test]
+    fn reads_legacy_command_approval_without_call_id() {
+        let mut session = AgentSession::new("old-session".to_owned());
+        session.pending_command_approval = Some(PendingCommandApproval {
+            tool_call: crate::event::ToolCallDraft {
+                tool_name: "run_command".to_owned(),
+                arguments: serde_json::json!({"command":"printf hello"}),
+            },
+            call_id: "old-call".to_owned(),
+            reason: "legacy approval".to_owned(),
+            created_at: "2026-07-21T00:00:00Z".to_owned(),
+        });
+        let mut value = serde_json::to_value(session).expect("serialize session");
+        value["pending_command_approval"]
+            .as_object_mut()
+            .expect("pending approval")
+            .remove("call_id");
+
+        let loaded: AgentSession = serde_json::from_value(value).expect("read legacy approval");
+
+        assert_eq!(
+            loaded
+                .pending_command_approval
+                .expect("pending approval")
+                .call_id,
+            ""
+        );
     }
 
     #[test]

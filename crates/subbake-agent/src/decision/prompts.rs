@@ -5,13 +5,19 @@ use crate::tools::model_visible_tool_specs;
 
 pub(super) fn build_native_messages(
     input: &str,
+    loop_state: &AgentTaskLoop,
     dialogue: Option<&str>,
     legacy_pending: Option<&str>,
     effective_defaults: &str,
 ) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(system_contract(false, false, effective_defaults)),
-        ChatMessage::user(user_context(input, dialogue, legacy_pending, None)),
+        ChatMessage::user(user_context(
+            input,
+            dialogue,
+            legacy_pending,
+            Some((loop_state, None)),
+        )),
     ]
 }
 
@@ -96,9 +102,7 @@ fn user_context(
             for exchange in &loop_state.exchanges {
                 user.push_str(&format!(
                     "{} {} => {}\n",
-                    exchange.name,
-                    exchange.arguments,
-                    exchange.feedback.json()
+                    exchange.name, exchange.arguments, exchange.feedback
                 ));
             }
         }

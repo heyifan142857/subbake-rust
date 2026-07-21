@@ -114,9 +114,9 @@ exit "$status"
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:run command", &transcript);
     wait_for_output(&transcript, b"pending PTY command", STEP_TIMEOUT);
-    send(&writer, ESCAPE_KEY);
-    wait_for_action(&action_log, "RejectCommand", &transcript);
-    wait_for_output(&transcript, b"command rejected", STEP_TIMEOUT);
+    send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "ApproveCommand", &transcript);
+    wait_for_output(&transcript, b"command continued", STEP_TIMEOUT);
 
     send_text(&writer, "cancel me");
     send(&writer, ENTER_KEY);
@@ -242,8 +242,8 @@ fn scripted_interaction(
                 message: "pending PTY command".to_owned(),
             })
         }
-        TuiAction::RejectCommand => Ok(TuiInteraction::Message {
-            message: "command rejected".to_owned(),
+        TuiAction::ApproveCommand => Ok(TuiInteraction::Message {
+            message: "command continued".to_owned(),
         }),
         TuiAction::SubmitText(input) if input == "cancel me" => {
             while !guard.is_cancelled() {

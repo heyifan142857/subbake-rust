@@ -82,6 +82,48 @@ pub struct PendingPlan {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingCommandApproval {
     pub tool_call: ToolCallDraft,
+    #[serde(default)]
+    pub call_id: String,
     pub reason: String,
     pub created_at: String,
+}
+
+/// Provider-neutral state for an agent turn paused at an approval boundary.
+///
+/// Native provider continuations stay in memory. This persisted transcript is
+/// sufficient to rebuild a fresh model request after the process is restarted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingAgentTurn {
+    pub input: String,
+    #[serde(default)]
+    pub dialogue: Option<String>,
+    #[serde(default)]
+    pub legacy_pending: Option<String>,
+    pub effective_defaults: String,
+    #[serde(default)]
+    pub exchanges: Vec<PendingToolExchange>,
+    #[serde(default)]
+    pub completed_mutations: Vec<ToolCallDraft>,
+    #[serde(default)]
+    pub failure_counts: Vec<PendingFailureCount>,
+    #[serde(default)]
+    pub steps_used: usize,
+    #[serde(default)]
+    pub legacy_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingToolExchange {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub feedback: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFailureCount {
+    pub tool_call: ToolCallDraft,
+    pub category: String,
+    pub count: usize,
 }

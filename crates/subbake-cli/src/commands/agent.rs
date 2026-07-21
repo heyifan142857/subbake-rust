@@ -141,10 +141,10 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
                 TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
                 TuiAction::ApproveCommand => {
-                    engine.handle_command_decision(CommandDecision::Approve)?
+                    engine.handle_command_decision(CommandDecision::Approve, &mut *backend)?
                 }
                 TuiAction::RejectCommand => {
-                    engine.handle_command_decision(CommandDecision::Reject)?
+                    engine.handle_command_decision(CommandDecision::Reject, &mut *backend)?
                 }
                 TuiAction::SelectProfile(name) => engine.select_profile(name)?,
                 TuiAction::CreateProfile(name) => engine.create_profile(name)?,

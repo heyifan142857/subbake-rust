@@ -56,9 +56,11 @@ impl ToolFeedback {
 
 #[derive(Debug, Clone)]
 pub(super) struct ToolExchange {
+    pub(super) call_id: String,
     pub(super) name: String,
     pub(super) arguments: JsonValue,
-    pub(super) feedback: ToolFeedback,
+    pub(super) feedback: String,
+    pub(super) is_error: bool,
 }
 
 #[derive(Debug, Default)]

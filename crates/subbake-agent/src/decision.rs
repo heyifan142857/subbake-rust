@@ -17,7 +17,9 @@ use subbake_core::ports::{
 
 use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, ToolCallDraft};
+use crate::event::{
+    EventKind, PendingAgentTurn, PendingFailureCount, PendingToolExchange, ToolCallDraft,
+};
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::tool_execution::render_tool_outcome;
 use crate::tools::{
@@ -119,39 +121,56 @@ impl AgentEngine {
             text: input.to_owned(),
         })?;
 
-        let mut task = AgentTaskLoop::default();
-        let mut native_turn = None;
-        let mut legacy_mode = backend.native_tool_support() == NativeToolSupport::Unsupported;
-        let mut failure_counts = HashMap::new();
-        let mut completed_mutations = HashSet::new();
+        let state = AgentTurnState {
+            input: input.to_owned(),
+            dialogue,
+            legacy_pending,
+            effective_defaults,
+            task: AgentTaskLoop::default(),
+            legacy_mode: backend.native_tool_support() == NativeToolSupport::Unsupported,
+            failure_counts: HashMap::new(),
+            completed_mutations: HashSet::new(),
+            steps_used: 0,
+        };
+        self.run_turn(backend, state, None)
+    }
 
-        for _ in 0..AGENT_LOOP_MAX_STEPS {
+    fn run_turn(
+        &mut self,
+        backend: &mut dyn LlmBackend,
+        mut state: AgentTurnState,
+        mut native_turn: Option<NativeTurn>,
+    ) -> AgentResult<String> {
+        while state.steps_used < AGENT_LOOP_MAX_STEPS {
             self.check_cancelled()?;
             let decision = self.call_model(
                 backend,
-                input,
-                &task,
-                dialogue.as_deref(),
-                legacy_pending.as_deref(),
+                &state.input,
+                &state.task,
+                state.dialogue.as_deref(),
+                state.legacy_pending.as_deref(),
                 &mut native_turn,
-                &mut legacy_mode,
+                &mut state.legacy_mode,
                 true,
-                &effective_defaults,
+                &state.effective_defaults,
             )?;
+            state.steps_used += 1;
             match decision.action {
                 DecisionAction::Respond => {
+                    self.clear_pending_agent_turn()?;
                     return self.finish_response(nonempty_response(decision.text), false);
                 }
                 DecisionAction::AskUser => {
+                    self.clear_pending_agent_turn()?;
                     return self.finish_response(nonempty_question(decision.text), true);
                 }
                 DecisionAction::ToolCalls => {
                     let continuation = decision.continuation;
                     let processed = self.process_tool_calls(
                         decision.calls,
-                        &mut task,
-                        &mut failure_counts,
-                        &mut completed_mutations,
+                        &mut state.task,
+                        &mut state.failure_counts,
+                        &mut state.completed_mutations,
                     )?;
                     match processed {
                         ProcessedCalls::Continue(results) => {
@@ -161,13 +180,25 @@ impl AgentEngine {
                             });
                         }
                         ProcessedCalls::Planned => {
+                            self.clear_pending_agent_turn()?;
                             return self.finish_response(self.pending_plan_summary(), false);
                         }
-                        ProcessedCalls::AwaitingCommandApproval => {
+                        ProcessedCalls::AwaitingCommandApproval { call, reason } => {
+                            self.pending_native_continuation = continuation;
+                            self.store_command_approval(
+                                ToolCallDraft {
+                                    tool_name: call.name,
+                                    arguments: call.arguments,
+                                },
+                                call.id,
+                                reason,
+                                state.into_pending(),
+                            )?;
                             return self
                                 .finish_response(self.pending_command_approval_summary(), false);
                         }
                         ProcessedCalls::RepeatedFailure(message) => {
+                            self.clear_pending_agent_turn()?;
                             return self.finish_response(message, false);
                         }
                     }
@@ -180,15 +211,16 @@ impl AgentEngine {
         }
         let final_decision = self.call_model(
             backend,
-            input,
-            &task,
-            dialogue.as_deref(),
-            legacy_pending.as_deref(),
+            &state.input,
+            &state.task,
+            state.dialogue.as_deref(),
+            state.legacy_pending.as_deref(),
             &mut native_turn,
-            &mut legacy_mode,
+            &mut state.legacy_mode,
             false,
-            &effective_defaults,
+            &state.effective_defaults,
         )?;
+        self.clear_pending_agent_turn()?;
         match final_decision.action {
             DecisionAction::Respond => {
                 self.finish_response(nonempty_response(final_decision.text), false)
@@ -243,6 +275,7 @@ impl AgentEngine {
             } else {
                 GenerationRequest::text(build_native_messages(
                     input,
+                    task,
                     dialogue,
                     legacy_pending,
                     effective_defaults,
@@ -334,14 +367,10 @@ impl AgentEngine {
             if let Some(observer) = self.observer.as_mut() {
                 observer.on_tool_call(&call.name, &call.arguments);
             }
-            self.store_command_approval(
-                ToolCallDraft {
-                    tool_name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                },
+            return Ok(ProcessedCalls::AwaitingCommandApproval {
+                call: call.clone(),
                 reason,
-            )?;
-            return Ok(ProcessedCalls::AwaitingCommandApproval);
+            });
         }
 
         let planned = calls
@@ -441,9 +470,11 @@ impl AgentEngine {
             let is_error = !feedback.success;
             let result_json = feedback.json();
             task.exchanges.push(ToolExchange {
+                call_id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
-                feedback: feedback.clone(),
+                feedback: feedback.json(),
+                is_error,
             });
             native_results.push(ModelToolResult {
                 id: call.id,
@@ -485,6 +516,135 @@ impl AgentEngine {
             observer.on_response(&text);
         }
         Ok(text)
+    }
+
+    pub fn handle_command_decision(
+        &mut self,
+        decision: crate::engine::CommandDecision,
+        backend: &mut dyn LlmBackend,
+    ) -> AgentResult<String> {
+        let pending = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_command_approval.clone())
+            .ok_or_else(|| AgentError::invalid_state("no command awaiting approval"))?;
+        let Some(persisted_turn) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_agent_turn.clone())
+        else {
+            return self.handle_legacy_command_decision(decision, &pending.tool_call);
+        };
+
+        let mut state = AgentTurnState::from_pending(persisted_turn);
+        let available_tools = model_visible_tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let feedback = match decision {
+            crate::engine::CommandDecision::Approve => {
+                match self.run_tool(&pending.tool_call.tool_name, &pending.tool_call.arguments) {
+                    Ok(outcome) => ToolFeedback::success(&pending.tool_call.tool_name, outcome),
+                    Err(error) if error.is_cancelled() => return Err(error),
+                    Err(error) => ToolFeedback::failure(
+                        &pending.tool_call.tool_name,
+                        error.to_string(),
+                        "execution",
+                        available_tools,
+                    ),
+                }
+            }
+            crate::engine::CommandDecision::Reject => ToolFeedback::failure(
+                &pending.tool_call.tool_name,
+                "the user declined this command".to_owned(),
+                "user_denied",
+                available_tools,
+            ),
+        };
+        let is_error = !feedback.success;
+        let output = feedback.json();
+        let call_id = if pending.call_id.is_empty() {
+            "json-tool-call".to_owned()
+        } else {
+            pending.call_id
+        };
+        state.task.exchanges.push(ToolExchange {
+            call_id: call_id.clone(),
+            name: pending.tool_call.tool_name.clone(),
+            arguments: pending.tool_call.arguments.clone(),
+            feedback: output.clone(),
+            is_error,
+        });
+        if !is_error
+            && find_tool_spec(&pending.tool_call.tool_name)
+                .is_some_and(|spec| spec.mutates_with(&pending.tool_call.arguments))
+        {
+            state.completed_mutations.insert(CallKey::new(
+                &pending.tool_call.tool_name,
+                &pending.tool_call.arguments,
+            ));
+        }
+
+        let result = ModelToolResult {
+            id: call_id,
+            name: pending.tool_call.tool_name,
+            output,
+            is_error,
+        };
+        let native_turn = self
+            .pending_native_continuation
+            .take()
+            .map(|continuation| NativeTurn {
+                continuation,
+                results: vec![result],
+            });
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| AgentError::invalid_state("no active session"))?;
+        session.pending_command_approval = None;
+        session.pending_agent_turn = Some(state.to_pending());
+        self.record(match decision {
+            crate::engine::CommandDecision::Approve => EventKind::CommandApproved,
+            crate::engine::CommandDecision::Reject => EventKind::CommandRejected,
+        })?;
+
+        self.run_turn(backend, state, native_turn)
+    }
+
+    fn handle_legacy_command_decision(
+        &mut self,
+        decision: crate::engine::CommandDecision,
+        call: &ToolCallDraft,
+    ) -> AgentResult<String> {
+        let result = match decision {
+            crate::engine::CommandDecision::Approve => {
+                render_tool_outcome(&self.run_tool(&call.tool_name, &call.arguments)?)
+            }
+            crate::engine::CommandDecision::Reject => "Rejected pending command.".to_owned(),
+        };
+        self.session
+            .as_mut()
+            .ok_or_else(|| AgentError::invalid_state("no active session"))?
+            .pending_command_approval = None;
+        self.record(match decision {
+            crate::engine::CommandDecision::Approve => EventKind::CommandApproved,
+            crate::engine::CommandDecision::Reject => EventKind::CommandRejected,
+        })?;
+        self.record_if_active(EventKind::Assistant {
+            text: result.clone(),
+        })?;
+        Ok(result)
+    }
+
+    fn clear_pending_agent_turn(&mut self) -> AgentResult<()> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        if session.pending_agent_turn.take().is_some() {
+            self.save()?;
+        }
+        Ok(())
     }
 
     fn take_legacy_pending_action(&mut self) -> AgentResult<Option<String>> {
@@ -576,6 +736,114 @@ impl AgentEngine {
         args: &JsonValue,
     ) -> AgentResult<subbake_core::AgentToolOutcome> {
         crate::tool_runner::ToolRunner::run(self, name, args)
+    }
+}
+
+struct AgentTurnState {
+    input: String,
+    dialogue: Option<String>,
+    legacy_pending: Option<String>,
+    effective_defaults: String,
+    task: AgentTaskLoop,
+    legacy_mode: bool,
+    failure_counts: HashMap<FailureKey, usize>,
+    completed_mutations: HashSet<CallKey>,
+    steps_used: usize,
+}
+
+impl AgentTurnState {
+    fn into_pending(self) -> PendingAgentTurn {
+        self.to_pending()
+    }
+
+    fn to_pending(&self) -> PendingAgentTurn {
+        PendingAgentTurn {
+            input: self.input.clone(),
+            dialogue: self.dialogue.clone(),
+            legacy_pending: self.legacy_pending.clone(),
+            effective_defaults: self.effective_defaults.clone(),
+            exchanges: self
+                .task
+                .exchanges
+                .iter()
+                .map(|exchange| PendingToolExchange {
+                    call_id: exchange.call_id.clone(),
+                    tool_name: exchange.name.clone(),
+                    arguments: exchange.arguments.clone(),
+                    feedback: exchange.feedback.clone(),
+                    is_error: exchange.is_error,
+                })
+                .collect(),
+            completed_mutations: self
+                .completed_mutations
+                .iter()
+                .map(|call| ToolCallDraft {
+                    tool_name: call.name.clone(),
+                    arguments: serde_json::from_str(&call.arguments)
+                        .unwrap_or_else(|_| JsonValue::Object(Default::default())),
+                })
+                .collect(),
+            failure_counts: self
+                .failure_counts
+                .iter()
+                .map(|(failure, count)| PendingFailureCount {
+                    tool_call: ToolCallDraft {
+                        tool_name: failure.call.name.clone(),
+                        arguments: serde_json::from_str(&failure.call.arguments)
+                            .unwrap_or_else(|_| JsonValue::Object(Default::default())),
+                    },
+                    category: failure.category.clone(),
+                    count: *count,
+                })
+                .collect(),
+            steps_used: self.steps_used,
+            legacy_mode: self.legacy_mode,
+        }
+    }
+
+    fn from_pending(pending: PendingAgentTurn) -> Self {
+        Self {
+            input: pending.input,
+            dialogue: pending.dialogue,
+            legacy_pending: pending.legacy_pending,
+            effective_defaults: pending.effective_defaults,
+            task: AgentTaskLoop {
+                exchanges: pending
+                    .exchanges
+                    .into_iter()
+                    .map(|exchange| ToolExchange {
+                        call_id: exchange.call_id,
+                        name: exchange.tool_name,
+                        arguments: exchange.arguments,
+                        feedback: exchange.feedback,
+                        is_error: exchange.is_error,
+                    })
+                    .collect(),
+            },
+            legacy_mode: pending.legacy_mode,
+            failure_counts: pending
+                .failure_counts
+                .into_iter()
+                .map(|failure| {
+                    (
+                        FailureKey {
+                            call: CallKey::new(
+                                &failure.tool_call.tool_name,
+                                &failure.tool_call.arguments,
+                            ),
+                            category: failure.category,
+                        },
+                        failure.count,
+                    )
+                })
+                .collect(),
+            completed_mutations: pending
+                .completed_mutations
+                .into_iter()
+                .map(|call| CallKey::new(&call.tool_name, &call.arguments))
+                .collect(),
+            steps_used: pending.steps_used,
+        }
     }
 }
 
@@ -672,7 +940,7 @@ struct FailureKey {
 enum ProcessedCalls {
     Continue(Vec<ModelToolResult>),
     Planned,
-    AwaitingCommandApproval,
+    AwaitingCommandApproval { call: ModelToolCall, reason: String },
     RepeatedFailure(String),
 }
 
@@ -858,6 +1126,173 @@ mod tests {
         assert_eq!(response, "Whisper checked; continued the task.");
         assert!(!engine.has_pending_plan());
         assert_eq!(backend.prompts.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approved_json_command_continues_the_same_task_without_new_user_input() {
+        let root = temp_root("json-command-approval-continuation");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"run_command",
+                    "arguments":{"command":"printf approved-output","network":true}
+                }),
+                json!({"action":"respond","text":"continued after approval"}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let pending = engine
+            .run_line("inspect, then continue", &mut backend)
+            .expect("request approval");
+        assert!(pending.contains("Command awaiting approval"));
+        assert!(engine.has_pending_command_approval());
+
+        let response = engine
+            .handle_command_decision(crate::engine::CommandDecision::Approve, &mut backend)
+            .expect("approve and continue");
+
+        assert_eq!(response, "continued after approval");
+        assert!(!engine.has_pending_command_approval());
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .expect("session")
+                .pending_agent_turn
+                .is_none()
+        );
+        assert!(backend.prompts[1][1].content.contains("approved-output"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approved_native_command_returns_the_original_call_result_to_the_model() {
+        let root = temp_root("native-command-approval-continuation");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = NativeSequenceBackend {
+            steps: VecDeque::from([
+                NativeStep::Calls(vec![ModelToolCall {
+                    id: "call-approved".to_owned(),
+                    name: "run_command".to_owned(),
+                    arguments: json!({"command":"printf native-output","network":true}),
+                }]),
+                NativeStep::Text("native continued".to_owned()),
+            ]),
+            definitions: Vec::new(),
+            continued_results: Vec::new(),
+        };
+
+        engine
+            .run_line("inspect natively", &mut backend)
+            .expect("request approval");
+        let response = engine
+            .handle_command_decision(crate::engine::CommandDecision::Approve, &mut backend)
+            .expect("approve and continue");
+
+        assert_eq!(response, "native continued");
+        assert_eq!(backend.continued_results.len(), 1);
+        assert_eq!(backend.continued_results[0][0].id, "call-approved");
+        assert!(
+            !backend.continued_results[0][0].is_error,
+            "{}",
+            backend.continued_results[0][0].output
+        );
+        assert!(
+            backend.continued_results[0][0]
+                .output
+                .contains("native-output")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_command_is_feedback_and_the_model_can_recover() {
+        let root = temp_root("rejected-command-continuation");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = NativeSequenceBackend {
+            steps: VecDeque::from([
+                NativeStep::Calls(vec![ModelToolCall {
+                    id: "call-rejected".to_owned(),
+                    name: "run_command".to_owned(),
+                    arguments: json!({"command":"printf must-not-run","network":true}),
+                }]),
+                NativeStep::Text("used a safer alternative".to_owned()),
+            ]),
+            definitions: Vec::new(),
+            continued_results: Vec::new(),
+        };
+
+        engine
+            .run_line("inspect safely", &mut backend)
+            .expect("request approval");
+        let response = engine
+            .handle_command_decision(crate::engine::CommandDecision::Reject, &mut backend)
+            .expect("reject and continue");
+
+        assert_eq!(response, "used a safer alternative");
+        assert!(backend.continued_results[0][0].is_error);
+        assert!(
+            backend.continued_results[0][0]
+                .output
+                .contains("user_denied")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_session_approves_and_replays_the_persisted_turn() {
+        let root = temp_root("resumed-command-approval");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut first_backend = JsonSequenceBackend {
+            decisions: VecDeque::from([json!({
+                "action":"tool_call",
+                "tool_name":"run_command",
+                "arguments":{"command":"printf resumed-output","network":true}
+            })]),
+            prompts: Vec::new(),
+        };
+        engine
+            .run_line("inspect across restart", &mut first_backend)
+            .expect("request approval");
+        let session_id = engine.session.as_ref().expect("session").id.clone();
+
+        let mut resumed = AgentEngine::new(root.clone());
+        resumed
+            .resume_session(Some(&session_id))
+            .expect("resume session");
+        let mut resumed_backend = JsonSequenceBackend {
+            decisions: VecDeque::from([json!({
+                "action":"respond",
+                "text":"resumed and continued"
+            })]),
+            prompts: Vec::new(),
+        };
+        let response = resumed
+            .handle_command_decision(
+                crate::engine::CommandDecision::Approve,
+                &mut resumed_backend,
+            )
+            .expect("approve resumed command");
+
+        assert_eq!(response, "resumed and continued");
+        assert!(
+            resumed_backend.prompts[0][1]
+                .content
+                .contains("resumed-output")
+        );
+        assert!(
+            resumed_backend.prompts[0][1]
+                .content
+                .contains("inspect across restart")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
