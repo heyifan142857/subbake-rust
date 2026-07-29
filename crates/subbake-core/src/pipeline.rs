@@ -24,6 +24,7 @@ use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload
 use crate::storage::{InputSignature, ResumeSnapshot};
 use crate::validation::validate_translation_batch;
 
+mod name_alignment;
 mod online_terminology;
 mod persistence;
 mod planning;
@@ -429,6 +430,42 @@ where
         prepared: &[PreparedBatch],
         generated: &mut HashMap<usize, BatchWithUsage>,
     ) -> CoreResult<()> {
+        if lightweight_name_alignment(&self.options) {
+            let candidates = self.memory.name_candidates.clone();
+            let target_language = self.options.target_language.clone();
+            for batch in prepared.iter().filter(|batch| !batch.pending.is_empty()) {
+                let index = batch.index + 1;
+                let result = generated.get_mut(&index).ok_or_else(|| {
+                    CoreError::DataInvariant(format!("translation window omitted batch {index}"))
+                })?;
+                if let Err(error) = name_alignment::reconcile_batch(
+                    &batch.pending,
+                    result,
+                    &mut self.memory,
+                    &self.required_glossary,
+                    &candidates,
+                    &target_language,
+                ) {
+                    let mut retried =
+                        self.translate_batch_impl(index, &batch.pending, true, Some(error))?;
+                    name_alignment::reconcile_batch(
+                        &batch.pending,
+                        &mut retried,
+                        &mut self.memory,
+                        &self.required_glossary,
+                        &candidates,
+                        &target_language,
+                    )
+                    .map_err(|retry_error| {
+                        CoreError::InvalidTranslation(format!(
+                            "batch {index} name alignment failed after retry: {retry_error}"
+                        ))
+                    })?;
+                    *result = retried;
+                }
+            }
+            return Ok(());
+        }
         if !self.options.online_terminology {
             return Ok(());
         }
@@ -575,11 +612,13 @@ where
                     ));
                 };
                 prepare_translation_result(
+                    lightweight_name_alignment(&self.options),
                     self.options.online_terminology,
-                    &self.memory.terminology_candidates,
+                    marker_candidates(&self.options, &self.memory),
                     batch,
                     &mut payload,
-                );
+                    true,
+                )?;
                 validate_translation_batch(batch, &payload.lines)?;
                 self.cache_hits += 1;
                 results.insert(
@@ -621,11 +660,13 @@ where
                 let (json, usage) = response.into_json().map_err(CoreError::from)?;
                 let mut payload = parse_translation_payload(&json)?;
                 prepare_translation_result(
+                    lightweight_name_alignment(&self.options),
                     self.options.online_terminology,
-                    &self.memory.terminology_candidates,
+                    marker_candidates(&self.options, &self.memory),
                     &batch,
                     &mut payload,
-                );
+                    false,
+                )?;
                 validate_translation_batch(&batch, &payload.lines)?;
                 Ok((payload, usage))
             }) {
@@ -808,11 +849,13 @@ where
             ));
         };
         prepare_translation_result(
+            lightweight_name_alignment(&self.options),
             self.options.online_terminology,
-            &self.memory.terminology_candidates,
+            marker_candidates(&self.options, &self.memory),
             batch,
             result,
-        );
+            cached,
+        )?;
         validate_translation_batch(batch, &result.lines)?;
         let BackendPayload::Translation(result) = backend_result.payload else {
             return Err(CoreError::DataInvariant(
@@ -1289,11 +1332,13 @@ where
                 let lines = match &mut response.payload {
                     BackendPayload::Translation(result) => {
                         prepare_translation_result(
+                            lightweight_name_alignment(&self.options),
                             self.options.online_terminology,
-                            &self.memory.terminology_candidates,
+                            marker_candidates(&self.options, &self.memory),
                             source,
                             result,
-                        );
+                            cached,
+                        )?;
                         &result.lines
                     }
                     BackendPayload::Review(result) => {
@@ -1453,11 +1498,22 @@ struct BatchWithUsage {
 }
 
 fn prepare_translation_result(
+    lightweight_names: bool,
     online_terminology: bool,
     candidates: &[String],
     source: &[SubtitleSegment],
     result: &mut BatchTranslationResult,
-) {
+    cached: bool,
+) -> CoreResult<()> {
+    if lightweight_names {
+        let markers = name_alignment::select_markers(source, candidates);
+        name_alignment::validate_markers(source, &result.lines, &markers)?;
+        if !cached {
+            // The lightweight contract learns names only from inline markers.
+            // Ignore unrequested side-channel fields from a raw model response.
+            result.glossary_updates.clear();
+        }
+    }
     if online_terminology {
         let markers = online_terminology::select_markers(source, candidates);
         let extracted = online_terminology::extract_terms(&mut result.lines, &markers);
@@ -1465,6 +1521,21 @@ fn prepare_translation_result(
             combine_glossary(std::mem::take(&mut result.glossary_updates), extracted);
     }
     restore_batch_formatting(source, &mut result.lines);
+    Ok(())
+}
+
+fn lightweight_name_alignment(options: &PipelineOptions) -> bool {
+    options.mode == crate::entities::TranslationMode::Turbo
+        && !options.online_terminology
+        && !options.preserve_names
+}
+
+fn marker_candidates<'a>(options: &PipelineOptions, memory: &'a ContextMemory) -> &'a [String] {
+    if lightweight_name_alignment(options) {
+        &memory.name_candidates
+    } else {
+        &memory.terminology_candidates
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1598,6 +1669,54 @@ mod tests {
 
     struct CorrectedTerminologyBackend {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct NameMarkerBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for NameMarkerBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "name-markers"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            _cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let messages = request_messages(request)?;
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = prompt
+                .split("BATCH_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("BATCH_JSON_END").next())
+                .ok_or_else(|| CoreError::DataInvariant("missing batch json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+            let id = parsed["lines"][0]["id"]
+                .as_str()
+                .ok_or_else(|| CoreError::DataInvariant("missing line id".to_owned()))?;
+            let target = if call == 0 { "玛丽" } else { "玛莉" };
+            Ok(GenerationResponse::json(
+                serde_json::json!({
+                    "lines": [{
+                        "id": id,
+                        "translation": format!("⟦N0⟧{target}⟦/N0⟧来了。"),
+                    }]
+                }),
+                Usage::default(),
+            ))
+        }
     }
 
     impl LlmBackend for CorrectedTerminologyBackend {
@@ -2157,6 +2276,33 @@ mod tests {
     }
 
     #[test]
+    fn turbo_pipeline_reconciles_lightweight_names_in_subtitle_order() {
+        let mut options = PipelineOptions::new("names.txt".into());
+        options.batch_size = 1;
+        options.translation_concurrency = 2;
+        options.resume = false;
+        options.use_cache = false;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            NameMarkerBackend {
+                calls: Arc::clone(&calls),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline
+            .run_document(&document("names.txt", &["Mary arrived.", "Mary returned."]))
+            .expect("translate names");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(run.translated_segments[0].text, "玛丽来了。");
+        assert_eq!(run.translated_segments[1].text, "玛丽来了。");
+        assert_eq!(pipeline.memory.name_translations["mary"], "玛丽");
+        assert_eq!(pipeline.memory.glossary["Mary"], "玛丽");
+    }
+
+    #[test]
     fn pipeline_updates_translation_memory_and_saves_translated_shard() {
         let document = SubtitleDocument {
             path: "clip.txt".into(),
@@ -2661,6 +2807,7 @@ mod tests {
         let candidates = vec![TerminologyCandidate {
             source: "Axe Gang".to_owned(),
             context: "The Axe Gang is here.".to_owned(),
+            align_as_name: false,
         }];
         let parsed = parse_terminology_payload(
             &serde_json::json!({
@@ -2675,14 +2822,17 @@ mod tests {
             TerminologyCandidate {
                 source: "Joey Zasa".to_owned(),
                 context: "Joey Zasa arrived.".to_owned(),
+                align_as_name: true,
             },
             TerminologyCandidate {
                 source: "Joey".to_owned(),
                 context: "Joey!".to_owned(),
+                align_as_name: true,
             },
             TerminologyCandidate {
                 source: "Zasa".to_owned(),
                 context: "Zasa sent them.".to_owned(),
+                align_as_name: true,
             },
         ];
         let aliases = parse_terminology_payload(
@@ -2733,6 +2883,43 @@ mod tests {
         assert!(sources.contains(&"MacClannough".to_owned()));
         assert!(sources.contains(&"James".to_owned()));
         assert!(!sources.iter().any(|source| source.contains(['\'', '’'])));
+    }
+
+    #[test]
+    fn terminology_candidates_include_japanese_names_before_honorifics() {
+        let segments = vec![
+            segment("1", "ヒムロ君がいない?"),
+            segment("2", "待ってトキタ先生"),
+            segment("3", "ただの文章です"),
+        ];
+
+        let candidates = extract_terminology_candidates(&segments)
+            .into_iter()
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>();
+
+        assert!(candidates.contains(&"ヒムロ".to_owned()));
+        assert!(candidates.contains(&"トキタ".to_owned()));
+        assert!(!candidates.contains(&"文章".to_owned()));
+    }
+
+    #[test]
+    fn lightweight_name_candidates_require_recurrence_or_japanese_honorific() {
+        let candidates = extract_terminology_candidates(&[
+            segment("1", "Meet Alice now."),
+            segment("2", "Mary arrived."),
+            segment("3", "Mary left."),
+            segment("4", "トキタ君を待って"),
+        ]);
+        let aligned = candidates
+            .into_iter()
+            .filter(|candidate| candidate.align_as_name)
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>();
+
+        assert!(aligned.contains(&"Mary".to_owned()));
+        assert!(aligned.contains(&"トキタ".to_owned()));
+        assert!(!aligned.contains(&"Meet Alice".to_owned()));
     }
 
     #[test]

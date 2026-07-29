@@ -36,6 +36,11 @@ where
             .iter()
             .map(|candidate| candidate.source.clone())
             .collect();
+        self.memory.name_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.align_as_name)
+            .map(|candidate| candidate.source.clone())
+            .collect();
         let mut stats = TerminologyStats {
             candidates: candidates.len(),
             ..TerminologyStats::default()
@@ -195,6 +200,7 @@ where
 pub(super) struct TerminologyCandidate {
     pub(super) source: String,
     pub(super) context: String,
+    pub(super) align_as_name: bool,
 }
 
 pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<TerminologyCandidate> {
@@ -204,6 +210,7 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
         count: usize,
         words: usize,
         acronym: bool,
+        honorific: bool,
     }
 
     let mut candidates = std::collections::BTreeMap::<String, RankedCandidate>::new();
@@ -256,18 +263,37 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                     candidate: TerminologyCandidate {
                         source,
                         context: segment.text.chars().take(240).collect(),
+                        align_as_name: false,
                     },
                     count: 1,
                     words: word_count,
                     acronym: is_acronym,
+                    honorific: false,
                 });
             index = end;
+        }
+        for source in japanese_honorific_names(&segment.text) {
+            candidates
+                .entry(source.to_lowercase())
+                .and_modify(|candidate| candidate.count += 1)
+                .or_insert_with(|| RankedCandidate {
+                    candidate: TerminologyCandidate {
+                        source,
+                        context: segment.text.chars().take(240).collect(),
+                        align_as_name: true,
+                    },
+                    count: 1,
+                    words: 1,
+                    acronym: false,
+                    honorific: true,
+                });
         }
     }
     let mut ranked = candidates
         .into_values()
         .filter(|candidate| {
-            candidate.acronym
+            candidate.honorific
+                || candidate.acronym
                 || (candidate.words > 1
                     && candidate
                         .candidate
@@ -299,9 +325,49 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
     });
     ranked
         .into_iter()
-        .map(|candidate| candidate.candidate)
+        .map(|mut candidate| {
+            candidate.candidate.align_as_name =
+                candidate.honorific || (!candidate.acronym && candidate.count > 1);
+            candidate.candidate
+        })
         .take(256)
         .collect()
+}
+
+fn japanese_honorific_names(text: &str) -> Vec<String> {
+    const HONORIFICS: [&str; 8] = ["ちゃん", "さん", "さま", "先生", "博士", "君", "様", "氏"];
+    let mut names = Vec::new();
+    for honorific in HONORIFICS {
+        for (honorific_at, _) in text.match_indices(honorific) {
+            let mut start = honorific_at;
+            let mut length = 0;
+            for (index, character) in text[..honorific_at].char_indices().rev() {
+                if length == 8 || !is_japanese_name_character(character) {
+                    break;
+                }
+                start = index;
+                length += 1;
+            }
+            if length < 2 {
+                continue;
+            }
+            let candidate = &text[start..honorific_at];
+            if !names.iter().any(|name| name == candidate) {
+                names.push(candidate.to_owned());
+            }
+        }
+    }
+    names
+}
+
+fn is_japanese_name_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{9fff}'
+            | '\u{30a0}'..='\u{30ff}'
+            | '\u{ff66}'..='\u{ff9f}'
+            | '·'
+    )
 }
 
 fn is_common_sentence_initial(value: &str) -> bool {

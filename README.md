@@ -150,9 +150,10 @@ sbake translate episode.srt --mode cinema --profile cinema
 ```
 
 Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、组织、地点等
-专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。Turbo 和 Economy 暂时默认
-关闭这一行为；可用 `--online-terminology` 显式开启，或用
-`--no-online-terminology` 显式关闭。
+专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。Turbo 默认使用不增加
+模型请求的轻量人名标记，由 SubBake 按字幕顺序接受首个译名并在本地统一。更全面
+的在线术语在 Turbo 和 Economy 中仍默认关闭；可用 `--online-terminology` 显式开启，
+或用 `--no-online-terminology` 显式关闭。
 
 MKV、MP4/M4V/MOV 或 WebM 含有文本字幕轨时，可以直接翻译并追加译文轨。
 默认通过同目录临时文件安全重封装，再原子替换源容器，因此完成后不会额外保留一份
@@ -164,7 +165,8 @@ sbake translate movie.mkv --target-lang Chinese
 
 如需保留源容器，可在配置中设置 `preserve_source_container = true`，或单次使用
 `--preserve-source-container`。默认会把识别到的人名音译为目标语言文字；设置
-`preserve_names = true` 或使用 `--preserve-names` 可保留 Alice 这类源文拼写。
+`preserve_names = true` 或使用 `--preserve-names` 可保留 Alice 这类源文拼写，同时禁用
+Turbo 的轻量人名标记。
 
 `translate` 不会对没有文本字幕轨的媒体回退到语音转写；这类输入仍使用
 `sbake pipeline`。位图字幕（PGS/DVD/DVB）当前也不会自动 OCR。

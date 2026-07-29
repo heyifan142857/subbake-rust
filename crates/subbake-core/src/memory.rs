@@ -48,10 +48,19 @@ pub struct ContextMemory {
     pub recent_summaries: Vec<String>,
     #[serde(default)]
     pub glossary: BTreeMap<String, String>,
+    /// Canonical personal-name translations discovered during the current run.
+    /// Kept separate from the persisted advisory glossary so a fresh run can
+    /// choose its own first translation while resume remains deterministic.
+    #[serde(default)]
+    pub name_translations: BTreeMap<String, String>,
     #[serde(default)]
     pub terminology_entities: Vec<TerminologyEntity>,
     #[serde(default)]
     pub terminology_candidates: Vec<String>,
+    /// Locally high-confidence personal-name candidates eligible for Turbo's
+    /// lightweight indexed markers.
+    #[serde(default)]
+    pub name_candidates: Vec<String>,
     #[serde(default = "default_max_summaries")]
     pub max_summaries: usize,
 }
@@ -79,8 +88,10 @@ impl ContextMemory {
             style_rules: default_style_rules(),
             recent_summaries: Vec::new(),
             glossary: BTreeMap::new(),
+            name_translations: BTreeMap::new(),
             terminology_entities: Vec::new(),
             terminology_candidates: Vec::new(),
+            name_candidates: Vec::new(),
             max_summaries: DEFAULT_MAX_SUMMARIES,
         }
     }
@@ -289,5 +300,17 @@ mod tests {
         let json = serde_json::to_string(&memory).expect("serialize");
         let restored: ContextMemory = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, memory);
+    }
+
+    #[test]
+    fn older_memory_without_name_translations_remains_readable() {
+        let restored: ContextMemory = serde_json::from_str(
+            r#"{"style_rules":[],"recent_summaries":[],"glossary":{"Mary":"玛丽"},"terminology_entities":[],"terminology_candidates":[],"max_summaries":2}"#,
+        )
+        .expect("deserialize legacy memory");
+
+        assert!(restored.name_translations.is_empty());
+        assert!(restored.name_candidates.is_empty());
+        assert_eq!(restored.glossary["Mary"], "玛丽");
     }
 }

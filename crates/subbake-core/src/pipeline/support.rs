@@ -10,7 +10,8 @@ use crate::review::ReviewBatchPlan;
 use crate::storage::{JsonValue, build_request_hash, build_request_hash_v2};
 
 use super::BatchWithUsage;
-use super::online_terminology::{protect_terms, select_markers};
+use super::name_alignment::{protect_names, select_markers as select_name_markers};
+use super::online_terminology::{protect_terms, select_markers as select_term_markers};
 use super::translation_stage::PreparedBatch;
 
 pub(super) fn duration_ms(started: Instant) -> u64 {
@@ -37,7 +38,15 @@ pub(super) fn build_translation_messages(
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
     let term_markers = if options.online_terminology {
-        select_markers(batch, &memory.terminology_candidates)
+        select_term_markers(batch, &memory.terminology_candidates)
+    } else {
+        Vec::new()
+    };
+    let lightweight_names = options.mode == crate::entities::TranslationMode::Turbo
+        && !options.online_terminology
+        && !options.preserve_names;
+    let name_markers = if lightweight_names {
+        select_name_markers(batch, &memory.name_candidates)
     } else {
         Vec::new()
     };
@@ -94,7 +103,9 @@ pub(super) fn build_translation_messages(
     let lines = batch
         .iter()
         .map(|segment| {
-            let text = protect_terms(&protect_formatting(&segment.text), &term_markers);
+            let text = protect_formatting(&segment.text);
+            let text = protect_terms(&text, &term_markers);
+            let text = protect_names(&text, &name_markers);
             if compact_wire {
                 serde_json::json!([segment.id, text])
             } else {
@@ -110,7 +121,9 @@ pub(super) fn build_translation_messages(
     } else {
         "{\"lines\":[{\"id\":\"<source id>\",\"translation\":\"<non-empty target-language text>\"}]}"
     };
-    let terminology_rule = if term_markers.is_empty() {
+    let terminology_rule = if !name_markers.is_empty() {
+        "Tokens shaped like ⟦N<number>⟧ and ⟦/N<number>⟧ mark a possible personal-name span. Translate the text inside normally while copying both markers exactly once and in order. Do not add name markers or return separate terms, glossary_updates, or terminology_updates."
+    } else if term_markers.is_empty() {
         "Do not return terms, glossary_updates, or terminology_updates."
     } else {
         "Tokens shaped like ⟦T<number>⟧ and ⟦/T<number>⟧ mark a terminology span. Translate the text inside normally while copying both markers exactly once and in order. Do not return separate terms, glossary_updates, or terminology_updates."
@@ -381,29 +394,47 @@ mod tests {
     #[test]
     fn translation_prompt_makes_the_name_policy_explicit() {
         let mut options = PipelineOptions::new("episode.srt".into());
-        let memory = ContextMemory::default();
+        let mut memory = ContextMemory::default();
+        memory.name_candidates.push("Mary".to_owned());
+        let batch = [SubtitleSegment {
+            id: "1".to_owned(),
+            text: "Hi Mary.".to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+        }];
 
         let transliterated =
-            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
         assert!(
             transliterated[0]
                 .content
                 .contains("Do not leave a personal name unchanged")
         );
         assert!(transliterated[0].content.contains("terminology_updates"));
+        assert!(transliterated[0].content.contains("⟦N<number>⟧"));
+        assert!(transliterated[1].content.contains("⟦N0⟧Mary⟦/N0⟧"));
 
         options.preserve_names = true;
         let preserved =
-            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
         assert!(preserved[0].content.contains("source spelling"));
+        assert!(!preserved[0].content.contains("⟦N<number>⟧"));
 
         options.online_terminology = false;
         let minimal =
-            build_translation_messages(&options, 0, &[], &memory, &BTreeMap::new(), false);
+            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
         assert!(
             minimal[0]
                 .content
                 .contains("Do not return terms, glossary_updates, or terminology_updates")
         );
+
+        options.preserve_names = false;
+        options.online_terminology = true;
+        let comprehensive =
+            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
+        assert!(!comprehensive[0].content.contains("⟦N<number>⟧"));
     }
 }

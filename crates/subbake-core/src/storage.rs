@@ -7,7 +7,7 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 10;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 11;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 
@@ -580,7 +580,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "1ecb13dcdd63fd2b0d27293c27ecf80cafbf3751"
+            "0aebb161d2a5a8101ec52ec4bb4fa9c9fdcf42d0"
         );
     }
 

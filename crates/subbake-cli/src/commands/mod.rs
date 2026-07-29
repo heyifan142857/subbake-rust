@@ -145,9 +145,9 @@ Options:
       --output-format <FORMAT>     Output subtitle format: srt, vtt, txt, or ass
       --bilingual                  Include source and translated text
       --bilingual-font-scale <N>   Scale bilingual ASS fonts (default: 1.0)
-      --online-terminology         Merge terminology while translating (default in turbo/cinema)
+      --online-terminology         Merge comprehensive terminology while translating (default in cinema)
       --no-online-terminology      Disable incremental terminology responses
-      --preserve-names             Keep personal names in source spelling
+      --preserve-names             Keep names in source spelling; disable Turbo name alignment
       --transliterate-names        Transliterate personal names (default)
       --preserve-source-container  Write a separate translated media file
       --in-place-container         Atomically replace the source media (default)
