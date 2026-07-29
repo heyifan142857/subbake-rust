@@ -43,6 +43,39 @@ struct EmbedSubtitleRequest<'a> {
     output_path: &'a Path,
     target_language: &'a str,
     container_kind: SubtitleContainerKind,
+    subtitle_format: SubtitlePayloadFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitlePayloadFormat {
+    Srt,
+    Ass,
+}
+
+impl SubtitlePayloadFormat {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Ass => "ass",
+        }
+    }
+
+    const fn ffmpeg_codec(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Ass => "ass",
+        }
+    }
+
+    pub fn parse(value: &str) -> AdapterResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "srt" | "subrip" => Ok(Self::Srt),
+            "ass" | "ssa" => Ok(Self::Ass),
+            _ => Err(AdapterError::invalid_input(format!(
+                "unsupported embedded subtitle payload format `{value}`"
+            ))),
+        }
+    }
 }
 
 impl SubtitleContainerKind {
@@ -61,9 +94,9 @@ impl SubtitleContainerKind {
         }
     }
 
-    fn subtitle_codec(self) -> &'static str {
+    fn subtitle_codec(self, payload_format: SubtitlePayloadFormat) -> &'static str {
         match self {
-            Self::Matroska => "srt",
+            Self::Matroska => payload_format.ffmpeg_codec(),
             Self::Mp4 | Self::Mov => "mov_text",
             Self::WebM => "webvtt",
         }
@@ -76,6 +109,17 @@ impl SubtitleContainerKind {
             Self::Mov => "mov",
             Self::WebM => "webm",
         }
+    }
+}
+
+fn translated_payload_format(
+    container_kind: SubtitleContainerKind,
+    source_codec: &str,
+) -> SubtitlePayloadFormat {
+    if container_kind == SubtitleContainerKind::Matroska && matches!(source_codec, "ass" | "ssa") {
+        SubtitlePayloadFormat::Ass
+    } else {
+        SubtitlePayloadFormat::Srt
     }
 }
 
@@ -250,6 +294,23 @@ pub fn restore_embedded_subtitle_from_srt(
     subtitle_path: &Path,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
+    restore_embedded_subtitle(
+        input_path,
+        title,
+        subtitle_path,
+        SubtitlePayloadFormat::Srt,
+        cancellation,
+    )
+}
+
+/// Restore a previously replaced SubBake-managed text subtitle track.
+pub fn restore_embedded_subtitle(
+    input_path: &Path,
+    title: &str,
+    subtitle_path: &Path,
+    subtitle_format: SubtitlePayloadFormat,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
     let container_kind = SubtitleContainerKind::from_path(input_path).ok_or_else(|| {
         AdapterError::invalid_input(format!(
             "unsupported subtitle container: {}",
@@ -279,6 +340,7 @@ pub fn restore_embedded_subtitle_from_srt(
             output_path: &staged,
             target_language,
             container_kind,
+            subtitle_format,
         },
     )?;
     let restored = probe_subtitle_streams(Path::new(FFPROBE), &staged, cancellation)?;
@@ -358,18 +420,27 @@ fn translate_embedded_subtitle_with_programs(
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Running);
     let streams = probe_subtitle_streams(ffprobe, &request.input_path, cancellation)?;
     let source = select_text_stream(&streams, &request.settings.translation.source_language)?;
+    let payload_format = translated_payload_format(container_kind, &source.codec);
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Completed);
 
     let temporary = unique_temp_dir()?;
-    let extracted_path = temporary.path().join("source.srt");
+    let extracted_path = temporary
+        .path()
+        .join(format!("source.{}", payload_format.extension()));
     emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Running);
     extract_subtitle(
         ffmpeg,
         &request.input_path,
         source.index,
         &extracted_path,
+        payload_format,
         cancellation,
     )?;
+    if payload_format == SubtitlePayloadFormat::Srt
+        && matches!(source.codec.as_str(), "ass" | "ssa")
+    {
+        sanitize_ass_derived_srt_file(&extracted_path)?;
+    }
     emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Completed);
 
     let extracted_bytes = fs::read(&extracted_path).map_err(|source| {
@@ -380,14 +451,16 @@ fn translate_embedded_subtitle_with_programs(
         )
     })?;
     let identity = TranslationInputIdentity {
-        path: embedded_stream_identity(&request.input_path, source.index)?,
+        path: embedded_stream_identity(&request.input_path, source.index, payload_format)?,
         signature: input_signature_from_bytes(&extracted_bytes, None),
         output_path: final_output.clone(),
     };
-    let translated_path = temporary.path().join("translated.srt");
+    let translated_path = temporary
+        .path()
+        .join(format!("translated.{}", payload_format.extension()));
     request.input_path = extracted_path;
     request.output_path = Some(translated_path.clone());
-    request.settings.output.format = Some("srt".to_owned());
+    request.settings.output.format = Some(payload_format.extension().to_owned());
     let target_language = request.settings.translation.target_language.clone();
     let mut outcome = translate_subtitle_cancellable_with_progress_and_identity(
         request,
@@ -419,21 +492,28 @@ fn translate_embedded_subtitle_with_programs(
             "container contains multiple SubBake tracks titled `{expected_title}`; remove duplicates before translating so the operation remains safely undoable"
         )));
     }
-    let previous_subtitle = if let Some(previous) = previous_streams.first() {
-        let path = temporary.path().join("previous-translation.srt");
-        extract_subtitle(
-            ffmpeg,
-            &container_input,
-            previous.index,
-            &path,
-            cancellation,
-        )?;
-        Some(fs::read(&path).map_err(|source| {
-            AdapterError::external_io("read previous translated subtitle", Some(path), source)
-        })?)
-    } else {
-        None
-    };
+    let (previous_subtitle, previous_subtitle_format) =
+        if let Some(previous) = previous_streams.first() {
+            let previous_format = translated_payload_format(container_kind, &previous.codec);
+            let path = temporary.path().join(format!(
+                "previous-translation.{}",
+                previous_format.extension()
+            ));
+            extract_subtitle(
+                ffmpeg,
+                &container_input,
+                previous.index,
+                &path,
+                previous_format,
+                cancellation,
+            )?;
+            let bytes = fs::read(&path).map_err(|source| {
+                AdapterError::external_io("read previous translated subtitle", Some(path), source)
+            })?;
+            (Some(bytes), Some(previous_format.extension().to_owned()))
+        } else {
+            (None, None)
+        };
 
     let parent = final_output
         .parent()
@@ -459,13 +539,15 @@ fn translate_embedded_subtitle_with_programs(
             output_path: &staged_output.path,
             target_language: &target_language,
             container_kind,
+            subtitle_format: payload_format,
         },
     )?;
     let embedded_streams = probe_subtitle_streams(ffprobe, &staged_output.path, cancellation)?;
-    if !embedded_streams
-        .iter()
-        .any(|stream| stream.title.as_deref() == Some(expected_title.as_str()))
-    {
+    let expected_codec = container_kind.subtitle_codec(payload_format);
+    if !embedded_streams.iter().any(|stream| {
+        stream.title.as_deref() == Some(expected_title.as_str())
+            && subtitle_codec_matches(&stream.codec, expected_codec)
+    }) {
         return Err(AdapterError::ChildProcess {
             program: "ffprobe",
             status: None,
@@ -484,8 +566,13 @@ fn translate_embedded_subtitle_with_programs(
         in_place,
         subtitle_title: translated_subtitle_title(&target_language),
         previous_subtitle,
+        previous_subtitle_format,
     });
     Ok(outcome)
+}
+
+fn subtitle_codec_matches(actual: &str, expected: &str) -> bool {
+    actual == expected || matches!((actual, expected), ("subrip", "srt") | ("srt", "subrip"))
 }
 
 fn probe_subtitle_streams(
@@ -656,6 +743,7 @@ fn extract_subtitle(
     input_path: &Path,
     stream_index: usize,
     output_path: &Path,
+    payload_format: SubtitlePayloadFormat,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
     let map = format!("0:{stream_index}");
@@ -674,7 +762,7 @@ fn extract_subtitle(
             OsStr::new("-an"),
             OsStr::new("-dn"),
             OsStr::new("-c:s"),
-            OsStr::new("srt"),
+            OsStr::new(payload_format.ffmpeg_codec()),
             output_path.as_os_str(),
         ]),
         cancellation,
@@ -695,6 +783,16 @@ fn extract_subtitle(
         });
     }
     Ok(())
+}
+
+fn sanitize_ass_derived_srt_file(path: &Path) -> AdapterResult<()> {
+    let text = fs::read_to_string(path).map_err(|source| {
+        AdapterError::external_io("read ASS-derived SRT", Some(path.to_path_buf()), source)
+    })?;
+    let sanitized = subbake_core::formats::sanitize_ass_derived_font_tags(&text);
+    fs::write(path, sanitized).map_err(|source| {
+        AdapterError::external_io("sanitize ASS-derived SRT", Some(path.to_path_buf()), source)
+    })
 }
 
 fn embed_subtitle(
@@ -779,7 +877,10 @@ fn embed_subtitle_args(
         format!("-disposition:s:{subtitle_ordinal}").into(),
         "0".into(),
         format!("-c:s:{subtitle_ordinal}").into(),
-        request.container_kind.subtitle_codec().into(),
+        request
+            .container_kind
+            .subtitle_codec(request.subtitle_format)
+            .into(),
         "-f".into(),
         request.container_kind.muxer().into(),
         request.output_path.as_os_str().to_owned(),
@@ -886,7 +987,11 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn embedded_stream_identity(input_path: &Path, stream_index: usize) -> AdapterResult<PathBuf> {
+fn embedded_stream_identity(
+    input_path: &Path,
+    stream_index: usize,
+    payload_format: SubtitlePayloadFormat,
+) -> AdapterResult<PathBuf> {
     let stable_input = input_path.canonicalize().or_else(|_| {
         if input_path.is_absolute() {
             Ok(input_path.to_path_buf())
@@ -899,7 +1004,8 @@ fn embedded_stream_identity(input_path: &Path, stream_index: usize) -> AdapterRe
         .and_then(OsStr::to_str)
         .unwrap_or("container.mkv");
     Ok(stable_input.with_file_name(format!(
-        ".{name}.subbake-subtitle-stream-{stream_index}.srt"
+        ".{name}.subbake-subtitle-stream-{stream_index}.{}",
+        payload_format.extension()
     )))
 }
 
@@ -1128,6 +1234,7 @@ mod tests {
             output_path: Path::new("output.mkv"),
             target_language: "zh-Hans",
             container_kind: SubtitleContainerKind::Matroska,
+            subtitle_format: SubtitlePayloadFormat::Srt,
         };
         let args = embed_subtitle_args(&request, 2, "zh-Hans (SubBake translation)", &[]);
         let rendered = args
@@ -1150,9 +1257,68 @@ mod tests {
             ("movie.webm", "webvtt", "webm"),
         ] {
             let kind = SubtitleContainerKind::from_path(Path::new(path)).expect("container");
-            assert_eq!(kind.subtitle_codec(), codec);
+            assert_eq!(kind.subtitle_codec(SubtitlePayloadFormat::Srt), codec);
             assert_eq!(kind.muxer(), muxer);
         }
+        assert_eq!(
+            SubtitleContainerKind::Matroska.subtitle_codec(SubtitlePayloadFormat::Ass),
+            "ass"
+        );
         assert!(SubtitleContainerKind::from_path(Path::new("movie.avi")).is_none());
+    }
+
+    #[test]
+    fn payload_format_preserves_ass_only_when_the_container_supports_it() {
+        assert_eq!(
+            translated_payload_format(SubtitleContainerKind::Matroska, "ass"),
+            SubtitlePayloadFormat::Ass
+        );
+        assert_eq!(
+            translated_payload_format(SubtitleContainerKind::Matroska, "ssa"),
+            SubtitlePayloadFormat::Ass
+        );
+        assert_eq!(
+            translated_payload_format(SubtitleContainerKind::Matroska, "subrip"),
+            SubtitlePayloadFormat::Srt
+        );
+        assert_eq!(
+            translated_payload_format(SubtitleContainerKind::Mp4, "ass"),
+            SubtitlePayloadFormat::Srt
+        );
+    }
+
+    #[test]
+    fn ass_embedding_uses_the_ass_codec() {
+        let streams = [];
+        let request = EmbedSubtitleRequest {
+            input_path: Path::new("input.mkv"),
+            streams: &streams,
+            subtitle_path: Path::new("translated.ass"),
+            output_path: Path::new("output.mkv"),
+            target_language: "zh-Hans",
+            container_kind: SubtitleContainerKind::Matroska,
+            subtitle_format: SubtitlePayloadFormat::Ass,
+        };
+
+        let rendered = embed_subtitle_args(&request, 0, "zh-Hans (SubBake translation)", &[])
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let codec_index = rendered
+            .iter()
+            .position(|argument| argument == "-c:s:0")
+            .expect("subtitle codec argument");
+
+        assert_eq!(
+            rendered.get(codec_index + 1).map(String::as_str),
+            Some("ass")
+        );
+    }
+
+    #[test]
+    fn subtitle_codec_verification_accepts_ffprobe_subrip_name() {
+        assert!(subtitle_codec_matches("subrip", "srt"));
+        assert!(subtitle_codec_matches("ass", "ass"));
+        assert!(!subtitle_codec_matches("subrip", "ass"));
     }
 }

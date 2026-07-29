@@ -182,4 +182,13 @@ mod tests {
             PathBuf::from("/work/sample.zh-Hans.bilingual.vtt")
         );
     }
+
+    #[test]
+    fn ass_is_a_supported_subtitle_with_ass_default_output() {
+        assert!(is_supported_subtitle_path(Path::new("movie.ass")));
+        assert_eq!(
+            default_output_path(Path::new("movie.ass"), None, false).expect("ASS output path"),
+            PathBuf::from("movie.translated.ass")
+        );
+    }
 }

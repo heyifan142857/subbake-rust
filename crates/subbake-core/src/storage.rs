@@ -8,7 +8,7 @@ use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
 pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 10;
-pub const RENDER_FINGERPRINT_VERSION: u64 = 5;
+pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +331,10 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
             JsonValue::String(options.bilingual_order.as_str().to_owned()),
         ),
         (
+            "bilingual_font_scale".to_owned(),
+            JsonValue::Number(options.bilingual_font_scale.to_string()),
+        ),
+        (
             "review_policy".to_owned(),
             JsonValue::String(format!("{:?}", options.review_policy).to_lowercase()),
         ),
@@ -589,6 +593,18 @@ mod tests {
         assert_ne!(
             build_render_fingerprint(&target_first),
             build_render_fingerprint(&source_first)
+        );
+    }
+
+    #[test]
+    fn render_fingerprint_distinguishes_bilingual_font_scale() {
+        let default_scale = PipelineOptions::new("clip.ass".into());
+        let mut smaller = default_scale.clone();
+        smaller.bilingual_font_scale = 0.9;
+
+        assert_ne!(
+            build_render_fingerprint(&default_scale),
+            build_render_fingerprint(&smaller)
         );
     }
 

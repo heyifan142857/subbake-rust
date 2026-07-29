@@ -73,6 +73,8 @@ pub enum SemanticUndo {
     RestoreEmbeddedSubtitle {
         title: String,
         subtitle_backup_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subtitle_format: Option<String>,
     },
 }
 
@@ -391,6 +393,7 @@ impl FileGuard {
         &self,
         container_path: &Path,
         contents: &[u8],
+        subtitle_format: &str,
     ) -> FileGuardResult<PathBuf> {
         let safe = self.resolve(container_path)?;
         let relative = safe.strip_prefix(&self.project_root).unwrap_or(&safe);
@@ -402,7 +405,7 @@ impl FileGuard {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("container");
-        payload_path.set_file_name(format!("{name}.previous.srt"));
+        payload_path.set_file_name(format!("{name}.previous.{subtitle_format}"));
         if let Some(parent) = payload_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -745,7 +748,7 @@ mod tests {
         std::fs::write(&container, b"media bytes").expect("write container placeholder");
 
         let payload = guard
-            .store_embedded_subtitle_undo(&container, b"previous subtitle")
+            .store_embedded_subtitle_undo(&container, b"previous subtitle", "srt")
             .expect("store subtitle undo");
 
         assert!(payload.starts_with(root.join(".subbake/agent/backups")));
@@ -755,6 +758,25 @@ mod tests {
         );
         assert_ne!(payload, container);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_embedded_subtitle_undo_defaults_to_srt_at_restore_time() {
+        let value = serde_json::json!({
+            "kind": "restore_embedded_subtitle",
+            "title": "zh-Hans (SubBake translation)",
+            "subtitle_backup_path": "backup.srt"
+        });
+
+        let undo: SemanticUndo = serde_json::from_value(value).expect("legacy semantic undo");
+
+        assert!(matches!(
+            undo,
+            SemanticUndo::RestoreEmbeddedSubtitle {
+                subtitle_format: None,
+                ..
+            }
+        ));
     }
 
     #[test]

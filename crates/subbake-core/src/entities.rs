@@ -186,6 +186,35 @@ pub struct PassthroughBlock {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SubtitleDocumentMetadata {
+    #[default]
+    None,
+    Ass(AssDocumentMetadata),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssDocumentMetadata {
+    pub had_bom: bool,
+    pub records: Vec<AssRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssRecord {
+    Raw(String),
+    Dialogue(AssDialogueRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssDialogueRecord {
+    pub segment_id: String,
+    pub event_kind: String,
+    pub fields: Vec<String>,
+    pub start_index: usize,
+    pub end_index: usize,
+    pub text_index: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleDocument {
     pub path: PathBuf,
@@ -193,6 +222,7 @@ pub struct SubtitleDocument {
     pub segments: Vec<SubtitleSegment>,
     pub header: Option<String>,
     pub passthrough_blocks: Vec<PassthroughBlock>,
+    pub metadata: SubtitleDocumentMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +443,7 @@ pub struct PipelineOptions {
     pub mode: TranslationMode,
     pub bilingual: bool,
     pub bilingual_order: BilingualOrder,
+    pub bilingual_font_scale: f64,
     pub target_language: String,
     pub source_language: String,
     pub retries: usize,
@@ -452,6 +483,7 @@ impl PipelineOptions {
             mode: TranslationMode::Turbo,
             bilingual: false,
             bilingual_order: BilingualOrder::default(),
+            bilingual_font_scale: 1.0,
             target_language: default_target_language(),
             source_language: default_source_language(),
             retries: DEFAULT_RETRIES,

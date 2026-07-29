@@ -30,10 +30,10 @@ pub use editing::{
     SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle, edit_subtitle_cancellable,
 };
 pub use embedded_subtitles::{
-    default_embedded_translation_output_path, is_supported_subtitle_container_path,
-    remove_embedded_subtitle_by_title, restore_embedded_subtitle_from_srt,
-    translate_embedded_subtitle, translate_embedded_subtitle_cancellable,
-    translate_embedded_subtitle_cancellable_with_progress,
+    SubtitlePayloadFormat, default_embedded_translation_output_path,
+    is_supported_subtitle_container_path, remove_embedded_subtitle_by_title,
+    restore_embedded_subtitle, restore_embedded_subtitle_from_srt, translate_embedded_subtitle,
+    translate_embedded_subtitle_cancellable, translate_embedded_subtitle_cancellable_with_progress,
 };
 pub use error::{AdapterError, AdapterResult, ConfigError};
 pub use fs::{

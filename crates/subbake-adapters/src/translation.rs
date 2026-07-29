@@ -49,6 +49,7 @@ pub struct ContainerTranslationChange {
     /// replaced a track for the same target language. Interactive undo can
     /// persist this small payload instead of copying the media container.
     pub previous_subtitle: Option<Vec<u8>>,
+    pub previous_subtitle_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +297,8 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         request.settings.output.bilingual,
         request.settings.output.format.clone(),
     )
-    .with_bilingual_order(request.settings.output.bilingual_order);
+    .with_bilingual_order(request.settings.output.bilingual_order)
+    .with_bilingual_font_scale(request.settings.output.bilingual_font_scale);
     check_cancelled(cancellation)?;
     render_and_write_document(
         &document,
@@ -527,6 +529,42 @@ mod tests {
 
         assert_eq!(output, "[MOCK-EN] hello\n");
         assert_eq!(outcome.result.batches_translated, 1);
+    }
+
+    #[test]
+    fn translates_ass_and_preserves_script_style_metadata() {
+        let root = temp_root("translate-ass");
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("clip.ass");
+        fs::write(
+            &input_path,
+            "[Script Info]\nPlayResY: 1040\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans-serif,71\n\n[Events]\nFormat: Start, End, Style, Text\nDialogue: 0:00:00.00,0:00:01.00,Default,{\\i1}hello{\\i0}\n",
+        )
+        .expect("write ASS input");
+        let mut settings = TranslationSettings::default();
+        settings.translation.target_language = "zh-Hans".to_owned();
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        settings.output.bilingual = true;
+        settings.output.bilingual_font_scale = 0.9;
+
+        let outcome = translate_subtitle(TranslationRequest {
+            input_path,
+            output_path: None,
+            output_language_tag: None,
+            overwrite: true,
+            settings,
+        })
+        .expect("translate ASS");
+        let output_path = outcome.output_path.expect("ASS output path");
+        let output = fs::read_to_string(output_path).expect("read ASS output");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(output.contains("PlayResY: 1040"));
+        assert!(output.contains("Style: Default,sans-serif,63.9"));
+        assert!(output.contains("[MOCK-ZH-HANS]"));
+        assert!(output.contains("{\\i1}"));
+        assert!(output.contains("{\\i0}"));
+        assert!(output.contains("\\N"));
     }
 
     #[test]

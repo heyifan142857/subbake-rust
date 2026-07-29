@@ -3,15 +3,17 @@ use std::path::Path;
 use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
 use crate::error::{CoreError, CoreResult};
 
+mod ass;
 mod srt;
 mod txt;
 mod vtt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderOptions {
     pub bilingual: bool,
     pub bilingual_order: BilingualOrder,
     pub output_format: Option<String>,
+    pub bilingual_font_scale: f64,
 }
 
 impl RenderOptions {
@@ -20,6 +22,7 @@ impl RenderOptions {
             bilingual,
             bilingual_order: BilingualOrder::default(),
             output_format,
+            bilingual_font_scale: 1.0,
         }
     }
 
@@ -27,13 +30,21 @@ impl RenderOptions {
         self.bilingual_order = bilingual_order;
         self
     }
+
+    pub fn with_bilingual_font_scale(mut self, scale: f64) -> Self {
+        self.bilingual_font_scale = scale;
+        self
+    }
 }
+
+pub use srt::sanitize_ass_derived_font_tags;
 
 pub fn supported_format_from_path(path: &Path) -> Option<&'static str> {
     match path.extension().and_then(|value| value.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("srt") => Some("srt"),
         Some(ext) if ext.eq_ignore_ascii_case("vtt") => Some("vtt"),
         Some(ext) if ext.eq_ignore_ascii_case("txt") => Some("txt"),
+        Some(ext) if ext.eq_ignore_ascii_case("ass") => Some("ass"),
         _ => None,
     }
 }
@@ -54,6 +65,7 @@ pub fn parse_document_text(
         "srt" => srt::parse(path, text),
         "vtt" => vtt::parse(path, text),
         "txt" => Ok(txt::parse(path, text)),
+        "ass" => ass::parse(path, text),
         _ => Err(CoreError::UnsupportedFormat(format)),
     }
 }
@@ -66,6 +78,20 @@ pub fn render_document(
     let target_format = match options.output_format.as_deref() {
         Some(value) => normalize_format(value)?,
         None => document.format.clone(),
+    };
+
+    let portable_document;
+    let portable_segments;
+    let (document, translations) = if document.format == "ass" && target_format != "ass" {
+        portable_document = SubtitleDocument {
+            segments: ass::portable_segments(&document.segments, &target_format)?,
+            metadata: Default::default(),
+            ..document.clone()
+        };
+        portable_segments = ass::portable_segments(translations, &target_format)?;
+        (&portable_document, portable_segments.as_slice())
+    } else {
+        (document, translations)
     };
 
     match target_format.as_str() {
@@ -87,6 +113,13 @@ pub fn render_document(
             options.bilingual,
             options.bilingual_order,
         ),
+        "ass" => ass::render(
+            document,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+            options.bilingual_font_scale,
+        ),
         _ => Err(CoreError::UnsupportedFormat(target_format)),
     }
 }
@@ -101,7 +134,7 @@ pub(crate) fn bilingual_text(source: &str, target: &str, order: BilingualOrder) 
 pub fn normalize_format(value: &str) -> CoreResult<String> {
     let normalized = value.trim().trim_start_matches('.').to_lowercase();
     match normalized.as_str() {
-        "srt" | "vtt" | "txt" => Ok(normalized),
+        "srt" | "vtt" | "txt" | "ass" => Ok(normalized),
         _ => Err(CoreError::UnsupportedFormat(value.to_owned())),
     }
 }
@@ -241,5 +274,40 @@ mod tests {
             .expect("render vtt");
         assert!(rendered.contains("NOTE hello"));
         assert!(rendered.contains("c1\n00:00.000 --> 00:01.000 align:start\n你好\nHello"));
+    }
+
+    #[test]
+    fn ass_to_srt_drops_layout_overrides_but_keeps_semantic_emphasis() {
+        let ass = "[Script Info]\nPlayResY: 1080\n\n[V4+ Styles]\nFormat: Name, Fontsize\nStyle: Default,54\n\n[Events]\nFormat: Start, End, Text\nDialogue: 0:00:00.00,0:00:01.00,{\\an8\\i1}Hello{\\i0}\n";
+        let document = parse_document_text(Path::new("clip.ass"), ass, None).expect("parse ASS");
+        let rendered = render_document(
+            &document,
+            &document.segments,
+            &RenderOptions::new(false, Some("srt".to_owned())),
+        )
+        .expect("render SRT fallback");
+
+        assert!(rendered.contains("<i>Hello</i>"));
+        assert!(rendered.contains("00:00:00,000 --> 00:00:01,000"));
+        assert!(!rendered.contains("\\an8"));
+    }
+
+    #[test]
+    fn non_ass_source_cannot_invent_ass_style_metadata() {
+        let document = parse_document_text(
+            Path::new("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+            None,
+        )
+        .expect("parse SRT");
+
+        let error = render_document(
+            &document,
+            &document.segments,
+            &RenderOptions::new(false, Some("ass".to_owned())),
+        )
+        .expect_err("ASS output needs source metadata");
+
+        assert!(error.to_string().contains("ASS source style metadata"));
     }
 }

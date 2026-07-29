@@ -16,7 +16,10 @@ pub(crate) fn rank_subtitle_candidates(
             path.extension()
                 .and_then(|suffix| suffix.to_str())
                 .is_some_and(|suffix| {
-                    matches!(suffix.to_lowercase().as_str(), "srt" | "vtt" | "txt")
+                    matches!(
+                        suffix.to_lowercase().as_str(),
+                        "srt" | "vtt" | "txt" | "ass"
+                    )
                 })
         })
         .filter(|path| {
@@ -54,11 +57,17 @@ mod tests {
                 root.join("other.srt"),
                 root.join("The Matrix.srt"),
                 root.join("The Matrix.translated.srt"),
+                root.join("The Matrix.ass"),
             ],
             "matrix",
             root,
         );
-        assert_eq!(ranked[0], root.join("The Matrix.srt"));
-        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked[..2]
+                .iter()
+                .all(|path| path.file_stem().is_some_and(|stem| stem == "The Matrix"))
+        );
+        assert_eq!(ranked[2], root.join("other.srt"));
+        assert_eq!(ranked.len(), 3);
     }
 }

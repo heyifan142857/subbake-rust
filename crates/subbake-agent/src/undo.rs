@@ -100,11 +100,16 @@ fn restore_event(project_root: &Path, event: &crate::session::AgentEvent) -> Age
             SemanticUndo::RestoreEmbeddedSubtitle {
                 title,
                 subtitle_backup_path,
+                subtitle_format,
             } => {
-                subbake_adapters::restore_embedded_subtitle_from_srt(
+                let subtitle_format = subbake_adapters::SubtitlePayloadFormat::parse(
+                    subtitle_format.as_deref().unwrap_or("srt"),
+                )?;
+                subbake_adapters::restore_embedded_subtitle(
                     &target_path,
                     &title,
                     &subtitle_backup_path,
+                    subtitle_format,
                     &subbake_core::CancellationGuard::never(),
                 )?;
                 return Ok(());

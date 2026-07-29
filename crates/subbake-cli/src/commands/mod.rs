@@ -142,8 +142,9 @@ Options:
       --target-lang <LANGUAGE>     Target language
       --provider <NAME>            Provider name
       --model <NAME>               Model name
-      --output-format <FORMAT>     Output subtitle format
+      --output-format <FORMAT>     Output subtitle format: srt, vtt, txt, or ass
       --bilingual                  Include source and translated text
+      --bilingual-font-scale <N>   Scale bilingual ASS fonts (default: 1.0)
       --online-terminology         Merge terminology while translating (default in turbo/cinema)
       --no-online-terminology      Disable incremental terminology responses
       --preserve-names             Keep personal names in source spelling
@@ -160,7 +161,8 @@ Options:
 
 Additional provider, batching, concurrency, cache, retry, glossary, and runtime
 options are accepted. MKV, MP4/M4V/MOV, and WebM inputs select a matching text
-subtitle stream and add the translation while copying existing streams. By
+subtitle stream and add the translation while copying existing streams. Embedded
+subtitle codecs are selected automatically for container compatibility. By
 default the source container is atomically replaced after verification. Media
 input is never transcribed; use `sbake pipeline` when transcription is needed.
 "#;
@@ -175,6 +177,8 @@ Options:
       --profile <NAME>         Named provider profile
       --target-lang <LANGUAGE> Target language
       --bilingual              Include source and translated text
+      --bilingual-font-scale <N>
+                              Scale bilingual ASS fonts (default: 1.0)
   -h, --help                   Print help
 
 Translation provider, model, review, batching, cache, retry, and runtime options

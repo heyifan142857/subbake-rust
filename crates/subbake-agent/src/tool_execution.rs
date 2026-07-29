@@ -615,10 +615,16 @@ pub(crate) fn execute_translation_tool(
                 && !translated.result.dry_run
             {
                 let semantic_undo = if let Some(previous) = &change.previous_subtitle {
+                    let subtitle_format =
+                        change.previous_subtitle_format.as_deref().unwrap_or("srt");
                     SemanticUndo::RestoreEmbeddedSubtitle {
                         title: change.subtitle_title.clone(),
-                        subtitle_backup_path: guard
-                            .store_embedded_subtitle_undo(&input, previous)?,
+                        subtitle_backup_path: guard.store_embedded_subtitle_undo(
+                            &input,
+                            previous,
+                            subtitle_format,
+                        )?,
+                        subtitle_format: Some(subtitle_format.to_owned()),
                     }
                 } else {
                     SemanticUndo::RemoveEmbeddedSubtitle {

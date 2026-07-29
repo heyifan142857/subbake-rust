@@ -154,6 +154,7 @@ mod tests {
             format: "srt".to_owned(),
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
             segments: vec![SubtitleSegment {
                 id: "1".to_owned(),
                 text: text.to_owned(),

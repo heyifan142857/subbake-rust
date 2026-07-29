@@ -422,6 +422,7 @@ mod tests {
 
             [defaults.output]
             preserve_source_container = true
+            bilingual_font_scale = 0.9
             "#,
         )
         .expect("configuration with optional policies");
@@ -432,6 +433,7 @@ mod tests {
 
         assert!(settings.translation.preserve_names);
         assert!(settings.output.preserve_source_container);
+        assert_eq!(settings.output.bilingual_font_scale, 0.9);
         assert!(!ResolvedSettings::default().translation.preserve_names);
         assert!(!ResolvedSettings::default().output.preserve_source_container);
     }

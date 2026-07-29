@@ -83,6 +83,8 @@ struct OvernightManifest {
     source_language: String,
     target_language: String,
     bilingual: bool,
+    #[serde(default = "default_bilingual_font_scale")]
+    bilingual_font_scale: f64,
     output_format: Option<String>,
     batches: Vec<ManifestBatch>,
 }
@@ -166,6 +168,7 @@ pub fn submit_overnight(
         source_language: request.settings.translation.source_language,
         target_language: request.settings.translation.target_language,
         bilingual: request.settings.output.bilingual,
+        bilingual_font_scale: request.settings.output.bilingual_font_scale,
         output_format: request.settings.output.format,
         batches: batches
             .into_iter()
@@ -241,7 +244,8 @@ pub fn collect_overnight(
     let raw = client.download_output(output_file_id, cancellation)?;
     let translations = parse_output_lines(&client, &manifest, &raw)?;
     let translated = apply_lines(&document.segments, &translations)?;
-    let render_options = RenderOptions::new(manifest.bilingual, manifest.output_format.clone());
+    let render_options = RenderOptions::new(manifest.bilingual, manifest.output_format.clone())
+        .with_bilingual_font_scale(manifest.bilingual_font_scale);
     render_and_write_document(
         &document,
         &translated,
@@ -253,6 +257,10 @@ pub fn collect_overnight(
         output_path: manifest.output_path,
         translated_segments: translated.len(),
     })
+}
+
+const fn default_bilingual_font_scale() -> f64 {
+    1.0
 }
 
 fn batch_jsonl(client: &OpenAiBatchClient, batches: &[OvernightBatch]) -> AdapterResult<String> {
@@ -437,4 +445,33 @@ fn write_manifest(path: &Path, manifest: &OvernightManifest) -> AdapterResult<()
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn v1_manifest_without_font_scale_uses_the_compatible_default() {
+        let manifest: OvernightManifest = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "job_id": "job",
+            "input_file_id": "input-file",
+            "endpoint": "/v1/responses",
+            "status": "completed",
+            "output_file_id": "output-file",
+            "error_file_id": null,
+            "input_path": "sample.ass",
+            "output_path": "sample.translated.ass",
+            "input_signature": {"sha1": "abc", "size": 3, "mtime_ns": null},
+            "source_language": "English",
+            "target_language": "Chinese",
+            "bilingual": true,
+            "output_format": "ass",
+            "batches": []
+        }))
+        .expect("legacy overnight manifest");
+
+        assert_eq!(manifest.bilingual_font_scale, 1.0);
+    }
 }

@@ -2145,6 +2145,7 @@ mod tests {
             }],
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("clip.txt".into());
         options.batch_size = 1;
@@ -2170,6 +2171,7 @@ mod tests {
             }],
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("clip.txt".into());
         options.batch_size = 1;
@@ -2221,6 +2223,7 @@ mod tests {
                 .collect(),
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("resume.txt".into());
         options.batch_size = 1;
@@ -2306,6 +2309,7 @@ mod tests {
             }],
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("cache.txt".into());
         options.batch_size = 1;
@@ -3203,6 +3207,7 @@ mod tests {
                 .collect(),
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
         }
     }
 

@@ -1,10 +1,134 @@
 use std::path::Path;
 
-use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
+use crate::entities::{
+    BilingualOrder, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::formats::{bilingual_text, split_blocks};
 
 const TIMESTAMP_SEPARATOR: &str = "-->";
+
+pub fn sanitize_ass_derived_font_tags(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut font_stack = Vec::new();
+    while let Some(relative_start) = text[cursor..].find('<') {
+        let start = cursor + relative_start;
+        output.push_str(&text[cursor..start]);
+        let Some(relative_end) = text[start + 1..].find('>') else {
+            output.push_str(&text[start..]);
+            return output;
+        };
+        let end = start + 1 + relative_end;
+        let raw = &text[start..=end];
+        match parse_font_tag(&text[start + 1..end]) {
+            Some(FontTag::Open(attributes)) => {
+                let keep = !attributes.is_empty();
+                font_stack.push(keep);
+                if keep {
+                    output.push_str("<font ");
+                    output.push_str(&attributes.join(" "));
+                    output.push('>');
+                }
+            }
+            Some(FontTag::Close) => match font_stack.pop() {
+                Some(true) => output.push_str("</font>"),
+                Some(false) => {}
+                None => output.push_str(raw),
+            },
+            None => output.push_str(raw),
+        }
+        cursor = end + 1;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+enum FontTag {
+    Open(Vec<String>),
+    Close,
+}
+
+fn parse_font_tag(inner: &str) -> Option<FontTag> {
+    let trimmed = inner.trim();
+    if trimmed.eq_ignore_ascii_case("/font") {
+        return Some(FontTag::Close);
+    }
+    let prefix = trimmed.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("font") {
+        return None;
+    }
+    let rest = trimmed.get(4..)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let attributes = parse_attributes(rest.trim())?
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case("face") && !name.eq_ignore_ascii_case("size")
+        })
+        .map(|(_, raw)| raw)
+        .collect();
+    Some(FontTag::Open(attributes))
+}
+
+fn parse_attributes(text: &str) -> Option<Vec<(String, String)>> {
+    let mut attributes = Vec::new();
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        let start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=' && *byte != b'/')
+        {
+            cursor += 1;
+        }
+        if cursor == start {
+            return None;
+        }
+        let name = text[start..cursor].to_owned();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'=') {
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            match bytes.get(cursor) {
+                Some(b'\'' | b'"') => {
+                    let quote = bytes[cursor];
+                    cursor += 1;
+                    while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                        cursor += 1;
+                    }
+                    if bytes.get(cursor) != Some(&quote) {
+                        return None;
+                    }
+                    cursor += 1;
+                }
+                Some(_) => {
+                    while bytes
+                        .get(cursor)
+                        .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'/')
+                    {
+                        cursor += 1;
+                    }
+                }
+                None => return None,
+            }
+        }
+        attributes.push((name, text[start..cursor].trim().to_owned()));
+    }
+    Some(attributes)
+}
 
 pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
     let normalized = text
@@ -20,6 +144,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
             segments: Vec::new(),
             header: None,
             passthrough_blocks: Vec::new(),
+            metadata: SubtitleDocumentMetadata::None,
         });
     }
 
@@ -35,6 +160,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
         segments,
         header: None,
         passthrough_blocks: Vec::new(),
+        metadata: SubtitleDocumentMetadata::None,
     })
 }
 
@@ -140,4 +266,24 @@ fn parse_timing_line(line: &str) -> Option<Timing> {
             Some(settings)
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_nested_ass_font_size_and_face_tags() {
+        let source = "<font face=\"sans-serif\"><font size=\"71\"><i>Hello</i></font></font>";
+        assert_eq!(sanitize_ass_derived_font_tags(source), "<i>Hello</i>");
+    }
+
+    #[test]
+    fn retains_other_font_attributes_and_balanced_closer() {
+        let source = "<FONT face=\"Arial\" color=\"#ff0000\" size=71>Hello</FONT>";
+        assert_eq!(
+            sanitize_ass_derived_font_tags(source),
+            "<font color=\"#ff0000\">Hello</font>"
+        );
+    }
 }

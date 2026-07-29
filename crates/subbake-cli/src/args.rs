@@ -643,6 +643,10 @@ fn parse_translation_setting_option(
 ) -> CliResult<bool> {
     match option {
         "--output-format" => overrides.output.format = Some(required_value(args, index, option)?),
+        "--bilingual-font-scale" => {
+            overrides.output.bilingual_font_scale =
+                Some(parse_bilingual_font_scale(args, index, option)?)
+        }
         "--provider" => overrides.backend.id = Some(required_value(args, index, option)?),
         "--model" => overrides.backend.model = Some(required_value(args, index, option)?),
         "--api-key" => overrides.backend.api_key = Some(required_value(args, index, option)?),
@@ -759,6 +763,19 @@ fn parse_batch_size(args: &[String], index: &mut usize, flag: &str) -> CliResult
     Ok(value)
 }
 
+fn parse_bilingual_font_scale(args: &[String], index: &mut usize, flag: &str) -> CliResult<f64> {
+    let raw = required_value(args, index, flag)?;
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| CliError::usage(format!("{flag} must be a number from 0.1 through 2.0")))?;
+    if !value.is_finite() || !(0.1..=2.0).contains(&value) {
+        return Err(CliError::usage(format!(
+            "{flag} must be a number from 0.1 through 2.0"
+        )));
+    }
+    Ok(value)
+}
+
 fn parse_nonnegative_usize(args: &[String], index: &mut usize, flag: &str) -> CliResult<usize> {
     required_value(args, index, flag)?
         .parse::<usize>()
@@ -787,6 +804,25 @@ mod tests {
         ];
         let error = parse_translate_args(&args).expect_err("zero batch size should fail");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn parse_translate_accepts_bilingual_ass_font_scale() {
+        let config = empty_config("ass-font-scale");
+        let args = vec![
+            "clip.ass".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--bilingual".to_owned(),
+            "--bilingual-font-scale".to_owned(),
+            "0.9".to_owned(),
+        ];
+
+        let parsed = parse_translate_args(&args).expect("parse ASS font scale");
+
+        assert!(parsed.settings.output.bilingual);
+        assert_eq!(parsed.settings.output.bilingual_font_scale, 0.9);
+        let _ = std::fs::remove_file(config);
     }
 
     #[test]

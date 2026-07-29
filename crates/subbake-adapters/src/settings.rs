@@ -42,6 +42,7 @@ pub struct OutputSettings {
     pub format: Option<String>,
     pub bilingual: bool,
     pub bilingual_order: BilingualOrder,
+    pub bilingual_font_scale: f64,
     pub preserve_source_container: bool,
 }
 
@@ -159,6 +160,7 @@ pub struct OutputOverrides {
     pub format: Option<String>,
     pub bilingual: Option<bool>,
     pub bilingual_order: Option<BilingualOrder>,
+    pub bilingual_font_scale: Option<f64>,
     pub preserve_source_container: Option<bool>,
 }
 
@@ -241,6 +243,7 @@ impl SettingsOverrides {
                 format: settings.output.format.clone(),
                 bilingual: Some(settings.output.bilingual),
                 bilingual_order: Some(settings.output.bilingual_order),
+                bilingual_font_scale: Some(settings.output.bilingual_font_scale),
                 preserve_source_container: Some(settings.output.preserve_source_container),
             },
             storage: StorageOverrides {
@@ -342,6 +345,7 @@ impl OutputOverrides {
             format,
             bilingual,
             bilingual_order,
+            bilingual_font_scale,
             preserve_source_container
         );
     }
@@ -367,6 +371,7 @@ impl Default for ResolvedSettings {
                 format: None,
                 bilingual: false,
                 bilingual_order: BilingualOrder::default(),
+                bilingual_font_scale: 1.0,
                 preserve_source_container: false,
             },
             backend: BackendSettings {
@@ -562,6 +567,7 @@ impl ResolvedSettings {
             format,
             bilingual,
             bilingual_order,
+            bilingual_font_scale,
             preserve_source_container,
         } = overrides.output;
         if let Some(value) = format {
@@ -572,6 +578,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = bilingual_order {
             self.output.bilingual_order = value;
+        }
+        if let Some(value) = bilingual_font_scale {
+            self.output.bilingual_font_scale = value;
         }
         if let Some(value) = preserve_source_container {
             self.output.preserve_source_container = value;
@@ -619,6 +628,13 @@ impl ResolvedSettings {
         if !(1..=128).contains(&self.agent.max_steps) {
             return Err(AdapterError::invalid_input(
                 "configuration field `agent.max_steps` must be from 1 through 128",
+            ));
+        }
+        if !self.output.bilingual_font_scale.is_finite()
+            || !(0.1..=2.0).contains(&self.output.bilingual_font_scale)
+        {
+            return Err(AdapterError::invalid_input(
+                "configuration field `output.bilingual_font_scale` must be from 0.1 through 2.0",
             ));
         }
         if self
@@ -698,6 +714,7 @@ impl ResolvedSettings {
         options.review_concurrency = self.translation.review_concurrency;
         options.bilingual = self.output.bilingual;
         options.bilingual_order = self.output.bilingual_order;
+        options.bilingual_font_scale = self.output.bilingual_font_scale;
         options.mode = self.translation.mode;
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
@@ -845,6 +862,7 @@ mod tests {
                 },
                 output: OutputOverrides {
                     bilingual: Some(true),
+                    bilingual_font_scale: Some(0.9),
                     ..OutputOverrides::default()
                 },
                 storage: StorageOverrides {
@@ -861,6 +879,7 @@ mod tests {
         assert_eq!(settings.agent.max_steps, 24);
         assert!(!settings.agent.auto_approve_commands);
         assert!(settings.output.bilingual);
+        assert_eq!(settings.output.bilingual_font_scale, 0.9);
         assert_eq!(settings.storage.runtime_dir, Some(".runtime".into()));
     }
 
@@ -931,5 +950,15 @@ mod tests {
             })
             .expect_err("excessive agent max steps");
         assert!(error.to_string().contains("agent.max_steps"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_bilingual_font_scale() {
+        let mut settings = ResolvedSettings::default();
+        settings.output.bilingual_font_scale = 0.0;
+
+        let error = settings.validate().expect_err("invalid scale must fail");
+
+        assert!(error.to_string().contains("bilingual_font_scale"));
     }
 }

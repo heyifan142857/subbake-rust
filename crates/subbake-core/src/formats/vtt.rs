@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use crate::entities::{BilingualOrder, PassthroughBlock, SubtitleDocument, SubtitleSegment};
+use crate::entities::{
+    BilingualOrder, PassthroughBlock, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::formats::{bilingual_text, split_blocks};
 
@@ -34,6 +36,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
             segments: Vec::new(),
             header: Some(header),
             passthrough_blocks: Vec::new(),
+            metadata: SubtitleDocumentMetadata::None,
         });
     }
 
@@ -55,6 +58,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
         segments,
         header: Some(header),
         passthrough_blocks,
+        metadata: SubtitleDocumentMetadata::None,
     })
 }
 

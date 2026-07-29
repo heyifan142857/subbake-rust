@@ -267,7 +267,7 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         "output_format",
         StringArg,
         false,
-        "srt, vtt, or txt output format for this call",
+        "srt, vtt, txt, or ass output format for this call",
     ),
     arg(
         "output_path",
@@ -331,7 +331,7 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
         "output_format",
         StringArg,
         false,
-        "srt, vtt, or txt output format for this call",
+        "srt, vtt, txt, or ass output format for this call",
     ),
     arg(
         "output_dir",
