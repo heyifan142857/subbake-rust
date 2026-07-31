@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use subbake_adapters::{
-    ApiFormat, BackendConfig, ConfigurationResolver, ResolveRequest, RuntimeAction,
+    ApiFormat, BackendConfig, ConfigurationResolver, MemoryAction, ResolveRequest, RuntimeAction,
     SettingsOverrides, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
     WhisperAction, WhisperBuildVariant, apply_whisper_configuration,
     default_whisper_binary_path_for, default_whisper_models_dir_for,
@@ -36,6 +36,8 @@ pub struct BatchArgs {
     pub dir: PathBuf,
     pub recursive: bool,
     pub overwrite: bool,
+    pub fail_fast: bool,
+    pub retry_failed: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub translate: BatchTranslateOptions,
@@ -88,6 +90,27 @@ pub struct EvaluateArgs {
     pub candidate_path: PathBuf,
     pub reference_path: PathBuf,
     pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QaFailOn {
+    Never,
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone)]
+pub struct QaArgs {
+    pub subtitle_path: PathBuf,
+    pub json: bool,
+    pub fail_on: QaFailOn,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryArgs {
+    pub action: MemoryAction,
+    pub target_path: PathBuf,
+    pub settings: TranslationSettings,
 }
 
 impl TranslateArgs {
@@ -211,6 +234,85 @@ pub fn parse_evaluate_args(args: &[String]) -> CliResult<EvaluateArgs> {
     })
 }
 
+pub fn parse_qa_args(args: &[String]) -> CliResult<QaArgs> {
+    let subtitle_path = args
+        .first()
+        .ok_or_else(|| CliError::usage("qa requires a subtitle path"))?;
+    let mut json = false;
+    let mut fail_on = QaFailOn::Never;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--fail-on" => {
+                let value = required_value(args, &mut index, "--fail-on")?;
+                fail_on = match value.as_str() {
+                    "never" => QaFailOn::Never,
+                    "error" => QaFailOn::Error,
+                    "warning" => QaFailOn::Warning,
+                    _ => {
+                        return Err(CliError::usage(
+                            "--fail-on must be one of: never, error, warning",
+                        ));
+                    }
+                };
+            }
+            other => return Err(CliError::usage(format!("unknown qa option `{other}`"))),
+        }
+        index += 1;
+    }
+    Ok(QaArgs {
+        subtitle_path: PathBuf::from(subtitle_path),
+        json,
+        fail_on,
+    })
+}
+
+pub fn parse_memory_args(args: &[String]) -> CliResult<MemoryArgs> {
+    let action_name = args
+        .first()
+        .ok_or_else(|| CliError::usage("memory requires inspect, export, import, or prune"))?;
+    let target = args
+        .get(1)
+        .ok_or_else(|| CliError::usage(format!("memory {action_name} requires a target path")))?;
+    let mut tail_start = 2usize;
+    let action = match action_name.as_str() {
+        "inspect" => MemoryAction::Inspect,
+        "export" | "import" => {
+            let path = args.get(2).ok_or_else(|| {
+                CliError::usage(format!("memory {action_name} requires a bundle path"))
+            })?;
+            tail_start = 3;
+            if action_name == "export" {
+                MemoryAction::Export { path: path.into() }
+            } else {
+                MemoryAction::Import { path: path.into() }
+            }
+        }
+        "prune" => MemoryAction::Prune {
+            yes: args[2..].iter().any(|argument| argument == "--yes"),
+        },
+        _ => {
+            return Err(CliError::usage(
+                "memory requires inspect, export, import, or prune",
+            ));
+        }
+    };
+    let mut translation_args = vec![target.clone()];
+    translation_args.extend(
+        args[tail_start..]
+            .iter()
+            .filter(|argument| argument.as_str() != "--yes")
+            .cloned(),
+    );
+    let parsed = parse_translate_args(&translation_args)?;
+    Ok(MemoryArgs {
+        action,
+        target_path: target.into(),
+        settings: parsed.settings,
+    })
+}
+
 fn parse_file_translation_args(
     args: &[String],
     missing_input_message: &str,
@@ -308,6 +410,8 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
         dir: PathBuf::from(dir),
         recursive: false,
         overwrite: false,
+        fail_fast: false,
+        retry_failed: None,
         config_path: None,
         profile: None,
         translate: BatchTranslateOptions::default(),
@@ -321,6 +425,10 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
         match args[index].as_str() {
             "--recursive" => parsed.recursive = true,
             "--overwrite" => parsed.overwrite = true,
+            "--fail-fast" => parsed.fail_fast = true,
+            "--retry-failed" => {
+                parsed.retry_failed = Some(required_path(args, &mut index, "--retry-failed")?)
+            }
             "--config" | "--profile" => {
                 skip_two(args, &mut index)?;
             }
@@ -394,6 +502,8 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
                 parsed.settings.output_format = TranscriptionFormat::parse(&value)
                     .ok_or_else(|| CliError::usage("--format must be one of: srt, vtt, txt"))?;
             }
+            "--filter-hallucinations" => parsed.settings.filter_hallucinations = true,
+            "--no-filter-hallucinations" => parsed.settings.filter_hallucinations = false,
             other => {
                 return Err(CliError::usage(format!(
                     "unknown transcribe option `{other}`"
@@ -428,6 +538,8 @@ fn parse_pipeline_transcription_option(
                 CliError::usage("--transcribe-format must be one of: srt, vtt, txt")
             })?;
         }
+        "--filter-hallucinations" => settings.filter_hallucinations = true,
+        "--no-filter-hallucinations" => settings.filter_hallucinations = false,
         _ => return Ok(false),
     }
 
@@ -675,6 +787,10 @@ fn parse_translation_setting_option(
         "--target-lang" => {
             overrides.translation.target_language = Some(required_value(args, index, option)?)
         }
+        "--subtitle-stream" => {
+            overrides.translation.subtitle_stream_index =
+                Some(parse_nonnegative_usize(args, index, option)?)
+        }
         "--batch-size" => {
             overrides.translation.batch_size = Some(parse_batch_size(args, index, option)?)
         }
@@ -734,6 +850,12 @@ fn parse_translation_setting_option(
         "--agent-repair-attempts" => {
             overrides.translation.agent_repair_attempts =
                 Some(parse_nonnegative_usize(args, index, option)?)
+        }
+        "--max-requests" => {
+            overrides.translation.max_requests = Some(parse_batch_size(args, index, option)?)
+        }
+        "--max-tokens" => {
+            overrides.translation.max_tokens = Some(parse_batch_size(args, index, option)?)
         }
         _ => return Ok(false),
     }

@@ -11,6 +11,7 @@ pub mod overnight;
 pub mod pipeline;
 pub mod ports;
 pub mod progress;
+pub mod quality;
 mod recovery;
 mod review;
 pub mod storage;
@@ -34,11 +35,15 @@ pub use memory::ContextMemory;
 pub use ports::{
     BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,
     GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract,
-    ToolChoice, ToolConfiguration, ToolContinuation, ToolDefinition,
+    ToolChoice, ToolConfiguration, ToolContinuation, ToolDefinition, TranscriberBackend,
+    TranscriptionFormat,
 };
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
     TranslationProgress,
+};
+pub use quality::{
+    QualityIssue, QualityIssueKind, QualityPolicy, QualityReport, QualitySeverity, inspect_quality,
 };
 pub use tool_outcome::{
     AgentToolOutcome, CommandToolOutcome, FileToolOutcome, ObservationToolOutcome,

@@ -51,40 +51,64 @@ impl TranslationMode {
 /// numeric settings, while the domain keeps the semantic differences here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranslationPolicy {
+    pub batch_size: usize,
+    pub batch_token_budget: usize,
+    pub translation_concurrency: usize,
+    pub review_concurrency: usize,
     pub document_preflight: bool,
     pub include_context: bool,
     pub scene_aware_batching: bool,
     pub compact_wire: bool,
     pub deduplicate: bool,
     pub review_policy: ReviewPolicy,
+    pub terminology_preflight: bool,
+    pub online_terminology: bool,
 }
 
 impl TranslationPolicy {
     pub const fn for_mode(mode: TranslationMode) -> Self {
         match mode {
             TranslationMode::Economy => Self {
+                batch_size: 160,
+                batch_token_budget: 6_000,
+                translation_concurrency: 3,
+                review_concurrency: 1,
                 document_preflight: false,
                 include_context: false,
                 scene_aware_batching: false,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
+                terminology_preflight: false,
+                online_terminology: false,
             },
             TranslationMode::Turbo => Self {
+                batch_size: 96,
+                batch_token_budget: 2_400,
+                translation_concurrency: 8,
+                review_concurrency: 4,
                 document_preflight: false,
                 include_context: true,
                 scene_aware_batching: false,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
+                terminology_preflight: false,
+                online_terminology: false,
             },
             TranslationMode::Cinema => Self {
+                batch_size: 48,
+                batch_token_budget: 1_600,
+                translation_concurrency: 4,
+                review_concurrency: 3,
                 document_preflight: true,
                 include_context: true,
                 scene_aware_batching: true,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Full,
+                terminology_preflight: true,
+                online_terminology: true,
             },
         }
     }
@@ -464,6 +488,8 @@ pub struct PipelineOptions {
     pub use_cache: bool,
     pub agent: bool,
     pub agent_repair_attempts: usize,
+    pub max_requests: Option<usize>,
+    pub max_tokens: Option<usize>,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -499,6 +525,8 @@ impl PipelineOptions {
             use_cache: true,
             agent: true,
             agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
+            max_requests: None,
+            max_tokens: None,
             runtime_dir: None,
             glossary_path: None,
         }

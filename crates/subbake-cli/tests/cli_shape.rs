@@ -10,6 +10,8 @@ fn cli_exposes_redesigned_commands() {
     assert!(names.contains(&"provider"));
     assert!(names.contains(&"runtime"));
     assert!(names.contains(&"whisper"));
+    assert!(names.contains(&"qa"));
+    assert!(names.contains(&"memory"));
 }
 
 #[test]
@@ -19,6 +21,8 @@ fn help_is_available_without_required_operands() {
         vec!["transcribe", "--help"],
         vec!["runtime", "clean", "--help"],
         vec!["provider", "check", "--help"],
+        vec!["qa", "--help"],
+        vec!["memory", "--help"],
     ] {
         subbake_cli::run(args.into_iter().map(str::to_owned).collect())
             .expect("help should not execute or require operands");

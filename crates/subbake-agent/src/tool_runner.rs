@@ -12,7 +12,7 @@ use crate::tool_execution::{
     execute_adapter_tool, execute_command_tool, execute_local_tool, execute_session_tool,
     execute_translation_tool,
 };
-use crate::tools::ToolExecutor;
+use crate::tools::{ToolExecutor, ValidatedToolCall};
 
 pub(crate) struct ToolRunner;
 
@@ -23,15 +23,16 @@ impl ToolRunner {
         args: &JsonValue,
     ) -> AgentResult<AgentToolOutcome> {
         engine.check_cancelled()?;
+        let call =
+            ValidatedToolCall::parse(name, args).map_err(|error| AgentError::ToolArguments {
+                message: error.to_string(),
+            })?;
+        let args = call.arguments();
         engine.record_if_active(EventKind::ToolCall {
             tool_name: name.to_owned(),
             arguments: args.clone(),
         })?;
-        let executor = crate::tools::find_tool_spec(name)
-            .map(|spec| spec.executor)
-            .ok_or_else(|| AgentError::InvalidInput {
-                message: format!("unknown agent tool `{name}`"),
-            })?;
+        let executor = call.executor();
 
         if executor == ToolExecutor::RunCommand {
             let outcome = execute_command_tool(args, &engine.guard, &engine.operation_guard)?;

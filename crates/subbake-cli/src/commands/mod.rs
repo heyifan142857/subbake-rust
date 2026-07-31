@@ -1,15 +1,18 @@
 use crate::args::{
-    parse_agent_args, parse_batch_args, parse_evaluate_args, parse_overnight_args,
-    parse_pipeline_args, parse_provider_args, parse_resume_args, parse_runtime_args,
-    parse_transcribe_args, parse_translate_args, parse_whisper_args,
+    parse_agent_args, parse_batch_args, parse_evaluate_args, parse_memory_args,
+    parse_overnight_args, parse_pipeline_args, parse_provider_args, parse_qa_args,
+    parse_resume_args, parse_runtime_args, parse_transcribe_args, parse_translate_args,
+    parse_whisper_args,
 };
 use crate::{CliError, CliResult};
 
 mod agent;
 mod evaluate;
+mod memory;
 mod overnight;
 mod pipeline;
 mod provider;
+mod qa;
 mod runtime;
 mod transcribe;
 mod translate;
@@ -31,6 +34,8 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
         "evaluate" => evaluate::run(parse_evaluate_args(&args[1..])?),
+        "memory" => memory::run(parse_memory_args(&args[1..])?),
+        "qa" => qa::run(parse_qa_args(&args[1..])?),
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),
         "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
         "overnight" => overnight::run(parse_overnight_args(&args[1..])?),
@@ -71,6 +76,8 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
         ["translate"] => TRANSLATE_HELP,
         ["batch"] => BATCH_HELP,
         ["evaluate"] => EVALUATE_HELP,
+        ["memory"] | ["memory", _] => MEMORY_HELP,
+        ["qa"] => QA_HELP,
         ["transcribe"] => TRANSCRIBE_HELP,
         ["pipeline"] => PIPELINE_HELP,
         ["overnight"]
@@ -97,6 +104,8 @@ Commands:
   translate   Translate a subtitle file or an embedded container subtitle
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
+  memory      Inspect, export, import, or prune glossary and translation memory
+  qa          Inspect subtitle timing and readability without a reference
   transcribe  Transcribe audio or video into subtitles
   pipeline    Transcribe media when needed, then translate it
   overnight   Submit, check, and collect a provider-managed economy batch
@@ -140,6 +149,7 @@ Options:
       --profile <NAME>             Named provider profile
       --source-lang <LANGUAGE>     Source language
       --target-lang <LANGUAGE>     Target language
+      --subtitle-stream <INDEX>    Explicit embedded subtitle stream index
       --provider <NAME>            Provider name
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format: srt, vtt, txt, or ass
@@ -156,6 +166,8 @@ Options:
       --no-review                  Disable review
       --fast                       Deprecated alias for --mode turbo
       --dry-run                    Prepare work without provider calls
+      --max-requests <N>           Stop before exceeding N provider requests
+      --max-tokens <N>             Stop before the next call after N used tokens
       --json                       Emit structured JSON output
   -h, --help                       Print help
 
@@ -173,6 +185,8 @@ Usage: sbake batch <DIR> [OPTIONS]
 Options:
       --recursive              Include nested directories
       --overwrite              Replace existing outputs
+      --fail-fast              Stop at the first file failure
+      --retry-failed <MANIFEST> Process only failures from a prior batch manifest
       --config <PATH>          Configuration file
       --profile <NAME>         Named provider profile
       --target-lang <LANGUAGE> Target language
@@ -191,6 +205,25 @@ Usage: sbake evaluate <CANDIDATE> <REFERENCE> [--json]
 Reports deterministic chrF and mechanical MQM-style structural findings.
 Use it to track regressions; it does not replace human semantic evaluation.
 "#;
+const QA_HELP: &str = r#"Inspect subtitle timing and readability without a reference
+
+Usage: sbake qa <SUBTITLE> [--json] [--fail-on <LEVEL>]
+
+LEVEL is never (default), error, or warning. Checks empty text, invalid and
+overlapping timing, reading speed, line length/count, and repeated segments.
+"#;
+const MEMORY_HELP: &str = r#"Manage glossary and translation-memory data
+
+Usage:
+  sbake memory inspect <TARGET> [TRANSLATE OPTIONS]
+  sbake memory export <TARGET> <BUNDLE> [TRANSLATE OPTIONS]
+  sbake memory import <TARGET> <BUNDLE> [TRANSLATE OPTIONS]
+  sbake memory prune <TARGET> --yes [TRANSLATE OPTIONS]
+
+Bundles use a versioned JSON shape. Import merges entries without replacing
+existing local values; prune removes blank mappings. Runtime, profile, source-language, and target-language
+options are resolved the same way as translation.
+"#;
 const TRANSCRIBE_HELP: &str = r#"Transcribe audio or video into subtitles
 
 Usage: sbake transcribe <MEDIA> [OPTIONS]
@@ -201,6 +234,7 @@ Options:
       --model <NAME>           Transcription model
       --format <FORMAT>        Output format: srt, vtt, or txt
       --sidecar <PATH>         Use a sidecar transcript
+      --no-filter-hallucinations Keep repeated/silence marker segments
       --config <PATH>          Configuration file
       --profile <NAME>         Named profile
       --runtime-dir <DIR>      Runtime storage root

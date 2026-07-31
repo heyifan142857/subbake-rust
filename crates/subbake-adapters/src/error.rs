@@ -136,6 +136,17 @@ impl AdapterError {
         matches!(self, Self::Cancelled)
     }
 
+    pub fn is_resource_budget_exceeded(&self) -> bool {
+        matches!(
+            self,
+            Self::Core(CoreError::ResourceBudgetExceeded(_))
+                | Self::CoreContext {
+                    source: CoreError::ResourceBudgetExceeded(_),
+                    ..
+                }
+        )
+    }
+
     pub fn is_not_found(&self) -> bool {
         matches!(
             self,

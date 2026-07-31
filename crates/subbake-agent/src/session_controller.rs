@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::AgentResult;
 use crate::event::EventKind;
-use crate::session::{AgentEvent, AgentSession, AgentSessionStore, iso_now};
+use crate::session::{AgentEvent, AgentSession, AgentSessionStore};
 
 pub(crate) struct SessionController<'a> {
     store: &'a AgentSessionStore,
@@ -45,14 +45,8 @@ impl<'a> SessionController<'a> {
             .active
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        let (kind, text, data) = serialize_event(&kind);
-        session.events.push(AgentEvent {
-            kind,
-            text,
-            data,
-            created_at: iso_now(),
-        });
-        session.updated_at = iso_now();
+        session.events.push(AgentEvent::from_kind(&kind));
+        session.updated_at = crate::session::iso_now();
         self.store.save(session)
     }
 
@@ -65,76 +59,5 @@ impl<'a> SessionController<'a> {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
         Ok(self.store.path_for(&session.id))
-    }
-}
-
-fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
-    match kind {
-        EventKind::User { text } => ("user".into(), text.clone(), serde_json::json!({})),
-        EventKind::Assistant { text } => ("assistant".into(), text.clone(), serde_json::json!({})),
-        EventKind::AskUser { text } => ("ask_user".into(), text.clone(), serde_json::json!({})),
-        EventKind::ToolCall {
-            tool_name,
-            arguments,
-        } => (
-            "tool_call".into(),
-            tool_name.clone(),
-            serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
-        ),
-        EventKind::ToolFailure {
-            tool_name,
-            category,
-            error,
-        } => (
-            "tool_failure".into(),
-            format!("{tool_name}: {error}"),
-            serde_json::json!({"tool_name": tool_name, "category": category}),
-        ),
-        EventKind::FinalToolCall {
-            tool_name,
-            arguments,
-        } => (
-            "final_tool_call".into(),
-            tool_name.clone(),
-            serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
-        ),
-        EventKind::FileOperation(data) => (
-            "file_operation".into(),
-            format!("{} {}", data.action, data.path),
-            serde_json::to_value(data).unwrap_or_default(),
-        ),
-        EventKind::Plan {
-            message,
-            tool_calls,
-        } => (
-            "plan".into(),
-            message.clone(),
-            serde_json::json!({"message": message, "tool_calls": tool_calls}),
-        ),
-        EventKind::Approve => ("approve".into(), String::new(), serde_json::json!({})),
-        EventKind::Reject => ("reject".into(), String::new(), serde_json::json!({})),
-        EventKind::CommandApprovalRequested { tool_call, reason } => (
-            "command_approval_requested".into(),
-            reason.clone(),
-            serde_json::json!({"tool_call": tool_call, "reason": reason}),
-        ),
-        EventKind::CommandApproved => (
-            "command_approved".into(),
-            String::new(),
-            serde_json::json!({}),
-        ),
-        EventKind::CommandRejected => (
-            "command_rejected".into(),
-            String::new(),
-            serde_json::json!({}),
-        ),
-        EventKind::Undo => ("undo".into(), String::new(), serde_json::json!({})),
-        EventKind::Profile { name } => ("profile".into(), name.clone(), serde_json::json!({})),
-        EventKind::Error { text } => ("error".into(), text.clone(), serde_json::json!({})),
-        EventKind::Cancelled => (
-            "cancelled".into(),
-            "Cancelled.".into(),
-            serde_json::json!({}),
-        ),
     }
 }

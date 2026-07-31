@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{any::Any, fmt};
 
@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleSegment,
-    TerminologyPreflightResult, Usage,
+    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleDocument,
+    SubtitleSegment, TerminologyPreflightResult, Usage,
 };
 use crate::error::{CoreResult, LlmCallError};
 use crate::storage::{RunState, RuntimePaths};
@@ -391,6 +391,56 @@ pub trait DashboardSink {
     fn add_usage(&mut self, _usage: Usage) {}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptionFormat {
+    Srt,
+    Vtt,
+    Txt,
+}
+
+impl TranscriptionFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "srt" => Some(Self::Srt),
+            "vtt" => Some(Self::Vtt),
+            "txt" => Some(Self::Txt),
+            _ => None,
+        }
+    }
+
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Srt => "srt",
+            Self::Vtt => "vtt",
+            Self::Txt => "txt",
+        }
+    }
+}
+
+/// Side-effect boundary for speech-to-subtitle backends. Implementations live
+/// in adapters while orchestration can depend on this provider-neutral port.
+pub trait TranscriberBackend {
+    type Error: From<crate::CoreError>;
+
+    fn transcribe(
+        &self,
+        audio_path: &Path,
+        language: Option<&str>,
+        output_format: TranscriptionFormat,
+    ) -> Result<SubtitleDocument, Self::Error>;
+
+    fn transcribe_cancellable(
+        &self,
+        audio_path: &Path,
+        language: Option<&str>,
+        output_format: TranscriptionFormat,
+        cancellation: &CancellationGuard,
+    ) -> Result<SubtitleDocument, Self::Error> {
+        cancellation.check()?;
+        self.transcribe(audio_path, language, output_format)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NoopDashboard;
 
@@ -407,18 +457,12 @@ pub trait RuntimeStore {
     fn ensure_layout(&self) -> CoreResult<()>;
 
     fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()>;
-    fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
-        let _ = self;
-        Ok(Vec::new())
-    }
+    fn load_glossary(&self) -> CoreResult<Vec<(String, String)>>;
 
     fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()>;
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
-    fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
-        let _ = self;
-        Ok(Vec::new())
-    }
+    fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>>;
 
     fn save_batch_segments(
         &self,
@@ -428,17 +472,13 @@ pub trait RuntimeStore {
     ) -> CoreResult<()>;
     fn load_batch_segments(
         &self,
-        _kind: BatchShardKind,
-        _completed_batches: usize,
-    ) -> CoreResult<Vec<SubtitleSegment>> {
-        Ok(Vec::new())
-    }
+        kind: BatchShardKind,
+        completed_batches: usize,
+    ) -> CoreResult<Vec<SubtitleSegment>>;
 
     fn save_run_state(&self, state: &RunState) -> CoreResult<()>;
 
-    fn load_run_state(&self) -> CoreResult<Option<RunState>> {
-        Ok(None)
-    }
+    fn load_run_state(&self) -> CoreResult<Option<RunState>>;
 
     fn save_cached_response(
         &self,
@@ -449,11 +489,9 @@ pub trait RuntimeStore {
 
     fn load_cached_response(
         &self,
-        _stage: CacheStage,
-        _request_hash: &str,
-    ) -> CoreResult<Option<BackendJsonResult>> {
-        Ok(None)
-    }
+        stage: CacheStage,
+        request_hash: &str,
+    ) -> CoreResult<Option<BackendJsonResult>>;
 
     fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf>;
 

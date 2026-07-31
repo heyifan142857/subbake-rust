@@ -127,6 +127,7 @@ impl Error for LlmCallError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {
     Cancelled,
+    ResourceBudgetExceeded(String),
     Llm(LlmCallError),
     UnsupportedFormat(String),
     MalformedSubtitle(String),
@@ -141,6 +142,9 @@ impl Display for CoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             CoreError::Cancelled => write!(formatter, "cancelled"),
+            CoreError::ResourceBudgetExceeded(value) => {
+                write!(formatter, "resource budget exceeded: {value}")
+            }
             CoreError::Llm(error) => Display::fmt(error, formatter),
             CoreError::UnsupportedFormat(value) => {
                 write!(formatter, "unsupported subtitle format: {value}")
@@ -181,6 +185,10 @@ impl From<CoreError> for LlmCallError {
     fn from(error: CoreError) -> Self {
         match error {
             CoreError::Cancelled => Self::Cancelled,
+            CoreError::ResourceBudgetExceeded(message) => Self::Rejected {
+                status: None,
+                message: format!("resource budget exceeded: {message}"),
+            },
             CoreError::UnsupportedCapability(capability) => Self::UnsupportedCapability(capability),
             CoreError::Llm(error) => error,
             CoreError::InvalidBackendResponse(message) => Self::InvalidResponse(message),

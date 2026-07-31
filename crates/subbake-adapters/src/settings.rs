@@ -63,6 +63,8 @@ pub struct BackendSettings {
 pub struct TranslationDomainSettings {
     pub source_language: String,
     pub target_language: String,
+    /// Explicit ffprobe stream index for embedded subtitle containers.
+    pub subtitle_stream_index: Option<usize>,
     pub batch_size: usize,
     pub batch_token_budget: usize,
     pub translation_concurrency: usize,
@@ -78,6 +80,8 @@ pub struct TranslationDomainSettings {
     pub retries: usize,
     pub agent: bool,
     pub agent_repair_attempts: usize,
+    pub max_requests: Option<usize>,
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +133,7 @@ pub struct BackendOverrides {
 pub struct TranslationOverrides {
     pub source_language: Option<String>,
     pub target_language: Option<String>,
+    pub subtitle_stream_index: Option<usize>,
     pub batch_size: Option<usize>,
     pub batch_token_budget: Option<usize>,
     pub translation_concurrency: Option<usize>,
@@ -146,6 +151,8 @@ pub struct TranslationOverrides {
     pub retries: Option<usize>,
     pub agent: Option<bool>,
     pub agent_repair_attempts: Option<usize>,
+    pub max_requests: Option<usize>,
+    pub max_tokens: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,6 +226,7 @@ impl SettingsOverrides {
             translation: TranslationOverrides {
                 source_language: Some(settings.translation.source_language.clone()),
                 target_language: Some(settings.translation.target_language.clone()),
+                subtitle_stream_index: settings.translation.subtitle_stream_index,
                 batch_size: Some(settings.translation.batch_size),
                 batch_token_budget: Some(settings.translation.batch_token_budget),
                 translation_concurrency: Some(settings.translation.translation_concurrency),
@@ -235,6 +243,8 @@ impl SettingsOverrides {
                 retries: Some(settings.translation.retries),
                 agent: Some(settings.translation.agent),
                 agent_repair_attempts: Some(settings.translation.agent_repair_attempts),
+                max_requests: settings.translation.max_requests,
+                max_tokens: settings.translation.max_tokens,
             },
             transcription: TranscriptionOverrides {
                 model: settings.transcription.model.clone(),
@@ -291,6 +301,7 @@ impl TranslationOverrides {
             other,
             source_language,
             target_language,
+            subtitle_stream_index,
             batch_size,
             batch_token_budget,
             translation_concurrency,
@@ -306,7 +317,9 @@ impl TranslationOverrides {
             use_cache,
             retries,
             agent,
-            agent_repair_attempts
+            agent_repair_attempts,
+            max_requests,
+            max_tokens
         );
     }
 }
@@ -393,6 +406,7 @@ impl Default for ResolvedSettings {
             translation: TranslationDomainSettings {
                 source_language: DEFAULT_SOURCE_LANGUAGE.to_owned(),
                 target_language: DEFAULT_TARGET_LANGUAGE.to_owned(),
+                subtitle_stream_index: None,
                 batch_size: DEFAULT_BATCH_SIZE,
                 batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
                 translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
@@ -408,6 +422,8 @@ impl Default for ResolvedSettings {
                 retries: DEFAULT_RETRIES,
                 agent: true,
                 agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
+                max_requests: None,
+                max_tokens: None,
             },
             transcription: TranscriptionDomainSettings { model: None },
             storage: StorageSettings {
@@ -478,6 +494,7 @@ impl ResolvedSettings {
         let TranslationOverrides {
             source_language,
             target_language,
+            subtitle_stream_index,
             batch_size,
             batch_token_budget,
             translation_concurrency,
@@ -494,6 +511,8 @@ impl ResolvedSettings {
             retries,
             agent,
             agent_repair_attempts,
+            max_requests,
+            max_tokens,
         } = overrides.translation;
         if let Some(model) = overrides.transcription.model {
             self.transcription.model = Some(model);
@@ -519,6 +538,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = target_language {
             self.translation.target_language = value;
+        }
+        if let Some(value) = subtitle_stream_index {
+            self.translation.subtitle_stream_index = Some(value);
         }
         if let Some(value) = batch_size {
             self.translation.batch_size = value;
@@ -561,6 +583,12 @@ impl ResolvedSettings {
         }
         if let Some(value) = agent_repair_attempts {
             self.translation.agent_repair_attempts = value;
+        }
+        if let Some(value) = max_requests {
+            self.translation.max_requests = Some(value);
+        }
+        if let Some(value) = max_tokens {
+            self.translation.max_tokens = Some(value);
         }
 
         let OutputOverrides {
@@ -622,6 +650,16 @@ impl ResolvedSettings {
             if value.trim().is_empty() {
                 return Err(AdapterError::invalid_input(format!(
                     "configuration field `{name}` must not be empty"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("translation.max_requests", self.translation.max_requests),
+            ("translation.max_tokens", self.translation.max_tokens),
+        ] {
+            if value == Some(0) {
+                return Err(AdapterError::invalid_input(format!(
+                    "configuration field `{name}` must be greater than zero when set"
                 )));
             }
         }
@@ -726,6 +764,8 @@ impl ResolvedSettings {
         options.retries = self.translation.retries;
         options.agent = self.translation.agent;
         options.agent_repair_attempts = self.translation.agent_repair_attempts;
+        options.max_requests = self.translation.max_requests;
+        options.max_tokens = self.translation.max_tokens;
         options.runtime_dir = self.storage.runtime_dir.clone();
         options.glossary_path = self.storage.glossary_path.clone();
         options
@@ -748,36 +788,15 @@ impl ResolvedSettings {
     }
 
     fn apply_mode_defaults(&mut self, mode: TranslationMode) {
+        let policy = subbake_core::TranslationPolicy::for_mode(mode);
         self.translation.mode = mode;
-        match mode {
-            TranslationMode::Economy => {
-                self.translation.batch_size = 160;
-                self.translation.batch_token_budget = 6_000;
-                self.translation.translation_concurrency = 3;
-                self.translation.review_concurrency = 1;
-                self.translation.review_policy = ReviewPolicy::Off;
-                self.translation.terminology_preflight = false;
-                self.translation.online_terminology = false;
-            }
-            TranslationMode::Turbo => {
-                self.translation.batch_size = 96;
-                self.translation.batch_token_budget = 2_400;
-                self.translation.translation_concurrency = 8;
-                self.translation.review_concurrency = 4;
-                self.translation.review_policy = ReviewPolicy::Off;
-                self.translation.terminology_preflight = false;
-                self.translation.online_terminology = false;
-            }
-            TranslationMode::Cinema => {
-                self.translation.batch_size = 48;
-                self.translation.batch_token_budget = 1_600;
-                self.translation.translation_concurrency = 4;
-                self.translation.review_concurrency = 3;
-                self.translation.review_policy = ReviewPolicy::Full;
-                self.translation.terminology_preflight = true;
-                self.translation.online_terminology = true;
-            }
-        }
+        self.translation.batch_size = policy.batch_size;
+        self.translation.batch_token_budget = policy.batch_token_budget;
+        self.translation.translation_concurrency = policy.translation_concurrency;
+        self.translation.review_concurrency = policy.review_concurrency;
+        self.translation.review_policy = policy.review_policy;
+        self.translation.terminology_preflight = policy.terminology_preflight;
+        self.translation.online_terminology = policy.online_terminology;
     }
 }
 

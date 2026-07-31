@@ -12,6 +12,7 @@ use subbake_core::{
     CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, SubtitleDocument,
     TaskKind, TaskState,
 };
+pub use subbake_core::{TranscriberBackend, TranscriptionFormat};
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{read_document, render_and_write_document};
@@ -47,6 +48,7 @@ pub struct TranscriptionSettings {
     pub whisper_models_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub multiple_model_policy: MultipleModelPolicy,
+    pub filter_hallucinations: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -65,32 +67,13 @@ pub struct TranscriptionOutcome {
     pub model_auto_selected: bool,
     pub output_format: TranscriptionFormat,
     pub subtitle_entries: usize,
+    pub cleanup: TranscriptionCleanupStats,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TranscriptionFormat {
-    Srt,
-    Vtt,
-    Txt,
-}
-
-impl TranscriptionFormat {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "srt" => Some(Self::Srt),
-            "vtt" => Some(Self::Vtt),
-            "txt" => Some(Self::Txt),
-            _ => None,
-        }
-    }
-
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Srt => "srt",
-            Self::Vtt => "vtt",
-            Self::Txt => "txt",
-        }
-    }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptionCleanupStats {
+    pub removed_empty_or_silence: usize,
+    pub removed_repeated: usize,
 }
 
 impl Default for TranscriptionSettings {
@@ -104,30 +87,8 @@ impl Default for TranscriptionSettings {
             whisper_models_dir: None,
             runtime_dir: None,
             multiple_model_policy: MultipleModelPolicy::RequireExplicit,
+            filter_hallucinations: true,
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Transcriber backend trait
-// ---------------------------------------------------------------------------
-
-pub trait TranscriberBackend {
-    fn transcribe(
-        &self,
-        audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
-    ) -> AdapterResult<SubtitleDocument>;
-    fn transcribe_cancellable(
-        &self,
-        audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
-        cancellation: &CancellationGuard,
-    ) -> AdapterResult<SubtitleDocument> {
-        check_cancelled(cancellation)?;
-        self.transcribe(audio_path, language, output_format)
     }
 }
 
@@ -161,6 +122,8 @@ impl WhisperCppTranscriber {
 }
 
 impl TranscriberBackend for WhisperCppTranscriber {
+    type Error = AdapterError;
+
     fn transcribe(
         &self,
         audio_path: &Path,
@@ -383,6 +346,7 @@ pub fn transcribe_media_cancellable_with_progress(
             model_auto_selected: false,
             output_format: request.settings.output_format,
             subtitle_entries: document.segments.len(),
+            cleanup: TranscriptionCleanupStats::default(),
         });
     }
 
@@ -410,12 +374,17 @@ pub fn transcribe_media_cancellable_with_progress(
     verify_whisper_cli(&binary, cancellation)?;
     let transcriber =
         WhisperCppTranscriber::new(binary, model_path, Vec::new()).with_progress(progress.clone());
-    let doc = transcriber.transcribe_cancellable(
+    let mut doc = transcriber.transcribe_cancellable(
         prepared_audio.path(),
         request.settings.language.as_deref(),
         fmt,
         cancellation,
     )?;
+    let cleanup = if request.settings.filter_hallucinations {
+        clean_transcription_document(&mut doc)
+    } else {
+        TranscriptionCleanupStats::default()
+    };
 
     check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
@@ -437,7 +406,37 @@ pub fn transcribe_media_cancellable_with_progress(
         model_auto_selected,
         output_format: fmt,
         subtitle_entries: doc.segments.len(),
+        cleanup,
     })
+}
+
+fn clean_transcription_document(document: &mut SubtitleDocument) -> TranscriptionCleanupStats {
+    let mut stats = TranscriptionCleanupStats::default();
+    let mut previous = String::new();
+    let mut repeated = 0usize;
+    document.segments.retain(|segment| {
+        let normalized = segment
+            .text
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.is_empty() || matches!(normalized.as_str(), "[blank_audio]" | "[silence]") {
+            stats.removed_empty_or_silence += 1;
+            return false;
+        }
+        if normalized == previous {
+            repeated += 1;
+            if repeated >= 2 {
+                stats.removed_repeated += 1;
+                return false;
+            }
+        } else {
+            previous = normalized;
+            repeated = 0;
+        }
+        true
+    });
+    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +993,33 @@ mod tests {
                 .contains("hello")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conservative_cleanup_removes_silence_markers_and_third_repetition() {
+        let mut document = SubtitleDocument {
+            path: PathBuf::from("whisper.srt"),
+            format: "srt".to_owned(),
+            segments: ["[BLANK_AUDIO]", "Hello", "Hello", "Hello"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| SubtitleSegment {
+                    id: (index + 1).to_string(),
+                    text: text.to_owned(),
+                    start: None,
+                    end: None,
+                    identifier: None,
+                    settings: None,
+                })
+                .collect(),
+            header: None,
+            passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
+        };
+        let stats = clean_transcription_document(&mut document);
+        assert_eq!(stats.removed_empty_or_silence, 1);
+        assert_eq!(stats.removed_repeated, 1);
+        assert_eq!(document.segments.len(), 2);
     }
 
     #[test]

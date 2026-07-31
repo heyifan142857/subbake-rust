@@ -31,6 +31,8 @@ pub fn translate_batch(args: BatchArgs) -> CliResult<()> {
             root: args.dir,
             recursive: args.recursive,
             overwrite: args.overwrite,
+            fail_fast: args.fail_fast,
+            retry_manifest: args.retry_failed,
             output_dir: None,
             output_language_tag: None,
             settings: args.translate.settings,

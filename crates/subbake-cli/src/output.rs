@@ -34,6 +34,13 @@ pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
         println!("Model: {} (automatically selected)", outcome.model);
     }
     println!("Output: {}", outcome.output_path.display());
+    let removed = outcome.cleanup.removed_empty_or_silence + outcome.cleanup.removed_repeated;
+    if removed > 0 {
+        println!(
+            "Cleanup: {removed} segment(s) removed ({} empty/silence, {} repeated)",
+            outcome.cleanup.removed_empty_or_silence, outcome.cleanup.removed_repeated
+        );
+    }
 }
 
 pub fn print_provider_check_outcome(outcome: &ProviderCheckOutcome) {
@@ -156,7 +163,8 @@ fn dry_run_text(result: &PipelineResult, json: bool) -> String {
     }
 
     let mut output = format!(
-        "Dry run: no model calls were made.\nPlanned batches: {}\n",
+        "Dry run: no model calls were made.\nPlanned batches: {}\nEstimated translation requests: {}\n",
+        result.planned_batches.len(),
         result.planned_batches.len()
     );
     for batch in &result.planned_batches {
@@ -169,7 +177,7 @@ fn dry_run_text(result: &PipelineResult, json: bool) -> String {
 }
 
 fn batch_text(outcome: &BatchTranslationOutcome) -> String {
-    if outcome.processed == 0 && outcome.skipped.is_empty() {
+    if outcome.processed == 0 && outcome.skipped.is_empty() && outcome.failures.is_empty() {
         return "No subtitle files found.\n".to_owned();
     }
 
@@ -180,10 +188,19 @@ fn batch_text(outcome: &BatchTranslationOutcome) -> String {
             path.display()
         ));
     }
+    for failure in &outcome.failures {
+        output.push_str(&format!(
+            "Failed: {}: {}\n",
+            failure.input.display(),
+            failure.error
+        ));
+    }
     output.push_str(&format!(
-        "Batch result: {} processed, {} skipped, 0 failed\n",
+        "Batch result: {} processed, {} skipped, {} failed\nManifest: {}\n",
         outcome.processed,
-        outcome.skipped.len()
+        outcome.skipped.len(),
+        outcome.failures.len(),
+        outcome.manifest_path.display()
     ));
     output
 }
@@ -418,6 +435,8 @@ mod tests {
             inputs: Vec::new(),
             skipped: Vec::new(),
             outputs: Vec::new(),
+            failures: Vec::new(),
+            manifest_path: ".subbake/batch/test.json".into(),
             subtitle_entries: 0,
             dry_run: false,
             cache_hits: 0,

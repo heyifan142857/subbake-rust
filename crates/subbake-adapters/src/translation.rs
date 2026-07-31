@@ -3,6 +3,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
+
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::normalize_language;
 use subbake_core::pipeline::SubtitlePipeline;
@@ -64,6 +66,9 @@ pub struct BatchTranslationRequest {
     pub root: PathBuf,
     pub recursive: bool,
     pub overwrite: bool,
+    /// Stop on the first ordinary file failure. Cancellation always stops.
+    pub fail_fast: bool,
+    pub retry_manifest: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub output_language_tag: Option<String>,
     pub settings: TranslationSettings,
@@ -75,12 +80,31 @@ pub struct BatchTranslationOutcome {
     pub inputs: Vec<PathBuf>,
     pub skipped: Vec<PathBuf>,
     pub outputs: Vec<PathBuf>,
+    pub failures: Vec<BatchTranslationFailure>,
+    pub manifest_path: PathBuf,
     pub subtitle_entries: usize,
     pub dry_run: bool,
     pub cache_hits: usize,
     pub resumed_translation_batches: usize,
     pub resumed_review_batches: usize,
     pub translation_memory_hits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchTranslationFailure {
+    pub input: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchTranslationManifest {
+    version: u64,
+    root: PathBuf,
+    processed: Vec<PathBuf>,
+    skipped: Vec<PathBuf>,
+    outputs: Vec<PathBuf>,
+    failures: Vec<BatchTranslationFailure>,
+    complete: bool,
 }
 
 pub fn translate_subtitle(request: TranslationRequest) -> AdapterResult<TranslationOutcome> {
@@ -353,23 +377,49 @@ pub fn translate_subtitle_batch_with_progress(
         .map(|value| normalize_language(value, false))
         .transpose()
         .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
-    let files = discover_subtitle_files(&request.root, request.recursive)?;
+    let files = match request.retry_manifest.as_deref() {
+        Some(path) => failed_inputs_from_manifest(path, &request.root)?,
+        None => discover_subtitle_files(&request.root, request.recursive)?,
+    };
     let total_files = files.len();
     let mut processed = 0usize;
     let mut processed_inputs = Vec::new();
     let mut skipped = Vec::new();
     let mut outputs = Vec::new();
+    let mut failures = Vec::new();
     let mut subtitle_entries = 0usize;
     let mut cache_hits = 0usize;
     let mut resumed_translation_batches = 0usize;
     let mut resumed_review_batches = 0usize;
     let mut translation_memory_hits = 0usize;
+    let manifest_path = batch_manifest_path(&request);
+    persist_batch_manifest(
+        &manifest_path,
+        &BatchTranslationManifest {
+            version: 1,
+            root: request.root.clone(),
+            processed: Vec::new(),
+            skipped: Vec::new(),
+            outputs: Vec::new(),
+            failures: Vec::new(),
+            complete: false,
+        },
+    )?;
 
     for input_path in files {
         check_cancelled(cancellation)?;
         let output_path = batch_translation_output_path(&request, &input_path)?;
         if output_path.exists() && !request.overwrite && !request.settings.translation.dry_run {
             skipped.push(input_path);
+            persist_batch_progress(
+                &manifest_path,
+                &request.root,
+                &processed_inputs,
+                &skipped,
+                &outputs,
+                &failures,
+                false,
+            )?;
             continue;
         }
 
@@ -390,7 +440,33 @@ pub fn translate_subtitle_batch_with_progress(
             },
             cancellation,
             progress.clone(),
-        )?;
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error)
+                if error.is_cancelled()
+                    || error.is_resource_budget_exceeded()
+                    || request.fail_fast =>
+            {
+                return Err(error);
+            }
+            Err(error) => {
+                failures.push(BatchTranslationFailure {
+                    input: input_path,
+                    error: error.to_string(),
+                });
+                persist_batch_progress(
+                    &manifest_path,
+                    &request.root,
+                    &processed_inputs,
+                    &skipped,
+                    &outputs,
+                    &failures,
+                    false,
+                )?;
+                continue;
+            }
+        };
         if let Some(output_path) = outcome.output_path {
             outputs.push(output_path);
         }
@@ -401,6 +477,15 @@ pub fn translate_subtitle_batch_with_progress(
         translation_memory_hits += outcome.result.translation_memory_hits;
         processed_inputs.push(input_path);
         processed += 1;
+        persist_batch_progress(
+            &manifest_path,
+            &request.root,
+            &processed_inputs,
+            &skipped,
+            &outputs,
+            &failures,
+            false,
+        )?;
     }
 
     let mut done = subbake_core::ProgressEvent::running(
@@ -412,18 +497,130 @@ pub fn translate_subtitle_batch_with_progress(
     );
     done.state = subbake_core::TaskState::Completed;
     progress.emit(done);
+    persist_batch_progress(
+        &manifest_path,
+        &request.root,
+        &processed_inputs,
+        &skipped,
+        &outputs,
+        &failures,
+        true,
+    )?;
 
     Ok(BatchTranslationOutcome {
         processed,
         inputs: processed_inputs,
         skipped,
         outputs,
+        failures,
+        manifest_path,
         subtitle_entries,
         dry_run: request.settings.translation.dry_run,
         cache_hits,
         resumed_translation_batches,
         resumed_review_batches,
         translation_memory_hits,
+    })
+}
+
+fn failed_inputs_from_manifest(path: &Path, expected_root: &Path) -> AdapterResult<Vec<PathBuf>> {
+    let bytes = fs::read(path).map_err(|source| {
+        AdapterError::external_io(
+            "read batch retry manifest",
+            Some(path.to_path_buf()),
+            source,
+        )
+    })?;
+    let manifest: BatchTranslationManifest =
+        serde_json::from_slice(&bytes).map_err(|source| AdapterError::Serialization {
+            context: "parse batch retry manifest",
+            source,
+        })?;
+    if manifest.version != 1 {
+        return Err(AdapterError::invalid_input(format!(
+            "unsupported batch manifest version {}",
+            manifest.version
+        )));
+    }
+    let actual_root = manifest.root.canonicalize().unwrap_or(manifest.root);
+    let expected_root = expected_root
+        .canonicalize()
+        .unwrap_or_else(|_| expected_root.to_path_buf());
+    if actual_root != expected_root {
+        return Err(AdapterError::invalid_input(format!(
+            "batch manifest belongs to `{}`, not `{}`",
+            actual_root.display(),
+            expected_root.display()
+        )));
+    }
+    Ok(manifest
+        .failures
+        .into_iter()
+        .map(|failure| failure.input)
+        .collect())
+}
+
+fn batch_manifest_path(request: &BatchTranslationRequest) -> PathBuf {
+    let root = request
+        .settings
+        .storage
+        .runtime_dir
+        .clone()
+        .unwrap_or_else(|| request.root.join(".subbake"));
+    let stable_root = request.root.to_string_lossy().to_string();
+    let key =
+        subbake_core::storage::stable_hash(&subbake_core::storage::JsonValue::Object(vec![(
+            "root".to_owned(),
+            subbake_core::storage::JsonValue::String(stable_root),
+        )]));
+    root.join("batch").join(format!("{}.json", &key[..16]))
+}
+
+fn persist_batch_progress(
+    path: &Path,
+    root: &Path,
+    processed: &[PathBuf],
+    skipped: &[PathBuf],
+    outputs: &[PathBuf],
+    failures: &[BatchTranslationFailure],
+    complete: bool,
+) -> AdapterResult<()> {
+    persist_batch_manifest(
+        path,
+        &BatchTranslationManifest {
+            version: 1,
+            root: root.to_path_buf(),
+            processed: processed.to_vec(),
+            skipped: skipped.to_vec(),
+            outputs: outputs.to_vec(),
+            failures: failures.to_vec(),
+            complete,
+        },
+    )
+}
+
+fn persist_batch_manifest(path: &Path, manifest: &BatchTranslationManifest) -> AdapterResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AdapterError::invalid_input(format!("batch manifest has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).map_err(|source| {
+        AdapterError::external_io(
+            "create batch manifest directory",
+            Some(parent.to_path_buf()),
+            source,
+        )
+    })?;
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let bytes =
+        serde_json::to_vec_pretty(manifest).map_err(|source| AdapterError::Serialization {
+            context: "serialize batch manifest",
+            source,
+        })?;
+    fs::write(&temporary, bytes).map_err(|source| {
+        AdapterError::external_io("write batch manifest", Some(temporary.clone()), source)
+    })?;
+    fs::rename(&temporary, path).map_err(|source| {
+        AdapterError::external_io("commit batch manifest", Some(path.to_path_buf()), source)
     })
 }
 
@@ -665,6 +862,8 @@ mod tests {
             root: root.clone(),
             recursive: false,
             overwrite: false,
+            fail_fast: false,
+            retry_manifest: None,
             output_dir: None,
             output_language_tag: None,
             settings: TranslationSettings::default(),
@@ -693,6 +892,8 @@ mod tests {
             root: root.clone(),
             recursive: false,
             overwrite: false,
+            fail_fast: true,
+            retry_manifest: None,
             output_dir: None,
             output_language_tag: None,
             settings: TranslationSettings::default(),
@@ -703,6 +904,56 @@ mod tests {
 
         assert!(message.contains(&input_path.display().to_string()));
         assert!(message.contains("Malformed SRT block:\nas a warning."));
+    }
+
+    #[test]
+    fn batch_continues_after_a_file_failure_and_persists_a_complete_manifest() {
+        let root = temp_root("batch-continue");
+        fs::create_dir_all(&root).expect("create temp root");
+        let malformed = root.join("bad.srt");
+        let valid = root.join("good.txt");
+        fs::write(&malformed, "as a warning.\n").expect("write malformed subtitle");
+        fs::write(&valid, "hello\n").expect("write valid subtitle");
+
+        let outcome = translate_subtitle_batch(BatchTranslationRequest {
+            root: root.clone(),
+            recursive: false,
+            overwrite: false,
+            fail_fast: false,
+            retry_manifest: None,
+            output_dir: None,
+            output_language_tag: None,
+            settings: TranslationSettings::default(),
+        })
+        .expect("ordinary file failure should not stop the batch");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome.manifest_path).expect("read batch manifest"))
+                .expect("parse batch manifest");
+        let retry_manifest = outcome.manifest_path.clone();
+        fs::write(&malformed, "1\n00:00:00,000 --> 00:00:01,000\nFixed\n\n")
+            .expect("repair malformed input");
+        let retry = translate_subtitle_batch(BatchTranslationRequest {
+            root: root.clone(),
+            recursive: false,
+            overwrite: false,
+            fail_fast: false,
+            retry_manifest: Some(retry_manifest),
+            output_dir: None,
+            output_language_tag: None,
+            settings: TranslationSettings::default(),
+        })
+        .expect("retry failed inputs only");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(outcome.processed, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].input, malformed);
+        assert_eq!(manifest["version"], 1);
+        assert_eq!(manifest["complete"], true);
+        assert_eq!(manifest["failures"].as_array().map(Vec::len), Some(1));
+        assert_eq!(retry.processed, 1);
+        assert!(retry.failures.is_empty());
+        assert_eq!(retry.inputs, vec![malformed]);
     }
 
     #[test]

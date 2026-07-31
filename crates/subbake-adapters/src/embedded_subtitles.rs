@@ -419,7 +419,11 @@ fn translate_embedded_subtitle_with_programs(
 
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Running);
     let streams = probe_subtitle_streams(ffprobe, &request.input_path, cancellation)?;
-    let source = select_text_stream(&streams, &request.settings.translation.source_language)?;
+    let source = select_text_stream(
+        &streams,
+        &request.settings.translation.source_language,
+        request.settings.translation.subtitle_stream_index,
+    )?;
     let payload_format = translated_payload_format(container_kind, &source.codec);
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Completed);
 
@@ -629,6 +633,7 @@ fn probe_subtitle_streams(
 fn select_text_stream<'a>(
     streams: &'a [SubtitleStream],
     source_language: &str,
+    requested_index: Option<usize>,
 ) -> AdapterResult<&'a SubtitleStream> {
     let text_streams = streams
         .iter()
@@ -659,6 +664,23 @@ fn select_text_stream<'a>(
             )
         };
         return Err(AdapterError::invalid_input(message));
+    }
+
+    if let Some(index) = requested_index {
+        return text_streams
+            .iter()
+            .copied()
+            .find(|stream| stream.index == index)
+            .ok_or_else(|| {
+                let available = text_streams
+                    .iter()
+                    .map(|stream| stream.index.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                AdapterError::invalid_input(format!(
+                    "subtitle stream {index} is not a translatable text stream; available text stream indices: {available}"
+                ))
+            });
     }
 
     let requested_language = normalized_primary_language(source_language);
@@ -1186,7 +1208,7 @@ mod tests {
             stream(4, "hdmv_pgs_subtitle", Some("eng"), false, false),
         ];
 
-        let selected = select_text_stream(&streams, "Auto").expect("select stream");
+        let selected = select_text_stream(&streams, "Auto", None).expect("select stream");
 
         assert_eq!(selected.index, 3);
     }
@@ -1198,16 +1220,35 @@ mod tests {
             stream(3, "ass", Some("eng"), false, false),
         ];
 
-        let selected = select_text_stream(&streams, "en").expect("select English");
+        let selected = select_text_stream(&streams, "en", None).expect("select English");
 
         assert_eq!(selected.index, 3);
+    }
+
+    #[test]
+    fn explicit_stream_index_overrides_language_and_default_selection() {
+        let streams = vec![
+            stream(2, "subrip", Some("spa"), true, false),
+            stream(7, "ass", Some("eng"), false, false),
+        ];
+
+        let selected = select_text_stream(&streams, "es", Some(7)).expect("select stream 7");
+        assert_eq!(selected.index, 7);
+
+        let error = select_text_stream(&streams, "Auto", Some(9))
+            .expect_err("missing stream must fail explicitly");
+        assert!(
+            error
+                .to_string()
+                .contains("available text stream indices: 2, 7")
+        );
     }
 
     #[test]
     fn bitmap_only_container_reports_supported_boundary() {
         let streams = vec![stream(3, "hdmv_pgs_subtitle", Some("eng"), true, false)];
 
-        let error = select_text_stream(&streams, "Auto").expect_err("bitmap must fail");
+        let error = select_text_stream(&streams, "Auto", None).expect_err("bitmap must fail");
 
         assert!(error.to_string().contains("no translatable text"));
         assert!(error.to_string().contains("hdmv_pgs_subtitle"));

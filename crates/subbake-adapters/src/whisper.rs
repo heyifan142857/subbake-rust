@@ -197,11 +197,18 @@ pub fn run_whisper_cancellable_with_progress(
 // Binary install: prebuilt download from GitHub Releases → cmake fallback
 // ---------------------------------------------------------------------------
 
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        Runtime::new().unwrap_or_else(|_| panic!("unable to start whisper runtime"))
-    })
+fn runtime() -> AdapterResult<&'static Runtime> {
+    static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| Runtime::new().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|message| {
+            AdapterError::external_io(
+                "start whisper runtime",
+                None,
+                io::Error::other(message.clone()),
+            )
+        })
 }
 
 const GITHUB_REPO_OWNER: &str = "ggml-org";
@@ -340,7 +347,7 @@ fn install_binary(
         let archive_path = download_dir.join(&asset.name);
 
         // Download the archive using reqwest.
-        runtime().block_on(async {
+        runtime()?.block_on(async {
             download_file(
                 &asset.url,
                 &archive_path,
@@ -560,7 +567,7 @@ async fn await_http_cancellable<T>(
 }
 
 fn list_versions(cancellation: &CancellationGuard) -> AdapterResult<WhisperVersionList> {
-    let fetched: AdapterResult<Vec<GithubRelease>> = runtime().block_on(fetch_json(
+    let fetched: AdapterResult<Vec<GithubRelease>> = runtime()?.block_on(fetch_json(
         GITHUB_RELEASES_URL,
         cancellation,
         "fetch whisper.cpp versions",
@@ -598,7 +605,7 @@ fn list_versions(cancellation: &CancellationGuard) -> AdapterResult<WhisperVersi
 fn fetch_available_models(
     cancellation: &CancellationGuard,
 ) -> AdapterResult<(Vec<String>, Option<String>)> {
-    let fetched: AdapterResult<Vec<HuggingFaceEntry>> = runtime().block_on(fetch_json(
+    let fetched: AdapterResult<Vec<HuggingFaceEntry>> = runtime()?.block_on(fetch_json(
         HF_MODEL_TREE_URL,
         cancellation,
         "fetch whisper.cpp model catalog",
@@ -977,7 +984,7 @@ fn build_from_source(
         "https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/archive/refs/tags/{WHISPER_VERSION_TAG}.tar.gz"
     );
     let tarball_path = build_dir.join("source.tar.gz");
-    runtime().block_on(async {
+    runtime()?.block_on(async {
         download_file(
             &tarball_url,
             &tarball_path,
@@ -1249,7 +1256,7 @@ fn download_model(
     })?;
 
     let url = format!("{HF_MODEL_BASE}/ggml-{name}.bin");
-    let checksum = runtime().block_on(async {
+    let checksum = runtime()?.block_on(async {
         download_file(&url, &dest, None, cancellation, progress, "DOWNLOAD_MODEL").await
     })?;
     write_atomic(&checksum_path, format!("{checksum}\n").as_bytes())?;
@@ -1841,6 +1848,7 @@ mod tests {
         token.cancel();
 
         let error = runtime()
+            .expect("test runtime")
             .block_on(download_file(
                 "https://invalid.example/artifact",
                 &destination,

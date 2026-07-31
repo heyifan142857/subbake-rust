@@ -80,7 +80,7 @@ impl ToolArgKind {
         match self {
             Self::String => value.is_string(),
             Self::Boolean => value.is_boolean(),
-            Self::Integer => value.is_i64() || value.is_u64(),
+            Self::Integer => value.is_u64(),
             Self::StringMap => value
                 .as_object()
                 .is_some_and(|map| map.values().all(serde_json::Value::is_string)),
@@ -234,6 +234,12 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         "target language name or BCP-47 tag for this call",
     ),
     arg(
+        "subtitle_stream",
+        IntegerArg,
+        false,
+        "explicit embedded subtitle stream index",
+    ),
+    arg(
         "bilingual",
         BooleanArg,
         false,
@@ -280,6 +286,18 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         BooleanArg,
         false,
         "replace an existing output; defaults to false",
+    ),
+    arg(
+        "max_requests",
+        IntegerArg,
+        false,
+        "maximum provider requests for this call",
+    ),
+    arg(
+        "max_tokens",
+        IntegerArg,
+        false,
+        "stop before the next provider request after this many used tokens",
     ),
 ];
 const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
@@ -338,6 +356,18 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
         StringArg,
         false,
         "project-local output directory; recursive calls preserve relative directories",
+    ),
+    arg(
+        "max_requests",
+        IntegerArg,
+        false,
+        "maximum provider requests for this call",
+    ),
+    arg(
+        "max_tokens",
+        IntegerArg,
+        false,
+        "stop before the next provider request after this many used tokens",
     ),
 ];
 const EDIT_SUBTITLE_ARGS: &[ToolArgSpec] = &[
@@ -903,6 +933,36 @@ pub fn validate_tool_call(
         }
     }
     Ok(())
+}
+
+/// A tool call that has crossed the registry boundary exactly once. Executors
+/// may still use JSON for compatibility with persisted v1 plans, but they can
+/// no longer receive an unknown tool, extra field, missing required field, or
+/// a value of the wrong primitive type.
+pub(crate) struct ValidatedToolCall<'a> {
+    spec: &'static ToolSpec,
+    arguments: &'a serde_json::Value,
+}
+
+impl<'a> ValidatedToolCall<'a> {
+    pub(crate) fn parse(
+        name: &str,
+        arguments: &'a serde_json::Value,
+    ) -> Result<Self, ToolValidationError> {
+        validate_tool_call(name, arguments)?;
+        let spec = find_tool_spec(name).ok_or_else(|| ToolValidationError::UnknownTool {
+            name: name.to_owned(),
+        })?;
+        Ok(Self { spec, arguments })
+    }
+
+    pub(crate) fn executor(&self) -> ToolExecutor {
+        self.spec.executor
+    }
+
+    pub(crate) fn arguments(&self) -> &'a serde_json::Value {
+        self.arguments
+    }
 }
 
 #[cfg(test)]

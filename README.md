@@ -17,6 +17,7 @@ SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写 CLI，也�
 - 支持 OpenAI、Anthropic、Gemini 及兼容接口
 - 提供带计划确认、会话恢复、历史记录和撤销功能的终端 Agent
 - 支持术语表与翻译记忆，并兼容部分旧版运行数据
+- 提供无参考译文的字幕 QA、可恢复批处理清单和资源预算
 
 ## 安装
 
@@ -113,6 +114,8 @@ auto_approve_commands = false # true：自动批准命令，但不会绕过硬�
 
 [defaults.translation]
 preserve_names = false # false：默认强制音译人名；true：保留源文拼写
+# max_requests = 100 # 可选：调用前限制 provider 请求数
+# max_tokens = 200000 # 可选：达到累计 token 后不再开始下一批请求
 
 [defaults.transcription]
 model = "small-q8_0" # 可选；未设置时根据已安装模型选择
@@ -147,6 +150,12 @@ sbake translate episode.srt
 sbake translate episode.srt --mode economy
 sbake translate episode.srt --mode turbo
 sbake translate episode.srt --mode cinema --profile cinema
+```
+
+容器中有多条文本字幕轨时，可绕过自动语言/default 选择并使用 ffprobe 的全局流索引：
+
+```bash
+sbake translate movie.mkv --subtitle-stream 7 --target-lang Chinese
 ```
 
 Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、组织、地点等
@@ -198,11 +207,18 @@ sbake evaluate candidate.zh-Hans.translated.srt reference.srt --json
 sbake batch ./subtitles
 ```
 
+批处理默认隔离单文件失败并继续，且在 `.subbake/batch/`（配置 runtime 目录时位于其
+`batch/` 子目录）逐项原子更新版本化 JSON 清单。使用 `--fail-fast` 可在首个文件失败时
+停止。
+
 转写音视频：
 
 ```bash
 sbake transcribe episode.mp4
 ```
+
+转写默认保守移除空白/静音标记和第三次起的连续完全重复片段，并报告清理数量；使用
+`--no-filter-hallucinations` 可关闭。
 
 先转写，再翻译：
 
@@ -214,6 +230,23 @@ sbake pipeline episode.mp4
 
 ```bash
 sbake resume
+```
+
+无需参考译文即可检查空文本、时间轴、重叠、阅读速度、行长和重复片段：
+
+```bash
+sbake qa episode.srt
+sbake qa episode.srt --json --fail-on warning
+```
+
+术语表与翻译记忆可使用版本化 JSON bundle 管理；命令接受与翻译相同的 profile、语言
+和 runtime 选项：
+
+```bash
+sbake memory inspect episode.srt
+sbake memory export episode.srt memory.json
+sbake memory import episode.srt memory.json
+sbake memory prune episode.srt --yes
 ```
 
 查看完整命令：

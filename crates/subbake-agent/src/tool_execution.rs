@@ -537,6 +537,24 @@ pub(crate) fn execute_translation_tool(
     if let Some(online_terminology) = args.get("online_terminology").and_then(JsonValue::as_bool) {
         settings.translation.online_terminology = online_terminology;
     }
+    if let Some(subtitle_stream) = args.get("subtitle_stream").and_then(JsonValue::as_u64) {
+        settings.translation.subtitle_stream_index = Some(
+            usize::try_from(subtitle_stream)
+                .map_err(|_| AgentError::invalid_input("subtitle_stream is too large"))?,
+        );
+    }
+    if let Some(max_requests) = args.get("max_requests").and_then(JsonValue::as_u64) {
+        settings.translation.max_requests = Some(
+            usize::try_from(max_requests)
+                .map_err(|_| AgentError::invalid_input("max_requests is too large"))?,
+        );
+    }
+    if let Some(max_tokens) = args.get("max_tokens").and_then(JsonValue::as_u64) {
+        settings.translation.max_tokens = Some(
+            usize::try_from(max_tokens)
+                .map_err(|_| AgentError::invalid_input("max_tokens is too large"))?,
+        );
+    }
     if let Some(preserve_source) = args
         .get("preserve_source_container")
         .and_then(JsonValue::as_bool)
@@ -689,6 +707,8 @@ pub(crate) fn execute_translation_tool(
                 root: input.clone(),
                 recursive,
                 overwrite,
+                fail_fast: false,
+                retry_manifest: None,
                 output_dir,
                 output_language_tag: language_tag,
                 settings: settings.clone(),
@@ -757,6 +777,10 @@ pub(crate) fn execute_translation_tool(
                             path,
                             reason: "output exists and overwrite is false".to_owned(),
                         })
+                        .chain(translated.failures.into_iter().map(|failure| SkippedPath {
+                            path: failure.input,
+                            reason: failure.error,
+                        }))
                         .collect(),
                     subtitle_entries: translated.subtitle_entries,
                     dry_run: translated.dry_run,

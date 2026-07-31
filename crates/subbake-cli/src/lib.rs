@@ -12,6 +12,8 @@ pub fn command_names() -> &'static [&'static str] {
         "resume",
         "translate",
         "batch",
+        "qa",
+        "memory",
         "transcribe",
         "pipeline",
         "provider",

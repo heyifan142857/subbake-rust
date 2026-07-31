@@ -80,6 +80,8 @@ pub struct SubtitlePipeline<B, D> {
     /// Turbo starts conservatively and uses additive increase / multiplicative
     /// decrease when the provider signals pressure.
     adaptive_translation_concurrency: usize,
+    provider_requests: usize,
+    provider_tokens: usize,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -107,6 +109,8 @@ where
             cancellation: CancellationGuard::never(),
             progress: None,
             adaptive_translation_concurrency,
+            provider_requests: 0,
+            provider_tokens: 0,
         }
     }
 
@@ -121,21 +125,27 @@ where
     }
 
     fn execute_json(&mut self, messages: &[ChatMessage]) -> CoreResult<(serde_json::Value, Usage)> {
-        self.backend
+        self.reserve_requests(1)?;
+        let result = self
+            .backend
             .execute(
                 GenerationRequest::json(messages.to_vec()),
                 &self.cancellation,
             )
             .map_err(CoreError::from)?
             .into_json()
-            .map_err(CoreError::from)
+            .map_err(CoreError::from)?;
+        self.provider_tokens = self.provider_tokens.saturating_add(result.1.total_tokens);
+        Ok(result)
     }
 
     fn execute_review_json(
         &mut self,
         messages: &[ChatMessage],
     ) -> CoreResult<(serde_json::Value, Usage)> {
-        self.reviewer
+        self.reserve_requests(1)?;
+        let result = self
+            .reviewer
             .as_mut()
             .unwrap_or(&mut self.backend)
             .execute(
@@ -144,7 +154,47 @@ where
             )
             .map_err(CoreError::from)?
             .into_json()
-            .map_err(CoreError::from)
+            .map_err(CoreError::from)?;
+        self.provider_tokens = self.provider_tokens.saturating_add(result.1.total_tokens);
+        Ok(result)
+    }
+
+    fn reserve_requests(&mut self, additional: usize) -> CoreResult<()> {
+        if additional == 0 {
+            return Ok(());
+        }
+        if let Some(limit) = self.options.max_requests
+            && self.provider_requests.saturating_add(additional) > limit
+        {
+            return Err(CoreError::ResourceBudgetExceeded(format!(
+                "request limit is {limit}; {} request(s) already used and {additional} more required",
+                self.provider_requests
+            )));
+        }
+        if let Some(limit) = self.options.max_tokens
+            && self.provider_tokens >= limit
+        {
+            return Err(CoreError::ResourceBudgetExceeded(format!(
+                "token limit is {limit}; {} token(s) already used",
+                self.provider_tokens
+            )));
+        }
+        self.provider_requests = self.provider_requests.saturating_add(additional);
+        Ok(())
+    }
+
+    fn record_response_tokens(
+        &mut self,
+        responses: &[Result<crate::ports::GenerationResponse, crate::LlmCallError>],
+    ) {
+        for response in responses
+            .iter()
+            .filter_map(|response| response.as_ref().ok())
+        {
+            self.provider_tokens = self
+                .provider_tokens
+                .saturating_add(response.usage.total_tokens);
+        }
     }
 
     fn report(
@@ -640,6 +690,7 @@ where
             .iter()
             .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
+        self.reserve_requests(pending.len())?;
         let responses = self
             .backend
             .execute_many(
@@ -648,6 +699,7 @@ where
                 &self.cancellation,
             )
             .map_err(CoreError::from)?;
+        self.record_response_tokens(&responses);
         if responses.len() != pending.len() {
             return Err(CoreError::InvalidBackendResponse(format!(
                 "backend returned {} responses for {} translation requests",
@@ -1042,6 +1094,7 @@ where
             .iter()
             .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
             .collect();
+        self.reserve_requests(pending.len())?;
         let responses = self
             .backend
             .execute_many(
@@ -1050,6 +1103,7 @@ where
                 &self.cancellation,
             )
             .map_err(CoreError::from)?;
+        self.record_response_tokens(&responses);
         if responses.len() != pending.len() {
             return Err(CoreError::InvalidBackendResponse(format!(
                 "backend returned {} responses for {} review requests",
@@ -1560,6 +1614,12 @@ fn failure_error(
     failure_path: Option<&PathBuf>,
     repair: Option<&RepairOutcome>,
 ) -> CoreError {
+    if matches!(
+        error,
+        CoreError::Cancelled | CoreError::ResourceBudgetExceeded(_)
+    ) {
+        return error.clone();
+    }
     let mut message = format!("{stage} batch {batch_index} failed: {error}");
     if let Some(repair) = repair
         && repair.payload.is_none()
@@ -1665,6 +1725,19 @@ mod tests {
                 },
             ))
         }
+    }
+
+    #[test]
+    fn request_budget_stops_before_starting_a_provider_side_effect() {
+        let mut options = PipelineOptions::new(PathBuf::from("budget.srt"));
+        options.terminology_preflight = false;
+        options.agent = false;
+        options.max_requests = Some(0);
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        let error = pipeline
+            .run_document(&document("budget.srt", &["hello"]))
+            .expect_err("zero request budget must stop before generation");
+        assert!(matches!(error, CoreError::ResourceBudgetExceeded(_)));
     }
 
     struct CorrectedTerminologyBackend {
@@ -3429,11 +3502,20 @@ mod tests {
             Ok(())
         }
 
+        fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+
         fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()> {
             let mut data = self.data.lock().expect("capture lock");
             data.saved_translation_memory = entries.to_vec();
             data.saved_translation_memory.sort();
             Ok(())
+        }
+
+        fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
+            // Cache-focused tests opt out of translation-memory short-circuiting.
+            Ok(Vec::new())
         }
 
         fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()> {

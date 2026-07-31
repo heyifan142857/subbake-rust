@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{PendingAgentTurn, PendingCommandApproval, PendingPlan};
+use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, PendingPlan};
 
 pub const SESSION_VERSION: u64 = 1;
 
@@ -104,6 +104,133 @@ impl AgentEvent {
     pub fn tag(&self) -> EventTag {
         EventTag::parse(&self.kind)
     }
+
+    pub(crate) fn from_kind(event: &EventKind) -> Self {
+        let (kind, text, data) = match event {
+            EventKind::User { text } => ("user", text.clone(), serde_json::json!({})),
+            EventKind::Assistant { text } => ("assistant", text.clone(), serde_json::json!({})),
+            EventKind::AskUser { text } => ("ask_user", text.clone(), serde_json::json!({})),
+            EventKind::ToolCall {
+                tool_name,
+                arguments,
+            } => (
+                "tool_call",
+                tool_name.clone(),
+                serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
+            ),
+            EventKind::ToolFailure {
+                tool_name,
+                category,
+                error,
+            } => (
+                "tool_failure",
+                format!("{tool_name}: {error}"),
+                serde_json::json!({"tool_name": tool_name, "category": category}),
+            ),
+            EventKind::FinalToolCall {
+                tool_name,
+                arguments,
+            } => (
+                "final_tool_call",
+                tool_name.clone(),
+                serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
+            ),
+            EventKind::FileOperation(data) => (
+                "file_operation",
+                format!("{} {}", data.action, data.path),
+                serde_json::to_value(data).unwrap_or_default(),
+            ),
+            EventKind::Plan {
+                message,
+                tool_calls,
+            } => (
+                "plan",
+                message.clone(),
+                serde_json::json!({"message": message, "tool_calls": tool_calls}),
+            ),
+            EventKind::CommandApprovalRequested { tool_call, reason } => (
+                "command_approval_requested",
+                reason.clone(),
+                serde_json::json!({"tool_call": tool_call, "reason": reason}),
+            ),
+            EventKind::CommandApproved => {
+                ("command_approved", String::new(), serde_json::json!({}))
+            }
+            EventKind::CommandRejected => {
+                ("command_rejected", String::new(), serde_json::json!({}))
+            }
+            EventKind::Approve => ("approve", String::new(), serde_json::json!({})),
+            EventKind::Reject => ("reject", String::new(), serde_json::json!({})),
+            EventKind::Undo => ("undo", String::new(), serde_json::json!({})),
+            EventKind::Profile { name } => ("profile", name.clone(), serde_json::json!({})),
+            EventKind::Error { text } => ("error", text.clone(), serde_json::json!({})),
+            EventKind::Cancelled => ("cancelled", "Cancelled.".to_owned(), serde_json::json!({})),
+        };
+        Self {
+            kind: kind.to_owned(),
+            text,
+            data,
+            created_at: iso_now(),
+        }
+    }
+
+    /// Recover the typed runtime event while keeping unknown future v1 event
+    /// kinds readable through the persisted `AgentEvent` representation.
+    pub fn typed(&self) -> Option<EventKind> {
+        let string = |key: &str| self.data.get(key)?.as_str().map(str::to_owned);
+        match self.tag() {
+            EventTag::User => Some(EventKind::User {
+                text: self.text.clone(),
+            }),
+            EventTag::Assistant => Some(EventKind::Assistant {
+                text: self.text.clone(),
+            }),
+            EventTag::AskUser => Some(EventKind::AskUser {
+                text: self.text.clone(),
+            }),
+            EventTag::ToolCall => Some(EventKind::ToolCall {
+                tool_name: string("tool_name")?,
+                arguments: self.data.get("arguments")?.clone(),
+            }),
+            EventTag::FinalToolCall => Some(EventKind::FinalToolCall {
+                tool_name: string("tool_name")?,
+                arguments: self.data.get("arguments")?.clone(),
+            }),
+            EventTag::ToolFailure => {
+                let tool_name = string("tool_name")?;
+                let prefix = format!("{tool_name}: ");
+                Some(EventKind::ToolFailure {
+                    tool_name,
+                    category: string("category")?,
+                    error: self.text.strip_prefix(&prefix)?.to_owned(),
+                })
+            }
+            EventTag::FileOperation => serde_json::from_value(self.data.clone())
+                .ok()
+                .map(EventKind::FileOperation),
+            EventTag::Plan => Some(EventKind::Plan {
+                message: string("message").unwrap_or_else(|| self.text.clone()),
+                tool_calls: serde_json::from_value(self.data.get("tool_calls")?.clone()).ok()?,
+            }),
+            EventTag::CommandApprovalRequested => Some(EventKind::CommandApprovalRequested {
+                tool_call: serde_json::from_value(self.data.get("tool_call")?.clone()).ok()?,
+                reason: string("reason").unwrap_or_else(|| self.text.clone()),
+            }),
+            EventTag::CommandApproved => Some(EventKind::CommandApproved),
+            EventTag::CommandRejected => Some(EventKind::CommandRejected),
+            EventTag::Approve => Some(EventKind::Approve),
+            EventTag::Reject => Some(EventKind::Reject),
+            EventTag::Undo => Some(EventKind::Undo),
+            EventTag::Profile => Some(EventKind::Profile {
+                name: self.text.clone(),
+            }),
+            EventTag::Error => Some(EventKind::Error {
+                text: self.text.clone(),
+            }),
+            EventTag::Cancelled => Some(EventKind::Cancelled),
+            EventTag::Unknown => None,
+        }
+    }
 }
 
 /// An interactive agent session.
@@ -149,7 +276,8 @@ impl AgentSession {
         }
     }
 
-    pub fn record_event(&mut self, kind: &str, text: &str, data: serde_json::Value) {
+    #[cfg(test)]
+    fn record_event(&mut self, kind: &str, text: &str, data: serde_json::Value) {
         self.events.push(AgentEvent {
             kind: kind.to_owned(),
             text: text.to_owned(),
@@ -531,5 +659,25 @@ mod tests {
         assert_eq!(s.len(), 20); // "2026-07-08T19:39:00Z"
         assert_eq!(&s[10..11], "T");
         assert_eq!(&s[19..20], "Z");
+    }
+
+    #[test]
+    fn typed_events_round_trip_through_the_v1_wire_shape() {
+        let original = EventKind::ToolCall {
+            tool_name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path":"sample.srt"}),
+        };
+        let persisted = AgentEvent::from_kind(&original);
+        assert_eq!(persisted.kind, "tool_call");
+        assert_eq!(persisted.typed(), Some(original));
+
+        let future = AgentEvent {
+            kind: "future_event".to_owned(),
+            text: String::new(),
+            data: serde_json::json!({}),
+            created_at: iso_now(),
+        };
+        assert_eq!(future.tag(), EventTag::Unknown);
+        assert_eq!(future.typed(), None);
     }
 }
