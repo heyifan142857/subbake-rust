@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use subbake_core::error::{CoreError, CoreResult};
@@ -16,6 +16,7 @@ pub(super) struct ProtocolContinuation {
     system: Option<String>,
     pub(super) history: Vec<Value>,
     pub(super) call_ids: HashMap<String, Option<String>>,
+    pending_call_ids: HashSet<String>,
 }
 
 pub(super) fn start(format: ApiFormat, messages: &[ChatMessage]) -> ProtocolContinuation {
@@ -62,6 +63,7 @@ pub(super) fn start(format: ApiFormat, messages: &[ChatMessage]) -> ProtocolCont
         system,
         history,
         call_ids: HashMap::new(),
+        pending_call_ids: HashSet::new(),
     }
 }
 
@@ -69,13 +71,46 @@ pub(super) fn append_results(
     continuation: &mut ProtocolContinuation,
     results: &[ModelToolResult],
 ) -> CoreResult<()> {
+    let mut result_ids = HashSet::new();
     for result in results {
+        if !result_ids.insert(result.id.clone()) {
+            return Err(CoreError::DataInvariant(format!(
+                "native tool results contain duplicate call `{}`",
+                result.id
+            )));
+        }
         if !continuation.call_ids.contains_key(&result.id) {
             return Err(CoreError::DataInvariant(format!(
                 "native tool result references unknown call `{}`",
                 result.id
             )));
         }
+    }
+    if result_ids != continuation.pending_call_ids {
+        let mut missing = continuation
+            .pending_call_ids
+            .difference(&result_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut unexpected = result_ids
+            .difference(&continuation.pending_call_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        unexpected.sort();
+        return Err(CoreError::DataInvariant(format!(
+            "native tool results do not match the pending calls (missing: {}; unexpected: {})",
+            if missing.is_empty() {
+                "none".to_owned()
+            } else {
+                missing.join(", ")
+            },
+            if unexpected.is_empty() {
+                "none".to_owned()
+            } else {
+                unexpected.join(", ")
+            },
+        )));
     }
     match continuation.format {
         ApiFormat::OpenaiChat => {
@@ -142,6 +177,7 @@ pub(super) fn append_results(
                 .push(json!({"role":"user","parts":parts}));
         }
     }
+    continuation.pending_call_ids.clear();
     Ok(())
 }
 
@@ -189,6 +225,11 @@ pub(super) fn parse_response(
     body: &Value,
     continuation: &mut ProtocolContinuation,
 ) -> CoreResult<(Option<String>, Vec<ModelToolCall>)> {
+    if !continuation.pending_call_ids.is_empty() {
+        return Err(CoreError::DataInvariant(
+            "cannot parse a new native response while tool calls are unresolved".to_owned(),
+        ));
+    }
     let mut calls = Vec::new();
     let text = match format {
         ApiFormat::OpenaiChat => parse_openai_chat(body, continuation, &mut calls)?,
@@ -196,6 +237,14 @@ pub(super) fn parse_response(
         ApiFormat::AnthropicMessages => parse_anthropic(body, continuation, &mut calls)?,
         ApiFormat::GeminiGenerateContent => parse_gemini(body, continuation, &mut calls)?,
     };
+    for call in &calls {
+        if !continuation.pending_call_ids.insert(call.id.clone()) {
+            return Err(CoreError::InvalidBackendResponse(format!(
+                "native response contains duplicate tool call id `{}`",
+                call.id
+            )));
+        }
+    }
     Ok((text.filter(|value| !value.is_empty()), calls))
 }
 
@@ -572,5 +621,73 @@ fn parse_wire_arguments(value: &Value) -> CoreResult<Value> {
         })
     } else {
         Ok(value.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn continuation_with_two_calls() -> ProtocolContinuation {
+        let mut continuation = start(
+            ApiFormat::OpenaiChat,
+            &[ChatMessage {
+                role: "user".to_owned(),
+                content: "inspect".to_owned(),
+                cacheable: false,
+            }],
+        );
+        parse_response(
+            ApiFormat::OpenaiChat,
+            &json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"list_files","arguments":"{}"}},
+                {"id":"call_2","type":"function","function":{"name":"list_files","arguments":"{}"}}
+            ]}}]}),
+            &mut continuation,
+        )
+        .expect("parse calls");
+        continuation
+    }
+
+    fn result(id: &str) -> ModelToolResult {
+        ModelToolResult {
+            id: id.to_owned(),
+            name: "list_files".to_owned(),
+            output: "{}".to_owned(),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn native_continuation_requires_one_result_for_every_pending_call() {
+        let mut incomplete = continuation_with_two_calls();
+        let error = append_results(&mut incomplete, &[result("call_1")])
+            .expect_err("missing result must fail");
+        assert!(error.to_string().contains("missing: call_2"));
+
+        let mut duplicate = continuation_with_two_calls();
+        let error = append_results(&mut duplicate, &[result("call_1"), result("call_1")])
+            .expect_err("duplicate result must fail");
+        assert!(error.to_string().contains("duplicate call `call_1`"));
+
+        let mut complete = continuation_with_two_calls();
+        append_results(&mut complete, &[result("call_1"), result("call_2")])
+            .expect("complete results");
+        assert!(complete.pending_call_ids.is_empty());
+    }
+
+    #[test]
+    fn native_response_rejects_duplicate_call_ids() {
+        let mut continuation = start(ApiFormat::OpenaiChat, &[]);
+        let error = parse_response(
+            ApiFormat::OpenaiChat,
+            &json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
+                {"id":"same","type":"function","function":{"name":"list_files","arguments":"{}"}},
+                {"id":"same","type":"function","function":{"name":"search_files","arguments":"{}"}}
+            ]}}]}),
+            &mut continuation,
+        )
+        .expect_err("duplicate call ids must fail");
+        assert!(error.to_string().contains("duplicate tool call id `same`"));
     }
 }

@@ -204,7 +204,7 @@ impl SubBakeTui {
                     crate::session::EventTag::Plan => {
                         (MsgStyle::System, format!("Plan: {}", event.text))
                     }
-                    crate::session::EventTag::Error => {
+                    crate::session::EventTag::ToolFailure | crate::session::EventTag::Error => {
                         (MsgStyle::Error, format!("✖ {}", event.text))
                     }
                     crate::session::EventTag::Cancelled => {

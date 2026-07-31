@@ -108,7 +108,7 @@ bilingual_order = "target_first" # target_first 或 source_first
 preserve_source_container = false # false：原位更新容器；true：另存译后容器
 
 [defaults.agent]
-max_steps = 24 # 单次任务最多模型步骤，允许 1..=128
+max_steps = 64 # 单次任务最多模型步骤，允许 1..=128
 auto_approve_commands = false # true：自动批准命令，但不会绕过硬性拒绝或 Plan 审批
 
 [defaults.translation]

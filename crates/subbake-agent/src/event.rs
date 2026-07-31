@@ -37,6 +37,11 @@ pub enum EventKind {
         tool_name: String,
         arguments: serde_json::Value,
     },
+    ToolFailure {
+        tool_name: String,
+        category: String,
+        error: String,
+    },
     FinalToolCall {
         tool_name: String,
         arguments: serde_json::Value,
@@ -84,8 +89,17 @@ pub struct PendingCommandApproval {
     pub tool_call: ToolCallDraft,
     #[serde(default)]
     pub call_id: String,
+    #[serde(default)]
+    pub remaining_tool_calls: Vec<PendingToolCall>,
     pub reason: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingToolCall {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
 }
 
 /// Provider-neutral state for an agent turn paused at an approval boundary.
@@ -107,6 +121,8 @@ pub struct PendingAgentTurn {
     #[serde(default)]
     pub failure_counts: Vec<PendingFailureCount>,
     #[serde(default)]
+    pub aggregate_failure_counts: Vec<PendingAggregateFailureCount>,
+    #[serde(default)]
     pub steps_used: usize,
     #[serde(default)]
     pub legacy_mode: bool,
@@ -124,6 +140,13 @@ pub struct PendingToolExchange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingFailureCount {
     pub tool_call: ToolCallDraft,
+    pub category: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingAggregateFailureCount {
+    pub tool_name: String,
     pub category: String,
     pub count: usize,
 }

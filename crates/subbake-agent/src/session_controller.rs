@@ -81,6 +81,15 @@ fn serialize_event(kind: &EventKind) -> (String, String, serde_json::Value) {
             tool_name.clone(),
             serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
         ),
+        EventKind::ToolFailure {
+            tool_name,
+            category,
+            error,
+        } => (
+            "tool_failure".into(),
+            format!("{tool_name}: {error}"),
+            serde_json::json!({"tool_name": tool_name, "category": category}),
+        ),
         EventKind::FinalToolCall {
             tool_name,
             arguments,

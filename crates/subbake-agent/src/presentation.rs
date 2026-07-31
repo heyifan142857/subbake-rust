@@ -113,7 +113,7 @@ impl ConversationPresenter {
                     EventTag::User => "You",
                     EventTag::Assistant | EventTag::AskUser => "Agent",
                     EventTag::ToolCall => "Tool",
-                    EventTag::Error => "Error",
+                    EventTag::ToolFailure | EventTag::Error => "Error",
                     _ => return None,
                 };
                 Some(format!("{label}: {}", event.text))
@@ -157,7 +157,7 @@ impl ConversationPresenter {
                     EventTag::ToolCall => "Tool",
                     EventTag::FileOperation => "File operation",
                     EventTag::Plan => "Plan",
-                    EventTag::Error => "Error",
+                    EventTag::ToolFailure | EventTag::Error => "Error",
                     _ => return None,
                 };
                 let text = if event.text.trim().is_empty() {

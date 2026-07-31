@@ -86,6 +86,44 @@ impl AgentError {
             _ => false,
         }
     }
+
+    pub(crate) fn tool_failure_category(&self) -> String {
+        match self {
+            Self::Cancelled => "cancelled".to_owned(),
+            Self::InvalidInput { .. } => "invalid_input".to_owned(),
+            Self::InvalidDecision { .. } => "invalid_decision".to_owned(),
+            Self::ToolArguments { .. } => "invalid_arguments".to_owned(),
+            Self::ToolPolicy { .. } => "tool_policy".to_owned(),
+            Self::InvalidState { .. } => "invalid_state".to_owned(),
+            Self::FileGuard(_) => "file_guard".to_owned(),
+            Self::SessionStorage { .. } | Self::SessionData { .. } => "session_storage".to_owned(),
+            Self::Adapter(source) => adapter_failure_category(source),
+            Self::AdapterContext { source, .. } => adapter_failure_category(source),
+            Self::Core(_) => "core".to_owned(),
+            Self::WorkerStopped | Self::WorkerPanicked => "worker".to_owned(),
+            Self::Reported { source, .. } => source.tool_failure_category(),
+            Self::Io { .. } => "external_io".to_owned(),
+        }
+    }
+}
+
+fn adapter_failure_category(error: &AdapterError) -> String {
+    match error {
+        AdapterError::Cancelled => "cancelled".to_owned(),
+        AdapterError::InvalidInput { .. } => "invalid_input".to_owned(),
+        AdapterError::Configuration(_) | AdapterError::ConfigurationFile { .. } => {
+            "configuration".to_owned()
+        }
+        AdapterError::Authentication { .. } => "authentication".to_owned(),
+        AdapterError::RateLimited { .. } => "rate_limited".to_owned(),
+        AdapterError::Timeout { .. } => "timeout".to_owned(),
+        AdapterError::Transport { .. } => "transport".to_owned(),
+        AdapterError::ServiceRejected { .. } => "service_rejected".to_owned(),
+        AdapterError::ExternalIo { .. } => "external_io".to_owned(),
+        AdapterError::Serialization { .. } => "serialization".to_owned(),
+        AdapterError::ChildProcess { program, .. } => format!("child_process:{program}"),
+        AdapterError::Core(_) | AdapterError::CoreContext { .. } => "core".to_owned(),
+    }
 }
 
 impl From<CoreError> for AgentError {

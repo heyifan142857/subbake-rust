@@ -387,7 +387,7 @@ impl Default for ResolvedSettings {
             },
             reviewer_backend: None,
             agent: AgentDomainSettings {
-                max_steps: 24,
+                max_steps: 64,
                 auto_approve_commands: false,
             },
             translation: TranslationDomainSettings {
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(settings.backend.id, "openai");
         assert_eq!(settings.backend.model, "gpt-test");
         assert_eq!(settings.translation.batch_size, 12);
-        assert_eq!(settings.agent.max_steps, 24);
+        assert_eq!(settings.agent.max_steps, 64);
         assert!(!settings.agent.auto_approve_commands);
         assert!(settings.output.bilingual);
         assert_eq!(settings.output.bilingual_font_scale, 0.9);

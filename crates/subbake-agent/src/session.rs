@@ -30,6 +30,7 @@ pub enum EventTag {
     Assistant,
     AskUser,
     ToolCall,
+    ToolFailure,
     FinalToolCall,
     FileOperation,
     Plan,
@@ -52,6 +53,7 @@ impl EventTag {
             "assistant" => Self::Assistant,
             "ask_user" => Self::AskUser,
             "tool_call" => Self::ToolCall,
+            "tool_failure" => Self::ToolFailure,
             "final_tool_call" => Self::FinalToolCall,
             "file_operation" => Self::FileOperation,
             "plan" => Self::Plan,
@@ -429,6 +431,7 @@ mod tests {
                 arguments: serde_json::json!({"command":"printf hello"}),
             },
             call_id: "old-call".to_owned(),
+            remaining_tool_calls: Vec::new(),
             reason: "legacy approval".to_owned(),
             created_at: "2026-07-21T00:00:00Z".to_owned(),
         });
@@ -437,16 +440,27 @@ mod tests {
             .as_object_mut()
             .expect("pending approval")
             .remove("call_id");
+        value["pending_command_approval"]
+            .as_object_mut()
+            .expect("pending approval")
+            .remove("remaining_tool_calls");
 
         let loaded: AgentSession = serde_json::from_value(value).expect("read legacy approval");
 
-        assert_eq!(
-            loaded
-                .pending_command_approval
-                .expect("pending approval")
-                .call_id,
-            ""
-        );
+        let pending = loaded.pending_command_approval.expect("pending approval");
+        assert_eq!(pending.call_id, "");
+        assert!(pending.remaining_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reads_legacy_pending_turn_without_aggregate_failure_counts() {
+        let pending: crate::event::PendingAgentTurn = serde_json::from_value(serde_json::json!({
+            "input":"continue",
+            "effective_defaults":"defaults"
+        }))
+        .expect("read legacy pending turn");
+
+        assert!(pending.aggregate_failure_counts.is_empty());
     }
 
     #[test]

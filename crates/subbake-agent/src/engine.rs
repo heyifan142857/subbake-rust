@@ -6,7 +6,7 @@
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
 use std::path::PathBuf;
-use subbake_core::ports::ToolContinuation;
+use subbake_core::ports::{ModelToolResult, ToolContinuation};
 use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
@@ -156,8 +156,13 @@ pub struct AgentEngine {
     cancellation: CancellationToken,
     pub(crate) operation_guard: CancellationGuard,
     pub(crate) progress: Option<SharedProgress>,
-    pub(crate) pending_native_continuation: Option<ToolContinuation>,
+    pub(crate) pending_native_continuation: Option<PendingNativeContinuation>,
     pub(crate) runtime_policy: AgentRuntimePolicy,
+}
+
+pub(crate) struct PendingNativeContinuation {
+    pub(crate) continuation: ToolContinuation,
+    pub(crate) results: Vec<ModelToolResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +337,7 @@ impl AgentEngine {
         &mut self,
         tool_call: ToolCallDraft,
         call_id: String,
+        remaining_tool_calls: Vec<crate::event::PendingToolCall>,
         reason: String,
         turn: PendingAgentTurn,
     ) -> AgentResult<()> {
@@ -347,6 +353,7 @@ impl AgentEngine {
         session.pending_command_approval = Some(PendingCommandApproval {
             tool_call: tool_call.clone(),
             call_id,
+            remaining_tool_calls,
             reason: reason.clone(),
             created_at: crate::session::iso_now(),
         });
@@ -699,6 +706,7 @@ mod error_persistence_tests {
                 arguments: serde_json::json!({"command":"printf hello"}),
             },
             call_id: String::new(),
+            remaining_tool_calls: Vec::new(),
             reason: "unknown command".to_owned(),
             created_at: crate::session::iso_now(),
         });

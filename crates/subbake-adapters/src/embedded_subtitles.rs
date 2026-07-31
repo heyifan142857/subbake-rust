@@ -848,6 +848,8 @@ fn embed_subtitle_args(
         "-v".into(),
         "error".into(),
         "-y".into(),
+        "-fflags".into(),
+        "+genpts".into(),
         "-i".into(),
         request.input_path.as_os_str().to_owned(),
         "-i".into(),
@@ -896,32 +898,7 @@ fn remux_without_streams(
     container_kind: SubtitleContainerKind,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
-    let mut args = vec![
-        OsString::from("-nostdin"),
-        "-hide_banner".into(),
-        "-v".into(),
-        "error".into(),
-        "-y".into(),
-        "-i".into(),
-        input_path.as_os_str().to_owned(),
-        "-map".into(),
-        "0".into(),
-    ];
-    for stream_index in removed_streams {
-        args.push("-map".into());
-        args.push(format!("-0:{stream_index}").into());
-    }
-    args.extend([
-        "-map_metadata".into(),
-        "0".into(),
-        "-map_chapters".into(),
-        "0".into(),
-        "-c".into(),
-        "copy".into(),
-        "-f".into(),
-        container_kind.muxer().into(),
-        output_path.as_os_str().to_owned(),
-    ]);
+    let args = remux_without_streams_args(input_path, output_path, removed_streams, container_kind);
     let output = run_command_cancellable(
         Command::new(ffmpeg).args(args),
         cancellation,
@@ -942,6 +919,43 @@ fn remux_without_streams(
         });
     }
     Ok(())
+}
+
+fn remux_without_streams_args(
+    input_path: &Path,
+    output_path: &Path,
+    removed_streams: &[usize],
+    container_kind: SubtitleContainerKind,
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-nostdin"),
+        "-hide_banner".into(),
+        "-v".into(),
+        "error".into(),
+        "-y".into(),
+        "-fflags".into(),
+        "+genpts".into(),
+        "-i".into(),
+        input_path.as_os_str().to_owned(),
+        "-map".into(),
+        "0".into(),
+    ];
+    for stream_index in removed_streams {
+        args.push("-map".into());
+        args.push(format!("-0:{stream_index}").into());
+    }
+    args.extend([
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+        "-c".into(),
+        "copy".into(),
+        "-f".into(),
+        container_kind.muxer().into(),
+        output_path.as_os_str().to_owned(),
+    ]);
+    args
 }
 
 fn matroska_language(language: &str) -> &str {
@@ -1245,6 +1259,44 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg == "-metadata:s:s:2"));
         assert!(rendered.iter().any(|arg| arg == "-disposition:s:2"));
         assert!(rendered.iter().any(|arg| arg == "language=chi"));
+        let input_index = rendered
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("input option");
+        assert_eq!(
+            rendered
+                .get(input_index - 2)
+                .map(|argument| argument.as_ref()),
+            Some("-fflags")
+        );
+        assert_eq!(
+            rendered
+                .get(input_index - 1)
+                .map(|argument| argument.as_ref()),
+            Some("+genpts")
+        );
+    }
+
+    #[test]
+    fn subtitle_removal_generates_missing_timestamps_before_input() {
+        let rendered = remux_without_streams_args(
+            Path::new("input.mkv"),
+            Path::new("output.mkv"),
+            &[4],
+            SubtitleContainerKind::Matroska,
+        )
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        let input_index = rendered
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("input option");
+
+        assert_eq!(
+            &rendered[input_index - 2..input_index],
+            ["-fflags", "+genpts"]
+        );
     }
 
     #[test]
