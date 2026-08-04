@@ -905,6 +905,11 @@ fn embed_subtitle_args(
             .container_kind
             .subtitle_codec(request.subtitle_format)
             .into(),
+    ]);
+    if request.container_kind == SubtitleContainerKind::Matroska {
+        args.extend(["-max_interleave_delta".into(), "0".into()]);
+    }
+    args.extend([
         "-f".into(),
         request.container_kind.muxer().into(),
         request.output_path.as_os_str().to_owned(),
@@ -1315,6 +1320,41 @@ mod tests {
                 .get(input_index - 1)
                 .map(|argument| argument.as_ref()),
             Some("+genpts")
+        );
+    }
+
+    #[test]
+    fn matroska_embedding_waits_for_correct_subtitle_interleaving() {
+        let streams = [];
+        let matroska_request = EmbedSubtitleRequest {
+            input_path: Path::new("input.mkv"),
+            streams: &streams,
+            subtitle_path: Path::new("translated.srt"),
+            output_path: Path::new("output.mkv"),
+            target_language: "zh-Hans",
+            container_kind: SubtitleContainerKind::Matroska,
+            subtitle_format: SubtitlePayloadFormat::Srt,
+        };
+        let mp4_request = EmbedSubtitleRequest {
+            input_path: Path::new("input.mp4"),
+            streams: &streams,
+            subtitle_path: Path::new("translated.srt"),
+            output_path: Path::new("output.mp4"),
+            target_language: "zh-Hans",
+            container_kind: SubtitleContainerKind::Mp4,
+            subtitle_format: SubtitlePayloadFormat::Srt,
+        };
+
+        let matroska =
+            embed_subtitle_args(&matroska_request, 0, "zh-Hans (SubBake translation)", &[]);
+        let mp4 = embed_subtitle_args(&mp4_request, 0, "zh-Hans (SubBake translation)", &[]);
+
+        assert!(matroska.windows(2).any(|arguments| {
+            arguments[0] == OsStr::new("-max_interleave_delta") && arguments[1] == OsStr::new("0")
+        }));
+        assert!(
+            !mp4.iter()
+                .any(|argument| argument == OsStr::new("-max_interleave_delta"))
         );
     }
 
