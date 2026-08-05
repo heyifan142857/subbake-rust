@@ -21,7 +21,7 @@ SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写 CLI，也�
 
 ## 安装
 
-需要 Rust 2024 edition 对应的较新 Rust 工具链：
+需要较新的 Rust 工具链；处理音视频时还需安装 FFmpeg。
 
 ```bash
 git clone https://github.com/heyifan142857/subbake-rust.git
@@ -29,236 +29,75 @@ cd subbake-rust
 cargo install --path crates/subbake-cli
 ```
 
-安装后使用 `sbake` 命令。音视频处理还需要 FFmpeg；本地转写可通过内置命令管理 whisper.cpp：
+如需本地转写，再安装 whisper.cpp 和模型：
 
 ```bash
 sbake whisper install
-sbake whisper versions
-sbake whisper model list
 sbake whisper model base
 ```
 
-`whisper install` 默认安装可移植的 CPU 构建；可通过
-`--variant cuda|metal|vulkan|openblas` 显式选择加速源码构建。Whisper 运行路径默认位于
-`.subbake/whisper`；配置 `storage.runtime_dir` 后改为 `<runtime_dir>/whisper`，也可用
-`storage.whisper_binary_path` 和 `storage.whisper_models_dir` 分别覆盖。
-
-`whisper versions` 会从 whisper.cpp 的 GitHub Releases 拉取版本列表，并标出当前经过
-SubBake 固定校验、可安装的版本。`whisper model list` 会从官方 Hugging Face 仓库拉取
-模型目录，同时标记已经下载到本地的模型。安装 CLI 和模型后即可转写：
+默认安装 CPU 版本，也可用 `--variant cuda|metal|vulkan|openblas` 选择加速构建。安装后即可运行：
 
 ```bash
 sbake transcribe movie.mp4 --model base --language Auto
 sbake pipeline movie.mp4 --transcribe-model base --target-language zh-Hans
 ```
 
-也可以直接启动 `sbake`，对 Agent 说“安装 Whisper”。Agent 会先请求批准安装
-whisper-cli，安装完成后拉取模型列表并让你选择；只有你明确选择模型后才会继续下载。
-
-转写未指定模型时：唯一已安装模型会自动使用；多个模型中存在完整的 `small` 时优先
-使用它。Agent 在没有完整 `small` 时按 `small* > base* > medium* >
-large-v3-turbo* > large-v3* > large-v2* > large-v1* > tiny*` 自动选择，并明确
-报告所选模型；同一家族按多语言完整版、q8、q5、英文专用版排序。CLI 遇到无法唯一
-决定的多个模型时会列出候选并要求 `--model`。可用
-`[defaults.transcription].model` 固定首选模型。
-
-转写前，除 WAV 外的 MP3、M4A、FLAC、OGG 和视频输入都会先通过 FFmpeg 统一转换为
-16 kHz、单声道、16-bit PCM WAV。`PREPARE_AUDIO` 会按媒体时长显示转换进度；中间
-WAV 存放在运行目录的唯一临时目录中，并在转写成功、失败或取消后自动清理。
-Whisper 推理默认使用可用并行度的一半（最多 16 个线程），并通过 `TRANSCRIBE`
-进度条持续报告 whisper-cli 的实际完成百分比。
-
 ## 配置
 
-SubBake 会依次查找 `~/.config/subbake/config.toml` 和项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
+SubBake 会读取 `~/.config/subbake/config.toml` 或项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
 
 ```toml
 version = 2
-default_profile = "turbo"
+default_profile = "default"
 
-[backends.fast]
+[backends.openai]
 id = "openai"
 model = "gpt-4.1-mini"
 api_format = "openai_chat"
 api_key_env = "OPENAI_API_KEY"
 timeout_seconds = 120
 
-[backends.reviewer]
-id = "anthropic"
-model = "claude-sonnet-4-5"
-api_format = "anthropic_messages"
-api_key_env = "ANTHROPIC_API_KEY"
-timeout_seconds = 120
+[profiles.default]
+translator = "openai"
 
-[profiles.turbo]
-translator = "fast"
-
-[profiles.turbo.translation]
+[profiles.default.translation]
 mode = "turbo"
 source_language = "English"
 target_language = "Simplified Chinese"
-
-[profiles.cinema]
-translator = "fast"
-reviewer = "reviewer"
-
-[profiles.cinema.translation]
-mode = "cinema"
-
-[defaults.output]
-bilingual = true
-bilingual_order = "target_first" # target_first 或 source_first
-preserve_source_container = false # false：原位更新容器；true：另存译后容器
-
-[defaults.agent]
-max_steps = 64 # 单次任务最多模型步骤，允许 1..=128
-auto_approve_commands = false # true：自动批准命令，但不会绕过硬性拒绝或 Plan 审批
-
-[defaults.translation]
-preserve_names = false # false：默认强制音译人名；true：保留源文拼写
-# max_requests = 100 # 可选：调用前限制 provider 请求数
-# max_tokens = 200000 # 可选：达到累计 token 后不再开始下一批请求
-
-[defaults.transcription]
-model = "small-q8_0" # 可选；未设置时根据已安装模型选择
-
 ```
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-sbake provider check --profile openai
+sbake provider check --profile default
 ```
 
-也可以使用 `--config` 指定配置文件，或使用 `--profile` 切换完整运行档案。
-配置格式当前版本为 `2`，并兼容读取既有版本 `1`。v2 将可复用的 provider
-backend 与运行 profile 分开，Cinema profile 可选配置独立 reviewer；未配置时会
-回退到 translator 并在结果中标出。`translation.mode` 可选 `economy`、`turbo`
-或 `cinema`，高级批次、并发、审校设置仍可覆盖模式默认值。
+使用 `--config` 指定其他配置文件，使用 `--profile` 切换 profile。翻译模式可选
+`economy`、`turbo` 或 `cinema`。
 
 ## 使用
 
-直接启动交互式 Agent：
-
 ```bash
+# 交互式 Agent
 sbake
-```
 
-翻译单个字幕：
-
-```bash
-sbake translate episode.srt
-
-# 最小 token、最低延迟或最高质量
-sbake translate episode.srt --mode economy
-sbake translate episode.srt --mode turbo
-sbake translate episode.srt --mode cinema --profile cinema
-```
-
-容器中有多条文本字幕轨时，可绕过自动语言/default 选择并使用 ffprobe 的全局流索引：
-
-```bash
+# 翻译字幕、文本文件或媒体中的文本字幕轨
+sbake translate episode.srt --target-lang Chinese
 sbake translate movie.mkv --subtitle-stream 7 --target-lang Chinese
-```
 
-Cinema 默认让每个翻译批次返回术语增量，并在本地按字幕顺序归并人物、组织、地点等
-专名；同一人物的全名、姓氏和昵称会保留各自的自然译法。Turbo 默认使用不增加
-模型请求的轻量人名标记，由 SubBake 按字幕顺序接受首个译名并在本地统一。更全面
-的在线术语在 Turbo 和 Economy 中仍默认关闭；可用 `--online-terminology` 显式开启，
-或用 `--no-online-terminology` 显式关闭。
-
-MKV、MP4/M4V/MOV 或 WebM 含有文本字幕轨时，可以直接翻译并追加译文轨。
-默认通过同目录临时文件安全重封装，再原子替换源容器，因此完成后不会额外保留一份
-完整媒体副本；原有视频、音频及其他流仍会复制到更新后的容器：
-
-```bash
-sbake translate movie.mkv --target-lang Chinese
-```
-
-如需保留源容器，可在配置中设置 `preserve_source_container = true`，或单次使用
-`--preserve-source-container`。默认会把识别到的人名音译为目标语言文字；设置
-`preserve_names = true` 或使用 `--preserve-names` 可保留 Alice 这类源文拼写，同时禁用
-Turbo 的轻量人名标记。
-
-`translate` 不会对没有文本字幕轨的媒体回退到语音转写；这类输入仍使用
-`sbake pipeline`。位图字幕（PGS/DVD/DVB）当前也不会自动 OCR。
-
-提交可等待的异步翻译（`overnight`）：
-
-```bash
-# OpenAI Batch；仅支持 openai_chat / openai_responses，且必须是 Economy 模式
-sbake overnight submit episode.srt --mode economy --profile openai
-# 输出的 Manifest 路径是后续操作的唯一凭据（不含 API key）
-sbake overnight status .subbake/.../overnight/batch_xxx.json --profile openai
-sbake overnight collect .subbake/.../overnight/batch_xxx.json --profile openai
-```
-
-`collect` 会重新校验输入字幕的签名，避免把延迟完成的结果写入已经修改过的文件。
-
-离线对照译文回归：
-
-```bash
-sbake evaluate candidate.zh-Hans.translated.srt reference.srt --json
-```
-
-该命令给出可复现的 chrF 与机械 MQM 结构发现（序号、数字、格式、空译文），用于
-版本回归比较；语义与风格仍应由人工抽检。
-
-批量翻译目录：
-
-```bash
+# 批量翻译
 sbake batch ./subtitles
-```
 
-批处理默认隔离单文件失败并继续，且在 `.subbake/batch/`（配置 runtime 目录时位于其
-`batch/` 子目录）逐项原子更新版本化 JSON 清单。使用 `--fail-fast` 可在首个文件失败时
-停止。
-
-转写音视频：
-
-```bash
+# 转写，或转写后翻译
 sbake transcribe episode.mp4
-```
-
-转写默认保守移除空白/静音标记和第三次起的连续完全重复片段，并报告清理数量；使用
-`--no-filter-hallucinations` 可关闭。
-
-先转写，再翻译：
-
-```bash
 sbake pipeline episode.mp4
-```
 
-恢复最近一次 Agent 会话：
-
-```bash
+# 恢复最近的 Agent 会话
 sbake resume
 ```
 
-无需参考译文即可检查空文本、时间轴、重叠、阅读速度、行长和重复片段：
-
-```bash
-sbake qa episode.srt
-sbake qa episode.srt --json --fail-on warning
-```
-
-术语表与翻译记忆可使用版本化 JSON bundle 管理；命令接受与翻译相同的 profile、语言
-和 runtime 选项：
-
-```bash
-sbake memory inspect episode.srt
-sbake memory export episode.srt memory.json
-sbake memory import episode.srt memory.json
-sbake memory prune episode.srt --yes
-```
-
-查看完整命令：
-
-```bash
-sbake --help
-```
-
-`translate` 只处理字幕、文本文件或上述容器中的文本字幕轨。其他音视频输入请明确
-使用 `transcribe` 或 `pipeline`。
+`translate` 不会自动转写音视频；没有文本字幕轨时请使用 `pipeline`。完整选项请运行
+`sbake --help` 或 `sbake <COMMAND> --help`。
 
 ## 开发
 
@@ -267,11 +106,6 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-
-## TODO
-
-- 完善 Turbo 边翻译边生成、消费并按字幕顺序归并术语对照表的正确性，再评估恢复默认开启。
-- 为 whisper.cpp 转写增加静音、音乐和低置信度区间的重复幻觉检测与过滤。
 
 ## License
 
