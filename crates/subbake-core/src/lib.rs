@@ -34,9 +34,9 @@ pub use evaluation::{EvaluationReport, MqmCounts, evaluate};
 pub use memory::ContextMemory;
 pub use ports::{
     BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,
-    GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport, ResponseContract,
-    ToolChoice, ToolConfiguration, ToolContinuation, ToolDefinition, TranscriberBackend,
-    TranscriptionFormat,
+    GenerationResponse, ModelToolCall, ModelToolResult, NativeToolSupport, ReasoningPolicy,
+    ResponseContract, ToolChoice, ToolConfiguration, ToolContinuation, ToolDefinition,
+    TranscriberBackend, TranscriptionFormat,
 };
 pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,

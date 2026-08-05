@@ -1212,6 +1212,10 @@ mod tests {
             cancellation: &subbake_core::CancellationGuard,
         ) -> Result<GenerationResponse, LlmCallError> {
             cancellation.check().map_err(LlmCallError::from)?;
+            assert_eq!(
+                request.reasoning,
+                subbake_core::ReasoningPolicy::ProviderDefault
+            );
             let GenerationInput::Messages(messages) = request.input else {
                 return Err(LlmCallError::ContinuationMismatch(
                     "json test backend cannot continue".to_owned(),
@@ -1257,6 +1261,10 @@ mod tests {
             cancellation: &subbake_core::CancellationGuard,
         ) -> Result<GenerationResponse, LlmCallError> {
             cancellation.check().map_err(LlmCallError::from)?;
+            assert_eq!(
+                request.reasoning,
+                subbake_core::ReasoningPolicy::ProviderDefault
+            );
             self.definitions.push(
                 request
                     .tools

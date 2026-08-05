@@ -10,7 +10,8 @@ use subbake_core::entities::{BatchTranslationResult, GlossaryEntry, TranslationL
 use subbake_core::error::{CoreError, CoreResult, LlmCallError};
 use subbake_core::ports::{
     BatchExecutionOptions, ChatMessage, GenerationContent, GenerationInput, GenerationRequest,
-    GenerationResponse, LlmBackend, NativeToolSupport, ResponseContract, ToolContinuation,
+    GenerationResponse, LlmBackend, NativeToolSupport, ReasoningPolicy, ResponseContract,
+    ToolContinuation,
 };
 use tokio::runtime::Runtime;
 
@@ -25,7 +26,9 @@ use native::{
     parse_response as parse_native_response, request_body as native_request_body,
     start as native_start,
 };
-use protocols::{authenticate, endpoint, request_body, response_text, usage};
+use protocols::{
+    apply_reasoning_policy, authenticate, endpoint, request_body, response_text, usage,
+};
 #[cfg(test)]
 use transport::native_tools_unsupported;
 use transport::{await_http, classify_status_error, client, send_json};
@@ -358,8 +361,15 @@ impl ProtocolAdapter {
     fn authenticated(&self, request: RequestBuilder) -> RequestBuilder {
         authenticate(self.format, &self.config, &self.key, request)
     }
-    fn body(&self, messages: &[ChatMessage], contract: ResponseContract) -> Value {
-        request_body(self.format, &self.config.model, messages, contract)
+    fn body(
+        &self,
+        messages: &[ChatMessage],
+        contract: ResponseContract,
+        reasoning: ReasoningPolicy,
+    ) -> Value {
+        let mut body = request_body(self.format, &self.config.model, messages, contract);
+        apply_reasoning_policy(self.format, &self.config, reasoning, &mut body);
+        body
     }
 
     async fn send_payload(
@@ -459,9 +469,10 @@ impl ProtocolAdapter {
         &self,
         messages: &[ChatMessage],
         contract: ResponseContract,
+        reasoning: ReasoningPolicy,
         cancel: &CancellationGuard,
     ) -> Result<GenerationResponse, LlmCallError> {
-        let payload = self.body(messages, contract);
+        let payload = self.body(messages, contract, reasoning);
         let body = self.send_payload(&payload, cancel, false).await?;
         let text = self
             .content(&body)
@@ -539,11 +550,14 @@ impl LlmBackend for ProtocolAdapter {
             }
             return result;
         }
+        let reasoning = request.reasoning;
         match request.input {
-            GenerationInput::Messages(messages) => {
-                self.runtime
-                    .block_on(self.run(&messages, request.response_contract, cancellation))
-            }
+            GenerationInput::Messages(messages) => self.runtime.block_on(self.run(
+                &messages,
+                request.response_contract,
+                reasoning,
+                cancellation,
+            )),
             GenerationInput::Continue { .. } => Err(LlmCallError::ContinuationMismatch(
                 "continuation request is missing native tool configuration".to_owned(),
             )),
@@ -575,10 +589,16 @@ impl LlmBackend for ProtocolAdapter {
                     let result = if request.tools.is_some() {
                         adapter.run_native(request, &cancellation).await
                     } else {
+                        let reasoning = request.reasoning;
                         match request.input {
                             GenerationInput::Messages(messages) => {
                                 adapter
-                                    .run(&messages, request.response_contract, &cancellation)
+                                    .run(
+                                        &messages,
+                                        request.response_contract,
+                                        reasoning,
+                                        &cancellation,
+                                    )
                                     .await
                             }
                             GenerationInput::Continue { .. } => {
@@ -715,12 +735,14 @@ fn parse_translation_line(v: &Value, index: usize) -> CoreResult<TranslationLine
 mod tests {
     use serde_json::json;
     use subbake_core::error::LlmCallError;
-    use subbake_core::ports::{ModelToolResult, ResponseContract, ToolChoice, ToolDefinition};
+    use subbake_core::ports::{
+        ModelToolResult, ReasoningPolicy, ResponseContract, ToolChoice, ToolDefinition,
+    };
 
     use super::{
-        ApiFormat, append_native_results, apply_response_contract, classify_status_error,
-        native_request_body, native_start, native_tools_unsupported, parse_native_response,
-        parse_translation_payload,
+        ApiFormat, BackendConfig, append_native_results, apply_reasoning_policy,
+        apply_response_contract, classify_status_error, native_request_body, native_start,
+        native_tools_unsupported, parse_native_response, parse_translation_payload,
     };
 
     fn tool() -> ToolDefinition {
@@ -788,6 +810,55 @@ mod tests {
         let mut text = json!({"model": "x"});
         apply_response_contract(ApiFormat::OpenaiChat, ResponseContract::Text, &mut text);
         assert!(text.get("response_format").is_none());
+    }
+
+    #[test]
+    fn deepseek_structured_requests_disable_thinking_without_changing_agent_defaults() {
+        let mut config = BackendConfig::new("deepseek", "deepseek-v4-flash");
+        config.api_format = Some(ApiFormat::AnthropicMessages);
+
+        let mut structured = json!({"model": config.model});
+        apply_reasoning_policy(
+            ApiFormat::AnthropicMessages,
+            &config,
+            ReasoningPolicy::Disabled,
+            &mut structured,
+        );
+        assert_eq!(structured["thinking"]["type"], "disabled");
+
+        let mut openai_chat = json!({"model": config.model});
+        apply_reasoning_policy(
+            ApiFormat::OpenaiChat,
+            &config,
+            ReasoningPolicy::Disabled,
+            &mut openai_chat,
+        );
+        assert_eq!(openai_chat["thinking"]["type"], "disabled");
+
+        let mut agent = json!({"model": config.model});
+        apply_reasoning_policy(
+            ApiFormat::AnthropicMessages,
+            &config,
+            ReasoningPolicy::ProviderDefault,
+            &mut agent,
+        );
+        assert!(agent.get("thinking").is_none());
+    }
+
+    #[test]
+    fn reasoning_policy_does_not_add_deepseek_fields_to_other_providers() {
+        let mut config = BackendConfig::new("anthropic", "claude-sonnet");
+        config.api_format = Some(ApiFormat::AnthropicMessages);
+        let mut body = json!({"model": config.model});
+
+        apply_reasoning_policy(
+            ApiFormat::AnthropicMessages,
+            &config,
+            ReasoningPolicy::Disabled,
+            &mut body,
+        );
+
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

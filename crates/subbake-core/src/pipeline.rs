@@ -129,7 +129,7 @@ where
         let result = self
             .backend
             .execute(
-                GenerationRequest::json(messages.to_vec()),
+                GenerationRequest::json(messages.to_vec()).without_reasoning(),
                 &self.cancellation,
             )
             .map_err(CoreError::from)?
@@ -149,7 +149,7 @@ where
             .as_mut()
             .unwrap_or(&mut self.backend)
             .execute(
-                GenerationRequest::json(messages.to_vec()),
+                GenerationRequest::json(messages.to_vec()).without_reasoning(),
                 &self.cancellation,
             )
             .map_err(CoreError::from)?
@@ -688,7 +688,9 @@ where
         }
         let requests = pending
             .iter()
-            .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
+            .map(|(_, _, _, messages)| {
+                GenerationRequest::json(messages.clone()).without_reasoning()
+            })
             .collect();
         self.reserve_requests(pending.len())?;
         let responses = self
@@ -1092,7 +1094,9 @@ where
         }
         let requests = pending
             .iter()
-            .map(|(_, _, _, messages)| GenerationRequest::json(messages.clone()))
+            .map(|(_, _, _, messages)| {
+                GenerationRequest::json(messages.clone()).without_reasoning()
+            })
             .collect();
         self.reserve_requests(pending.len())?;
         let responses = self
@@ -1725,6 +1729,39 @@ mod tests {
                 },
             ))
         }
+    }
+
+    struct NonThinkingBackend;
+
+    impl LlmBackend for NonThinkingBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "non-thinking"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            assert_eq!(request.reasoning, crate::ports::ReasoningPolicy::Disabled);
+            EchoBackend.execute(request, cancellation)
+        }
+    }
+
+    #[test]
+    fn translation_requests_disable_provider_reasoning() {
+        let mut options = PipelineOptions::new(PathBuf::from("reasoning.srt"));
+        options.terminology_preflight = false;
+        options.agent = false;
+        let mut pipeline = SubtitlePipeline::new(NonThinkingBackend, NoopDashboard, options);
+
+        pipeline
+            .run_document(&document("reasoning.srt", &["hello"]))
+            .expect("translate without provider reasoning");
     }
 
     #[test]

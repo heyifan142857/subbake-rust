@@ -57,6 +57,7 @@ pub struct BackendSettings {
     pub api_key_env: Option<String>,
     pub auth_header: Option<String>,
     pub auth_prefix: Option<String>,
+    pub timeout_seconds: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +127,7 @@ pub struct BackendOverrides {
     pub api_key_env: Option<String>,
     pub auth_header: Option<String>,
     pub auth_prefix: Option<String>,
+    pub timeout_seconds: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +219,7 @@ impl SettingsOverrides {
                 api_key_env: settings.backend.api_key_env.clone(),
                 auth_header: settings.backend.auth_header.clone(),
                 auth_prefix: settings.backend.auth_prefix.clone(),
+                timeout_seconds: Some(settings.backend.timeout_seconds),
             },
             reviewer_backend: settings.reviewer_backend.as_ref().map(backend_overrides),
             agent: AgentOverrides {
@@ -289,7 +292,8 @@ impl BackendOverrides {
             endpoint_url,
             api_key_env,
             auth_header,
-            auth_prefix
+            auth_prefix,
+            timeout_seconds
         );
     }
 }
@@ -347,6 +351,7 @@ fn backend_overrides(settings: &BackendSettings) -> BackendOverrides {
         api_key_env: settings.api_key_env.clone(),
         auth_header: settings.auth_header.clone(),
         auth_prefix: settings.auth_prefix.clone(),
+        timeout_seconds: Some(settings.timeout_seconds),
     }
 }
 
@@ -397,6 +402,7 @@ impl Default for ResolvedSettings {
                 api_key_env: None,
                 auth_header: None,
                 auth_prefix: None,
+                timeout_seconds: crate::llm_backends::default_timeout_seconds(),
             },
             reviewer_backend: None,
             agent: AgentDomainSettings {
@@ -454,6 +460,7 @@ impl ResolvedSettings {
             api_key_env,
             auth_header,
             auth_prefix,
+            timeout_seconds,
         } = overrides.backend;
         if let Some(value) = id {
             self.backend.id = value;
@@ -481,6 +488,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = auth_prefix {
             self.backend.auth_prefix = Some(value);
+        }
+        if let Some(value) = timeout_seconds {
+            self.backend.timeout_seconds = value;
         }
         if let Some(reviewer) = overrides.reviewer_backend {
             let mut settings = self
@@ -725,6 +735,7 @@ impl ResolvedSettings {
             endpoint_url: self.backend.endpoint_url.clone(),
             auth_header: self.backend.auth_header.clone(),
             auth_prefix: self.backend.auth_prefix.clone(),
+            timeout_seconds: self.backend.timeout_seconds,
         }
     }
 
@@ -828,6 +839,9 @@ fn apply_backend_overrides(settings: &mut BackendSettings, overrides: BackendOve
     if let Some(value) = overrides.auth_prefix {
         settings.auth_prefix = Some(value);
     }
+    if let Some(value) = overrides.timeout_seconds {
+        settings.timeout_seconds = value;
+    }
 }
 
 fn backend_config(settings: &BackendSettings) -> BackendConfig {
@@ -842,6 +856,7 @@ fn backend_config(settings: &BackendSettings) -> BackendConfig {
         endpoint_url: settings.endpoint_url.clone(),
         auth_header: settings.auth_header.clone(),
         auth_prefix: settings.auth_prefix.clone(),
+        timeout_seconds: settings.timeout_seconds,
     }
 }
 
@@ -900,6 +915,33 @@ mod tests {
         assert!(settings.output.bilingual);
         assert_eq!(settings.output.bilingual_font_scale, 0.9);
         assert_eq!(settings.storage.runtime_dir, Some(".runtime".into()));
+        assert_eq!(settings.backend.timeout_seconds, 120.0);
+    }
+
+    #[test]
+    fn backend_timeout_is_overridable_and_validated() {
+        let settings = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                backend: BackendOverrides {
+                    timeout_seconds: Some(300.0),
+                    ..BackendOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect("valid timeout");
+        assert_eq!(settings.backend.timeout_seconds, 300.0);
+        assert_eq!(settings.backend_config().timeout_seconds, 300.0);
+
+        let error = ResolvedSettings::default()
+            .with_overrides(SettingsOverrides {
+                backend: BackendOverrides {
+                    timeout_seconds: Some(0.5),
+                    ..BackendOverrides::default()
+                },
+                ..SettingsOverrides::default()
+            })
+            .expect_err("sub-second timeout must fail");
+        assert!(error.to_string().contains("timeout_seconds"));
     }
 
     #[test]

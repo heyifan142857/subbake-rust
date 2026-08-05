@@ -511,11 +511,13 @@ mod tests {
             id = "openai"
             model = "fast-model"
             api_format = "openai_chat"
+            timeout_seconds = 300
 
             [backends.judge]
             id = "anthropic"
             model = "judge-model"
             api_format = "anthropic_messages"
+            timeout_seconds = 600
 
             [profiles.cinema]
             translator = "fast"
@@ -531,12 +533,20 @@ mod tests {
             .expect("resolve");
         assert_eq!(profile.as_deref(), Some("cinema"));
         assert_eq!(settings.backend.model, "fast-model");
+        assert_eq!(settings.backend.timeout_seconds, 300.0);
         assert_eq!(
             settings
                 .reviewer_backend
                 .as_ref()
                 .map(|backend| backend.model.as_str()),
             Some("judge-model")
+        );
+        assert_eq!(
+            settings
+                .reviewer_backend
+                .as_ref()
+                .map(|backend| backend.timeout_seconds),
+            Some(600.0)
         );
         assert_eq!(
             settings.translation.mode,

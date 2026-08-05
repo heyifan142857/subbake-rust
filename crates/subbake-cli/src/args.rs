@@ -591,6 +591,13 @@ pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
                 overrides.backend.auth_prefix =
                     Some(required_value(args, &mut index, "--auth-prefix")?)
             }
+            "--timeout-seconds" => {
+                overrides.backend.timeout_seconds = Some(parse_timeout_seconds(
+                    args,
+                    &mut index,
+                    "--timeout-seconds",
+                )?)
+            }
             other => {
                 return Err(CliError::usage(format!(
                     "unknown provider option `{other}`"
@@ -781,6 +788,9 @@ fn parse_translation_setting_option(
         "--auth-prefix" => {
             overrides.backend.auth_prefix = Some(required_value(args, index, option)?)
         }
+        "--timeout-seconds" => {
+            overrides.backend.timeout_seconds = Some(parse_timeout_seconds(args, index, option)?)
+        }
         "--source-lang" => {
             overrides.translation.source_language = Some(required_value(args, index, option)?)
         }
@@ -893,6 +903,21 @@ fn parse_bilingual_font_scale(args: &[String], index: &mut usize, flag: &str) ->
     if !value.is_finite() || !(0.1..=2.0).contains(&value) {
         return Err(CliError::usage(format!(
             "{flag} must be a number from 0.1 through 2.0"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_timeout_seconds(args: &[String], index: &mut usize, flag: &str) -> CliResult<f64> {
+    let raw = required_value(args, index, flag)?;
+    let value = raw.parse::<f64>().map_err(|_| {
+        CliError::usage(format!(
+            "{flag} must be a number greater than or equal to 1"
+        ))
+    })?;
+    if !value.is_finite() || value < 1.0 {
+        return Err(CliError::usage(format!(
+            "{flag} must be a number greater than or equal to 1"
         )));
     }
     Ok(value)
@@ -1372,6 +1397,8 @@ mod tests {
             "sk-test".to_owned(),
             "--base-url".to_owned(),
             "https://example.test/v1".to_owned(),
+            "--timeout-seconds".to_owned(),
+            "300".to_owned(),
         ];
 
         let parsed = parse_provider_args(&args).expect("provider check should parse");
@@ -1383,6 +1410,33 @@ mod tests {
             parsed.config.base_url.as_deref(),
             Some("https://example.test/v1")
         );
+        assert_eq!(parsed.config.timeout_seconds, 300.0);
+    }
+
+    #[test]
+    fn translate_timeout_cli_override_is_validated() {
+        let config = empty_config("translate-timeout");
+        let config_value = config.to_string_lossy().into_owned();
+        let parsed = parse_translate_args(&[
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            config_value.clone(),
+            "--timeout-seconds".to_owned(),
+            "600".to_owned(),
+        ])
+        .expect("valid timeout");
+        assert_eq!(parsed.settings.backend.timeout_seconds, 600.0);
+
+        let error = parse_translate_args(&[
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            config_value,
+            "--timeout-seconds".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect_err("zero timeout must fail");
+        let _ = std::fs::remove_file(config);
+        assert!(error.to_string().contains("--timeout-seconds"));
     }
 
     #[test]

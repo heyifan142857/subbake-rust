@@ -16,9 +16,7 @@ use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
     render_and_write_document, stable_runtime_input_path,
 };
-use crate::llm_backends::{
-    OpenAiBatchClient, OpenAiBatchStatus, build_openai_batch_client, default_timeout_seconds,
-};
+use crate::llm_backends::{OpenAiBatchClient, OpenAiBatchStatus, build_openai_batch_client};
 use crate::settings::TranslationSettings;
 
 const MANIFEST_VERSION: u64 = 1;
@@ -144,10 +142,8 @@ pub fn submit_overnight(
         request.settings.translation.batch_token_budget,
         &prefix,
     )?;
-    let client = build_openai_batch_client(
-        &request.settings.backend_config(),
-        default_timeout_seconds(),
-    )?;
+    let backend_config = request.settings.backend_config();
+    let client = build_openai_batch_client(&backend_config, backend_config.timeout_seconds)?;
     let jsonl = batch_jsonl(&client, &batches)?;
     let status = client.submit_jsonl(
         &jsonl,
@@ -364,7 +360,8 @@ fn client_for_manifest(
     settings: &TranslationSettings,
     manifest: &OvernightManifest,
 ) -> AdapterResult<OpenAiBatchClient> {
-    let client = build_openai_batch_client(&settings.backend_config(), default_timeout_seconds())?;
+    let backend_config = settings.backend_config();
+    let client = build_openai_batch_client(&backend_config, backend_config.timeout_seconds)?;
     if client.endpoint_path() != manifest.endpoint {
         return Err(AdapterError::invalid_input(
             "configured OpenAI API format does not match the overnight manifest",

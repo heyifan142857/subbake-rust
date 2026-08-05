@@ -6,7 +6,7 @@ mod openai_responses;
 use reqwest::RequestBuilder;
 use serde_json::Value;
 use subbake_core::entities::Usage;
-use subbake_core::ports::{ChatMessage, ResponseContract};
+use subbake_core::ports::{ChatMessage, ReasoningPolicy, ResponseContract};
 
 use crate::providers::{ApiFormat, BackendConfig};
 
@@ -53,6 +53,20 @@ pub(super) fn request_body(
         ApiFormat::OpenaiResponses => openai_responses::request_body(model, messages, contract),
         ApiFormat::AnthropicMessages => anthropic::request_body(model, messages),
         ApiFormat::GeminiGenerateContent => gemini::request_body(messages),
+    }
+}
+
+pub(super) fn apply_reasoning_policy(
+    format: ApiFormat,
+    config: &BackendConfig,
+    policy: ReasoningPolicy,
+    body: &mut Value,
+) {
+    if policy != ReasoningPolicy::Disabled || !config.id.eq_ignore_ascii_case("deepseek") {
+        return;
+    }
+    if matches!(format, ApiFormat::AnthropicMessages | ApiFormat::OpenaiChat) {
+        body["thinking"] = serde_json::json!({"type": "disabled"});
     }
 }
 

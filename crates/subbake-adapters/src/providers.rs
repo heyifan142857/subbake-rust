@@ -38,7 +38,7 @@ impl ApiFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendConfig {
     /// Stable profile identifier. It never selects a protocol.
     pub id: String,
@@ -51,6 +51,9 @@ pub struct BackendConfig {
     pub api_key_env: Option<String>,
     pub auth_header: Option<String>,
     pub auth_prefix: Option<String>,
+    /// Timeout for each provider HTTP attempt. Idle approval time is outside
+    /// this boundary because no request future exists while approval is pending.
+    pub timeout_seconds: f64,
 }
 
 impl BackendConfig {
@@ -68,6 +71,7 @@ impl BackendConfig {
             api_key_env: None,
             auth_header: None,
             auth_prefix: None,
+            timeout_seconds: crate::llm_backends::default_timeout_seconds(),
         }
     }
     pub fn resolved_api_key(&self) -> Option<String> {
@@ -94,6 +98,11 @@ impl BackendConfig {
                 "api_format is required for custom provider profiles",
             ));
         }
+        if !self.timeout_seconds.is_finite() || self.timeout_seconds < 1.0 {
+            return Err(AdapterError::invalid_input(
+                "backend timeout_seconds must be a finite number greater than or equal to 1",
+            ));
+        }
         Ok(())
     }
 }
@@ -117,7 +126,7 @@ fn non_empty_string(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value.trim())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProviderCheckRequest {
     pub config: BackendConfig,
 }
@@ -129,7 +138,7 @@ pub struct ProviderCheckOutcome {
 }
 
 pub fn build_backend(config: &BackendConfig) -> AdapterResult<Box<dyn LlmBackend>> {
-    build_backend_with_timeout(config, crate::llm_backends::default_timeout_seconds())
+    build_backend_with_timeout(config, config.timeout_seconds)
 }
 pub fn build_backend_with_timeout(
     config: &BackendConfig,
@@ -186,6 +195,7 @@ mod tests {
         assert_eq!(BackendConfig::new("openai", "x").api_format, None);
         assert_eq!(BackendConfig::new("anthropic", "x").api_format, None);
         assert_eq!(BackendConfig::new("gemini", "x").api_format, None);
+        assert_eq!(BackendConfig::new("mock", "x").timeout_seconds, 120.0);
     }
 
     #[test]
@@ -200,6 +210,13 @@ mod tests {
     fn rejects_header_injection() {
         let mut config = BackendConfig::new("mock", "x");
         config.auth_header = Some("X-Key\r\nInjected: yes".to_owned());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_request_timeout() {
+        let mut config = BackendConfig::new("mock", "x");
+        config.timeout_seconds = f64::INFINITY;
         assert!(config.validate().is_err());
     }
 }

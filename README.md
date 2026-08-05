@@ -81,12 +81,14 @@ id = "openai"
 model = "gpt-4.1-mini"
 api_format = "openai_chat"
 api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
 
 [backends.reviewer]
 id = "anthropic"
 model = "claude-sonnet-4-5"
 api_format = "anthropic_messages"
 api_key_env = "ANTHROPIC_API_KEY"
+timeout_seconds = 120
 
 [profiles.turbo]
 translator = "fast"

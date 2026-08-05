@@ -153,7 +153,7 @@ where
             let response = self
                 .backend
                 .execute(
-                    GenerationRequest::json(messages.to_vec()),
+                    GenerationRequest::json(messages.to_vec()).without_reasoning(),
                     self.cancellation,
                 )
                 .map_err(CoreError::from)

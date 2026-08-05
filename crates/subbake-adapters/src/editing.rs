@@ -70,7 +70,10 @@ pub fn edit_subtitle_cancellable(
 
     let mut backend = build_backend(&request.settings.backend_config())?;
     let (payload, _) = backend
-        .execute(GenerationRequest::json(messages), cancellation)
+        .execute(
+            GenerationRequest::json(messages).without_reasoning(),
+            cancellation,
+        )
         .map_err(AdapterError::from)?
         .into_json()
         .map_err(AdapterError::from)?;

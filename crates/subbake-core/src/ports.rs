@@ -108,11 +108,19 @@ pub struct ToolConfiguration {
     pub choice: ToolChoice,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningPolicy {
+    #[default]
+    ProviderDefault,
+    Disabled,
+}
+
 #[derive(Debug)]
 pub struct GenerationRequest {
     pub input: GenerationInput,
     pub response_contract: ResponseContract,
     pub tools: Option<ToolConfiguration>,
+    pub reasoning: ReasoningPolicy,
 }
 
 impl GenerationRequest {
@@ -121,6 +129,7 @@ impl GenerationRequest {
             input: GenerationInput::Messages(messages),
             response_contract: ResponseContract::JsonObject,
             tools: None,
+            reasoning: ReasoningPolicy::ProviderDefault,
         }
     }
 
@@ -129,7 +138,13 @@ impl GenerationRequest {
             input: GenerationInput::Messages(messages),
             response_contract: ResponseContract::Text,
             tools: None,
+            reasoning: ReasoningPolicy::ProviderDefault,
         }
+    }
+
+    pub fn without_reasoning(mut self) -> Self {
+        self.reasoning = ReasoningPolicy::Disabled;
+        self
     }
 
     pub fn with_tools(mut self, definitions: Vec<ToolDefinition>, choice: ToolChoice) -> Self {
@@ -157,6 +172,7 @@ impl GenerationRequest {
                 definitions,
                 choice,
             }),
+            reasoning: ReasoningPolicy::ProviderDefault,
         }
     }
 }
@@ -502,7 +518,7 @@ pub trait RuntimeStore {
 mod tool_tests {
     use super::{
         BatchExecutionOptions, ChatMessage, GenerationInput, GenerationRequest, GenerationResponse,
-        LlmBackend, ToolContinuation,
+        LlmBackend, ReasoningPolicy, ToolContinuation,
     };
     use crate::CancellationToken;
     use crate::entities::Usage;
@@ -558,6 +574,16 @@ mod tool_tests {
             continuation.downcast_for::<usize>("provider-b"),
             Err(crate::error::LlmCallError::ContinuationMismatch(_))
         ));
+    }
+
+    #[test]
+    fn generation_requests_preserve_task_reasoning_policy() {
+        let agent = GenerationRequest::text(vec![ChatMessage::user("decide")]);
+        assert_eq!(agent.reasoning, ReasoningPolicy::ProviderDefault);
+
+        let structured =
+            GenerationRequest::json(vec![ChatMessage::user("translate")]).without_reasoning();
+        assert_eq!(structured.reasoning, ReasoningPolicy::Disabled);
     }
 
     #[test]
