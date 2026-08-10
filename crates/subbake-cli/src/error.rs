@@ -1,6 +1,7 @@
 use std::io;
 
 use subbake_adapters::AdapterError;
+#[cfg(feature = "agent")]
 use subbake_agent::AgentError;
 use thiserror::Error;
 
@@ -14,6 +15,7 @@ pub enum CliError {
     Cancelled,
     #[error(transparent)]
     Adapter(Box<AdapterError>),
+    #[cfg(feature = "agent")]
     #[error(transparent)]
     Agent(Box<AgentError>),
     #[error("{context}: {source}")]
@@ -36,6 +38,7 @@ impl CliError {
             Self::Usage { .. } => 2,
             Self::Cancelled => 130,
             Self::Adapter(error) if error.is_cancelled() => 130,
+            #[cfg(feature = "agent")]
             Self::Agent(error) if error.is_cancelled() => 130,
             Self::Adapter(error)
                 if matches!(
@@ -52,6 +55,7 @@ impl CliError {
     }
 }
 
+#[cfg(feature = "agent")]
 impl From<AgentError> for CliError {
     fn from(error: AgentError) -> Self {
         if error.is_cancelled() {

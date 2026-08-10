@@ -6,10 +6,12 @@ use subbake_adapters::{
     WhisperAction, WhisperBuildVariant, apply_whisper_configuration,
     default_whisper_binary_path_for, default_whisper_models_dir_for,
 };
+#[cfg(feature = "agent")]
 use subbake_agent::{AgentAction, AgentActionKind};
 
 use crate::{CliError, CliResult};
 
+#[cfg(feature = "agent")]
 #[derive(Debug, Clone)]
 pub struct AgentArgs {
     pub action: AgentAction,
@@ -127,6 +129,7 @@ impl TranslateArgs {
     }
 }
 
+#[cfg(feature = "agent")]
 pub fn parse_agent_args(args: &[String]) -> CliResult<AgentArgs> {
     if !args.is_empty() {
         return Err(CliError::usage(
@@ -142,6 +145,7 @@ pub fn parse_agent_args(args: &[String]) -> CliResult<AgentArgs> {
     Ok(AgentArgs { action })
 }
 
+#[cfg(feature = "agent")]
 pub fn parse_resume_args(args: &[String]) -> CliResult<AgentArgs> {
     if args.len() > 1 {
         return Err(CliError::usage("resume accepts at most one session id"));
@@ -1084,6 +1088,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "agent")]
     #[test]
     fn parse_resume_accepts_optional_session() {
         let args = vec!["abc".to_owned()];

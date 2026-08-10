@@ -29,6 +29,13 @@ cd subbake-rust
 cargo install --path crates/subbake-cli
 ```
 
+默认安装包含交互式 Agent 和全部 CLI 命令。如只需要非交互式 CLI（包括翻译、
+批处理、转写、流水线和运行时管理），可以关闭默认的 `agent` feature：
+
+```bash
+cargo install --path crates/subbake-cli --no-default-features
+```
+
 如需本地转写，再安装 whisper.cpp 和模型：
 
 ```bash

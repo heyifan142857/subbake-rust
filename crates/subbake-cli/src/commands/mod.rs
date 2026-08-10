@@ -1,11 +1,13 @@
+#[cfg(feature = "agent")]
+use crate::args::{parse_agent_args, parse_resume_args};
 use crate::args::{
-    parse_agent_args, parse_batch_args, parse_evaluate_args, parse_memory_args,
-    parse_overnight_args, parse_pipeline_args, parse_provider_args, parse_qa_args,
-    parse_resume_args, parse_runtime_args, parse_transcribe_args, parse_translate_args,
-    parse_whisper_args,
+    parse_batch_args, parse_evaluate_args, parse_memory_args, parse_overnight_args,
+    parse_pipeline_args, parse_provider_args, parse_qa_args, parse_runtime_args,
+    parse_transcribe_args, parse_translate_args, parse_whisper_args,
 };
 use crate::{CliError, CliResult};
 
+#[cfg(feature = "agent")]
 mod agent;
 mod evaluate;
 mod memory;
@@ -20,7 +22,15 @@ mod whisper;
 
 pub fn dispatch(args: Vec<String>) -> CliResult<()> {
     if args.is_empty() {
-        return agent::run(parse_agent_args(&[])?);
+        #[cfg(feature = "agent")]
+        {
+            return agent::run(parse_agent_args(&[])?);
+        }
+        #[cfg(not(feature = "agent"))]
+        {
+            print!("{}", help_text(&[]));
+            return Ok(());
+        }
     }
 
     if let Some(help) = requested_help(&args) {
@@ -29,7 +39,9 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
     }
 
     match args[0].as_str() {
+        #[cfg(feature = "agent")]
         "agent" => agent::run(parse_agent_args(&args[1..])?),
+        #[cfg(feature = "agent")]
         "resume" => agent::run(parse_resume_args(&args[1..])?),
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
@@ -71,7 +83,9 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
         .as_slice()
     {
         [] => TOP_LEVEL_HELP,
+        #[cfg(feature = "agent")]
         ["agent"] => AGENT_HELP,
+        #[cfg(feature = "agent")]
         ["resume"] => RESUME_HELP,
         ["translate"] => TRANSLATE_HELP,
         ["batch"] => BATCH_HELP,
@@ -94,6 +108,7 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
     }
 }
 
+#[cfg(feature = "agent")]
 const TOP_LEVEL_HELP: &str = r#"Agent-first subtitle translation and transcription CLI
 
 Usage: sbake [OPTIONS] [COMMAND]
@@ -127,12 +142,44 @@ Examples:
   sbake provider check
 "#;
 
+#[cfg(not(feature = "agent"))]
+const TOP_LEVEL_HELP: &str = r#"Subtitle translation and transcription CLI
+
+Usage: sbake [OPTIONS] [COMMAND]
+
+Commands:
+  translate   Translate a subtitle file or an embedded container subtitle
+  batch       Translate subtitle files in a directory
+  evaluate    Compare a subtitle output with a reference offline
+  memory      Inspect, export, import, or prune glossary and translation memory
+  qa          Inspect subtitle timing and readability without a reference
+  transcribe  Transcribe audio or video into subtitles
+  pipeline    Transcribe media when needed, then translate it
+  overnight   Submit, check, and collect a provider-managed economy batch
+  provider    Validate a model provider configuration
+  runtime     Inspect or clean runtime artifacts
+  whisper     Install and manage whisper.cpp and its models
+  help        Print help for a command
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Examples:
+  sbake translate movie.srt --target-lang Chinese
+  sbake pipeline movie.mp4 --target-lang English
+  sbake overnight submit movie.srt --mode economy --profile openai
+  sbake provider check
+"#;
+
+#[cfg(feature = "agent")]
 const AGENT_HELP: &str = r#"Start the interactive subtitle agent
 
 Usage: sbake agent
 
 The agent is also started when sbake is run without a command.
 "#;
+#[cfg(feature = "agent")]
 const RESUME_HELP: &str = r#"Resume an interactive agent session
 
 Usage: sbake resume [SESSION_ID]

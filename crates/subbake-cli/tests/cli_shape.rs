@@ -2,8 +2,16 @@
 fn cli_exposes_redesigned_commands() {
     let names = subbake_cli::command_names();
 
-    assert!(names.contains(&"agent"));
-    assert!(names.contains(&"resume"));
+    #[cfg(feature = "agent")]
+    {
+        assert!(names.contains(&"agent"));
+        assert!(names.contains(&"resume"));
+    }
+    #[cfg(not(feature = "agent"))]
+    {
+        assert!(!names.contains(&"agent"));
+        assert!(!names.contains(&"resume"));
+    }
     assert!(names.contains(&"translate"));
     assert!(names.contains(&"batch"));
     assert!(names.contains(&"pipeline"));
@@ -74,12 +82,29 @@ fn provider_check_uses_mock_backend() {
     let _ = std::fs::remove_file(config);
 }
 
+#[cfg(feature = "agent")]
 #[test]
 fn agent_rejects_unknown_subcommand() {
     let error = subbake_cli::run(vec!["agent".to_owned(), "bogus".to_owned()])
         .expect_err("unknown agent command should fail");
 
     assert!(error.to_string().contains("start the agent"));
+}
+
+#[cfg(not(feature = "agent"))]
+#[test]
+fn cli_only_build_shows_help_without_a_command() {
+    subbake_cli::run(Vec::new()).expect("CLI-only build should show help");
+}
+
+#[cfg(not(feature = "agent"))]
+#[test]
+fn cli_only_build_rejects_agent_commands() {
+    for command in ["agent", "resume"] {
+        let error = subbake_cli::run(vec![command.to_owned()])
+            .expect_err("Agent commands should not exist in a CLI-only build");
+        assert!(error.to_string().contains("unknown command"));
+    }
 }
 
 #[test]
