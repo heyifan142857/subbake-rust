@@ -75,6 +75,9 @@ pub struct TranslationDomainSettings {
     pub terminology_preflight: bool,
     pub online_terminology: bool,
     pub preserve_names: bool,
+    pub max_characters_per_second: Option<f64>,
+    pub max_characters_per_line: Option<usize>,
+    pub max_lines: Option<usize>,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -147,6 +150,9 @@ pub struct TranslationOverrides {
     pub terminology_preflight: Option<bool>,
     pub online_terminology: Option<bool>,
     pub preserve_names: Option<bool>,
+    pub max_characters_per_second: Option<f64>,
+    pub max_characters_per_line: Option<usize>,
+    pub max_lines: Option<usize>,
     pub dry_run: Option<bool>,
     pub resume: Option<bool>,
     pub use_cache: Option<bool>,
@@ -240,6 +246,9 @@ impl SettingsOverrides {
                 terminology_preflight: Some(settings.translation.terminology_preflight),
                 online_terminology: Some(settings.translation.online_terminology),
                 preserve_names: Some(settings.translation.preserve_names),
+                max_characters_per_second: settings.translation.max_characters_per_second,
+                max_characters_per_line: settings.translation.max_characters_per_line,
+                max_lines: settings.translation.max_lines,
                 dry_run: Some(settings.translation.dry_run),
                 resume: Some(settings.translation.resume),
                 use_cache: Some(settings.translation.use_cache),
@@ -316,6 +325,9 @@ impl TranslationOverrides {
             terminology_preflight,
             online_terminology,
             preserve_names,
+            max_characters_per_second,
+            max_characters_per_line,
+            max_lines,
             dry_run,
             resume,
             use_cache,
@@ -422,6 +434,9 @@ impl Default for ResolvedSettings {
                 terminology_preflight: true,
                 online_terminology: false,
                 preserve_names: false,
+                max_characters_per_second: None,
+                max_characters_per_line: None,
+                max_lines: None,
                 dry_run: false,
                 resume: true,
                 use_cache: true,
@@ -515,6 +530,9 @@ impl ResolvedSettings {
             terminology_preflight,
             online_terminology,
             preserve_names,
+            max_characters_per_second,
+            max_characters_per_line,
+            max_lines,
             dry_run,
             resume,
             use_cache,
@@ -575,6 +593,15 @@ impl ResolvedSettings {
         }
         if let Some(value) = preserve_names {
             self.translation.preserve_names = value;
+        }
+        if let Some(value) = max_characters_per_second {
+            self.translation.max_characters_per_second = Some(value);
+        }
+        if let Some(value) = max_characters_per_line {
+            self.translation.max_characters_per_line = Some(value);
+        }
+        if let Some(value) = max_lines {
+            self.translation.max_lines = Some(value);
         }
         if let Some(value) = dry_run {
             self.translation.dry_run = value;
@@ -666,12 +693,26 @@ impl ResolvedSettings {
         for (name, value) in [
             ("translation.max_requests", self.translation.max_requests),
             ("translation.max_tokens", self.translation.max_tokens),
+            (
+                "translation.max_characters_per_line",
+                self.translation.max_characters_per_line,
+            ),
+            ("translation.max_lines", self.translation.max_lines),
         ] {
             if value == Some(0) {
                 return Err(AdapterError::invalid_input(format!(
                     "configuration field `{name}` must be greater than zero when set"
                 )));
             }
+        }
+        if self
+            .translation
+            .max_characters_per_second
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(AdapterError::invalid_input(
+                "configuration field `translation.max_characters_per_second` must be a finite number greater than zero when set",
+            ));
         }
         if !(1..=128).contains(&self.agent.max_steps) {
             return Err(AdapterError::invalid_input(
@@ -769,6 +810,9 @@ impl ResolvedSettings {
         options.terminology_preflight = self.translation.terminology_preflight;
         options.online_terminology = self.translation.online_terminology;
         options.preserve_names = self.translation.preserve_names;
+        options.max_characters_per_second = self.translation.max_characters_per_second;
+        options.max_characters_per_line = self.translation.max_characters_per_line;
+        options.max_lines = self.translation.max_lines;
         options.dry_run = self.translation.dry_run;
         options.resume = self.translation.resume;
         options.use_cache = self.translation.use_cache;

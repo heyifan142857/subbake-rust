@@ -814,6 +814,17 @@ fn parse_translation_setting_option(
         "--review-concurrency" => {
             overrides.translation.review_concurrency = Some(parse_batch_size(args, index, option)?)
         }
+        "--max-characters-per-second" => {
+            overrides.translation.max_characters_per_second =
+                Some(parse_positive_f64(args, index, option)?)
+        }
+        "--max-characters-per-line" => {
+            overrides.translation.max_characters_per_line =
+                Some(parse_batch_size(args, index, option)?)
+        }
+        "--max-lines" => {
+            overrides.translation.max_lines = Some(parse_batch_size(args, index, option)?)
+        }
         "--runtime-dir" => {
             overrides.storage.runtime_dir = Some(required_path(args, index, option)?)
         }
@@ -904,6 +915,17 @@ fn parse_bilingual_font_scale(args: &[String], index: &mut usize, flag: &str) ->
         return Err(CliError::usage(format!(
             "{flag} must be a number from 0.1 through 2.0"
         )));
+    }
+    Ok(value)
+}
+
+fn parse_positive_f64(args: &[String], index: &mut usize, flag: &str) -> CliResult<f64> {
+    let raw = required_value(args, index, flag)?;
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| CliError::usage(format!("{flag} must be a positive number")))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CliError::usage(format!("{flag} must be a positive number")));
     }
     Ok(value)
 }
@@ -1012,6 +1034,12 @@ mod tests {
             "2".to_owned(),
             "--batch-token-budget".to_owned(),
             "1800".to_owned(),
+            "--max-characters-per-second".to_owned(),
+            "18.5".to_owned(),
+            "--max-characters-per-line".to_owned(),
+            "40".to_owned(),
+            "--max-lines".to_owned(),
+            "2".to_owned(),
         ];
         let parsed = parse_translate_args(&args).expect("translation options");
         let _ = std::fs::remove_file(config);
@@ -1023,6 +1051,15 @@ mod tests {
         assert_eq!(parsed.settings.translation.translation_concurrency, 3);
         assert_eq!(parsed.settings.translation.review_concurrency, 2);
         assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
+        assert_eq!(
+            parsed.settings.translation.max_characters_per_second,
+            Some(18.5)
+        );
+        assert_eq!(
+            parsed.settings.translation.max_characters_per_line,
+            Some(40)
+        );
+        assert_eq!(parsed.settings.translation.max_lines, Some(2));
     }
 
     #[test]

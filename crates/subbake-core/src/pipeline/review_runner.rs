@@ -54,7 +54,7 @@ where
         let mut next_review = resumed;
         while next_review < stage.len() {
             pipeline.cancellation.check()?;
-            let concurrency = if pipeline.backend.supports_parallel_generation() {
+            let concurrency = if pipeline.review_backend_supports_parallel_generation() {
                 pipeline.options.review_concurrency.max(1)
             } else {
                 1
@@ -68,11 +68,7 @@ where
                 usage,
             );
             let window_size = if pipeline.options.mode == crate::entities::TranslationMode::Turbo
-                && pipeline
-                    .reviewer
-                    .as_ref()
-                    .unwrap_or(&pipeline.backend)
-                    .supports_parallel_generation()
+                && pipeline.review_backend_supports_parallel_generation()
             {
                 concurrency.saturating_mul(2)
             } else {

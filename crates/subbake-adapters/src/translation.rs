@@ -242,9 +242,10 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .as_ref()
         .map(|identity| identity.output_path.clone())
         .unwrap_or_else(|| output_path.clone());
+    let stable_input_path = stable_runtime_input_path(runtime_input_path)?;
     let options = request
         .settings
-        .to_pipeline_options(runtime_input_path.to_path_buf(), Some(runtime_output_path));
+        .to_pipeline_options(stable_input_path.clone(), Some(runtime_output_path));
     let backend = build_backend(&request.settings.backend_config())?;
     let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
         || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off
@@ -256,7 +257,6 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .transpose()?;
 
     // Wire runtime store for glossary/TM persistence.
-    let stable_input_path = stable_runtime_input_path(runtime_input_path)?;
     let paths = build_runtime_paths(
         runtime_input_path,
         &stable_input_path,

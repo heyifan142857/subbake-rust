@@ -53,20 +53,6 @@ fn ends_sentence(text: &str) -> bool {
         .ends_with(['.', '!', '?', '。', '！', '？', '…'])
 }
 
-pub(crate) fn combine_summaries(left: &str, right: &str, limit: usize) -> String {
-    let mut summaries = Vec::new();
-    for summary in [left.trim(), right.trim()] {
-        if !summary.is_empty() && !summaries.contains(&summary) {
-            summaries.push(summary);
-        }
-    }
-    summaries
-        .into_iter()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
 pub(crate) fn combine_glossary(
     left: Vec<GlossaryEntry>,
     right: Vec<GlossaryEntry>,
@@ -187,7 +173,7 @@ pub(crate) fn build_agent_repair_messages(
         "agent_repair_review"
     };
     let return_keys = if stage == "translate" {
-        "\"lines\", \"summary\", and \"glossary_updates\""
+        "\"lines\""
     } else {
         "\"lines\" and \"review_notes\""
     };

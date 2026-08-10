@@ -17,12 +17,12 @@ use crate::ports::{
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
-    backend_payload_json, build_agent_repair_messages, combine_glossary, combine_summaries,
-    parse_translation_payload, retry_correction_message, split_index,
+    backend_payload_json, build_agent_repair_messages, combine_glossary, parse_translation_payload,
+    retry_correction_message, split_index,
 };
 use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
-use crate::storage::{InputSignature, ResumeSnapshot};
-use crate::validation::validate_translation_batch;
+use crate::storage::{InputSignature, ResumeSnapshot, build_glossary_fingerprint};
+use crate::validation::{FinalValidationPolicy, validate_final_output, validate_translation_batch};
 
 mod name_alignment;
 mod online_terminology;
@@ -40,8 +40,8 @@ use planning::{BatchPlanner, DeduplicationPlan};
 use review_runner::{ReviewBatchInput, ReviewRun};
 pub use support::translation_memory_key;
 use support::{
-    build_translation_messages, is_agent_repairable, is_operational_llm_failure,
-    merge_review_patch, request_hash, validate_review_candidate_ids,
+    build_translation_messages, contextual_translation_memory_keys, is_agent_repairable,
+    is_operational_llm_failure, merge_review_patch, request_hash, validate_review_candidate_ids,
 };
 use terminology::TerminologyStage;
 #[cfg(test)]
@@ -50,7 +50,7 @@ use terminology::{
     parse_payload as parse_terminology_payload,
 };
 use translation_runner::TranslationRun;
-use translation_stage::PreparedBatch;
+use translation_stage::{PreparedBatch, TranslationPromptContext};
 
 #[cfg(test)]
 use crate::entities::{ReviewPolicy, ReviewReport};
@@ -157,6 +157,13 @@ where
             .map_err(CoreError::from)?;
         self.provider_tokens = self.provider_tokens.saturating_add(result.1.total_tokens);
         Ok(result)
+    }
+
+    pub(super) fn review_backend_supports_parallel_generation(&self) -> bool {
+        self.reviewer
+            .as_ref()
+            .unwrap_or(&self.backend)
+            .supports_parallel_generation()
     }
 
     fn reserve_requests(&mut self, additional: usize) -> CoreResult<()> {
@@ -321,9 +328,23 @@ where
 
         let deduplication =
             DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
+        let translation_memory_scope = self
+            .options
+            .input_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_string_lossy();
+        let translation_memory_keys =
+            contextual_translation_memory_keys(&translation_memory_scope, &document.segments);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
             .scene_aware(self.options.policy().scene_aware_batching)
             .split(deduplication.canonical());
+        let source_contexts = BatchPlanner::source_contexts(
+            deduplication.canonical(),
+            &batches,
+            self.options.mode,
+            self.options.batch_token_budget,
+        );
         let original_batches =
             BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
                 .scene_aware(self.options.policy().scene_aware_batching)
@@ -381,6 +402,10 @@ where
 
         let terminology = self.run_terminology_preflight(document)?;
         self.sync_enforced_entities();
+        // Freeze the effective preflight glossary once for this run. Later
+        // batches may learn advisory terms, but all Resume writes must retain
+        // the same semantic-input fingerprint.
+        self.options.glossary_fingerprint = Some(build_glossary_fingerprint(&self.memory.glossary));
 
         let resume = self.load_resume_snapshot(&batches)?;
         self.sync_enforced_entities();
@@ -390,7 +415,15 @@ where
             batches,
             segments: translated_segments,
             usage,
-        } = translation_runner::run(self, &translation_document, batches, &resume, &terminology)?;
+        } = translation_runner::run(
+            self,
+            &translation_document,
+            batches,
+            &resume,
+            &terminology,
+            &translation_memory_keys,
+            &source_contexts,
+        )?;
         let translated_segments = deduplication.expand(&document.segments, &translated_segments)?;
         let ReviewRun {
             output,
@@ -409,6 +442,18 @@ where
             &resume,
             &terminology,
             usage,
+        )?;
+        validate_final_output(
+            &document.segments,
+            &output,
+            &self.required_glossary,
+            &self.options.source_language,
+            &self.options.target_language,
+            FinalValidationPolicy {
+                max_characters_per_second: self.options.max_characters_per_second,
+                max_characters_per_line: self.options.max_characters_per_line,
+                max_lines: self.options.max_lines,
+            },
         )?;
         self.report(
             "WRITE_OUTPUT",
@@ -496,8 +541,13 @@ where
                     &candidates,
                     &target_language,
                 ) {
-                    let mut retried =
-                        self.translate_batch_impl(index, &batch.pending, true, Some(error))?;
+                    let mut retried = self.translate_batch_impl(
+                        index,
+                        &batch.pending,
+                        &batch.prompt_context,
+                        true,
+                        Some(error),
+                    )?;
                     name_alignment::reconcile_batch(
                         &batch.pending,
                         &mut retried,
@@ -552,8 +602,13 @@ where
                         .entry(source.clone())
                         .or_insert_with(|| target.clone());
                 }
-                let mut retried =
-                    self.translate_batch_impl(index, &batch.pending, true, Some(error.clone()))?;
+                let mut retried = self.translate_batch_impl(
+                    index,
+                    &batch.pending,
+                    &batch.prompt_context,
+                    true,
+                    Some(error.clone()),
+                )?;
                 if expected_terminology && retried.terminology_updates.is_empty() {
                     return Err(CoreError::InvalidTranslation(format!(
                         "batch {index} omitted terminology updates after correction"
@@ -618,29 +673,34 @@ where
         &mut self,
         batch_index: usize,
         batch: &[SubtitleSegment],
+        prompt_context: &TranslationPromptContext,
     ) -> CoreResult<BatchWithUsage> {
-        self.translate_batch_impl(batch_index, batch, true, None)
+        self.translate_batch_impl(batch_index, batch, prompt_context, true, None)
     }
 
     fn translate_window(
         &mut self,
-        batches: &[(usize, Vec<SubtitleSegment>)],
+        batches: &[(usize, Vec<SubtitleSegment>, TranslationPromptContext)],
     ) -> CoreResult<HashMap<usize, BatchWithUsage>> {
         if !self.backend.supports_parallel_generation() {
             let mut results = HashMap::new();
-            for (batch_index, batch) in batches {
-                results.insert(*batch_index, self.translate_batch(*batch_index, batch)?);
+            for (batch_index, batch, prompt_context) in batches {
+                results.insert(
+                    *batch_index,
+                    self.translate_batch(*batch_index, batch, prompt_context)?,
+                );
             }
             return Ok(results);
         }
 
         let mut results = HashMap::new();
         let mut pending = Vec::new();
-        for (batch_index, batch) in batches {
+        for (batch_index, batch, prompt_context) in batches {
             let messages = build_translation_messages(
                 &self.options,
                 *batch_index,
                 batch,
+                prompt_context,
                 &self.memory,
                 &self.required_glossary,
                 self.options.policy().compact_wire && self.backend.supports_compact_translation(),
@@ -683,12 +743,18 @@ where
                     },
                 );
             } else {
-                pending.push((*batch_index, batch.clone(), hash, messages));
+                pending.push((
+                    *batch_index,
+                    batch.clone(),
+                    prompt_context.clone(),
+                    hash,
+                    messages,
+                ));
             }
         }
         let requests = pending
             .iter()
-            .map(|(_, _, _, messages)| {
+            .map(|(_, _, _, _, messages)| {
                 GenerationRequest::json(messages.clone()).without_reasoning()
             })
             .collect();
@@ -709,7 +775,9 @@ where
                 pending.len()
             )));
         }
-        for ((batch_index, batch, hash, _), response) in pending.into_iter().zip(responses) {
+        for ((batch_index, batch, prompt_context, hash, _), response) in
+            pending.into_iter().zip(responses)
+        {
             match response.map_err(CoreError::from).and_then(|response| {
                 let (json, usage) = response.into_json().map_err(CoreError::from)?;
                 let mut payload = parse_translation_payload(&json)?;
@@ -740,7 +808,13 @@ where
                 Err(error) => {
                     results.insert(
                         batch_index,
-                        self.translate_batch_impl(batch_index, &batch, true, Some(error))?,
+                        self.translate_batch_impl(
+                            batch_index,
+                            &batch,
+                            &prompt_context,
+                            true,
+                            Some(error),
+                        )?,
                     );
                 }
             }
@@ -752,6 +826,7 @@ where
         &mut self,
         batch_index: usize,
         batch: &[SubtitleSegment],
+        prompt_context: &TranslationPromptContext,
         record_failure: bool,
         initial_error: Option<CoreError>,
     ) -> CoreResult<BatchWithUsage> {
@@ -774,6 +849,7 @@ where
                 &self.options,
                 batch_index,
                 batch,
+                prompt_context,
                 &self.memory,
                 &self.required_glossary,
                 self.options.policy().compact_wire && self.backend.supports_compact_translation(),
@@ -817,7 +893,7 @@ where
                             resolved: false,
                             error: None,
                         });
-                        match self.translate_split(batch_index, batch, split) {
+                        match self.translate_split(batch_index, batch, prompt_context, split) {
                             Ok(result) => {
                                 if let Some(split_log) = attempt_log.split_retry.as_mut() {
                                     split_log.resolved = true;
@@ -934,15 +1010,20 @@ where
         &mut self,
         batch_index: usize,
         batch: &[SubtitleSegment],
+        prompt_context: &TranslationPromptContext,
         split: usize,
     ) -> CoreResult<BatchWithUsage> {
-        let left = self.translate_batch_impl(batch_index, &batch[..split], false, None)?;
-        let right = self.translate_batch_impl(batch_index, &batch[split..], false, None)?;
+        let left_context = prompt_context.for_left_split(&batch[split..]);
+        let right_context = prompt_context.for_right_split(&batch[..split]);
+        let left =
+            self.translate_batch_impl(batch_index, &batch[..split], &left_context, false, None)?;
+        let right =
+            self.translate_batch_impl(batch_index, &batch[split..], &right_context, false, None)?;
         let mut usage = left.usage;
         usage.add(right.usage);
         Ok(BatchWithUsage {
             lines: left.lines.into_iter().chain(right.lines).collect(),
-            summary: combine_summaries(&left.summary, &right.summary, self.memory.max_summaries),
+            summary: String::new(),
             glossary_updates: combine_glossary(left.glossary_updates, right.glossary_updates),
             terminology_updates: left
                 .terminology_updates
@@ -1039,12 +1120,7 @@ where
         &mut self,
         batches: &[(usize, ReviewBatchPlan)],
     ) -> CoreResult<HashMap<usize, ReviewWithUsage>> {
-        if !self
-            .reviewer
-            .as_ref()
-            .unwrap_or(&self.backend)
-            .supports_parallel_generation()
-        {
+        if !self.review_backend_supports_parallel_generation() {
             let mut output = HashMap::new();
             for (index, batch) in batches {
                 output.insert(*index, self.review_batch(*index, batch)?);
@@ -1099,14 +1175,19 @@ where
             })
             .collect();
         self.reserve_requests(pending.len())?;
-        let responses = self
-            .backend
-            .execute_many(
+        let responses = match self.reviewer.as_mut() {
+            Some(reviewer) => reviewer.execute_many(
                 requests,
                 BatchExecutionOptions::new(self.options.review_concurrency),
                 &self.cancellation,
-            )
-            .map_err(CoreError::from)?;
+            ),
+            None => self.backend.execute_many(
+                requests,
+                BatchExecutionOptions::new(self.options.review_concurrency),
+                &self.cancellation,
+            ),
+        }
+        .map_err(CoreError::from)?;
         self.record_response_tokens(&responses);
         if responses.len() != pending.len() {
             return Err(CoreError::InvalidBackendResponse(format!(
@@ -1563,6 +1644,9 @@ fn prepare_translation_result(
     result: &mut BatchTranslationResult,
     cached: bool,
 ) -> CoreResult<()> {
+    // `summary` remains readable in legacy cache payloads, but translation
+    // context is now derived from subtitle lines and confirmed translations.
+    result.summary.clear();
     if lightweight_names {
         let markers = name_alignment::select_markers(source, candidates);
         name_alignment::validate_markers(source, &result.lines, &markers)?;
@@ -1896,6 +1980,37 @@ mod tests {
         fail_on_call: Option<usize>,
     }
 
+    struct ContextCaptureBackend {
+        contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl LlmBackend for ContextCaptureBackend {
+        fn supports_parallel_generation(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "context-capture"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
+            self.contexts
+                .lock()
+                .map_err(|_| CoreError::DataInvariant("context lock poisoned".to_owned()))?
+                .push(translation_context(&messages));
+            EchoBackend.execute(GenerationRequest::json(messages), cancellation)
+        }
+    }
+
     impl LlmBackend for CountingBackend {
         fn provider_name(&self) -> &str {
             "test"
@@ -1925,6 +2040,76 @@ mod tests {
         translation_calls: Arc<AtomicUsize>,
         review_calls: Arc<AtomicUsize>,
         fail_on_review_call: Option<usize>,
+    }
+
+    struct RoutedParallelBackend {
+        label: &'static str,
+        translation_calls: Arc<AtomicUsize>,
+        review_calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for RoutedParallelBackend {
+        fn supports_parallel_generation(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            self.label
+        }
+
+        fn model_name(&self) -> &str {
+            self.label
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !prompt.contains("TASK_START\nreview_translations\nTASK_END") {
+                self.translation_calls.fetch_add(1, Ordering::SeqCst);
+                return EchoBackend.execute(GenerationRequest::json(messages), cancellation);
+            }
+
+            self.review_calls.fetch_add(1, Ordering::SeqCst);
+            let body = prompt
+                .split("REVIEW_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("REVIEW_JSON_END").next())
+                .ok_or_else(|| CoreError::DataInvariant("missing review json".to_owned()))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+            let changes = parsed["lines"]
+                .as_array()
+                .ok_or_else(|| CoreError::DataInvariant("missing review lines".to_owned()))?
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": format!(
+                            "[{} REVIEW] {}",
+                            self.label,
+                            line["translation"].as_str().unwrap_or_default()
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(GenerationResponse::json(
+                serde_json::json!({"changes": changes}),
+                Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    total_tokens: 5,
+                    ..Usage::default()
+                },
+            ))
+        }
     }
 
     impl LlmBackend for ReviewBackend {
@@ -2032,6 +2217,66 @@ mod tests {
                 ));
             }
             EchoBackend.execute(GenerationRequest::json(messages), cancellation)
+        }
+    }
+
+    struct GlossaryRegressionBackend;
+
+    impl LlmBackend for GlossaryRegressionBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "glossary-regression"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            _cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let messages = request_messages(request)?;
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (start, end, translation, reviewing) =
+                if prompt.contains("TASK_START\nreview_translations\nTASK_END") {
+                    ("REVIEW_JSON_START", "REVIEW_JSON_END", "他来了。", true)
+                } else {
+                    ("BATCH_JSON_START", "BATCH_JSON_END", "勋爵来了。", false)
+                };
+            let body = prompt
+                .split(start)
+                .nth(1)
+                .and_then(|value| value.split(end).next())
+                .ok_or_else(|| CoreError::DataInvariant(format!("missing {start}")))?;
+            let parsed: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+            let lines = parsed["lines"]
+                .as_array()
+                .ok_or_else(|| CoreError::DataInvariant("missing lines".to_owned()))?
+                .iter()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": translation,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let payload = if reviewing {
+                serde_json::json!({"changes": lines})
+            } else {
+                serde_json::json!({
+                    "lines": lines,
+                    "summary": "",
+                    "glossary_updates": [],
+                    "terminology_updates": [],
+                })
+            };
+            Ok(GenerationResponse::json(payload, Usage::default()))
         }
     }
 
@@ -2452,12 +2697,206 @@ mod tests {
 
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
         let data = captured.lock().expect("capture lock");
-        assert_eq!(
-            data.saved_translation_memory,
-            vec![("hello".to_owned(), "[ECHO] hello".to_owned())]
-        );
+        assert_eq!(data.saved_translation_memory.len(), 1);
+        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v1:"));
+        assert_eq!(data.saved_translation_memory[0].1, "[ECHO] hello");
         assert_eq!(data.saved_batches.len(), 1);
         assert_eq!(data.saved_batches[0].1[0].text, "[ECHO] hello");
+    }
+
+    #[test]
+    fn pipeline_run_state_fingerprints_the_frozen_glossary() {
+        let document = document("resume-glossary.txt", &["hello"]);
+        let mut options = PipelineOptions::new("resume-glossary.txt".into());
+        options.terminology_preflight = false;
+        let signature = input_signature_from_bytes(b"hello\n", Some(123));
+        let loaded_glossary = vec![("Lord".to_owned(), "勋爵".to_owned())];
+        let captured = Arc::new(Mutex::new(CapturedStoreData {
+            loaded_glossary: loaded_glossary.clone(),
+            ..CapturedStoreData::default()
+        }));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("resume-glossary.txt"),
+                std::path::Path::new("/workspace/resume-glossary.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options.clone())
+            .with_store(Box::new(store))
+            .with_input_signature(signature.clone());
+
+        pipeline.run_document(&document).expect("run");
+
+        let state = captured
+            .lock()
+            .expect("capture lock")
+            .saved_state
+            .clone()
+            .expect("saved run state");
+        let mut expected_options = options;
+        expected_options.glossary_fingerprint = Some(build_glossary_fingerprint(
+            &loaded_glossary.into_iter().collect(),
+        ));
+        let expected = crate::storage::build_translation_fingerprint(&expected_options, &signature);
+        assert_eq!(state.translation_fingerprint, expected);
+
+        expected_options.glossary_fingerprint = Some(build_glossary_fingerprint(
+            &[("Lord".to_owned(), "领主".to_owned())]
+                .into_iter()
+                .collect(),
+        ));
+        let changed = crate::storage::build_translation_fingerprint(&expected_options, &signature);
+        assert!(state.resume_snapshot(&changed).is_none());
+    }
+
+    #[test]
+    fn contextual_translation_memory_is_scoped_and_ignores_legacy_keys() {
+        let source = document("/shows/one/clip.txt", &["Fine."]);
+        let key = contextual_translation_memory_keys("/shows/one", &source.segments)["1"].clone();
+        let captured = Arc::new(Mutex::new(CapturedStoreData {
+            loaded_translation_memory: vec![
+                (key, "好的。".to_owned()),
+                (translation_memory_key("Fine."), "罚款。".to_owned()),
+            ],
+            ..CapturedStoreData::default()
+        }));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("/shows/one/clip.txt"),
+                std::path::Path::new("/shows/one/clip.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
+        let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
+        same_scope_options.resume = false;
+        let same_scope_calls = Arc::new(AtomicUsize::new(0));
+        let mut same_scope = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&same_scope_calls),
+                fail_on_call: Some(1),
+            },
+            NoopDashboard,
+            same_scope_options,
+        )
+        .with_store(Box::new(store.clone()));
+
+        let reused = same_scope.run_document(&source).expect("contextual TM hit");
+
+        assert_eq!(same_scope_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reused.translated_segments[0].text, "好的。");
+        assert_eq!(reused.result.translation_memory_hits, 1);
+
+        let other_source = document("/shows/two/clip.txt", &["Fine."]);
+        let mut other_scope_options = PipelineOptions::new("/shows/two/clip.txt".into());
+        other_scope_options.resume = false;
+        let other_scope_calls = Arc::new(AtomicUsize::new(0));
+        let mut other_scope = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&other_scope_calls),
+                fail_on_call: None,
+            },
+            NoopDashboard,
+            other_scope_options,
+        )
+        .with_store(Box::new(store));
+
+        let translated = other_scope
+            .run_document(&other_source)
+            .expect("different scope translates");
+
+        assert_eq!(other_scope_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(translated.translated_segments[0].text, "[ECHO] Fine.");
+        assert_eq!(translated.result.translation_memory_hits, 0);
+    }
+
+    #[test]
+    fn final_validation_checks_required_glossary_on_translation_memory_hits() {
+        let source = document("/shows/one/terms.txt", &["The Lord is here."]);
+        let key = contextual_translation_memory_keys("/shows/one", &source.segments)["1"].clone();
+        let captured = Arc::new(Mutex::new(CapturedStoreData {
+            loaded_translation_memory: vec![(key, "领主来了。".to_owned())],
+            loaded_glossary: vec![("Lord".to_owned(), "勋爵".to_owned())],
+            ..CapturedStoreData::default()
+        }));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("/shows/one/terms.txt"),
+                std::path::Path::new("/shows/one/terms.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: captured,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
+        options.glossary_path = Some("glossary.json".into());
+        options.resume = false;
+        let mut pipeline = SubtitlePipeline::new(
+            CountingBackend {
+                calls: Arc::clone(&calls),
+                fail_on_call: Some(1),
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(store));
+
+        let error = pipeline
+            .run_document(&source)
+            .expect_err("invalid TM term must fail final validation");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(error.to_string().contains("`Lord` -> `勋爵`"));
+    }
+
+    #[test]
+    fn final_validation_checks_required_glossary_after_review() {
+        let source = document("review-terms.txt", &["The Lord is here."]);
+        let captured = Arc::new(Mutex::new(CapturedStoreData {
+            loaded_glossary: vec![("Lord".to_owned(), "勋爵".to_owned())],
+            ..CapturedStoreData::default()
+        }));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("review-terms.txt"),
+                std::path::Path::new("review-terms.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: captured,
+        };
+        let mut options = PipelineOptions::new("review-terms.txt".into());
+        options.glossary_path = Some("glossary.json".into());
+        options.review_policy = ReviewPolicy::Full;
+        options.terminology_preflight = false;
+        options.resume = false;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, NoopDashboard, options)
+            .with_store(Box::new(store));
+
+        let error = pipeline
+            .run_document(&source)
+            .expect_err("reviewer must not remove a required term");
+
+        assert!(error.to_string().contains("final output validation failed"));
+        assert!(error.to_string().contains("`Lord` -> `勋爵`"));
     }
 
     #[test]
@@ -2913,6 +3352,34 @@ mod tests {
     }
 
     #[test]
+    fn targeted_review_uses_term_boundaries_and_inflections() {
+        let batches = vec![vec![segment("1", "The actors left the theater.")]];
+        let mut memory = ContextMemory::new();
+        memory.glossary.extend([
+            ("actor".to_owned(), "演员".to_owned()),
+            ("he".to_owned(), "他".to_owned()),
+        ]);
+
+        let valid = build_review_plan(
+            &batches,
+            &[segment("1", "演员离开了剧院。")],
+            &memory,
+            "en",
+            "zh-Hans",
+        );
+        assert!(valid.is_empty());
+
+        let missing_inflected_term = build_review_plan(
+            &batches,
+            &[segment("1", "人们离开了剧院。")],
+            &memory,
+            "en",
+            "zh-Hans",
+        );
+        assert_eq!(missing_inflected_term[0].reasons, vec!["glossary mismatch"]);
+    }
+
+    #[test]
     fn terminology_payload_accepts_only_known_nonempty_candidates() {
         let candidates = vec![TerminologyCandidate {
             source: "Axe Gang".to_owned(),
@@ -3067,6 +3534,7 @@ mod tests {
             index: 0,
             memory_hits: HashMap::new(),
             pending: vec![segment("69", "The Lord bless thee and keep thee.")],
+            prompt_context: TranslationPromptContext::default(),
         }];
         let generated = HashMap::from([(
             1,
@@ -3096,6 +3564,7 @@ mod tests {
             &options,
             1,
             &prepared[0].pending,
+            &TranslationPromptContext::default(),
             &memory,
             &BTreeMap::new(),
             false,
@@ -3109,6 +3578,7 @@ mod tests {
             &options,
             1,
             &prepared[0].pending,
+            &TranslationPromptContext::default(),
             &memory,
             &required,
             false,
@@ -3163,11 +3633,13 @@ mod tests {
                 index: 0,
                 memory_hits: HashMap::new(),
                 pending: vec![segment("1", "Zasa arrived.")],
+                prompt_context: TranslationPromptContext::default(),
             },
             translation_stage::PreparedBatch {
                 index: 1,
                 memory_hits: HashMap::new(),
                 pending: vec![segment("2", "Zasa sent them.")],
+                prompt_context: TranslationPromptContext::default(),
             },
         ];
         let entity = |canonical: &str, source: &str, target: &str| TerminologyEntity {
@@ -3239,6 +3711,7 @@ mod tests {
             index: 0,
             memory_hits: HashMap::new(),
             pending: vec![segment("1", "Zasa arrived.")],
+            prompt_context: TranslationPromptContext::default(),
         }];
         let mut generated = HashMap::from([(
             1,
@@ -3320,6 +3793,132 @@ mod tests {
         assert_eq!(
             run.translated_segments[0].text,
             "[REVIEWED] [ECHO] Meet Alice now."
+        );
+    }
+
+    #[test]
+    fn parallel_review_uses_the_explicit_reviewer_backend() {
+        let document = document("parallel-review.txt", &["First.", "Second."]);
+        let mut options = PipelineOptions::new("parallel-review.txt".into());
+        options.batch_size = 1;
+        options.translation_concurrency = 2;
+        options.review_concurrency = 2;
+        options.terminology_preflight = false;
+        options.review_policy = ReviewPolicy::Full;
+        options.resume = false;
+        options.use_cache = false;
+        let translator_translation_calls = Arc::new(AtomicUsize::new(0));
+        let translator_review_calls = Arc::new(AtomicUsize::new(0));
+        let reviewer_translation_calls = Arc::new(AtomicUsize::new(0));
+        let reviewer_review_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            RoutedParallelBackend {
+                label: "translator",
+                translation_calls: Arc::clone(&translator_translation_calls),
+                review_calls: Arc::clone(&translator_review_calls),
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_reviewer(RoutedParallelBackend {
+            label: "reviewer",
+            translation_calls: Arc::clone(&reviewer_translation_calls),
+            review_calls: Arc::clone(&reviewer_review_calls),
+        });
+
+        let run = pipeline.run_document(&document).expect("reviewed run");
+
+        assert_eq!(translator_translation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(translator_review_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reviewer_translation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reviewer_review_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(run.result.review.usage.total_tokens, 10);
+        assert!(
+            run.translated_segments
+                .iter()
+                .all(|segment| segment.text.starts_with("[reviewer REVIEW]"))
+        );
+    }
+
+    #[test]
+    fn parallel_translation_uses_source_context_then_confirmed_previous_window() {
+        let document = document(
+            "parallel-context.txt",
+            &["Line 1.", "Line 2.", "Line 3.", "Line 4.", "Line 5."],
+        );
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut options = PipelineOptions::new("parallel-context.txt".into());
+        options.batch_size = 1;
+        options.translation_concurrency = 2;
+        options.terminology_preflight = false;
+        options.preserve_names = true;
+        options.resume = false;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(
+            ContextCaptureBackend {
+                contexts: Arc::clone(&contexts),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        pipeline.run_document(&document).expect("contextual run");
+
+        let contexts = contexts.lock().expect("context lock");
+        assert_eq!(contexts.len(), 5);
+        assert_eq!(contexts[0]["editable_ids"], serde_json::json!(["1"]));
+        assert_eq!(
+            contexts[0]["readonly_source"]["after"],
+            serde_json::json!([
+                {"id": "2", "source": "Line 2."},
+                {"id": "3", "source": "Line 3."},
+                {"id": "4", "source": "Line 4."}
+            ])
+        );
+        assert!(contexts[1].get("confirmed_previous").is_none());
+        assert_eq!(contexts[4]["confirmed_previous"][0]["id"], "4");
+        assert_eq!(
+            contexts[4]["confirmed_previous"][0]["translation"],
+            "[ECHO] Line 4."
+        );
+        assert!(
+            contexts
+                .iter()
+                .all(|context| context.get("recent").is_none())
+        );
+    }
+
+    #[test]
+    fn parallel_review_falls_back_to_the_translator_without_a_reviewer() {
+        let document = document("parallel-self-review.txt", &["First.", "Second."]);
+        let mut options = PipelineOptions::new("parallel-self-review.txt".into());
+        options.batch_size = 1;
+        options.translation_concurrency = 2;
+        options.review_concurrency = 2;
+        options.terminology_preflight = false;
+        options.review_policy = ReviewPolicy::Full;
+        options.resume = false;
+        options.use_cache = false;
+        let translation_calls = Arc::new(AtomicUsize::new(0));
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            RoutedParallelBackend {
+                label: "translator",
+                translation_calls: Arc::clone(&translation_calls),
+                review_calls: Arc::clone(&review_calls),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("self-reviewed run");
+
+        assert_eq!(translation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(review_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            run.translated_segments
+                .iter()
+                .all(|segment| segment.text.starts_with("[translator REVIEW]"))
         );
     }
 
@@ -3511,6 +4110,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct CapturedStoreData {
         saved_translation_memory: Vec<(String, String)>,
+        loaded_translation_memory: Vec<(String, String)>,
+        loaded_glossary: Vec<(String, String)>,
         review_reports: Vec<ReviewReport>,
         saved_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_review_batches: Vec<(usize, Vec<SubtitleSegment>)>,
@@ -3540,7 +4141,12 @@ mod tests {
         }
 
         fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
-            Ok(Vec::new())
+            Ok(self
+                .data
+                .lock()
+                .expect("capture lock")
+                .loaded_glossary
+                .clone())
         }
 
         fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()> {
@@ -3551,8 +4157,12 @@ mod tests {
         }
 
         fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
-            // Cache-focused tests opt out of translation-memory short-circuiting.
-            Ok(Vec::new())
+            Ok(self
+                .data
+                .lock()
+                .expect("capture lock")
+                .loaded_translation_memory
+                .clone())
         }
 
         fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()> {

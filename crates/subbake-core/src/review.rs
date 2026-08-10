@@ -4,6 +4,7 @@ use crate::entities::{PipelineOptions, ReviewResult, SubtitleSegment, Translatio
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
 use crate::ports::ChatMessage;
+use crate::term_matcher::TermMatcher;
 use crate::validation::validate_full_alignment;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,10 +135,6 @@ pub(crate) fn build_review_messages(
             "editable": candidate_reasons.contains_key(&source.id),
         })).collect::<Vec<_>>(),
     });
-    let recent = memory.recent_summaries_for_prompt();
-    if !recent.is_empty() {
-        payload["recent"] = serde_json::json!(recent);
-    }
     if !glossary.is_empty() {
         payload["glossary"] = serde_json::Value::Object(
             glossary
@@ -242,12 +239,10 @@ fn line_review_reasons(
     cross_language: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    let source_lower = source.text.to_lowercase();
-    let translated_lower = translated.text.to_lowercase();
-    if memory.glossary.iter().any(|(term, target)| {
-        source_lower.contains(&term.to_lowercase())
-            && !translated_lower.contains(&target.to_lowercase())
-    }) {
+    if !TermMatcher::case_insensitive()
+        .missing_required(&source.text, &translated.text, &memory.glossary)
+        .is_empty()
+    {
         reasons.push("glossary mismatch".to_owned());
     }
     if formatting_tokens(&source.text) != formatting_tokens(&translated.text) {

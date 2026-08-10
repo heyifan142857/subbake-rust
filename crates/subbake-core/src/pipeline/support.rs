@@ -7,12 +7,17 @@ use crate::formatting::protect_formatting;
 use crate::memory::ContextMemory;
 use crate::ports::{CacheStage, ChatMessage};
 use crate::review::ReviewBatchPlan;
-use crate::storage::{JsonValue, build_request_hash, build_request_hash_v2};
+use crate::storage::{JsonValue, build_request_hash, build_request_hash_v2, stable_hash};
+use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
 use super::name_alignment::{protect_names, select_markers as select_name_markers};
 use super::online_terminology::{protect_terms, select_markers as select_term_markers};
-use super::translation_stage::PreparedBatch;
+#[cfg(test)]
+use super::translation_stage::{ConfirmedTranslationContext, SourceBatchContext};
+use super::translation_stage::{PreparedBatch, TranslationPromptContext};
+
+const REVIEW_ROUTING_CACHE_VERSION: u64 = 2;
 
 pub(super) fn duration_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -22,6 +27,7 @@ pub(super) fn build_translation_messages(
     options: &PipelineOptions,
     batch_index: usize,
     batch: &[SubtitleSegment],
+    prompt_context: &TranslationPromptContext,
     memory: &ContextMemory,
     required_glossary: &BTreeMap<String, String>,
     compact_wire: bool,
@@ -31,6 +37,7 @@ pub(super) fn build_translation_messages(
         "tgt": options.target_language,
         "batch_index": batch_index,
         "mode": options.mode.as_str(),
+        "editable_ids": batch.iter().map(|segment| segment.id.as_str()).collect::<Vec<_>>(),
     });
     let batch_texts = batch
         .iter()
@@ -59,13 +66,24 @@ pub(super) fn build_translation_messages(
                 .map(serde_json::Value::String)
                 .collect(),
         );
-        let recent = memory.recent_summaries_for_prompt();
-        if !recent.is_empty() {
-            context["recent"] = serde_json::Value::Array(
-                recent
+        if !prompt_context.source.before.is_empty() || !prompt_context.source.after.is_empty() {
+            context["readonly_source"] = serde_json::json!({
+                "before": readonly_source_lines(&prompt_context.source.before),
+                "after": readonly_source_lines(&prompt_context.source.after),
+            });
+        }
+        if !prompt_context.previous_confirmed.is_empty() {
+            context["confirmed_previous"] = serde_json::Value::Array(
+                prompt_context
+                    .previous_confirmed
                     .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
+                    .map(|line| {
+                        serde_json::json!({
+                            "id": line.id,
+                            "source": line.source,
+                            "translation": line.translation,
+                        })
+                    })
                     .collect(),
             );
         }
@@ -134,6 +152,7 @@ Return JSON only with this shape:\n\
 {response_shape}\n\
 Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
+CONTEXT_JSON.editable_ids is the complete set of ids you may return. CONTEXT_JSON.readonly_source and CONTEXT_JSON.confirmed_previous are read-only context; never return or modify their ids.\n\
 Tokens shaped like ⟦SBK_FMT_<number>⟧ are protected subtitle formatting markers. Copy each marker exactly once and in the original order.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
@@ -156,6 +175,15 @@ only when they fit the meaning in the current context.\n{}\n{terminology_rule}",
     ]
 }
 
+fn readonly_source_lines(segments: &[SubtitleSegment]) -> serde_json::Value {
+    serde_json::Value::Array(
+        segments
+            .iter()
+            .map(|segment| serde_json::json!({"id": segment.id, "source": segment.text}))
+            .collect(),
+    )
+}
+
 pub(super) fn request_hash(
     options: &PipelineOptions,
     stage: CacheStage,
@@ -176,23 +204,32 @@ pub(super) fn request_hash(
             })
             .collect(),
     );
-    let reviewer_stage = matches!(
-        stage,
-        CacheStage::Review | CacheStage::Terminology | CacheStage::AgentReviewRepair
-    );
-    let fingerprint = if reviewer_stage {
-        options
-            .reviewer_fingerprint
-            .as_ref()
-            .or(options.provider_fingerprint.as_ref())
-    } else {
-        options.provider_fingerprint.as_ref()
-    };
+    let fingerprint = request_backend_fingerprint(options, stage);
     if let Some(fingerprint) = fingerprint {
-        build_request_hash_v2(fingerprint, stage.as_str(), messages)
+        build_request_hash_v2(&fingerprint, stage.as_str(), messages)
     } else {
         build_request_hash(&options.provider, &options.model, stage.as_str(), messages)
     }
+}
+
+fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> Option<String> {
+    if stage == CacheStage::Review
+        && let Some(reviewer) = &options.reviewer_fingerprint
+    {
+        return Some(format!(
+            "review-routing-v{REVIEW_ROUTING_CACHE_VERSION}:{reviewer}"
+        ));
+    }
+    if matches!(
+        stage,
+        CacheStage::Review | CacheStage::Terminology | CacheStage::AgentReviewRepair
+    ) {
+        return options
+            .reviewer_fingerprint
+            .clone()
+            .or_else(|| options.provider_fingerprint.clone());
+    }
+    options.provider_fingerprint.clone()
 }
 
 pub(super) fn is_agent_repairable(error: &CoreError) -> bool {
@@ -280,18 +317,16 @@ pub(super) fn validate_window_terminology(
             continue;
         };
         for (segment, line) in batch.pending.iter().zip(&result.lines) {
-            let source_lower = segment.text.to_lowercase();
-            let translation_lower = line.translation.to_lowercase();
-            for (term, target) in required_glossary {
-                if source_lower.contains(&term.to_lowercase())
-                    && !translation_lower.contains(&target.to_lowercase())
-                    && !defer_missing_to_review
-                {
-                    return Err(CoreError::InvalidTranslation(format!(
-                        "line {} does not use required glossary translation `{term}` -> `{target}`",
-                        segment.id
-                    )));
-                }
+            if !defer_missing_to_review
+                && let Some((term, target)) = TermMatcher::case_insensitive()
+                    .missing_required(&segment.text, &line.translation, required_glossary)
+                    .into_iter()
+                    .next()
+            {
+                return Err(CoreError::InvalidTranslation(format!(
+                    "line {} does not use required glossary translation `{term}` -> `{target}`",
+                    segment.id
+                )));
             }
         }
     }
@@ -347,6 +382,53 @@ pub fn translation_memory_key(text: &str) -> String {
     attached
 }
 
+pub(super) fn contextual_translation_memory_keys(
+    scope: &str,
+    segments: &[SubtitleSegment],
+) -> HashMap<String, String> {
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let previous = index
+                .checked_sub(1)
+                .and_then(|previous| segments.get(previous))
+                .map(|segment| segment.text.as_str());
+            let next = segments
+                .get(index.saturating_add(1))
+                .map(|segment| segment.text.as_str());
+            (
+                segment.id.clone(),
+                contextual_translation_memory_key(scope, previous, &segment.text, next),
+            )
+        })
+        .collect()
+}
+
+fn contextual_translation_memory_key(
+    scope: &str,
+    previous: Option<&str>,
+    text: &str,
+    next: Option<&str>,
+) -> String {
+    let source = translation_memory_key(text);
+    if source.is_empty() {
+        return String::new();
+    }
+    let payload = JsonValue::Array(vec![
+        JsonValue::String(scope.to_owned()),
+        previous
+            .map(translation_memory_key)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+        JsonValue::String(source.clone()),
+        next.map(translation_memory_key)
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+    ]);
+    format!("ctx-v1:{}:{source}", stable_hash(&payload))
+}
+
 pub(super) fn merge_translation_lines(
     batch: &[SubtitleSegment],
     tm_hits: &HashMap<String, String>,
@@ -376,11 +458,12 @@ pub(super) fn merge_translation_lines(
 
 pub(super) fn update_translation_memory(
     memory: &mut HashMap<String, String>,
+    memory_keys: &HashMap<String, String>,
     source: &[SubtitleSegment],
     translated: &[SubtitleSegment],
 ) {
     for (source, translated) in source.iter().zip(translated) {
-        let key = translation_memory_key(&source.text);
+        let key = memory_keys.get(&source.id).cloned().unwrap_or_default();
         if !key.is_empty() && !translated.text.trim().is_empty() {
             memory.insert(key, translated.text.clone());
         }
@@ -390,6 +473,57 @@ pub(super) fn update_translation_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_routing_cache_version_only_salts_an_explicit_reviewer() {
+        let mut options = PipelineOptions::new("episode.srt".into());
+        options.provider_fingerprint = Some("translator-route".to_owned());
+
+        assert_eq!(
+            request_backend_fingerprint(&options, CacheStage::Review).as_deref(),
+            Some("translator-route")
+        );
+
+        options.reviewer_fingerprint = Some("reviewer-route".to_owned());
+        assert_eq!(
+            request_backend_fingerprint(&options, CacheStage::Review).as_deref(),
+            Some("review-routing-v2:reviewer-route")
+        );
+        assert_eq!(
+            request_backend_fingerprint(&options, CacheStage::Terminology).as_deref(),
+            Some("reviewer-route")
+        );
+        assert_eq!(
+            request_backend_fingerprint(&options, CacheStage::AgentReviewRepair).as_deref(),
+            Some("reviewer-route")
+        );
+        assert_eq!(
+            request_backend_fingerprint(&options, CacheStage::Translate).as_deref(),
+            Some("translator-route")
+        );
+    }
+
+    #[test]
+    fn contextual_tm_keys_distinguish_neighbors_and_project_scope() {
+        let first = vec![
+            segment("1", "He paid the fee."),
+            segment("2", "Fine."),
+            segment("3", "We can leave."),
+        ];
+        let second = vec![
+            segment("1", "The weather is clear."),
+            segment("2", "Fine."),
+            segment("3", "We should stay."),
+        ];
+
+        let first_keys = contextual_translation_memory_keys("/shows/one", &first);
+        let second_keys = contextual_translation_memory_keys("/shows/one", &second);
+        let other_project = contextual_translation_memory_keys("/shows/two", &first);
+
+        assert!(first_keys["2"].starts_with("ctx-v1:"));
+        assert_ne!(first_keys["2"], second_keys["2"]);
+        assert_ne!(first_keys["2"], other_project["2"]);
+    }
 
     #[test]
     fn translation_prompt_makes_the_name_policy_explicit() {
@@ -405,8 +539,15 @@ mod tests {
             settings: None,
         }];
 
-        let transliterated =
-            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
+        let transliterated = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &memory,
+            &BTreeMap::new(),
+            false,
+        );
         assert!(
             transliterated[0]
                 .content
@@ -417,14 +558,28 @@ mod tests {
         assert!(transliterated[1].content.contains("⟦N0⟧Mary⟦/N0⟧"));
 
         options.preserve_names = true;
-        let preserved =
-            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
+        let preserved = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &memory,
+            &BTreeMap::new(),
+            false,
+        );
         assert!(preserved[0].content.contains("source spelling"));
         assert!(!preserved[0].content.contains("⟦N<number>⟧"));
 
         options.online_terminology = false;
-        let minimal =
-            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
+        let minimal = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &memory,
+            &BTreeMap::new(),
+            false,
+        );
         assert!(
             minimal[0]
                 .content
@@ -433,8 +588,80 @@ mod tests {
 
         options.preserve_names = false;
         options.online_terminology = true;
-        let comprehensive =
-            build_translation_messages(&options, 0, &batch, &memory, &BTreeMap::new(), false);
+        let comprehensive = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &memory,
+            &BTreeMap::new(),
+            false,
+        );
         assert!(!comprehensive[0].content.contains("⟦N<number>⟧"));
+    }
+
+    #[test]
+    fn translation_prompt_separates_editable_and_read_only_context() {
+        let options = PipelineOptions::new("episode.srt".into());
+        let mut memory = ContextMemory::default();
+        memory.update("legacy model summary", &[]);
+        let batch = [segment("2", "Who is she?")];
+        let prompt_context = TranslationPromptContext {
+            source: SourceBatchContext {
+                before: vec![segment("1", "A woman enters.")],
+                after: vec![segment("3", "Her name is Mary.")],
+            },
+            previous_confirmed: vec![ConfirmedTranslationContext {
+                id: "1".to_owned(),
+                source: "A woman enters.".to_owned(),
+                translation: "一位女士走了进来。".to_owned(),
+            }],
+        };
+
+        let messages = build_translation_messages(
+            &options,
+            2,
+            &batch,
+            &prompt_context,
+            &memory,
+            &BTreeMap::new(),
+            false,
+        );
+        let prompt = &messages[1].content;
+        let context = prompt
+            .split("CONTEXT_JSON_START")
+            .nth(1)
+            .and_then(|value| value.split("CONTEXT_JSON_END").next())
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .expect("context json");
+        let payload = prompt
+            .split("BATCH_JSON_START")
+            .nth(1)
+            .and_then(|value| value.split("BATCH_JSON_END").next())
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .expect("batch json");
+
+        assert_eq!(context["editable_ids"], serde_json::json!(["2"]));
+        assert_eq!(context["readonly_source"]["before"][0]["id"], "1");
+        assert_eq!(context["readonly_source"]["after"][0]["id"], "3");
+        assert_eq!(
+            context["confirmed_previous"][0]["translation"],
+            "一位女士走了进来。"
+        );
+        assert!(context.get("recent").is_none());
+        assert_eq!(payload["lines"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["lines"][0]["id"], "2");
+        assert!(messages[0].content.contains("read-only context"));
+    }
+
+    fn segment(id: &str, text: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+        }
     }
 }

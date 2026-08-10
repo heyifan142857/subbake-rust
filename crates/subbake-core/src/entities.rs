@@ -478,11 +478,20 @@ pub struct PipelineOptions {
     /// Keep personal names in their source spelling instead of translating or
     /// transliterating them into the target language.
     pub preserve_names: bool,
+    /// Optional hard subtitle readability limits. `None` disables the
+    /// corresponding final-output check.
+    pub max_characters_per_second: Option<f64>,
+    pub max_characters_per_line: Option<usize>,
+    pub max_lines: Option<usize>,
     pub timeout_seconds: f64,
     /// Non-secret identity of the configured API route, used to isolate v2
     /// cache entries across protocols and relay endpoints.
     pub provider_fingerprint: Option<String>,
     pub reviewer_fingerprint: Option<String>,
+    /// Hash of the glossary snapshot frozen after terminology preflight. This
+    /// is populated by the pipeline and keeps Resume state tied to the exact
+    /// terminology context without persisting glossary contents in run state.
+    pub glossary_fingerprint: Option<String>,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -517,9 +526,13 @@ impl PipelineOptions {
             terminology_preflight: true,
             online_terminology: false,
             preserve_names: false,
+            max_characters_per_second: None,
+            max_characters_per_line: None,
+            max_lines: None,
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,
             reviewer_fingerprint: None,
+            glossary_fingerprint: None,
             dry_run: false,
             resume: true,
             use_cache: true,

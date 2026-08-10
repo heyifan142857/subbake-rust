@@ -15,6 +15,7 @@ pub mod quality;
 mod recovery;
 mod review;
 pub mod storage;
+pub mod term_matcher;
 pub mod tool_outcome;
 pub mod validation;
 
@@ -45,9 +46,11 @@ pub use progress::{
 pub use quality::{
     QualityIssue, QualityIssueKind, QualityPolicy, QualityReport, QualitySeverity, inspect_quality,
 };
+pub use term_matcher::{TermMatch, TermMatcher};
 pub use tool_outcome::{
     AgentToolOutcome, CommandToolOutcome, FileToolOutcome, ObservationToolOutcome,
     ProfileToolOutcome, SkippedPath, SubtitleEditToolOutcome, ToolExecutionStatus,
     TranscriptionToolOutcome, TranslationToolOutcome, WhisperModelFact, WhisperToolOutcome,
 };
+pub use validation::{FinalValidationPolicy, validate_final_output};
 pub mod cancellation;

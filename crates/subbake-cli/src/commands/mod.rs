@@ -164,6 +164,11 @@ Options:
       --mode <MODE>               Translation mode: economy, turbo, or cinema
       --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
+      --max-characters-per-second <N>
+                                   Reject subtitles above this reading speed
+      --max-characters-per-line <N>
+                                   Reject subtitle lines longer than N characters
+      --max-lines <N>              Reject subtitle entries with more than N lines
       --fast                       Deprecated alias for --mode turbo
       --dry-run                    Prepare work without provider calls
       --max-requests <N>           Stop before exceeding N provider requests

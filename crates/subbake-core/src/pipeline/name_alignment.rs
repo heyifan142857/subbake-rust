@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
+use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
 
@@ -23,49 +24,38 @@ struct TranslatedNameMarker {
 pub(super) fn select_markers(source: &[SubtitleSegment], candidates: &[String]) -> Vec<NameMarker> {
     let haystack = source
         .iter()
-        .map(|segment| segment.text.to_lowercase())
+        .map(|segment| segment.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let mut matched = candidates
+    let eligible = candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| {
-            haystack.contains(&candidate.to_lowercase()) && !is_source_stable_acronym(candidate)
-        })
-        .map(|(index, source)| NameMarker {
-            index,
-            source: source.clone(),
-        })
+        .filter(|(_, candidate)| !is_source_stable_acronym(candidate))
         .collect::<Vec<_>>();
-    matched.sort_by_key(|marker| std::cmp::Reverse(marker.source.chars().count()));
-    let mut selected = Vec::<NameMarker>::new();
-    for marker in matched {
-        if selected.len() == 12 {
-            break;
-        }
-        if !selected
-            .iter()
-            .any(|existing| existing.source.contains(&marker.source))
-        {
-            selected.push(marker);
-        }
-    }
-    selected
+    let terms = eligible
+        .iter()
+        .map(|(_, candidate)| candidate.as_str())
+        .collect::<Vec<_>>();
+    TermMatcher::case_insensitive()
+        .matching_indices(&haystack, &terms)
+        .into_iter()
+        .filter_map(|matched| eligible.get(matched))
+        .take(12)
+        .map(|(index, source)| NameMarker {
+            index: *index,
+            source: (*source).clone(),
+        })
+        .collect()
 }
 
 pub(super) fn protect_names(text: &str, markers: &[NameMarker]) -> String {
-    markers.iter().fold(text.to_owned(), |protected, marker| {
-        if !protected.contains(&marker.source) {
-            return protected;
-        }
-        protected.replace(
-            &marker.source,
-            &format!(
-                "⟦N{index}⟧{}⟦/N{index}⟧",
-                marker.source,
-                index = marker.index
-            ),
-        )
+    let terms = markers
+        .iter()
+        .map(|marker| marker.source.as_str())
+        .collect::<Vec<_>>();
+    TermMatcher::case_insensitive().replace_matches(text, &terms, |matched, text| {
+        let index = markers[matched].index;
+        format!("⟦N{index}⟧{text}⟦/N{index}⟧")
     })
 }
 
@@ -156,7 +146,7 @@ pub(super) fn reconcile_batch(
             || proposed.is_empty()
             || !source
                 .iter()
-                .any(|segment| segment.text.contains(source_form))
+                .any(|segment| TermMatcher::case_insensitive().contains(&segment.text, source_form))
         {
             return Err(CoreError::InvalidTranslation(format!(
                 "cached name alignment contains invalid entry `{source_form}` -> `{proposed}`"
@@ -205,7 +195,7 @@ fn parse_markers(
         let Some(marker) = markers.iter().find(|marker| marker.index == index) else {
             return Err(invalid_marker(&format!("unknown marker id `{index}`")));
         };
-        if !source_line.contains(&marker.source) {
+        if !TermMatcher::case_insensitive().contains(source_line, &marker.source) {
             return Err(invalid_marker(&format!(
                 "marker `{index}` moved to a line without `{}`",
                 marker.source

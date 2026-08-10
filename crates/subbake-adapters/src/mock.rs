@@ -198,7 +198,7 @@ fn translate_subtitles(prompt: &str) -> CoreResult<BatchTranslationResult> {
 
     Ok(BatchTranslationResult {
         lines,
-        summary: "Mock summary of the latest subtitle batch.".to_owned(),
+        summary: String::new(),
         glossary_updates,
         terminology_updates: Vec::new(),
     })

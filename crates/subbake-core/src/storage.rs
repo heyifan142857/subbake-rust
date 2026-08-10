@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,16 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 3;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 11;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 15;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
+/// Bump when any translation, terminology, review, or repair prompt contract
+/// changes in a way that can alter persisted translated/reviewed shards.
+pub const PROMPT_CONTRACT_VERSION: u64 = 1;
+/// Bump when translation-memory keying, lookup, or application semantics change.
+pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 1;
+/// Bump when deterministic final-output validation semantics change.
+pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -224,7 +232,7 @@ pub fn build_runtime_paths(
         translated_batches_dir: run_dir.join("translated_batches"),
         reviewed_batches_dir: run_dir.join("reviewed_batches"),
         translation_memory_path: root_dir.join(format!(
-            "translation_memory.v3.{language_pair}.{translation_memory_mode}.json"
+            "translation_memory.v4.{language_pair}.{translation_memory_mode}.json"
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
         review_report_path: run_dir.join("review_report.json"),
@@ -237,6 +245,15 @@ pub fn input_signature_from_bytes(bytes: &[u8], mtime_ns: Option<u128>) -> Input
         size: bytes.len() as u64,
         mtime_ns,
     }
+}
+
+pub fn build_glossary_fingerprint(glossary: &BTreeMap<String, String>) -> String {
+    stable_hash(&JsonValue::Object(
+        glossary
+            .iter()
+            .map(|(source, target)| (source.clone(), JsonValue::String(target.clone())))
+            .collect(),
+    ))
 }
 
 pub fn build_translation_fingerprint(
@@ -285,6 +302,35 @@ pub fn build_translation_fingerprint(
         ),
         ("model".to_owned(), JsonValue::String(options.model.clone())),
         (
+            "provider_fingerprint".to_owned(),
+            optional_string(&options.provider_fingerprint),
+        ),
+        (
+            "reviewer_fingerprint".to_owned(),
+            optional_string(&options.reviewer_fingerprint),
+        ),
+        (
+            "glossary_fingerprint".to_owned(),
+            optional_string(&options.glossary_fingerprint),
+        ),
+        (
+            "semantic_versions".to_owned(),
+            JsonValue::Object(vec![
+                (
+                    "prompt_contract".to_owned(),
+                    JsonValue::Number(PROMPT_CONTRACT_VERSION.to_string()),
+                ),
+                (
+                    "translation_memory_policy".to_owned(),
+                    JsonValue::Number(TRANSLATION_MEMORY_POLICY_VERSION.to_string()),
+                ),
+                (
+                    "final_validation_policy".to_owned(),
+                    JsonValue::Number(FINAL_VALIDATION_POLICY_VERSION.to_string()),
+                ),
+            ]),
+        ),
+        (
             "batch_size".to_owned(),
             JsonValue::Number(options.batch_size.to_string()),
         ),
@@ -305,6 +351,36 @@ pub fn build_translation_fingerprint(
             JsonValue::Bool(options.preserve_names),
         ),
         (
+            "review_policy".to_owned(),
+            JsonValue::String(options.review_policy.as_str().to_owned()),
+        ),
+        ("agent".to_owned(), JsonValue::Bool(options.agent)),
+        (
+            "agent_repair_attempts".to_owned(),
+            JsonValue::Number(options.agent_repair_attempts.to_string()),
+        ),
+        (
+            "max_characters_per_second".to_owned(),
+            options
+                .max_characters_per_second
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "max_characters_per_line".to_owned(),
+            options
+                .max_characters_per_line
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "max_lines".to_owned(),
+            options
+                .max_lines
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
             "mode".to_owned(),
             JsonValue::String(options.mode.as_str().to_owned()),
         ),
@@ -317,6 +393,13 @@ pub fn build_translation_fingerprint(
             JsonValue::String(options.target_language.clone()),
         ),
     ]))
+}
+
+fn optional_string(value: &Option<String>) -> JsonValue {
+    value
+        .as_ref()
+        .map(|value| JsonValue::String(value.clone()))
+        .unwrap_or(JsonValue::Null)
 }
 
 pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
@@ -580,7 +663,81 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "0aebb161d2a5a8101ec52ec4bb4fa9c9fdcf42d0"
+            "8fb90ea254514132447e85687e4525258b02562b"
+        );
+    }
+
+    #[test]
+    fn glossary_fingerprint_is_order_independent_and_content_sensitive() {
+        let first = BTreeMap::from([
+            ("Alice".to_owned(), "爱丽丝".to_owned()),
+            ("Lord".to_owned(), "勋爵".to_owned()),
+        ]);
+        let mut same_entries = BTreeMap::new();
+        same_entries.insert("Lord".to_owned(), "勋爵".to_owned());
+        same_entries.insert("Alice".to_owned(), "爱丽丝".to_owned());
+        let changed = BTreeMap::from([
+            ("Alice".to_owned(), "爱丽丝".to_owned()),
+            ("Lord".to_owned(), "领主".to_owned()),
+        ]);
+
+        assert_eq!(
+            build_glossary_fingerprint(&first),
+            build_glossary_fingerprint(&same_entries)
+        );
+        assert_ne!(
+            build_glossary_fingerprint(&first),
+            build_glossary_fingerprint(&changed)
+        );
+    }
+
+    #[test]
+    fn translation_fingerprint_covers_resume_semantic_inputs() {
+        let signature = input_signature_from_bytes(b"subtitle", Some(123));
+        let glossary = BTreeMap::from([("Lord".to_owned(), "勋爵".to_owned())]);
+        let mut baseline = PipelineOptions::new("clip.srt".into());
+        baseline.provider_fingerprint = Some("openai|responses|https://one.example|gpt".to_owned());
+        baseline.reviewer_fingerprint =
+            Some("anthropic|messages|https://review.example|opus".to_owned());
+        baseline.glossary_fingerprint = Some(build_glossary_fingerprint(&glossary));
+        let fingerprint = build_translation_fingerprint(&baseline, &signature);
+
+        let mut changed_provider = baseline.clone();
+        changed_provider.provider_fingerprint =
+            Some("openai|responses|https://two.example|gpt".to_owned());
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_provider, &signature)
+        );
+
+        let mut changed_reviewer = baseline.clone();
+        changed_reviewer.reviewer_fingerprint = None;
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_reviewer, &signature)
+        );
+
+        let mut changed_glossary = baseline.clone();
+        changed_glossary.glossary_fingerprint = Some(build_glossary_fingerprint(&BTreeMap::from(
+            [("Lord".to_owned(), "领主".to_owned())],
+        )));
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_glossary, &signature)
+        );
+
+        let mut changed_review = baseline.clone();
+        changed_review.review_policy = crate::entities::ReviewPolicy::Full;
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_review, &signature)
+        );
+
+        let mut changed_validation = baseline.clone();
+        changed_validation.max_lines = Some(2);
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_validation, &signature)
         );
     }
 
@@ -654,7 +811,7 @@ mod tests {
             paths
                 .translation_memory_path
                 .to_string_lossy()
-                .contains("translation_memory.v3.auto-zh-hans.standard.json")
+                .contains("translation_memory.v4.auto-zh-hans.standard.json")
         );
     }
 

@@ -1,12 +1,13 @@
-// In-run translation context: accumulates glossary entries and recent
-// summaries across batches so each prompt can carry relevant context. Mirrors
-// Python `subbake/memory.py::ContextMemory`.
+// In-run translation context. The persisted `recent_summaries` field remains
+// readable for storage compatibility, but translation prompts use deterministic
+// neighboring source and confirmed-translation context instead.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::entities::{GlossaryEntry, TerminologyEntity};
+use crate::term_matcher::TermMatcher;
 
 pub const DEFAULT_MAX_SUMMARIES: usize = 2;
 pub const GLOSSARY_RELEVANCE_LIMIT: usize = 24;
@@ -149,32 +150,40 @@ impl ContextMemory {
     }
 
     /// Return up to `GLOSSARY_RELEVANCE_LIMIT` glossary entries whose source or
-    /// target (case-insensitive) appears in the batch texts. Mirrors
-    /// `prompts.select_relevant_glossary`.
+    /// target matches the batch texts using shared script-aware term rules.
     pub fn select_relevant_glossary(&self, texts: &[&str]) -> Vec<(String, String)> {
         if self.glossary.is_empty() || texts.is_empty() {
             return Vec::new();
         }
-        let haystack = texts.join("\n").to_lowercase();
-        let mut matched = Vec::new();
-        for (source, target) in &self.glossary {
-            if english_possessive_base(source).is_some() {
-                continue;
-            }
-            if haystack.contains(&source.to_lowercase())
-                || haystack.contains(&target.to_lowercase())
-            {
-                matched.push((source.clone(), target.clone()));
-                if matched.len() >= GLOSSARY_RELEVANCE_LIMIT {
-                    break;
+        let haystack = texts.join("\n");
+        let entries = self
+            .glossary
+            .iter()
+            .filter(|(source, _)| english_possessive_base(source).is_none())
+            .collect::<Vec<_>>();
+        let terms = entries
+            .iter()
+            .flat_map(|(source, target)| [source.as_str(), target.as_str()])
+            .collect::<Vec<_>>();
+        let matcher = TermMatcher::case_insensitive();
+        let mut selected = vec![false; entries.len()];
+        matcher
+            .matching_indices(&haystack, &terms)
+            .into_iter()
+            .filter_map(|term_index| {
+                let index = term_index / 2;
+                let entry = entries.get(index)?;
+                if std::mem::replace(selected.get_mut(index)?, true) {
+                    return None;
                 }
-            }
-        }
-        matched
+                Some(((*entry.0).clone(), (*entry.1).clone()))
+            })
+            .take(GLOSSARY_RELEVANCE_LIMIT)
+            .collect()
     }
 
-    /// Recent summaries, newest last, capped at `max_summaries` — the slice
-    /// injected into prompts as `recent`.
+    /// Legacy persisted summaries, newest last, capped at `max_summaries`.
+    /// Translation and review prompts no longer consume this field.
     pub fn recent_summaries_for_prompt(&self) -> &[String] {
         let start = self
             .recent_summaries
@@ -269,6 +278,24 @@ mod tests {
 
         let matched = memory.select_relevant_glossary(&["alice runs away"]);
         assert_eq!(matched, vec![("alice".to_owned(), "爱丽丝".to_owned())]);
+    }
+
+    #[test]
+    fn glossary_selection_uses_boundaries_inflections_and_cjk_longest_match() {
+        let mut memory = ContextMemory::new();
+        memory.glossary.extend([
+            ("he".to_owned(), "他".to_owned()),
+            ("actor".to_owned(), "演员".to_owned()),
+            ("纽约".to_owned(), "纽约".to_owned()),
+            ("纽约时报".to_owned(), "纽约时报中文版".to_owned()),
+        ]);
+
+        let matched = memory.select_relevant_glossary(&["The actors read the 纽约时报."]);
+
+        assert!(matched.contains(&("actor".to_owned(), "演员".to_owned())));
+        assert!(matched.contains(&("纽约时报".to_owned(), "纽约时报中文版".to_owned())));
+        assert!(!matched.iter().any(|(source, _)| source == "he"));
+        assert!(!matched.iter().any(|(source, _)| source == "纽约"));
     }
 
     #[test]

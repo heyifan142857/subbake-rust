@@ -129,11 +129,17 @@ impl RuntimeStore for FileRuntimeStore {
     }
 
     fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
-        if !self.paths.translation_memory_path.exists() {
+        let path = if self.paths.translation_memory_path.exists() {
+            self.paths.translation_memory_path.clone()
+        } else if let Some(path) =
+            legacy_translation_memory_path(&self.paths.translation_memory_path)
+            && path.exists()
+        {
+            path
+        } else {
             return Ok(Vec::new());
-        }
-        let text =
-            fs::read_to_string(&self.paths.translation_memory_path).map_err(storage_error)?;
+        };
+        let text = fs::read_to_string(&path).map_err(storage_error)?;
         let map: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&text).map_err(|error| {
                 CoreError::DataInvariant(format!("translation memory parse failed: {error}",))
@@ -305,6 +311,12 @@ impl RuntimeStore for FileRuntimeStore {
     }
 }
 
+fn legacy_translation_memory_path(current: &Path) -> Option<PathBuf> {
+    let file_name = current.file_name()?.to_str()?;
+    let suffix = file_name.strip_prefix("translation_memory.v4.")?;
+    Some(current.with_file_name(format!("translation_memory.v3.{suffix}")))
+}
+
 fn string_map_json(entries: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Object(
         entries
@@ -462,6 +474,41 @@ mod tests {
         assert!(loaded.contains(&("Alice".to_owned(), "爱丽丝".to_owned())));
         assert!(loaded.contains(&("Bob".to_owned(), "鲍勃".to_owned())));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reads_v3_translation_memory_until_v4_is_written() {
+        let root = temp_root("translation-memory-v3");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let legacy_path = legacy_translation_memory_path(&paths.translation_memory_path)
+            .expect("v4 path has a v3 predecessor");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&legacy_path, r#"{"hello":"你好"}"#).expect("write v3 memory");
+        let store = FileRuntimeStore::new(paths.clone());
+
+        assert_eq!(
+            store.load_translation_memory().expect("load v3 memory"),
+            vec![("hello".to_owned(), "你好".to_owned())]
+        );
+
+        store
+            .save_translation_memory(&[("ctx-v1:new:hello".to_owned(), "您好".to_owned())])
+            .expect("write v4 memory");
+        assert_eq!(
+            store.load_translation_memory().expect("prefer v4 memory"),
+            vec![("ctx-v1:new:hello".to_owned(), "您好".to_owned())]
+        );
+        assert!(legacy_path.exists());
+        assert!(paths.translation_memory_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

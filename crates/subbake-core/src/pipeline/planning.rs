@@ -1,7 +1,14 @@
 use std::collections::HashMap;
 
-use crate::entities::{BatchPlanEntry, SubtitleSegment};
+use crate::entities::{BatchPlanEntry, SubtitleSegment, TranslationMode};
 use crate::error::{CoreError, CoreResult};
+
+use super::support::contextual_translation_memory_keys;
+use super::translation_stage::SourceBatchContext;
+
+const TURBO_CONTEXT_LINES: usize = 3;
+const MIN_CINEMA_CONTEXT_TOKENS: usize = 128;
+const MAX_CINEMA_CONTEXT_TOKENS: usize = 1_200;
 
 pub(super) struct DeduplicationPlan {
     canonical: Vec<SubtitleSegment>,
@@ -18,15 +25,16 @@ impl DeduplicationPlan {
                 duplicates: 0,
             };
         }
-        let mut first_id_by_text = HashMap::<String, String>::new();
+        let context_keys = contextual_translation_memory_keys("", segments);
+        let mut first_id_by_context = HashMap::<String, String>::new();
         let mut canonical = Vec::new();
         let mut canonical_id_by_segment = Vec::with_capacity(segments.len());
         for segment in segments {
-            let key = segment.text.trim().to_owned();
-            if let Some(id) = first_id_by_text.get(&key) {
+            let key = context_keys.get(&segment.id).cloned().unwrap_or_default();
+            if let Some(id) = first_id_by_context.get(&key) {
                 canonical_id_by_segment.push(id.clone());
             } else {
-                first_id_by_text.insert(key, segment.id.clone());
+                first_id_by_context.insert(key, segment.id.clone());
                 canonical_id_by_segment.push(segment.id.clone());
                 canonical.push(segment.clone());
             }
@@ -139,6 +147,121 @@ impl BatchPlanner {
             })
             .collect()
     }
+
+    pub(super) fn source_contexts(
+        segments: &[SubtitleSegment],
+        batches: &[Vec<SubtitleSegment>],
+        mode: TranslationMode,
+        batch_token_budget: usize,
+    ) -> Vec<SourceBatchContext> {
+        let mut offset = 0usize;
+        batches
+            .iter()
+            .map(|batch| {
+                let start = offset;
+                let end = start.saturating_add(batch.len()).min(segments.len());
+                offset = end;
+                match mode {
+                    TranslationMode::Economy => SourceBatchContext::default(),
+                    TranslationMode::Turbo => SourceBatchContext {
+                        before: segments[start.saturating_sub(TURBO_CONTEXT_LINES)..start].to_vec(),
+                        after: segments
+                            [end..end.saturating_add(TURBO_CONTEXT_LINES).min(segments.len())]
+                            .to_vec(),
+                    },
+                    TranslationMode::Cinema => cinema_source_context(
+                        segments,
+                        start,
+                        end,
+                        cinema_context_budget(batch_token_budget),
+                    ),
+                }
+            })
+            .collect()
+    }
+}
+
+fn cinema_source_context(
+    segments: &[SubtitleSegment],
+    start: usize,
+    end: usize,
+    token_budget: usize,
+) -> SourceBatchContext {
+    if segments.is_empty() || start >= end {
+        return SourceBatchContext::default();
+    }
+    let current_scene_start = scene_start(segments, start);
+    let current_scene_end = scene_end(segments, end);
+    let before_start = if current_scene_start < start {
+        current_scene_start
+    } else {
+        scene_start(segments, current_scene_start.saturating_sub(1))
+    };
+    let after_end = if end < current_scene_end {
+        current_scene_end
+    } else if current_scene_end < segments.len() {
+        scene_end(segments, current_scene_end + 1)
+    } else {
+        current_scene_end
+    };
+    let before_budget = token_budget.div_ceil(2);
+    let after_budget = token_budget.saturating_sub(before_budget);
+    SourceBatchContext {
+        before: take_context_tail(&segments[before_start..start], before_budget),
+        after: take_context_head(&segments[end..after_end], after_budget),
+    }
+}
+
+fn scene_start(segments: &[SubtitleSegment], index: usize) -> usize {
+    let mut start = index.min(segments.len().saturating_sub(1));
+    while start > 0 && !scene_boundary(segments.get(start - 1), &segments[start]) {
+        start -= 1;
+    }
+    start
+}
+
+fn scene_end(segments: &[SubtitleSegment], index: usize) -> usize {
+    let mut end = index.min(segments.len());
+    while end < segments.len() && !scene_boundary(segments.get(end - 1), &segments[end]) {
+        end += 1;
+    }
+    end
+}
+
+fn cinema_context_budget(batch_token_budget: usize) -> usize {
+    batch_token_budget
+        .checked_div(2)
+        .unwrap_or_default()
+        .clamp(MIN_CINEMA_CONTEXT_TOKENS, MAX_CINEMA_CONTEXT_TOKENS)
+}
+
+fn take_context_tail(segments: &[SubtitleSegment], token_budget: usize) -> Vec<SubtitleSegment> {
+    let mut selected = Vec::new();
+    let mut tokens = 0usize;
+    for segment in segments.iter().rev() {
+        let estimate = estimated_text_tokens(&segment.text).saturating_add(4);
+        if !selected.is_empty() && tokens.saturating_add(estimate) > token_budget {
+            break;
+        }
+        selected.push(segment.clone());
+        tokens = tokens.saturating_add(estimate);
+    }
+    selected.reverse();
+    selected
+}
+
+fn take_context_head(segments: &[SubtitleSegment], token_budget: usize) -> Vec<SubtitleSegment> {
+    let mut selected = Vec::new();
+    let mut tokens = 0usize;
+    for segment in segments {
+        let estimate = estimated_text_tokens(&segment.text).saturating_add(4);
+        if !selected.is_empty() && tokens.saturating_add(estimate) > token_budget {
+            break;
+        }
+        selected.push(segment.clone());
+        tokens = tokens.saturating_add(estimate);
+    }
+    selected
 }
 
 fn scene_boundary(previous: Option<&SubtitleSegment>, next: &SubtitleSegment) -> bool {
@@ -209,14 +332,87 @@ mod tests {
 
     #[test]
     fn deduplication_translates_once_and_restores_original_ids() {
-        let source = vec![segment("1", "Again"), segment("2", "Again")];
+        let source = vec![
+            segment("1", "Start"),
+            segment("2", "Again"),
+            segment("3", "End"),
+            segment("4", "Start"),
+            segment("5", "Again"),
+            segment("6", "End"),
+        ];
         let plan = DeduplicationPlan::new(&source, true);
-        assert_eq!(plan.canonical().len(), 1);
+        assert_eq!(plan.canonical().len(), 5);
         assert_eq!(plan.duplicates(), 1);
-        let translated = vec![segment("1", "再来一次")];
+        let translated = plan
+            .canonical()
+            .iter()
+            .map(|item| {
+                if item.id == "2" {
+                    segment("2", "再来一次")
+                } else {
+                    item.clone()
+                }
+            })
+            .collect::<Vec<_>>();
         let expanded = plan.expand(&source, &translated).expect("expand");
-        assert_eq!(expanded[1].id, "2");
-        assert_eq!(expanded[1].text, "再来一次");
+        assert_eq!(expanded[4].id, "5");
+        assert_eq!(expanded[4].text, "再来一次");
+    }
+
+    #[test]
+    fn deduplication_keeps_identical_text_in_different_contexts() {
+        let source = vec![
+            segment("1", "He paid the fee."),
+            segment("2", "Fine."),
+            segment("3", "We can leave."),
+            segment("4", "The weather is clear."),
+            segment("5", "Fine."),
+            segment("6", "We should stay."),
+        ];
+
+        let plan = DeduplicationPlan::new(&source, true);
+
+        assert_eq!(plan.canonical(), source);
+        assert_eq!(plan.duplicates(), 0);
+    }
+
+    #[test]
+    fn turbo_context_uses_fixed_neighboring_source_lines() {
+        let source = (1..=8)
+            .map(|id| segment(&id.to_string(), &format!("line {id}")))
+            .collect::<Vec<_>>();
+        let batches = source
+            .chunks(2)
+            .map(<[SubtitleSegment]>::to_vec)
+            .collect::<Vec<_>>();
+
+        let contexts =
+            BatchPlanner::source_contexts(&source, &batches, TranslationMode::Turbo, 1_800);
+
+        assert_eq!(ids(&contexts[1].before), ["1", "2"]);
+        assert_eq!(ids(&contexts[1].after), ["5", "6", "7"]);
+    }
+
+    #[test]
+    fn cinema_context_uses_adjacent_scene_blocks() {
+        let source = vec![
+            timed_segment("1", "scene one a", "00:00:00,000", "00:00:01,000"),
+            timed_segment("2", "scene one b", "00:00:01,100", "00:00:02,000"),
+            timed_segment("3", "scene two a", "00:00:04,000", "00:00:05,000"),
+            timed_segment("4", "scene two b", "00:00:05,100", "00:00:06,000"),
+            timed_segment("5", "scene three", "00:00:08,000", "00:00:09,000"),
+        ];
+        let batches = vec![
+            source[0..2].to_vec(),
+            source[2..4].to_vec(),
+            source[4..].to_vec(),
+        ];
+
+        let contexts =
+            BatchPlanner::source_contexts(&source, &batches, TranslationMode::Cinema, 1_600);
+
+        assert_eq!(ids(&contexts[1].before), ["1", "2"]);
+        assert_eq!(ids(&contexts[1].after), ["5"]);
     }
 
     #[test]
@@ -229,5 +425,16 @@ mod tests {
             .scene_aware(true)
             .split(&[first, second]);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    fn timed_segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {
+        let mut segment = segment(id, text);
+        segment.start = Some(start.to_owned());
+        segment.end = Some(end.to_owned());
+        segment
+    }
+
+    fn ids(segments: &[SubtitleSegment]) -> Vec<&str> {
+        segments.iter().map(|segment| segment.id.as_str()).collect()
     }
 }

@@ -4,10 +4,11 @@ use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
 use crate::progress::TaskState;
 use crate::storage::ResumeSnapshot;
 use crate::validation::validate_full_alignment;
+use std::collections::HashMap;
 
 use super::SubtitlePipeline;
 use super::support::{update_translation_memory, validate_window_terminology};
-use super::translation_stage::TranslationStage;
+use super::translation_stage::{SourceBatchContext, TranslationPromptContext, TranslationStage};
 
 pub(super) struct TranslationRun {
     pub batches: Vec<Vec<SubtitleSegment>>,
@@ -21,6 +22,8 @@ pub(super) fn run<B, D>(
     batches: Vec<Vec<SubtitleSegment>>,
     resume: &ResumeSnapshot,
     terminology: &TerminologyStats,
+    memory_keys: &HashMap<String, String>,
+    source_contexts: &[SourceBatchContext],
 ) -> CoreResult<TranslationRun>
 where
     B: LlmBackend,
@@ -42,6 +45,7 @@ where
         batches,
         resume.translation_batches_completed,
         resume.translated_segments.clone(),
+        memory_keys.clone(),
     )?;
     let mut usage = resume.usage;
     if resume.translation_batches_completed == 0 {
@@ -67,11 +71,21 @@ where
         } else {
             concurrency
         };
-        let prepared = stage.prepare_window(
+        let previous_confirmed = stage.previous_confirmed_context();
+        let mut prepared = stage.prepare_window(
             window_size,
             pipeline.options.use_cache,
             &pipeline.translation_memory,
         );
+        for batch in &mut prepared {
+            batch.prompt_context = TranslationPromptContext {
+                source: source_contexts
+                    .get(batch.index)
+                    .cloned()
+                    .unwrap_or_default(),
+                previous_confirmed: previous_confirmed.clone(),
+            };
+        }
         pipeline.report(
             "TRANSLATE",
             TaskState::Running,
@@ -83,7 +97,13 @@ where
         let pending = prepared
             .iter()
             .filter(|batch| !batch.pending.is_empty())
-            .map(|batch| (batch.index + 1, batch.pending.clone()))
+            .map(|batch| {
+                (
+                    batch.index + 1,
+                    batch.pending.clone(),
+                    batch.prompt_context.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         pipeline.report_translation_window(
             stage.batches(),
@@ -122,15 +142,14 @@ where
             if let Some(result) = applied.result.as_ref() {
                 usage.add(result.usage);
                 pipeline.dashboard.add_usage(result.usage);
-                pipeline
-                    .memory
-                    .update(&result.summary, &result.glossary_updates);
+                pipeline.memory.update("", &result.glossary_updates);
                 pipeline.commit_terminology_updates(&result.terminology_updates);
             }
             pipeline.translation_memory_hits = stage.memory_hits();
             if pipeline.options.use_cache {
                 update_translation_memory(
                     &mut pipeline.translation_memory,
+                    memory_keys,
                     &applied.source,
                     &applied.translated,
                 );

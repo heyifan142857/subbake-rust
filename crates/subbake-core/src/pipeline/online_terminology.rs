@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::entities::TerminologyKind;
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
 
@@ -17,50 +18,38 @@ pub(super) struct TermMarker {
 pub(super) fn select_markers(source: &[SubtitleSegment], candidates: &[String]) -> Vec<TermMarker> {
     let haystack = source
         .iter()
-        .map(|segment| segment.text.to_lowercase())
+        .map(|segment| segment.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let mut matched = candidates
+    let eligible = candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| {
-            haystack.contains(&candidate.to_lowercase()) && !is_source_stable_acronym(candidate)
-        })
-        .map(|(index, source)| TermMarker {
-            index,
-            source: source.clone(),
-        })
+        .filter(|(_, candidate)| !is_source_stable_acronym(candidate))
         .collect::<Vec<_>>();
-    matched.sort_by_key(|marker| std::cmp::Reverse(marker.source.chars().count()));
-    let mut selected = Vec::<TermMarker>::new();
-    for marker in matched {
-        if selected.len() == 12 {
-            break;
-        }
-        if !selected
-            .iter()
-            .any(|existing| existing.source.contains(&marker.source))
-        {
-            selected.push(marker);
-        }
-    }
-    selected
+    let terms = eligible
+        .iter()
+        .map(|(_, candidate)| candidate.as_str())
+        .collect::<Vec<_>>();
+    TermMatcher::case_insensitive()
+        .matching_indices(&haystack, &terms)
+        .into_iter()
+        .filter_map(|matched| eligible.get(matched))
+        .take(12)
+        .map(|(index, source)| TermMarker {
+            index: *index,
+            source: (*source).clone(),
+        })
+        .collect()
 }
 
 pub(super) fn protect_terms(text: &str, markers: &[TermMarker]) -> String {
-    markers.iter().fold(text.to_owned(), |protected, marker| {
-        if !protected.contains(&marker.source) {
-            return protected;
-        }
-        protected.replace(
-            &marker.source,
-            &format!(
-                "{}{index}⟧{}⟦/T{index}⟧",
-                TERM_MARKER_PREFIX,
-                marker.source,
-                index = marker.index
-            ),
-        )
+    let terms = markers
+        .iter()
+        .map(|marker| marker.source.as_str())
+        .collect::<Vec<_>>();
+    TermMatcher::case_insensitive().replace_matches(text, &terms, |matched, text| {
+        let index = markers[matched].index;
+        format!("{TERM_MARKER_PREFIX}{index}⟧{text}⟦/T{index}⟧")
     })
 }
 
@@ -165,7 +154,8 @@ pub(super) fn reconcile_batch(
             }
             let chosen = existing.unwrap_or_else(|| proposed.to_owned());
             let target_is_present = result.lines.iter().any(|line| {
-                matching_ids.contains(&line.id.as_str()) && line.translation.contains(proposed)
+                matching_ids.contains(&line.id.as_str())
+                    && TermMatcher::case_insensitive().contains(&line.translation, proposed)
             });
             if !target_is_present {
                 return Err(CoreError::InvalidTranslation(format!(
@@ -180,7 +170,7 @@ pub(super) fn reconcile_batch(
                 if !chosen.eq_ignore_ascii_case(proposed) {
                     for line in &result.lines {
                         if matching_ids.contains(&line.id.as_str())
-                            && line.translation.contains(proposed)
+                            && TermMatcher::case_insensitive().contains(&line.translation, proposed)
                         {
                             replacements
                                 .entry(line.id.clone())
@@ -214,7 +204,8 @@ pub(super) fn reconcile_batch(
             .collect::<Vec<_>>();
         if matching_ids.is_empty()
             || !result.lines.iter().any(|line| {
-                matching_ids.contains(&line.id.as_str()) && line.translation.contains(proposed)
+                matching_ids.contains(&line.id.as_str())
+                    && TermMatcher::case_insensitive().contains(&line.translation, proposed)
             })
         {
             continue;
@@ -226,7 +217,9 @@ pub(super) fn reconcile_batch(
             .unwrap_or_else(|| proposed.to_owned());
         if chosen != proposed {
             for line in &result.lines {
-                if matching_ids.contains(&line.id.as_str()) && line.translation.contains(proposed) {
+                if matching_ids.contains(&line.id.as_str())
+                    && TermMatcher::case_insensitive().contains(&line.translation, proposed)
+                {
                     replacements
                         .entry(line.id.clone())
                         .or_default()
@@ -257,30 +250,16 @@ fn requires_non_latin_name(target_language: &str) -> bool {
 }
 
 fn contains_case_insensitive(text: &str, needle: &str) -> bool {
-    let text = text.to_lowercase();
-    let needle = needle.to_lowercase();
-    if !needle.chars().any(|ch| ch.is_ascii_alphabetic()) {
-        return text.contains(&needle);
-    }
-    text.match_indices(&needle).any(|(start, matched)| {
-        let before = text[..start].chars().next_back();
-        let after = text[start + matched.len()..].chars().next();
-        !before.is_some_and(|ch| ch.is_ascii_alphanumeric())
-            && !after.is_some_and(|ch| ch.is_ascii_alphanumeric())
-    })
+    TermMatcher::case_insensitive().contains(text, needle)
 }
 
 fn simultaneous_replace(text: &str, replacements: &[(String, String)]) -> String {
-    let mut replacements = replacements.to_vec();
-    replacements.sort_by_key(|(old, _)| std::cmp::Reverse(old.chars().count()));
-    let mut output = text.to_owned();
-    for (index, (old, _)) in replacements.iter().enumerate() {
-        output = output.replace(old, &format!("\u{e000}{index}\u{e001}"));
-    }
-    for (index, (_, new)) in replacements.iter().enumerate() {
-        output = output.replace(&format!("\u{e000}{index}\u{e001}"), new);
-    }
-    output
+    let terms = replacements
+        .iter()
+        .map(|(source, _)| source.as_str())
+        .collect::<Vec<_>>();
+    TermMatcher::case_insensitive()
+        .replace_matches(text, &terms, |matched, _| replacements[matched].1.clone())
 }
 
 #[cfg(test)]
@@ -355,6 +334,10 @@ mod tests {
     fn source_matching_does_not_treat_joe_as_joey() {
         assert!(contains_case_insensitive("Mr. Joe Zasa", "Joe"));
         assert!(!contains_case_insensitive("Joey Zasa", "Joe"));
+        assert_eq!(
+            simultaneous_replace("Joey met Joe.", &[("Joe".to_owned(), "约瑟夫".to_owned())]),
+            "Joey met 约瑟夫."
+        );
     }
 
     #[test]

@@ -4,12 +4,46 @@ use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 
 use super::BatchWithUsage;
-use super::support::{apply_lines, merge_translation_lines, translation_memory_key};
+use super::support::{apply_lines, merge_translation_lines};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct SourceBatchContext {
+    pub before: Vec<SubtitleSegment>,
+    pub after: Vec<SubtitleSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ConfirmedTranslationContext {
+    pub id: String,
+    pub source: String,
+    pub translation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct TranslationPromptContext {
+    pub source: SourceBatchContext,
+    pub previous_confirmed: Vec<ConfirmedTranslationContext>,
+}
+
+impl TranslationPromptContext {
+    pub fn for_left_split(&self, right: &[SubtitleSegment]) -> Self {
+        let mut context = self.clone();
+        context.source.after = right.iter().cloned().chain(context.source.after).collect();
+        context
+    }
+
+    pub fn for_right_split(&self, left: &[SubtitleSegment]) -> Self {
+        let mut context = self.clone();
+        context.source.before.extend_from_slice(left);
+        context
+    }
+}
 
 pub(super) struct PreparedBatch {
     pub index: usize,
     pub memory_hits: HashMap<String, String>,
     pub pending: Vec<SubtitleSegment>,
+    pub prompt_context: TranslationPromptContext,
 }
 
 pub(super) struct AppliedBatch {
@@ -29,6 +63,7 @@ pub(super) struct TranslationStage {
     output: Vec<SubtitleSegment>,
     next_batch: usize,
     memory_hits: usize,
+    memory_keys: HashMap<String, String>,
 }
 
 impl TranslationStage {
@@ -36,6 +71,7 @@ impl TranslationStage {
         batches: Vec<Vec<SubtitleSegment>>,
         resumed: usize,
         output: Vec<SubtitleSegment>,
+        memory_keys: HashMap<String, String>,
     ) -> CoreResult<Self> {
         if resumed > batches.len() {
             return Err(CoreError::DataInvariant(format!(
@@ -55,6 +91,7 @@ impl TranslationStage {
             output,
             next_batch: resumed,
             memory_hits: 0,
+            memory_keys,
         })
     }
 
@@ -89,10 +126,14 @@ impl TranslationStage {
                 let mut memory_hits = HashMap::new();
                 let mut pending = Vec::new();
                 for segment in batch {
-                    let key = translation_memory_key(&segment.text);
+                    let key = self
+                        .memory_keys
+                        .get(&segment.id)
+                        .map(String::as_str)
+                        .unwrap_or_default();
                     if use_cache
                         && !key.is_empty()
-                        && let Some(text) = memory.get(&key)
+                        && let Some(text) = memory.get(key)
                     {
                         memory_hits.insert(segment.id.clone(), text.clone());
                     } else {
@@ -103,6 +144,7 @@ impl TranslationStage {
                     index,
                     memory_hits,
                     pending,
+                    prompt_context: TranslationPromptContext::default(),
                 }
             })
             .collect()
@@ -152,6 +194,25 @@ impl TranslationStage {
         &self.output
     }
 
+    pub fn previous_confirmed_context(&self) -> Vec<ConfirmedTranslationContext> {
+        let Some(previous_index) = self.next_batch.checked_sub(1) else {
+            return Vec::new();
+        };
+        let Some(source) = self.batches.get(previous_index) else {
+            return Vec::new();
+        };
+        let translated_start = self.output.len().saturating_sub(source.len());
+        source
+            .iter()
+            .zip(&self.output[translated_start..])
+            .map(|(source, translated)| ConfirmedTranslationContext {
+                id: source.id.clone(),
+                source: source.text.clone(),
+                translation: translated.text.clone(),
+            })
+            .collect()
+    }
+
     pub fn finish(self) -> Vec<SubtitleSegment> {
         self.output
     }
@@ -175,8 +236,13 @@ mod tests {
     #[test]
     fn prepares_and_applies_translation_memory_hits_in_order() {
         let batches = vec![vec![segment("1", "Hello"), segment("2", "world")]];
-        let mut stage = TranslationStage::new(batches, 0, Vec::new()).expect("stage");
-        let memory = HashMap::from([(translation_memory_key("Hello"), "Bonjour".to_owned())]);
+        let memory_key = "ctx-v1:test:hello".to_owned();
+        let memory_keys = HashMap::from([
+            ("1".to_owned(), memory_key.clone()),
+            ("2".to_owned(), "ctx-v1:test:world".to_owned()),
+        ]);
+        let mut stage = TranslationStage::new(batches, 0, Vec::new(), memory_keys).expect("stage");
+        let memory = HashMap::from([(memory_key, "Bonjour".to_owned())]);
         let mut prepared = stage.prepare_window(1, true, &memory);
         assert_eq!(prepared[0].pending, vec![segment("2", "world")]);
         let applied = stage
