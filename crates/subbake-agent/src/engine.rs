@@ -21,6 +21,7 @@ use crate::session_controller::SessionController;
 use crate::tool_execution::render_tool_outcome;
 use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
 use crate::undo::UndoService;
+use crate::{ConfigChange, ConfigEditorSnapshot};
 
 // ---------------------------------------------------------------------------
 // Observer trait — enables streaming output
@@ -84,7 +85,7 @@ pub fn is_known_slash_command(input: &str) -> bool {
             | "/undo"
             | "/sessions"
             | "/clear"
-            | "/model"
+            | "/config"
             | "/profile"
             | "/history"
             | "/exit"
@@ -265,6 +266,10 @@ impl AgentEngine {
         } else {
             Ok(())
         }
+    }
+
+    pub fn check_operation_cancelled(&self) -> AgentResult<()> {
+        self.check_cancelled()
     }
 
     /// Attach an observer for streaming output.
@@ -552,21 +557,28 @@ impl AgentEngine {
         ConversationPresenter::pending_plan_summary(plan)
     }
 
-    pub fn active_model_summary(&self) -> AgentResult<String> {
-        let settings =
-            ProfileCoordinator::new(&self.project_root, self.session.as_ref()).active_settings()?;
-        Ok(format!(
-            "Active model: {}/{}\nUse `/profile` to list configured model profiles.",
-            settings.backend.id, settings.backend.model
-        ))
-    }
-
     pub fn profile_choices(&self) -> AgentResult<Vec<String>> {
         ProfileCoordinator::new(&self.project_root, self.session.as_ref()).names()
     }
 
     pub fn profile_picker_choices(&self) -> AgentResult<Vec<ProfileChoice>> {
         ProfileCoordinator::new(&self.project_root, self.session.as_ref()).picker_choices()
+    }
+
+    pub fn config_editor_snapshot(&self) -> AgentResult<ConfigEditorSnapshot> {
+        ProfileCoordinator::new(&self.project_root, self.session.as_ref()).editor_snapshot()
+    }
+
+    pub fn prepare_config_update(
+        &self,
+        changes: Vec<ConfigChange>,
+    ) -> AgentResult<(
+        PathBuf,
+        subbake_adapters::ConfigEditTarget,
+        subbake_adapters::PreparedConfigUpdate,
+    )> {
+        ProfileCoordinator::new(&self.project_root, self.session.as_ref())
+            .prepare_editor_update(changes)
     }
 
     pub fn conversation_context_summary(&self, limit: usize) -> Option<String> {
@@ -595,7 +607,7 @@ impl AgentEngine {
             "/undo" => self.undo_last(),
             "/sessions" => self.sessions_summary(20),
             "/clear" => self.clear_session(),
-            "/model" => self.active_model_summary(),
+            "/config" => Ok("Opening configuration.".to_owned()),
             "/profile" => self
                 .run_tool("list_profiles", &serde_json::json!({}))
                 .map(|outcome| render_tool_outcome(&outcome)),
@@ -681,6 +693,8 @@ mod error_persistence_tests {
     fn only_registered_slash_commands_take_the_command_path() {
         assert!(is_known_slash_command("/plan on"));
         assert!(is_known_slash_command("/profile subtitles"));
+        assert!(is_known_slash_command("/config"));
+        assert!(!is_known_slash_command("/model"));
         assert!(is_known_slash_command("/history 50"));
         assert!(!is_known_slash_command(
             "/home/azote/Downloads/Braveheart.fixed.translated.srt改为中英双语"

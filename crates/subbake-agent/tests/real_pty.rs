@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use subbake_agent::{
-    AgentError, AgentResult, CancellationGuard, CancellationToken, ProfileChoice, StartupInfo,
-    SubBakeTui, TuiAction, TuiInteraction,
+    AgentError, AgentResult, CancellationGuard, CancellationToken, ConfigEditorSnapshot,
+    ConfigFieldId, ConfigFieldView, ProfileChoice, StartupInfo, SubBakeTui, TuiAction,
+    TuiInteraction,
 };
 
 const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
@@ -100,6 +101,13 @@ exit "$status"
     wait_for_action(&action_log, "CreateProfile:pty_profile", &transcript);
     wait_for_output(&transcript, b"\x1b[?1049l", STEP_TIMEOUT);
     wait_for_output(&transcript, b"profile created", STEP_TIMEOUT);
+
+    send_text(&writer, "/config");
+    send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "SubmitText:/config", &transcript);
+    wait_for_output_count(&transcript, b"\x1b[?1049h", 2, STEP_TIMEOUT);
+    send(&writer, b"q");
+    wait_for_output_count(&transcript, b"\x1b[?1049l", 2, STEP_TIMEOUT);
 
     send_text(&writer, "make a plan");
     send(&writer, ENTER_KEY);
@@ -229,6 +237,20 @@ fn scripted_interaction(
             model: "pty-created-model".to_owned(),
             message: format!("profile created: {name}"),
         }),
+        TuiAction::SubmitText(input) if input == "/config" => Ok(TuiInteraction::ConfigEditor {
+            message: String::new(),
+            snapshot: config_snapshot("defaults"),
+            provider: "mock".to_owned(),
+            model: "pty-model".to_owned(),
+            cache_enabled: false,
+        }),
+        TuiAction::ApplyConfig { .. } => Ok(TuiInteraction::ConfigEditor {
+            message: "Saved configuration.".to_owned(),
+            snapshot: config_snapshot("saved"),
+            provider: "mock".to_owned(),
+            model: "pty-model".to_owned(),
+            cache_enabled: true,
+        }),
         TuiAction::SubmitText(input) if input == "make a plan" => {
             Ok(TuiInteraction::PlanApproval {
                 message: "pending PTY plan".to_owned(),
@@ -261,6 +283,35 @@ fn scripted_interaction(
     }
 }
 
+fn config_snapshot(profile: &str) -> ConfigEditorSnapshot {
+    ConfigEditorSnapshot {
+        path: PathBuf::from("subbake.toml"),
+        target: subbake_adapters::ConfigEditTarget::Defaults,
+        active_profile: None,
+        profiles: Vec::new(),
+        fields: vec![
+            ConfigFieldView {
+                id: ConfigFieldId::ActiveProfile,
+                value: profile.to_owned(),
+                inherited: false,
+                configured: true,
+            },
+            ConfigFieldView {
+                id: ConfigFieldId::AgentMaxSteps,
+                value: "64".to_owned(),
+                inherited: true,
+                configured: true,
+            },
+            ConfigFieldView {
+                id: ConfigFieldId::AgentAutoApprove,
+                value: "false".to_owned(),
+                inherited: true,
+                configured: true,
+            },
+        ],
+    }
+}
+
 fn action_label(action: &TuiAction) -> String {
     match action {
         TuiAction::SubmitText(input) => format!("SubmitText:{input}"),
@@ -270,6 +321,11 @@ fn action_label(action: &TuiAction) -> String {
         TuiAction::RejectCommand => "RejectCommand".to_owned(),
         TuiAction::SelectProfile(name) => format!("SelectProfile:{name}"),
         TuiAction::CreateProfile(name) => format!("CreateProfile:{name}"),
+        TuiAction::SelectConfigProfile(name) => format!("SelectConfigProfile:{name}"),
+        TuiAction::CreateConfigProfile(name) => format!("CreateConfigProfile:{name}"),
+        TuiAction::ApplyConfig { changes, after } => {
+            format!("ApplyConfig:{}:{after:?}", changes.len())
+        }
         TuiAction::SelectSession(id) => format!("SelectSession:{id}"),
         TuiAction::TogglePlan => "TogglePlan".to_owned(),
     }
@@ -353,6 +409,39 @@ fn wait_for_output(transcript: &Transcript, needle: &[u8], timeout: Duration) {
         if result.timed_out() && !contains_subslice(&bytes, needle) {
             panic!(
                 "timed out waiting for {:?}; transcript: {}",
+                String::from_utf8_lossy(needle),
+                escape_bytes(&bytes)
+            );
+        }
+    }
+}
+
+fn wait_for_output_count(
+    transcript: &Transcript,
+    needle: &[u8],
+    expected_count: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut bytes = transcript.bytes.lock().expect("lock PTY transcript");
+    while count_subslice(&bytes, needle) < expected_count {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!(
+                "timed out waiting for {expected_count} occurrences of {:?}; transcript: {}",
+                String::from_utf8_lossy(needle),
+                escape_bytes(&bytes)
+            );
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let (next, result) = transcript
+            .changed
+            .wait_timeout(bytes, remaining)
+            .expect("wait for PTY output");
+        bytes = next;
+        if result.timed_out() && count_subslice(&bytes, needle) < expected_count {
+            panic!(
+                "timed out waiting for {expected_count} occurrences of {:?}; transcript: {}",
                 String::from_utf8_lossy(needle),
                 escape_bytes(&bytes)
             );

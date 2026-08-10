@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    ConfigFile, SettingsOverrides, TranslationSettings, append_profile_snapshot,
+    CONFIG_VERSION, ConfigEditTarget, ConfigFile, PreparedConfigUpdate, SettingsOverrides,
+    TranslationSettings, append_profile_snapshot, prepare_config_update,
 };
 
+use crate::config_editor::{ConfigChange, ConfigEditorSnapshot, build_snapshot};
 use crate::error::AgentResult;
 use crate::presentation::ProfileChoice;
 use crate::session::AgentSession;
@@ -115,4 +117,76 @@ impl<'a> ProfileCoordinator<'a> {
         });
         Ok(profiles)
     }
+
+    pub(crate) fn editor_snapshot(&self) -> AgentResult<ConfigEditorSnapshot> {
+        let (path, config) = self.load_config()?.unwrap_or_else(|| {
+            (
+                self.project_root.join("subbake.toml"),
+                ConfigFile {
+                    version: CONFIG_VERSION,
+                    default_profile: None,
+                    defaults: SettingsOverrides::default(),
+                    backends: std::collections::HashMap::new(),
+                    profiles: std::collections::HashMap::new(),
+                },
+            )
+        });
+        let profiles = picker_choices_for(
+            &config,
+            self.session.and_then(|session| session.profile.as_deref()),
+        )?;
+        build_snapshot(
+            path,
+            &config,
+            self.session.and_then(|session| session.profile.as_deref()),
+            profiles,
+        )
+    }
+
+    pub(crate) fn prepare_editor_update(
+        &self,
+        changes: Vec<ConfigChange>,
+    ) -> AgentResult<(PathBuf, ConfigEditTarget, PreparedConfigUpdate)> {
+        let snapshot = self.editor_snapshot()?;
+        let updates = changes
+            .into_iter()
+            .map(ConfigChange::into_update)
+            .collect::<AgentResult<Vec<_>>>()?;
+        let prepared = prepare_config_update(&snapshot.path, &snapshot.target, &updates)?;
+        Ok((snapshot.path, snapshot.target, prepared))
+    }
+}
+
+fn picker_choices_for(
+    config: &ConfigFile,
+    requested_profile: Option<&str>,
+) -> AgentResult<Vec<ProfileChoice>> {
+    let active = config
+        .selected_profile(requested_profile)
+        .map_err(subbake_adapters::AdapterError::from)?;
+    let mut profiles = config
+        .profiles
+        .keys()
+        .map(|name| {
+            let (settings, _) = config
+                .resolve(Some(name), SettingsOverrides::default())
+                .map_err(subbake_adapters::AdapterError::from)?;
+            Ok(ProfileChoice {
+                name: name.clone(),
+                provider: settings.backend.id,
+                model: settings.backend.model,
+                active: active == Some(name.as_str()),
+                create: false,
+            })
+        })
+        .collect::<AgentResult<Vec<_>>>()?;
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    profiles.push(ProfileChoice {
+        name: "new profile…".to_owned(),
+        provider: String::new(),
+        model: "copy active settings without credentials".to_owned(),
+        active: false,
+        create: true,
+    });
+    Ok(profiles)
 }

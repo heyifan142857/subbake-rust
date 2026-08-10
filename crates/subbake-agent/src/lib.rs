@@ -1,4 +1,5 @@
 mod command_policy;
+mod config_editor;
 pub mod decision;
 mod discovery;
 pub mod engine;
@@ -19,6 +20,10 @@ pub mod tui;
 mod tui_state;
 mod undo;
 
+pub use config_editor::{
+    ConfigChange, ConfigEditorSnapshot, ConfigFieldId, ConfigFieldKind, ConfigFieldView,
+    ConfigSection,
+};
 pub use decision::EchoDecisionBackend;
 pub use engine::{
     AgentEngine, AgentRuntimePolicy, CommandDecision, EngineObserver, PlanDecision,
@@ -31,7 +36,8 @@ pub use session::*;
 pub use subbake_core::{CancellationGuard, CancellationToken};
 pub use tools::{ALL_TOOL_SPECS, ToolKind};
 pub use tui::{
-    Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,
+    ConfigApplyAfter, Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, TuiAction, TuiInteraction,
+    TuiObserver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

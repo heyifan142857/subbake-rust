@@ -1,4 +1,5 @@
 use crate::engine::{ProfileChoice, SessionChoice};
+use crate::{ConfigChange, ConfigEditorSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupInfo {
@@ -35,6 +36,19 @@ pub enum TuiInteraction {
         message: String,
         options: Vec<ProfileChoice>,
     },
+    ConfigEditor {
+        message: String,
+        snapshot: ConfigEditorSnapshot,
+        provider: String,
+        model: String,
+        cache_enabled: bool,
+    },
+    ConfigClosed {
+        message: String,
+        provider: String,
+        model: String,
+        cache_enabled: bool,
+    },
     SessionChanged {
         input_history: Vec<String>,
         events: Vec<crate::session::AgentEvent>,
@@ -64,6 +78,19 @@ pub enum TuiAction {
     RejectCommand,
     SelectProfile(String),
     CreateProfile(String),
+    SelectConfigProfile(String),
+    CreateConfigProfile(String),
+    ApplyConfig {
+        changes: Vec<ConfigChange>,
+        after: ConfigApplyAfter,
+    },
     SelectSession(String),
     TogglePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigApplyAfter {
+    Stay,
+    Close,
+    SwitchProfile(String),
 }

@@ -11,6 +11,8 @@ use super::{
     InputMode, InteractionState, SubBakeTui, picker_viewport, terminal_width,
     truncate_with_ellipsis,
 };
+use crate::ConfigFieldKind;
+use crate::tui_state::{ConfigEditorState, ConfigFocus};
 
 pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
     let terminal_area = app
@@ -23,6 +25,9 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
             .suggestion_index
             .min(picker.options.len().saturating_sub(1)),
         InputMode::ChoosingProfile(picker) => app
+            .suggestion_index
+            .min(picker.options.len().saturating_sub(1)),
+        InputMode::ChoosingConfigProfile(picker) => app
             .suggestion_index
             .min(picker.options.len().saturating_sub(1)),
         _ => app
@@ -41,13 +46,16 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
         _ => None,
     };
     let profile_picker = match app.interaction_state.input_mode() {
-        InputMode::ChoosingProfile(picker) => Some(picker.options.clone()),
+        InputMode::ChoosingProfile(picker) | InputMode::ChoosingConfigProfile(picker) => {
+            Some(picker.options.clone())
+        }
         _ => None,
     };
     let creating_profile = matches!(
         app.interaction_state.input_mode(),
-        InputMode::CreatingProfile
+        InputMode::CreatingProfile | InputMode::CreatingConfigProfile
     );
+    let config_editor = app.config_editor.clone();
     let profile_name_input = app.input.text().to_owned();
     let startup_info = app.startup_info.clone();
     let plan_mode = app.plan_mode;
@@ -76,6 +84,15 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
 
     let draw_ui = |frame: &mut ratatui::Frame<'_>| {
         let area = frame.area();
+        if let Some(editor) = &config_editor
+            && !matches!(
+                app.interaction_state.input_mode(),
+                InputMode::ChoosingConfigProfile(_) | InputMode::CreatingConfigProfile
+            )
+        {
+            render_config_editor(frame, area, editor, &profile_name_input);
+            return;
+        }
         if let Some(options) = &session_picker {
             frame.render_widget(Clear, area);
             let block = Block::default().borders(Borders::ALL);
@@ -411,6 +428,198 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
         app.terminal.draw(draw_ui)?;
     }
     Ok(())
+}
+
+fn render_config_editor(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    editor: &ConfigEditorState,
+    input: &str,
+) {
+    frame.render_widget(Clear, area);
+    let outer = Block::default()
+        .title(" SubBake configuration ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let target = match &editor.snapshot.target {
+        subbake_adapters::ConfigEditTarget::Defaults => "defaults".to_owned(),
+        subbake_adapters::ConfigEditTarget::Profile(name) => format!("profile: {name}"),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Editing ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                target,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ·  {}", editor.snapshot.path.display()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        vertical[0],
+    );
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(20), Constraint::Min(20)])
+        .split(vertical[1]);
+    let section_lines = crate::ConfigSection::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, section)| {
+            let selected = index == editor.section_index;
+            Line::from(Span::styled(
+                format!("  {:<16}", section.label()),
+                if selected {
+                    selection_style(editor.focus == ConfigFocus::Sections)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(section_lines).block(
+            Block::default()
+                .title(" Categories ")
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        columns[0],
+    );
+
+    let ids = editor.field_ids();
+    let visible_height = usize::from(columns[1].height.saturating_sub(2)).max(1);
+    let selected = editor.field_index.min(ids.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_height)
+        .min(ids.len().saturating_sub(visible_height));
+    let lines = ids
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_height)
+        .map(|(index, id)| {
+            let view = editor.snapshot.fields.iter().find(|field| field.id == *id);
+            let changed = editor.changes.iter().rev().find(|change| change.id == *id);
+            let inherited = changed
+                .map(|change| change.value.is_none())
+                .or_else(|| view.map(|field| field.inherited))
+                .unwrap_or(false);
+            let configured = view.is_some_and(|field| field.configured);
+            let raw_value = editor.value(*id);
+            let value = match id.kind() {
+                ConfigFieldKind::Secret if changed.is_some_and(|change| change.value.is_some()) => {
+                    "•••••• (pending)".to_owned()
+                }
+                ConfigFieldKind::Secret if configured => "•••••• (configured)".to_owned(),
+                ConfigFieldKind::Secret => "not configured".to_owned(),
+                ConfigFieldKind::Boolean => {
+                    if raw_value == "true" {
+                        "● enabled".to_owned()
+                    } else {
+                        "○ disabled".to_owned()
+                    }
+                }
+                _ if raw_value.is_empty() => "—".to_owned(),
+                _ => raw_value,
+            };
+            let row_selected = index == selected;
+            let row_style = if row_selected && editor.focus == ConfigFocus::Fields {
+                selection_style(true)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::styled(format!("  {:<25}", id.label()), row_style),
+                Span::styled(truncate_with_ellipsis(&value, 32), row_style),
+                Span::styled(
+                    if inherited {
+                        "  inherited"
+                    } else if changed.is_some() {
+                        "  modified"
+                    } else {
+                        "  override"
+                    },
+                    if changed.is_some() {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(format!(" {} ", editor.section().label()))),
+        columns[1],
+    );
+
+    let footer = if let Some(id) = editor.editing_field {
+        let shown = if matches!(id.kind(), ConfigFieldKind::Secret) {
+            "•".repeat(input.chars().count())
+        } else {
+            input.to_owned()
+        };
+        format!("{}: {}  ·  Enter accept  Esc cancel", id.label(), shown)
+    } else {
+        "Tab focus  ↑↓ navigate  Enter edit  Space/←→ toggle  Del inherit  Ctrl+S save  Esc/q close"
+            .to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+        vertical[2],
+    );
+
+    if editor.confirm.is_some() {
+        let popup = centered_rect(58, 7, area);
+        frame.render_widget(Clear, popup);
+        let options = ["Save changes", "Discard changes", "Cancel"];
+        let lines = options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                Line::from(Span::styled(
+                    format!("  {option}"),
+                    selection_style(index == editor.field_index.min(2)),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Unsaved configuration ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
+            popup,
+        );
+    }
+}
+
+fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    ratatui::layout::Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn selection_style(selected: bool) -> Style {

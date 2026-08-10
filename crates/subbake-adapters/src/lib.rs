@@ -1,5 +1,6 @@
 pub mod command;
 pub mod config;
+pub mod config_edit;
 pub mod diagnostics;
 pub mod editing;
 pub mod embedded_subtitles;
@@ -25,6 +26,9 @@ pub use command::{
 pub use config::{
     CONFIG_VERSION, ConfigFile, ConfigurationResolver, ResolveRequest, ResolvedConfiguration,
     append_profile_snapshot, discover_config_path,
+};
+pub use config_edit::{
+    ConfigEditTarget, ConfigFieldUpdate, ConfigScalar, PreparedConfigUpdate, prepare_config_update,
 };
 pub use diagnostics::{diagnose_failure_path, format_diagnostic_report, load_diagnostic_reports};
 pub use editing::{

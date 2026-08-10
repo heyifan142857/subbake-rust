@@ -27,9 +27,9 @@ use crate::engine::SessionChoice;
 use crate::error::AgentResult;
 use crate::input_editor::InputEditor;
 use crate::tui_state::{
-    APPROVAL_OPTIONS, COMMAND_APPROVAL_OPTIONS, EmptyModeChoice, InputMode, InteractionState,
-    SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_up,
-    vertical_navigation,
+    APPROVAL_OPTIONS, COMMAND_APPROVAL_OPTIONS, ConfigEditorState, EmptyModeChoice, InputMode,
+    InteractionState, SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice,
+    history_down, history_up, vertical_navigation,
 };
 use subbake_core::{CancellationGuard, CancellationToken};
 use subbake_core::{ProgressEvent, TaskState};
@@ -44,7 +44,7 @@ mod worker;
 
 pub use history::{Msg, MsgStyle, MsgView, TuiObserver};
 use progress::format_progress;
-pub use protocol::{StartupInfo, TuiAction, TuiInteraction};
+pub use protocol::{ConfigApplyAfter, StartupInfo, TuiAction, TuiInteraction};
 use terminal::TerminalSessionGuard;
 use worker::{TuiWorker, WorkerRequest};
 
@@ -53,8 +53,8 @@ const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands"),
     ("/plan", "toggle plan mode; accepts on/off"),
-    ("/model", "show the active model"),
     ("/profile", "list or switch profiles"),
+    ("/config", "edit configuration"),
     ("/undo", "undo the last file operation"),
     ("/sessions", "choose a saved session"),
     ("/history", "show conversation history"),
@@ -84,6 +84,7 @@ pub struct SubBakeTui {
     plan_mode: bool,
     history_cursor: usize,
     startup_pending: bool,
+    config_editor: Option<ConfigEditorState>,
 }
 
 impl SubBakeTui {
@@ -116,6 +117,7 @@ impl SubBakeTui {
             plan_mode: false,
             history_cursor: 0,
             startup_pending: true,
+            config_editor: None,
         })
     }
 
@@ -295,6 +297,41 @@ impl SubBakeTui {
                             self.suggestion_index = 0;
                             let _ = message;
                         }
+                        Ok(TuiInteraction::ConfigEditor {
+                            message,
+                            snapshot,
+                            provider,
+                            model,
+                            cache_enabled,
+                        }) => {
+                            self.open_fullscreen_overlay()?;
+                            self.startup_info.provider = provider;
+                            self.startup_info.model = model;
+                            self.startup_info.cache_enabled = cache_enabled;
+                            self.startup_info.config = snapshot.path.display().to_string();
+                            self.config_editor = Some(ConfigEditorState::new(snapshot));
+                            self.interaction_state
+                                .set_input_mode(InputMode::ConfigEditor);
+                            self.suggestion_index = 0;
+                            self.input.clear();
+                            if !message.is_empty() {
+                                self.render_response(message);
+                            }
+                        }
+                        Ok(TuiInteraction::ConfigClosed {
+                            message,
+                            provider,
+                            model,
+                            cache_enabled,
+                        }) => {
+                            self.config_editor = None;
+                            self.close_fullscreen_overlay()?;
+                            self.startup_info.provider = provider;
+                            self.startup_info.model = model;
+                            self.startup_info.cache_enabled = cache_enabled;
+                            self.interaction_state.set_input_mode(InputMode::Editing);
+                            self.render_response(message);
+                        }
                         Ok(TuiInteraction::SessionChanged {
                             input_history,
                             events,
@@ -340,7 +377,13 @@ impl SubBakeTui {
                             if let Some(previous) = plan_mode_rollback {
                                 self.plan_mode = previous;
                             }
-                            self.interaction_state.set_input_mode(InputMode::Editing);
+                            self.interaction_state.set_input_mode(
+                                if self.config_editor.is_some() {
+                                    InputMode::ConfigEditor
+                                } else {
+                                    InputMode::Editing
+                                },
+                            );
                             if let Ok(mut view) = self.msg_view.lock() {
                                 if error.is_cancelled() {
                                     self.interaction_state.set_input_mode(InputMode::Editing);
@@ -378,8 +421,8 @@ impl SubBakeTui {
             "/help" | "/h" => r#"Commands:
   /help /h  —  this menu
   /plan [on|off] — toggle or set plan mode
-  /model    —  show active model
   /profile [NAME] — list or switch profiles
+  /config   —  edit configuration
   /undo     —  undo last file operation
   /sessions [ID] — choose or resume a saved session
   /history [LIMIT] — show recent history
@@ -388,7 +431,7 @@ impl SubBakeTui {
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
-            "/plan" | "/model" | "/profile" | "/undo" | "/sessions" | "/history" | "/clear" => {
+            "/plan" | "/profile" | "/config" | "/undo" | "/sessions" | "/history" | "/clear" => {
                 format!(
                     "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
                 )
@@ -742,9 +785,10 @@ mod tests {
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
         assert_eq!(slash_suggestions("/").len(), 10);
         assert_eq!(
-            slash_suggestions("/mod"),
-            vec![("/model", "show the active model")]
+            slash_suggestions("/con"),
+            vec![("/config", "edit configuration")]
         );
+        assert!(slash_suggestions("/mod").is_empty());
         assert!(slash_suggestions("hello /").is_empty());
     }
 

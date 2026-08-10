@@ -6,8 +6,8 @@ use subbake_adapters::{
 use subbake_agent::event::EventKind;
 use subbake_agent::{
     AgentActionKind, AgentEngine, AgentError, AgentResult, AgentRuntimePolicy, CommandDecision,
-    EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui, TuiAction, TuiInteraction,
-    is_known_slash_command,
+    ConfigApplyAfter, ConfigChange, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
+    TuiAction, TuiInteraction, is_known_slash_command,
 };
 
 use crate::CliResult;
@@ -88,13 +88,25 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
 
     Ok(tui.run(move |action, guard, _obs| {
         engine.begin_operation(guard);
+        let mut prepared_config_action = match &action {
+            TuiAction::ApplyConfig { changes, after } => Some(prepare_config_action(
+                &engine,
+                changes.clone(),
+                after.clone(),
+            )?),
+            _ => None,
+        };
         let submitted_text = match &action {
             TuiAction::SubmitText(text) => Some(text.as_str()),
             _ => None,
         };
         let requested_profile = match &action {
-            TuiAction::SelectProfile(name) => Some(name.as_str()),
-            TuiAction::CreateProfile(_) => None,
+            TuiAction::SelectProfile(name) | TuiAction::SelectConfigProfile(name) => {
+                Some(name.as_str())
+            }
+            TuiAction::CreateProfile(_)
+            | TuiAction::CreateConfigProfile(_)
+            | TuiAction::ApplyConfig { .. } => None,
             TuiAction::SubmitText(input) => input
                 .trim()
                 .strip_prefix("/profile ")
@@ -157,6 +169,27 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 }
                 TuiAction::SelectProfile(name) => engine.select_profile(name)?,
                 TuiAction::CreateProfile(name) => engine.create_profile(name)?,
+                TuiAction::SelectConfigProfile(name) => engine.select_profile(name)?,
+                TuiAction::CreateConfigProfile(name) => engine.create_profile(name)?,
+                TuiAction::ApplyConfig { .. } => {
+                    let pending = prepared_config_action.as_mut().ok_or_else(|| {
+                        AgentError::invalid_state("configuration update was not prepared")
+                    })?;
+                    engine.check_operation_cancelled()?;
+                    pending
+                        .prepared
+                        .take()
+                        .ok_or_else(|| {
+                            AgentError::invalid_state("configuration update was already applied")
+                        })?
+                        .commit(&pending.path)?;
+                    config_path = Some(pending.path.clone());
+                    engine.set_config_path(config_path.as_deref())?;
+                    if let ConfigApplyAfter::SwitchProfile(name) = &pending.after {
+                        engine.select_profile(name)?;
+                    }
+                    "Saved configuration.".to_owned()
+                }
                 TuiAction::SelectSession(id) => engine.select_session(id)?,
                 TuiAction::TogglePlan => engine.handle_toggle_plan()?,
             })
@@ -187,6 +220,10 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             apply_agent_runtime_policy(&mut engine, &settings)?;
             backend = candidate;
         }
+        if let Some(pending) = prepared_config_action.take() {
+            apply_agent_runtime_policy(&mut engine, &pending.settings)?;
+            backend = pending.backend;
+        }
         if let Some((candidate, settings, candidate_config_path, needs_config_pin)) =
             candidate_session_backend
         {
@@ -213,7 +250,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
         let _ = engine.save();
 
         let profile_options = submitted_text
-            .is_some_and(|input| matches!(input.trim(), "/model" | "/profile"))
+            .is_some_and(|input| input.trim() == "/profile")
             .then(|| engine.profile_picker_choices())
             .transpose()?
             .filter(|options| !options.is_empty());
@@ -223,7 +260,26 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             .transpose()?
             .filter(|options| !options.is_empty());
 
-        if requested_session.is_some() || changed_session {
+        if let TuiAction::ApplyConfig { after, .. } = &action {
+            let settings = resolved_settings(config_path.as_deref(), engine.active_profile())?;
+            if *after == ConfigApplyAfter::Close {
+                Ok(TuiInteraction::ConfigClosed {
+                    message: result,
+                    provider: settings.backend.id,
+                    model: settings.backend.model,
+                    cache_enabled: settings.translation.use_cache,
+                })
+            } else {
+                config_editor_interaction(&engine, config_path.as_deref(), result)
+            }
+        } else if matches!(
+            action,
+            TuiAction::SelectConfigProfile(_) | TuiAction::CreateConfigProfile(_)
+        ) {
+            config_editor_interaction(&engine, config_path.as_deref(), result)
+        } else if submitted_text.is_some_and(|input| input.trim() == "/config") {
+            config_editor_interaction(&engine, config_path.as_deref(), String::new())
+        } else if requested_session.is_some() || changed_session {
             let profile = engine.active_profile();
             let model = resolved_settings(config_path.as_deref(), profile)?
                 .backend
@@ -270,6 +326,69 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
     })?)
 }
 
+fn config_editor_interaction(
+    engine: &AgentEngine,
+    config_path: Option<&Path>,
+    message: String,
+) -> AgentResult<TuiInteraction> {
+    let settings = resolved_settings(config_path, engine.active_profile())?;
+    Ok(TuiInteraction::ConfigEditor {
+        message,
+        snapshot: engine.config_editor_snapshot()?,
+        provider: settings.backend.id,
+        model: settings.backend.model,
+        cache_enabled: settings.translation.use_cache,
+    })
+}
+
+struct PreparedConfigAction {
+    path: PathBuf,
+    prepared: Option<subbake_adapters::PreparedConfigUpdate>,
+    backend: Box<dyn subbake_core::ports::LlmBackend>,
+    settings: TranslationSettings,
+    after: ConfigApplyAfter,
+}
+
+fn prepare_config_action(
+    engine: &AgentEngine,
+    changes: Vec<ConfigChange>,
+    after: ConfigApplyAfter,
+) -> AgentResult<PreparedConfigAction> {
+    let (path, _, prepared) = engine.prepare_config_update(changes)?;
+    let profile = match &after {
+        ConfigApplyAfter::SwitchProfile(name) => Some(name.as_str()),
+        ConfigApplyAfter::Stay | ConfigApplyAfter::Close => engine.active_profile(),
+    };
+    let (settings, _) = prepared
+        .config()
+        .resolve(profile, subbake_adapters::SettingsOverrides::default())
+        .map_err(subbake_adapters::AdapterError::from)?;
+    let _ = AgentRuntimePolicy::new(
+        settings.agent.max_steps,
+        settings.agent.auto_approve_commands,
+    )?;
+    let backend = build_backend_for_settings(&settings)?;
+    Ok(PreparedConfigAction {
+        path,
+        prepared: Some(prepared),
+        backend,
+        settings,
+        after,
+    })
+}
+
+fn build_backend_for_settings(
+    settings: &TranslationSettings,
+) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
+    if settings.backend.id == "mock" {
+        return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
+    }
+    build_backend(&settings.backend_config()).map_err(|source| AgentError::AdapterContext {
+        operation: "build agent backend",
+        source: Box::new(source),
+    })
+}
+
 fn prepare_profile_backend(
     engine: &AgentEngine,
     config_path: Option<&Path>,
@@ -312,14 +431,7 @@ fn build_agent_decision_backend(
 ) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
     let settings = resolved_settings(config_path, profile)?;
 
-    if settings.backend.id == "mock" {
-        return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
-    }
-
-    build_backend(&settings.backend_config()).map_err(|source| AgentError::AdapterContext {
-        operation: "build agent backend",
-        source: Box::new(source),
-    })
+    build_backend_for_settings(&settings)
 }
 
 fn resolved_settings(
@@ -348,8 +460,11 @@ fn display_config_path(path: &Path) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_agent_decision_backend, prepare_profile_backend, session_config_path};
-    use subbake_agent::AgentEngine;
+    use super::{
+        build_agent_decision_backend, prepare_config_action, prepare_profile_backend,
+        session_config_path,
+    };
+    use subbake_agent::{AgentEngine, ConfigApplyAfter, ConfigChange, ConfigFieldId};
 
     #[test]
     fn invalid_profile_backend_fails_instead_of_falling_back_to_mock() {
@@ -421,6 +536,38 @@ mod tests {
         engine.set_config_path(Some(&pinned)).expect("pin config");
 
         assert_eq!(session_config_path(&engine), (Some(pinned), false));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_config_draft_does_not_touch_the_configuration_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-config-atomic-{nonce}"));
+        std::fs::create_dir_all(&root).expect("create root");
+        let path = root.join("subbake.toml");
+        let original = "version = 2\n# retained\n";
+        std::fs::write(&path, original).expect("write config");
+        let mut engine = AgentEngine::new(root.clone());
+        engine.start_session().expect("start session");
+        engine.set_config_path(Some(&path)).expect("pin config");
+
+        prepare_config_action(
+            &engine,
+            vec![ConfigChange {
+                id: ConfigFieldId::AgentMaxSteps,
+                value: Some("0".to_owned()),
+            }],
+            ConfigApplyAfter::Stay,
+        )
+        .err()
+        .expect("invalid max steps must fail");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,5 +1,6 @@
 use crate::engine::{ProfileChoice, SessionChoice};
 use crate::tui::TuiAction;
+use crate::{ConfigChange, ConfigEditorSnapshot, ConfigFieldId, ConfigFieldKind, ConfigSection};
 
 pub(crate) const APPROVAL_OPTIONS: &[(&str, &str)] = &[
     ("approve", "execute the pending plan"),
@@ -28,9 +29,116 @@ pub(crate) enum InputMode {
     BrowsingHistory { index: usize, draft: String },
     ChoosingProfile(TuiPicker),
     CreatingProfile,
+    ChoosingConfigProfile(TuiPicker),
+    CreatingConfigProfile,
+    ConfigEditor,
     ChoosingSession(SessionPicker),
     AwaitingPlanDecision,
     AwaitingCommandDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigFocus {
+    Sections,
+    Fields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigConfirm {
+    Close,
+    SwitchProfile(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigEditorState {
+    pub snapshot: ConfigEditorSnapshot,
+    pub section_index: usize,
+    pub field_index: usize,
+    pub focus: ConfigFocus,
+    pub changes: Vec<ConfigChange>,
+    pub editing_field: Option<ConfigFieldId>,
+    pub confirm: Option<ConfigConfirm>,
+}
+
+impl ConfigEditorState {
+    pub fn new(snapshot: ConfigEditorSnapshot) -> Self {
+        Self {
+            snapshot,
+            section_index: 0,
+            field_index: 0,
+            focus: ConfigFocus::Sections,
+            changes: Vec::new(),
+            editing_field: None,
+            confirm: None,
+        }
+    }
+
+    pub fn section(&self) -> ConfigSection {
+        ConfigSection::ALL[self.section_index.min(ConfigSection::ALL.len() - 1)]
+    }
+
+    pub fn field_ids(&self) -> Vec<ConfigFieldId> {
+        self.snapshot
+            .fields
+            .iter()
+            .filter(|field| field.id.section() == self.section())
+            .map(|field| field.id)
+            .collect()
+    }
+
+    pub fn selected_field(&self) -> Option<ConfigFieldId> {
+        let fields = self.field_ids();
+        fields
+            .get(self.field_index.min(fields.len().saturating_sub(1)))
+            .copied()
+    }
+
+    pub fn value(&self, id: ConfigFieldId) -> String {
+        if let Some(change) = self.changes.iter().rev().find(|change| change.id == id) {
+            return change.value.clone().unwrap_or_default();
+        }
+        self.snapshot
+            .fields
+            .iter()
+            .find(|field| field.id == id)
+            .map(|field| field.value.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_value(&mut self, id: ConfigFieldId, value: Option<String>) {
+        self.changes.retain(|change| change.id != id);
+        self.changes.push(ConfigChange { id, value });
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    pub fn cycle_selected(&mut self, backwards: bool) {
+        let Some(id) = self.selected_field() else {
+            return;
+        };
+        match id.kind() {
+            ConfigFieldKind::Boolean => {
+                let next = (self.value(id) != "true").to_string();
+                self.set_value(id, Some(next));
+            }
+            ConfigFieldKind::Choice(options) if !options.is_empty() => {
+                let current = self.value(id);
+                let index = options
+                    .iter()
+                    .position(|option| *option == current)
+                    .unwrap_or(0);
+                let next = if backwards {
+                    index.checked_sub(1).unwrap_or(options.len() - 1)
+                } else {
+                    (index + 1) % options.len()
+                };
+                self.set_value(id, Some(options[next].to_owned()));
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) enum InteractionState {
@@ -148,6 +256,9 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         InputMode::ChoosingProfile(picker) if !picker.options.is_empty() => {
             VerticalNavigation::Selection(picker.options.len())
         }
+        InputMode::ChoosingConfigProfile(picker) if !picker.options.is_empty() => {
+            VerticalNavigation::Selection(picker.options.len())
+        }
         InputMode::ChoosingSession(picker) if !picker.options.is_empty() => {
             VerticalNavigation::Selection(picker.options.len())
         }
@@ -162,10 +273,13 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         }
         InputMode::Editing | InputMode::BrowsingHistory { .. } => VerticalNavigation::History,
         InputMode::ChoosingProfile(_)
+        | InputMode::ChoosingConfigProfile(_)
         | InputMode::ChoosingSession(_)
         | InputMode::AwaitingPlanDecision
         | InputMode::AwaitingCommandDecision
-        | InputMode::CreatingProfile => VerticalNavigation::Disabled,
+        | InputMode::CreatingProfile
+        | InputMode::CreatingConfigProfile
+        | InputMode::ConfigEditor => VerticalNavigation::Disabled,
     }
 }
 
@@ -184,6 +298,12 @@ pub(crate) fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyM
             ProfilePickerChoice::Select(name) => {
                 Some(EmptyModeChoice::Submit(TuiAction::SelectProfile(name)))
             }
+            ProfilePickerChoice::Create => Some(EmptyModeChoice::CreateProfile),
+        },
+        InputMode::ChoosingConfigProfile(picker) => match profile_picker_choice(picker, index)? {
+            ProfilePickerChoice::Select(name) => Some(EmptyModeChoice::Submit(
+                TuiAction::SelectConfigProfile(name),
+            )),
             ProfilePickerChoice::Create => Some(EmptyModeChoice::CreateProfile),
         },
         InputMode::ChoosingSession(picker) => picker
@@ -268,5 +388,29 @@ mod tests {
             empty_mode_choice(&InputMode::AwaitingCommandDecision, 1),
             Some(EmptyModeChoice::Submit(TuiAction::RejectCommand))
         );
+    }
+
+    #[test]
+    fn config_boolean_fields_are_edited_as_typed_changes() {
+        let snapshot = ConfigEditorSnapshot {
+            path: std::path::PathBuf::from("subbake.toml"),
+            target: subbake_adapters::ConfigEditTarget::Defaults,
+            active_profile: None,
+            profiles: Vec::new(),
+            fields: vec![crate::ConfigFieldView {
+                id: crate::ConfigFieldId::AgentAutoApprove,
+                value: "false".to_owned(),
+                inherited: true,
+                configured: true,
+            }],
+        };
+        let mut editor = ConfigEditorState::new(snapshot);
+        editor.section_index = ConfigSection::ALL
+            .iter()
+            .position(|section| *section == ConfigSection::Agent)
+            .expect("agent section");
+        editor.cycle_selected(false);
+        assert_eq!(editor.value(crate::ConfigFieldId::AgentAutoApprove), "true");
+        assert!(editor.is_dirty());
     }
 }

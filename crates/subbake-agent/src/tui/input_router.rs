@@ -6,11 +6,13 @@ use subbake_core::{CancellationToken, TaskState};
 
 use super::worker::WorkerRequest;
 use super::{
-    EmptyModeChoice, InputMode, MsgStyle, SessionPicker, SubBakeTui, TuiAction, VerticalNavigation,
-    empty_mode_choice, is_insert_newline_key, is_profile_name_character, previous_suggestion,
-    slash_suggestions, vertical_navigation,
+    ConfigApplyAfter, EmptyModeChoice, InputMode, MsgStyle, SessionPicker, SubBakeTui, TuiAction,
+    VerticalNavigation, empty_mode_choice, is_insert_newline_key, is_profile_name_character,
+    previous_suggestion, slash_suggestions, vertical_navigation,
 };
+use crate::ConfigFieldKind;
 use crate::session::iso_now;
+use crate::tui_state::{ConfigConfirm, ConfigFocus, TuiPicker};
 
 pub(super) fn handle_event(
     app: &mut SubBakeTui,
@@ -20,66 +22,397 @@ pub(super) fn handle_event(
         return Ok(());
     }
     match event::read()? {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.running = false;
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.config_editor.is_some() {
+                return handle_config_event(app, request_tx, key.code, key.modifiers);
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.running = false;
-            }
-            KeyCode::Char('q') if app.input.is_empty() => {
-                app.running = false;
-            }
-            KeyCode::Esc => handle_escape(app, request_tx)?,
-            _ if is_insert_newline_key(key)
-                && !matches!(
-                    app.interaction_state.input_mode(),
-                    InputMode::CreatingProfile
-                ) =>
-            {
-                app.input.insert_newline();
-                app.interaction_state.set_input_mode(InputMode::Editing);
-                app.suggestion_index = 0;
-            }
-            KeyCode::Enter => handle_enter(app, request_tx)?,
-            KeyCode::Char(character) => {
-                if matches!(
-                    app.interaction_state.input_mode(),
-                    InputMode::CreatingProfile
-                ) && !is_profile_name_character(character)
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.running = false;
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.running = false;
+                }
+                KeyCode::Char('q') if app.input.is_empty() => {
+                    app.running = false;
+                }
+                KeyCode::Esc => handle_escape(app, request_tx)?,
+                _ if is_insert_newline_key(key)
+                    && !matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) =>
                 {
-                    return Ok(());
-                }
-                if !matches!(
-                    app.interaction_state.input_mode(),
-                    InputMode::CreatingProfile
-                ) {
+                    app.input.insert_newline();
                     app.interaction_state.set_input_mode(InputMode::Editing);
+                    app.suggestion_index = 0;
                 }
-                app.input.insert_char(character);
-                app.suggestion_index = 0;
-            }
-            KeyCode::Backspace => {
-                if !matches!(
-                    app.interaction_state.input_mode(),
-                    InputMode::CreatingProfile
-                ) {
-                    app.interaction_state.set_input_mode(InputMode::Editing);
+                KeyCode::Enter => handle_enter(app, request_tx)?,
+                KeyCode::Char(character) => {
+                    if matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) && !is_profile_name_character(character)
+                    {
+                        return Ok(());
+                    }
+                    if !matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) {
+                        app.interaction_state.set_input_mode(InputMode::Editing);
+                    }
+                    app.input.insert_char(character);
+                    app.suggestion_index = 0;
                 }
-                app.input.backspace();
-                app.suggestion_index = 0;
+                KeyCode::Backspace => {
+                    if !matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::CreatingProfile
+                    ) {
+                        app.interaction_state.set_input_mode(InputMode::Editing);
+                    }
+                    app.input.backspace();
+                    app.suggestion_index = 0;
+                }
+                KeyCode::Up => navigate_vertical(app, true)?,
+                KeyCode::Down => navigate_vertical(app, false)?,
+                KeyCode::Left | KeyCode::Right => navigate_horizontal(app, key.code),
+                KeyCode::BackTab => toggle_plan(app, request_tx)?,
+                KeyCode::Tab => complete_input(app),
+                _ => {}
             }
-            KeyCode::Up => navigate_vertical(app, true)?,
-            KeyCode::Down => navigate_vertical(app, false)?,
-            KeyCode::Left | KeyCode::Right => navigate_horizontal(app, key.code),
-            KeyCode::BackTab => toggle_plan(app, request_tx)?,
-            KeyCode::Tab => complete_input(app),
-            _ => {}
-        },
+        }
         Event::Resize(_, _) => {}
         _ => {}
     }
     Ok(())
+}
+
+fn handle_config_event(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> io::Result<()> {
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')) {
+        app.running = false;
+        return Ok(());
+    }
+    if app.interaction_state.is_processing() {
+        return if code == KeyCode::Esc {
+            handle_escape(app, request_tx)
+        } else {
+            Ok(())
+        };
+    }
+    match app.interaction_state.input_mode() {
+        InputMode::ChoosingConfigProfile(_) => match code {
+            KeyCode::Esc => {
+                app.interaction_state
+                    .set_input_mode(InputMode::ConfigEditor);
+                app.suggestion_index = 0;
+                Ok(())
+            }
+            KeyCode::Up => navigate_vertical(app, true),
+            KeyCode::Down => navigate_vertical(app, false),
+            KeyCode::Enter => handle_enter(app, request_tx),
+            _ => Ok(()),
+        },
+        InputMode::CreatingConfigProfile => match code {
+            KeyCode::Esc => {
+                app.input.clear();
+                app.interaction_state
+                    .set_input_mode(InputMode::ConfigEditor);
+                Ok(())
+            }
+            KeyCode::Enter => {
+                let name = app.input.take().trim().to_owned();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                submit_action(app, request_tx, TuiAction::CreateConfigProfile(name))
+            }
+            KeyCode::Char(character) if is_profile_name_character(character) => {
+                app.input.insert_char(character);
+                Ok(())
+            }
+            KeyCode::Backspace => {
+                app.input.backspace();
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+        InputMode::ConfigEditor => handle_config_editor_key(app, request_tx, code, modifiers),
+        _ => Ok(()),
+    }
+}
+
+fn handle_config_editor_key(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> io::Result<()> {
+    let editing = app
+        .config_editor
+        .as_ref()
+        .is_some_and(|editor| editor.editing_field.is_some());
+    if editing {
+        return handle_config_field_input(app, code);
+    }
+    let confirming = app
+        .config_editor
+        .as_ref()
+        .is_some_and(|editor| editor.confirm.is_some());
+    if confirming {
+        return handle_config_confirmation(app, request_tx, code);
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('s') {
+        return submit_config_apply(app, request_tx, ConfigApplyAfter::Stay);
+    }
+    match code {
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                editor.focus = match editor.focus {
+                    ConfigFocus::Sections => ConfigFocus::Fields,
+                    ConfigFocus::Fields => ConfigFocus::Sections,
+                };
+            }
+        }
+        KeyCode::Up | KeyCode::Down => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                let up = code == KeyCode::Up;
+                match editor.focus {
+                    ConfigFocus::Sections => {
+                        let count = crate::ConfigSection::ALL.len();
+                        editor.section_index = if up {
+                            previous_suggestion(editor.section_index, count)
+                        } else {
+                            (editor.section_index + 1) % count
+                        };
+                        editor.field_index = 0;
+                    }
+                    ConfigFocus::Fields => {
+                        let count = editor.field_ids().len();
+                        if count > 0 {
+                            editor.field_index = if up {
+                                previous_suggestion(editor.field_index, count)
+                            } else {
+                                (editor.field_index + 1) % count
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Left => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                if editor.focus == ConfigFocus::Fields
+                    && editor.selected_field().is_some_and(|id| {
+                        matches!(
+                            id.kind(),
+                            ConfigFieldKind::Boolean | ConfigFieldKind::Choice(_)
+                        )
+                    })
+                {
+                    editor.cycle_selected(true);
+                } else {
+                    editor.focus = ConfigFocus::Sections;
+                }
+            }
+        }
+        KeyCode::Right => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                if editor.focus == ConfigFocus::Fields
+                    && editor.selected_field().is_some_and(|id| {
+                        matches!(
+                            id.kind(),
+                            ConfigFieldKind::Boolean | ConfigFieldKind::Choice(_)
+                        )
+                    })
+                {
+                    editor.cycle_selected(false);
+                } else {
+                    editor.focus = ConfigFocus::Fields;
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(editor) = app.config_editor.as_mut()
+                && editor.focus == ConfigFocus::Fields
+            {
+                editor.cycle_selected(false);
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(editor) = app.config_editor.as_mut()
+                && let Some(id) = editor.selected_field()
+                && id != crate::ConfigFieldId::ActiveProfile
+            {
+                editor.set_value(id, None);
+            }
+        }
+        KeyCode::Enter => open_selected_config_field(app)?,
+        KeyCode::Esc | KeyCode::Char('q') => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                if editor.is_dirty() {
+                    editor.confirm = Some(ConfigConfirm::Close);
+                    editor.field_index = 0;
+                } else {
+                    app.config_editor = None;
+                    app.interaction_state.set_input_mode(InputMode::Editing);
+                    app.close_fullscreen_overlay()?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_selected_config_field(app: &mut SubBakeTui) -> io::Result<()> {
+    let Some(editor) = app.config_editor.as_mut() else {
+        return Ok(());
+    };
+    if editor.focus == ConfigFocus::Sections {
+        editor.focus = ConfigFocus::Fields;
+        return Ok(());
+    }
+    let Some(id) = editor.selected_field() else {
+        return Ok(());
+    };
+    match id.kind() {
+        ConfigFieldKind::Profile => {
+            app.interaction_state
+                .set_input_mode(InputMode::ChoosingConfigProfile(TuiPicker {
+                    options: editor.snapshot.profiles.clone(),
+                }));
+            app.suggestion_index = 0;
+        }
+        ConfigFieldKind::Boolean | ConfigFieldKind::Choice(_) => editor.cycle_selected(false),
+        _ => {
+            let value = if matches!(id.kind(), ConfigFieldKind::Secret) {
+                String::new()
+            } else {
+                editor.value(id)
+            };
+            editor.editing_field = Some(id);
+            app.input.set_text(value);
+        }
+    }
+    Ok(())
+}
+
+fn handle_config_field_input(app: &mut SubBakeTui, code: KeyCode) -> io::Result<()> {
+    match code {
+        KeyCode::Esc => {
+            app.input.clear();
+            if let Some(editor) = app.config_editor.as_mut() {
+                editor.editing_field = None;
+            }
+        }
+        KeyCode::Enter => {
+            let value = app.input.take();
+            if let Some(editor) = app.config_editor.as_mut()
+                && let Some(id) = editor.editing_field.take()
+                && !(matches!(id.kind(), ConfigFieldKind::Secret) && value.is_empty())
+            {
+                editor.set_value(id, (!value.is_empty()).then_some(value));
+            }
+        }
+        KeyCode::Char(character) => app.input.insert_char(character),
+        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Left => app.input.move_left(),
+        KeyCode::Right => app.input.move_right(),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_config_confirmation(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+    code: KeyCode,
+) -> io::Result<()> {
+    match code {
+        KeyCode::Up => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                editor.field_index = previous_suggestion(editor.field_index.min(2), 3);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                editor.field_index = (editor.field_index.min(2) + 1) % 3;
+            }
+        }
+        KeyCode::Esc => {
+            if let Some(editor) = app.config_editor.as_mut() {
+                editor.confirm = None;
+                editor.field_index = 0;
+            }
+        }
+        KeyCode::Enter => {
+            let Some(editor) = app.config_editor.as_ref() else {
+                return Ok(());
+            };
+            let choice = editor.field_index.min(2);
+            let confirm = editor.confirm.clone();
+            match (choice, confirm) {
+                (0, Some(ConfigConfirm::Close)) => {
+                    return submit_config_apply(app, request_tx, ConfigApplyAfter::Close);
+                }
+                (0, Some(ConfigConfirm::SwitchProfile(name))) => {
+                    return submit_config_apply(
+                        app,
+                        request_tx,
+                        ConfigApplyAfter::SwitchProfile(name),
+                    );
+                }
+                (1, Some(ConfigConfirm::Close)) => {
+                    app.config_editor = None;
+                    app.interaction_state.set_input_mode(InputMode::Editing);
+                    app.close_fullscreen_overlay()?;
+                }
+                (1, Some(ConfigConfirm::SwitchProfile(name))) => {
+                    if let Some(editor) = app.config_editor.as_mut() {
+                        editor.changes.clear();
+                        editor.confirm = None;
+                    }
+                    return submit_action(app, request_tx, TuiAction::SelectConfigProfile(name));
+                }
+                _ => {
+                    if let Some(editor) = app.config_editor.as_mut() {
+                        editor.confirm = None;
+                        editor.field_index = 0;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn submit_config_apply(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+    after: ConfigApplyAfter,
+) -> io::Result<()> {
+    let changes = app
+        .config_editor
+        .as_ref()
+        .map(|editor| editor.changes.clone())
+        .unwrap_or_default();
+    if changes.is_empty() {
+        if after == ConfigApplyAfter::Close {
+            app.config_editor = None;
+            app.interaction_state.set_input_mode(InputMode::Editing);
+            return app.close_fullscreen_overlay();
+        }
+        return Ok(());
+    }
+    submit_action(app, request_tx, TuiAction::ApplyConfig { changes, after })
 }
 
 fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) -> io::Result<()> {
@@ -143,8 +476,15 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
                 return Ok(());
             }
             Some(EmptyModeChoice::CreateProfile) => {
-                app.interaction_state
-                    .set_input_mode(InputMode::CreatingProfile);
+                let config_profile = matches!(
+                    app.interaction_state.input_mode(),
+                    InputMode::ChoosingConfigProfile(_)
+                );
+                app.interaction_state.set_input_mode(if config_profile {
+                    InputMode::CreatingConfigProfile
+                } else {
+                    InputMode::CreatingProfile
+                });
                 app.suggestion_index = 0;
                 if let Ok(mut view) = app.msg_view.lock() {
                     view.push(
@@ -173,6 +513,16 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
     };
 
     let action = selected_action.unwrap_or_else(|| take_input_action(app));
+    if let TuiAction::SelectConfigProfile(name) = &action
+        && let Some(editor) = app.config_editor.as_mut()
+        && editor.is_dirty()
+    {
+        editor.confirm = Some(ConfigConfirm::SwitchProfile(name.clone()));
+        editor.field_index = 0;
+        app.interaction_state
+            .set_input_mode(InputMode::ConfigEditor);
+        return Ok(());
+    }
     if matches!(&action, TuiAction::SubmitText(text) if text.is_empty()) {
         return Ok(());
     }
@@ -198,6 +548,10 @@ fn take_input_action(app: &mut SubBakeTui) -> TuiAction {
         app.interaction_state.input_mode(),
         InputMode::CreatingProfile
     );
+    let creating_config_profile = matches!(
+        app.interaction_state.input_mode(),
+        InputMode::CreatingConfigProfile
+    );
     app.interaction_state.set_input_mode(InputMode::Editing);
     if !trimmed.is_empty()
         && app
@@ -207,7 +561,9 @@ fn take_input_action(app: &mut SubBakeTui) -> TuiAction {
     {
         app.input_history.push(trimmed.clone());
     }
-    if creating_profile {
+    if creating_config_profile {
+        TuiAction::CreateConfigProfile(trimmed)
+    } else if creating_profile {
         TuiAction::CreateProfile(trimmed)
     } else {
         TuiAction::SubmitText(trimmed)
@@ -280,6 +636,7 @@ fn navigate_horizontal(app: &mut SubBakeTui, code: KeyCode) {
     let option_count = match app.interaction_state.input_mode() {
         InputMode::ChoosingSession(picker) => picker.options.len(),
         InputMode::ChoosingProfile(picker) => picker.options.len(),
+        InputMode::ChoosingConfigProfile(picker) => picker.options.len(),
         _ => 0,
     };
     if option_count > 0 {
