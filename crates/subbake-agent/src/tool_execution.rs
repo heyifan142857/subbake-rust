@@ -558,6 +558,9 @@ pub(crate) fn execute_translation_tool(
     let outcome = match executor {
         ToolExecutor::TranslateFile => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
+            let fresh_runtime = optional_bool(args, "fresh_runtime", false);
+            let runtime_dir =
+                fresh_runtime.then(|| isolate_translation_runtime(&mut settings, &input));
             let language_tag =
                 explicit_target_language.then(|| settings.translation.target_language.clone());
             let output_path = if let Some(path) = optional_argument(args, "output_path") {
@@ -661,6 +664,8 @@ pub(crate) fn execute_translation_tool(
                     resumed_translation_batches: translated.result.resumed_translation_batches,
                     resumed_review_batches: translated.result.resumed_review_batches,
                     translation_memory_hits: translated.result.translation_memory_hits,
+                    fresh_runtime,
+                    runtime_dir,
                 }),
                 file_operations,
                 group_file_operations: false,
@@ -668,6 +673,9 @@ pub(crate) fn execute_translation_tool(
         }
         ToolExecutor::TranslateSeries => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
+            let fresh_runtime = optional_bool(args, "fresh_runtime", false);
+            let runtime_dir =
+                fresh_runtime.then(|| isolate_translation_runtime(&mut settings, &input));
             let recursive = args
                 .get("recursive")
                 .and_then(JsonValue::as_bool)
@@ -766,6 +774,8 @@ pub(crate) fn execute_translation_tool(
                     resumed_translation_batches: translated.resumed_translation_batches,
                     resumed_review_batches: translated.resumed_review_batches,
                     translation_memory_hits: translated.translation_memory_hits,
+                    fresh_runtime,
+                    runtime_dir,
                 }),
                 file_operations,
                 group_file_operations: true,
@@ -948,6 +958,46 @@ fn optional_bool(args: &JsonValue, key: &str, default: bool) -> bool {
     args.get(key)
         .and_then(JsonValue::as_bool)
         .unwrap_or(default)
+}
+
+fn isolate_translation_runtime(settings: &mut TranslationSettings, input: &Path) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let base = settings.storage.runtime_dir.clone().unwrap_or_else(|| {
+        input
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".subbake")
+    });
+    let stem = input
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("translation");
+    let safe_stem = stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let runtime_dir = base.join("fresh").join(format!(
+        "{safe_stem}-{timestamp}-{}-{nonce}",
+        std::process::id()
+    ));
+
+    settings.storage.runtime_dir = Some(runtime_dir.clone());
+    settings.storage.glossary_path = None;
+    settings.translation.resume = false;
+    settings.translation.use_cache = false;
+    runtime_dir
 }
 
 fn nonempty_value(name: &str, value: &str) -> AgentResult<String> {
@@ -1159,6 +1209,14 @@ pub(crate) fn render_tool_outcome(outcome: &AgentToolOutcome) -> String {
                     facts.resumed_translation_batches,
                     facts.resumed_review_batches,
                     facts.translation_memory_hits
+                ));
+            }
+            if facts.fresh_runtime
+                && let Some(runtime_dir) = &facts.runtime_dir
+            {
+                lines.push(format!(
+                    "Fresh runtime: {} (Resume, request cache, translation memory, and accumulated glossary reuse disabled).",
+                    runtime_dir.display()
                 ));
             }
             lines.join("\n")
@@ -1558,6 +1616,64 @@ mod tests {
             default_facts.outputs,
             vec![root.join("sample.translated.srt")]
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fresh_runtime_is_unique_and_disables_all_translation_reuse() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("sample.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+        )
+        .expect("write subtitle");
+        let guard = FileGuard::new(root.clone());
+        let mut settings = TranslationSettings::default();
+        settings.storage.runtime_dir = Some(root.join("runtime"));
+        settings.storage.glossary_path = Some(root.join("shared-glossary.json"));
+
+        let run = |output_path: &str| {
+            execute_translation_tool(
+                ToolExecutor::TranslateFile,
+                &json!({
+                    "path": "sample.srt",
+                    "output_path": output_path,
+                    "fresh_runtime": true
+                }),
+                &guard,
+                &CancellationGuard::never(),
+                None,
+                settings.clone(),
+            )
+            .expect("fresh translation")
+            .expect("translation outcome")
+        };
+        let first = run("fresh-one.srt");
+        let second = run("fresh-two.srt");
+        let AgentToolOutcome::Translation(first) = first.outcome else {
+            panic!("expected first translation facts");
+        };
+        let AgentToolOutcome::Translation(second) = second.outcome else {
+            panic!("expected second translation facts");
+        };
+
+        let first_runtime = first.runtime_dir.clone().expect("first runtime");
+        let second_runtime = second.runtime_dir.clone().expect("second runtime");
+        assert!(first.fresh_runtime);
+        assert!(second.fresh_runtime);
+        assert_ne!(first_runtime, second_runtime);
+        assert!(first_runtime.starts_with(root.join("runtime/fresh")));
+        assert!(second_runtime.starts_with(root.join("runtime/fresh")));
+        assert!(first_runtime.is_dir());
+        assert!(second_runtime.is_dir());
+        for facts in [first, second] {
+            assert_eq!(facts.cache_hits, 0);
+            assert_eq!(facts.resumed_translation_batches, 0);
+            assert_eq!(facts.resumed_review_batches, 0);
+            assert_eq!(facts.translation_memory_hits, 0);
+        }
+        assert!(!root.join("shared-glossary.json").exists());
         let _ = fs::remove_dir_all(root);
     }
 

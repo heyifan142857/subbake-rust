@@ -207,7 +207,12 @@ where
 
     validate_full_alignment(&document.segments, stage.output())?;
     pipeline.cancellation.check()?;
-    pipeline.save_run_state(stage.len(), resume.review_batches_completed, true, usage)?;
+    pipeline.save_run_state(
+        stage.len(),
+        resume.review_batches_completed,
+        resume.validation_completed,
+        usage,
+    )?;
     pipeline.dashboard.mark_done("TRANSLATE");
     let batches = stage.batches().to_vec();
     Ok(TranslationRun {

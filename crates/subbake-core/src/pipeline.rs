@@ -12,8 +12,8 @@ use crate::formatting::restore_batch_formatting;
 use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
-    BackendJsonResult, BackendPayload, BatchExecutionOptions, CacheStage, ChatMessage,
-    DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
+    BackendJsonResult, BackendPayload, BatchExecutionOptions, BatchShardKind, CacheStage,
+    ChatMessage, DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
@@ -22,7 +22,10 @@ use crate::recovery::{
 };
 use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
 use crate::storage::{InputSignature, ResumeSnapshot, build_glossary_fingerprint};
-use crate::validation::{FinalValidationPolicy, validate_final_output, validate_translation_batch};
+use crate::validation::{
+    FinalValidationIssue, FinalValidationPolicy, final_validation_error, final_validation_issues,
+    validate_final_output, validate_full_alignment, validate_translation_batch,
+};
 
 mod name_alignment;
 mod online_terminology;
@@ -54,8 +57,6 @@ use translation_stage::{PreparedBatch, TranslationPromptContext};
 
 #[cfg(test)]
 use crate::entities::{ReviewPolicy, ReviewReport};
-#[cfg(test)]
-use crate::ports::BatchShardKind;
 #[cfg(test)]
 use support::validate_window_terminology;
 
@@ -426,11 +427,11 @@ where
         )?;
         let translated_segments = deduplication.expand(&document.segments, &translated_segments)?;
         let ReviewRun {
-            output,
+            mut output,
             stats: review,
             batches: review_batches,
             resumed: resumed_review_batches,
-            usage,
+            mut usage,
         } = review_runner::run(
             self,
             document,
@@ -443,18 +444,52 @@ where
             &terminology,
             usage,
         )?;
+        let final_validation_policy = FinalValidationPolicy {
+            max_characters_per_second: self.options.max_characters_per_second,
+            max_characters_per_line: self.options.max_characters_per_line,
+            max_lines: self.options.max_lines,
+        };
+        if resume.validation_completed {
+            if resume.finalized_segments.is_empty() {
+                return Err(CoreError::DataInvariant(
+                    "resume state marks final validation complete but has no finalized output"
+                        .to_owned(),
+                ));
+            }
+            validate_full_alignment(&document.segments, &resume.finalized_segments)?;
+            output = resume.finalized_segments.clone();
+        }
+        let issues = final_validation_issues(
+            &document.segments,
+            &output,
+            &self.required_glossary,
+            &self.options.source_language,
+            &self.options.target_language,
+            final_validation_policy,
+        )?;
+        if !issues.is_empty() {
+            self.repair_final_validation(
+                document,
+                &mut output,
+                &issues,
+                final_validation_policy,
+                &mut usage,
+            )?;
+        }
         validate_final_output(
             &document.segments,
             &output,
             &self.required_glossary,
             &self.options.source_language,
             &self.options.target_language,
-            FinalValidationPolicy {
-                max_characters_per_second: self.options.max_characters_per_second,
-                max_characters_per_line: self.options.max_characters_per_line,
-                max_lines: self.options.max_lines,
-            },
+            final_validation_policy,
         )?;
+        if let Some(store) = self.store.as_ref() {
+            self.cancellation.check()?;
+            store.save_batch_segments(BatchShardKind::Finalized, 1, &output)?;
+        }
+        self.cancellation.check()?;
+        self.save_run_state(batches.len(), review_batches, true, usage)?;
         self.report(
             "WRITE_OUTPUT",
             TaskState::Running,
@@ -1399,6 +1434,72 @@ where
         ))
     }
 
+    fn repair_final_validation(
+        &mut self,
+        document: &SubtitleDocument,
+        output: &mut [SubtitleSegment],
+        issues: &[FinalValidationIssue],
+        policy: FinalValidationPolicy,
+        usage: &mut Usage,
+    ) -> CoreResult<()> {
+        let initial_error = final_validation_error(issues);
+        let failing_ids = issues
+            .iter()
+            .map(|issue| issue.segment_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let source = document
+            .segments
+            .iter()
+            .filter(|segment| failing_ids.contains(segment.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let translated = output
+            .iter()
+            .filter(|segment| failing_ids.contains(segment.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(repair) = self.run_agent_repair(
+            "final_validation",
+            0,
+            &source,
+            Some(&translated),
+            &initial_error,
+            &[],
+        )?
+        else {
+            return Err(initial_error);
+        };
+        usage.add(repair.usage);
+        let Some(BackendPayload::Review(result)) = repair.payload else {
+            let detail = repair
+                .error
+                .unwrap_or_else(|| "no corrected payload was returned".to_owned());
+            return Err(CoreError::InvalidTranslation(format!(
+                "{initial_error}; targeted final-validation repair failed: {detail}"
+            )));
+        };
+        for line in result.lines {
+            let segment = output
+                .iter_mut()
+                .find(|segment| segment.id == line.id)
+                .ok_or_else(|| {
+                    CoreError::DataInvariant(format!(
+                        "final-validation repair returned unknown id `{}`",
+                        line.id
+                    ))
+                })?;
+            segment.text = line.translation;
+        }
+        validate_final_output(
+            &document.segments,
+            output,
+            &self.required_glossary,
+            &self.options.source_language,
+            &self.options.target_language,
+            policy,
+        )
+    }
+
     fn run_agent_repair(
         &mut self,
         stage: &str,
@@ -1491,6 +1592,32 @@ where
                     }
                 };
                 validate_translation_batch(source, lines)?;
+                if stage == "final_validation" {
+                    let repaired = source
+                        .iter()
+                        .map(|segment| {
+                            let mut repaired = segment.clone();
+                            repaired.text = lines
+                                .iter()
+                                .find(|line| line.id == segment.id)
+                                .map(|line| line.translation.clone())
+                                .unwrap_or_default();
+                            repaired
+                        })
+                        .collect::<Vec<_>>();
+                    validate_final_output(
+                        source,
+                        &repaired,
+                        &self.required_glossary,
+                        &self.options.source_language,
+                        &self.options.target_language,
+                        FinalValidationPolicy {
+                            max_characters_per_second: self.options.max_characters_per_second,
+                            max_characters_per_line: self.options.max_characters_per_line,
+                            max_lines: self.options.max_lines,
+                        },
+                    )?;
+                }
                 if self.options.use_cache
                     && !cached
                     && let Some(store) = self.store.as_ref()
@@ -2501,6 +2628,102 @@ mod tests {
         repair_calls: Arc<AtomicUsize>,
     }
 
+    struct FinalValidationRepairBackend {
+        repair_ids: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl LlmBackend for FinalValidationRepairBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "final-validation-repair"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            let messages = request_messages(request)?;
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if prompt.contains("AGENT_REPAIR_JSON_START") {
+                let body = prompt
+                    .split("AGENT_REPAIR_JSON_START")
+                    .nth(1)
+                    .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
+                    .ok_or_else(|| {
+                        LlmCallError::InvalidResponse("missing final repair payload".to_owned())
+                    })?;
+                let payload: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+                let ids = payload["expected_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                self.repair_ids
+                    .lock()
+                    .map_err(|_| LlmCallError::InvalidResponse("repair lock poisoned".to_owned()))?
+                    .push(ids.clone());
+                let lines = ids
+                    .into_iter()
+                    .map(|id| serde_json::json!({"id": id, "translation": "费用是12美元。"}))
+                    .collect::<Vec<_>>();
+                return Ok(GenerationResponse::json(
+                    serde_json::json!({"lines": lines, "review_notes": "fixed numeric fact"}),
+                    Usage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        total_tokens: 5,
+                        requests: 1,
+                        ..Usage::default()
+                    },
+                ));
+            }
+
+            let body = prompt
+                .split("BATCH_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("BATCH_JSON_END").next())
+                .ok_or_else(|| {
+                    LlmCallError::InvalidResponse("missing translation batch".to_owned())
+                })?;
+            let payload: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+            let lines = payload["lines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|line| {
+                    let id = line["id"].as_str().unwrap_or_default();
+                    serde_json::json!({
+                        "id": id,
+                        "translation": if id == "1" { "费用是13美元。" } else { "这里没有数字。" },
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(GenerationResponse::json(
+                serde_json::json!({"lines": lines}),
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    total_tokens: 14,
+                    requests: 1,
+                    ..Usage::default()
+                },
+            ))
+        }
+    }
+
     impl LlmBackend for AgentReviewBackend {
         fn provider_name(&self) -> &str {
             "test"
@@ -2739,6 +2962,15 @@ mod tests {
             .saved_state
             .clone()
             .expect("saved run state");
+        assert!(state.validation_completed);
+        assert_eq!(
+            captured
+                .lock()
+                .expect("capture lock")
+                .saved_finalized_batches
+                .len(),
+            1
+        );
         let mut expected_options = options;
         expected_options.glossary_fingerprint = Some(build_glossary_fingerprint(
             &loaded_glossary.into_iter().collect(),
@@ -2845,6 +3077,7 @@ mod tests {
         let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
         options.glossary_path = Some("glossary.json".into());
         options.resume = false;
+        options.agent = false;
         let mut pipeline = SubtitlePipeline::new(
             CountingBackend {
                 calls: Arc::clone(&calls),
@@ -2880,7 +3113,7 @@ mod tests {
                 "Chinese",
                 false,
             ),
-            data: captured,
+            data: Arc::clone(&captured),
         };
         let mut options = PipelineOptions::new("review-terms.txt".into());
         options.glossary_path = Some("glossary.json".into());
@@ -2889,7 +3122,8 @@ mod tests {
         options.resume = false;
         options.use_cache = false;
         let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, NoopDashboard, options)
-            .with_store(Box::new(store));
+            .with_store(Box::new(store))
+            .with_input_signature(input_signature_from_bytes(b"The Lord is here.\n", Some(1)));
 
         let error = pipeline
             .run_document(&source)
@@ -2897,6 +3131,15 @@ mod tests {
 
         assert!(error.to_string().contains("final output validation failed"));
         assert!(error.to_string().contains("`Lord` -> `勋爵`"));
+        let data = captured.lock().expect("capture lock");
+        assert!(
+            !data
+                .saved_state
+                .as_ref()
+                .expect("pre-validation state")
+                .validation_completed
+        );
+        assert!(data.saved_finalized_batches.is_empty());
     }
 
     #[test]
@@ -3155,6 +3398,88 @@ mod tests {
         let data = captured.lock().expect("capture lock");
         assert!(data.agent_logs.last().expect("agent log").success);
         assert!(data.failure_logs.is_empty());
+    }
+
+    #[test]
+    fn final_validation_repairs_only_failing_segments() {
+        let document = document(
+            "final-repair.srt",
+            &["The repair costs 12 dollars.", "There is no number here."],
+        );
+        let mut options = PipelineOptions::new("final-repair.srt".into());
+        options.batch_size = 8;
+        options.review_policy = ReviewPolicy::Off;
+        options.terminology_preflight = false;
+        options.online_terminology = false;
+        let signature = input_signature_from_bytes(b"final repair\n", Some(7));
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let paths = build_runtime_paths(
+            std::path::Path::new("final-repair.srt"),
+            std::path::Path::new("/workspace/final-repair.srt"),
+            None,
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let repair_ids = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            FinalValidationRepairBackend {
+                repair_ids: Arc::clone(&repair_ids),
+            },
+            NoopDashboard,
+            options.clone(),
+        )
+        .with_store(Box::new(CapturedStore {
+            paths: paths.clone(),
+            data: Arc::clone(&captured),
+        }))
+        .with_input_signature(signature.clone());
+
+        let run = pipeline
+            .run_document(&document)
+            .expect("targeted final validation repair");
+
+        assert_eq!(
+            *repair_ids.lock().expect("repair ids"),
+            vec![vec!["1".to_owned()]]
+        );
+        assert_eq!(run.translated_segments[0].text, "费用是12美元。");
+        assert_eq!(run.translated_segments[1].text, "这里没有数字。");
+        assert_eq!(run.result.agent_repairs.len(), 1);
+        assert_eq!(run.result.agent_repairs[0].stage, "final_validation");
+        assert!(run.result.agent_repairs[0].success);
+        assert_eq!(run.result.usage.total_tokens, 19);
+
+        let data = captured.lock().expect("capture lock");
+        assert!(
+            data.saved_state
+                .as_ref()
+                .expect("state")
+                .validation_completed
+        );
+        assert_eq!(data.saved_finalized_batches.len(), 1);
+        drop(data);
+
+        let resumed_repair_ids = Arc::new(Mutex::new(Vec::new()));
+        let mut resumed = SubtitlePipeline::new(
+            FinalValidationRepairBackend {
+                repair_ids: Arc::clone(&resumed_repair_ids),
+            },
+            NoopDashboard,
+            options,
+        )
+        .with_store(Box::new(CapturedStore {
+            paths,
+            data: Arc::clone(&captured),
+        }))
+        .with_input_signature(signature);
+        let resumed_run = resumed
+            .run_document(&document)
+            .expect("resume finalized output");
+
+        assert!(resumed_repair_ids.lock().expect("repair ids").is_empty());
+        assert_eq!(resumed_run.translated_segments, run.translated_segments);
     }
 
     #[test]
@@ -3529,6 +3854,34 @@ mod tests {
     }
 
     #[test]
+    fn terminology_candidates_reject_recurring_dialogue_starters_and_contractions() {
+        let candidates = extract_terminology_candidates(&[
+            segment("1", "I'm ready."),
+            segment("2", "I'm listening."),
+            segment("3", "You're late."),
+            segment("4", "You're impossible."),
+            segment("5", "Can't you see?"),
+            segment("6", "Can't we leave?"),
+            segment("7", "Please wait."),
+            segment("8", "Please stop."),
+            segment("9", "Clark is here."),
+            segment("10", "Where is Clark?"),
+        ]);
+        let sources = candidates
+            .iter()
+            .map(|candidate| candidate.source.as_str())
+            .collect::<Vec<_>>();
+        let aligned = candidates
+            .iter()
+            .filter(|candidate| candidate.align_as_name)
+            .map(|candidate| candidate.source.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(sources, vec!["Clark"]);
+        assert_eq!(aligned, vec!["Clark"]);
+    }
+
+    #[test]
     fn auto_terminology_is_advisory_but_explicit_glossary_is_required() {
         let prepared = vec![translation_stage::PreparedBatch {
             index: 0,
@@ -3595,7 +3948,22 @@ mod tests {
 
     #[test]
     fn terminology_preflight_freezes_glossary_before_all_translation_batches() {
-        let document = document("terms.txt", &["Meet Alice now.", "Meet Bob now."]);
+        let document = document(
+            "terms.txt",
+            &[
+                "Meet Alice now.",
+                "Alice returned.",
+                "Meet Bob now.",
+                "Bob returned.",
+            ],
+        );
+        assert_eq!(
+            extract_terminology_candidates(&document.segments)
+                .into_iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>(),
+            vec!["Alice".to_owned(), "Bob".to_owned()]
+        );
         let mut options = PipelineOptions::new("terms.txt".into());
         options.batch_size = 1;
         options.resume = false;
@@ -3613,7 +3981,7 @@ mod tests {
         let contexts = contexts.lock().expect("contexts lock");
 
         assert!(run.result.terminology.entries_added >= 2);
-        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts.len(), 4);
         assert!(contexts.iter().all(|context| {
             context["terminology_hints"]
                 .as_object()
@@ -4115,6 +4483,7 @@ mod tests {
         review_reports: Vec<ReviewReport>,
         saved_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_review_batches: Vec<(usize, Vec<SubtitleSegment>)>,
+        saved_finalized_batches: Vec<(usize, Vec<SubtitleSegment>)>,
         saved_state: Option<RunState>,
         cached_responses: Vec<(CacheStage, String, BackendJsonResult)>,
         failure_logs: Vec<FailureLog>,
@@ -4188,6 +4557,9 @@ mod tests {
                 BatchShardKind::Reviewed => data
                     .saved_review_batches
                     .push((batch_index, segments.to_vec())),
+                BatchShardKind::Finalized => data
+                    .saved_finalized_batches
+                    .push((batch_index, segments.to_vec())),
             }
             Ok(())
         }
@@ -4201,6 +4573,7 @@ mod tests {
             let batches = match kind {
                 BatchShardKind::Translated => &data.saved_batches,
                 BatchShardKind::Reviewed => &data.saved_review_batches,
+                BatchShardKind::Finalized => &data.saved_finalized_batches,
             };
             Ok(batches
                 .iter()

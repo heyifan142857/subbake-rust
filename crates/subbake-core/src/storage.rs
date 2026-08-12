@@ -7,17 +7,17 @@ use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
 use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
-pub const RUN_STATE_VERSION: u64 = 3;
+pub const RUN_STATE_VERSION: u64 = 4;
 pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 15;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 1;
+pub const PROMPT_CONTRACT_VERSION: u64 = 2;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 1;
 /// Bump when deterministic final-output validation semantics change.
-pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 1;
+pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 2;
 /// Bump when the ordering, buffering, or publication contract of an
 /// incremental pipeline changes.
 pub const PIPELINE_EXECUTION_POLICY_VERSION: u64 = 1;
@@ -32,6 +32,7 @@ pub struct RuntimePaths {
     pub failures_dir: PathBuf,
     pub translated_batches_dir: PathBuf,
     pub reviewed_batches_dir: PathBuf,
+    pub finalized_batches_dir: PathBuf,
     pub translation_memory_path: PathBuf,
     pub agent_logs_dir: PathBuf,
     pub review_report_path: PathBuf,
@@ -50,6 +51,8 @@ pub struct ResumeSnapshot {
     pub translated_segments: Vec<SubtitleSegment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reviewed_segments: Vec<SubtitleSegment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finalized_segments: Vec<SubtitleSegment>,
     #[serde(default)]
     pub usage: Usage,
     #[serde(default)]
@@ -131,7 +134,8 @@ impl RunState {
     }
 
     pub fn resume_snapshot(self, expected_translation_fingerprint: &str) -> Option<ResumeSnapshot> {
-        if !matches!(self.version, 1 | 2 | RUN_STATE_VERSION)
+        let state_version = self.version;
+        if !matches!(state_version, 1 | 2 | 3 | RUN_STATE_VERSION)
             || self.translation_fingerprint != expected_translation_fingerprint
         {
             return None;
@@ -139,11 +143,14 @@ impl RunState {
         Some(ResumeSnapshot {
             translated_segments: self.translated_segments,
             reviewed_segments: self.reviewed_segments,
+            finalized_segments: Vec::new(),
             usage: self.usage,
             memory: self.memory,
             translation_batches_completed: self.translation_batches_completed,
             review_batches_completed: self.review_batches_completed,
-            validation_completed: self.validation_completed,
+            // Versions before v4 marked validation complete at the end of
+            // translation/review, before deterministic final validation ran.
+            validation_completed: state_version >= 4 && self.validation_completed,
         })
     }
 }
@@ -234,6 +241,7 @@ pub fn build_runtime_paths(
         failures_dir: run_dir.join("failures"),
         translated_batches_dir: run_dir.join("translated_batches"),
         reviewed_batches_dir: run_dir.join("reviewed_batches"),
+        finalized_batches_dir: run_dir.join("finalized_batches"),
         translation_memory_path: root_dir.join(format!(
             "translation_memory.v4.{language_pair}.{translation_memory_mode}.json"
         )),
@@ -682,7 +690,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "8fb90ea254514132447e85687e4525258b02562b"
+            "8acecfa0ea450ed80d16e3da828f5237dd73c3d9"
         );
     }
 
@@ -910,5 +918,22 @@ mod tests {
         );
 
         assert!(state.resume_snapshot("different").is_none());
+    }
+
+    #[test]
+    fn pre_v4_run_state_never_claims_final_validation_completed() {
+        let state: RunState = serde_json::from_str(
+            r#"{
+                "version": 3,
+                "translation_fingerprint": "expected",
+                "validation_completed": true
+            }"#,
+        )
+        .expect("parse v3 state");
+
+        let snapshot = state
+            .resume_snapshot("expected")
+            .expect("matching v3 state");
+        assert!(!snapshot.validation_completed);
     }
 }

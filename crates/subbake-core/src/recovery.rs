@@ -167,10 +167,10 @@ pub(crate) fn build_agent_repair_messages(
     failed_attempts: &[AttemptLog],
     agent_attempts: &[AttemptLog],
 ) -> Vec<ChatMessage> {
-    let task = if stage == "translate" {
-        "agent_repair_translation"
-    } else {
-        "agent_repair_review"
+    let task = match stage {
+        "translate" => "agent_repair_translation",
+        "final_validation" => "agent_repair_final_validation",
+        _ => "agent_repair_review",
     };
     let return_keys = if stage == "translate" {
         "\"lines\""
@@ -202,7 +202,7 @@ pub(crate) fn build_agent_repair_messages(
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
     vec![
         ChatMessage::system(format!(
-            "You are SubBake's runtime repair agent.\nReturn valid JSON only.\nRepair the failed model output without changing source text, subtitle ids, order, count, runtime config, or files.\nEvery non-empty source entry must produce one non-empty {target_language} translation with the same id."
+            "You are SubBake's runtime repair agent.\nReturn valid JSON only.\nRepair the failed model output without changing source text, subtitle ids, order, count, runtime config, or files.\nEvery non-empty source entry must produce one non-empty {target_language} translation with the same id.\nFor final_validation, change only the supplied failing translations and preserve all source facts, numbers, formatting markers, and required terminology."
         )),
         ChatMessage::user(format!(
             "TASK_START\n{task}\nTASK_END\nRead this failure log and return a corrected response for the same batch.\nUse expected_ids as the complete authoritative list and preserve that exact order.\nDo not explain the fix. Do not include markdown.\nReturn JSON only with keys {return_keys}.\nAGENT_REPAIR_JSON_START{payload_json}AGENT_REPAIR_JSON_END"

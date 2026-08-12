@@ -12,6 +12,12 @@ pub struct FinalValidationPolicy {
     pub max_lines: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalValidationIssue {
+    pub segment_id: String,
+    pub message: String,
+}
+
 pub fn validate_translation_batch(
     source: &[SubtitleSegment],
     lines: &[TranslationLine],
@@ -94,32 +100,63 @@ pub fn validate_final_output(
     target_language: &str,
     policy: FinalValidationPolicy,
 ) -> CoreResult<()> {
+    let issues = final_validation_issues(
+        source,
+        translated,
+        required_glossary,
+        source_language,
+        target_language,
+        policy,
+    )?;
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(final_validation_error(&issues))
+}
+
+pub(crate) fn final_validation_issues(
+    source: &[SubtitleSegment],
+    translated: &[SubtitleSegment],
+    required_glossary: &BTreeMap<String, String>,
+    source_language: &str,
+    target_language: &str,
+    policy: FinalValidationPolicy,
+) -> CoreResult<Vec<FinalValidationIssue>> {
     validate_full_alignment(source, translated)?;
 
     let mut issues = Vec::new();
     let cross_language = !source_language.eq_ignore_ascii_case(target_language);
     for (source, translated) in source.iter().zip(translated) {
+        let mut segment_issues = Vec::new();
         validate_final_segment(
             source,
             translated,
             required_glossary,
             cross_language,
             policy,
-            &mut issues,
+            &mut segment_issues,
+        );
+        issues.extend(
+            segment_issues
+                .into_iter()
+                .map(|message| FinalValidationIssue {
+                    segment_id: source.id.clone(),
+                    message,
+                }),
         );
     }
+    Ok(issues)
+}
 
-    if issues.is_empty() {
-        return Ok(());
-    }
+pub(crate) fn final_validation_error(issues: &[FinalValidationIssue]) -> CoreError {
     let visible = issues
         .iter()
         .take(8)
-        .cloned()
+        .map(|issue| issue.message.clone())
         .collect::<Vec<_>>()
         .join("; ");
     let remainder = issues.len().saturating_sub(8);
-    Err(CoreError::InvalidTranslation(format!(
+    CoreError::InvalidTranslation(format!(
         "final output validation failed with {} issue(s): {visible}{}",
         issues.len(),
         if remainder == 0 {
@@ -127,7 +164,7 @@ pub fn validate_final_output(
         } else {
             format!("; and {remainder} more")
         }
-    )))
+    ))
 }
 
 fn validate_final_segment(
@@ -234,7 +271,34 @@ fn factual_tokens(text: &str) -> Vec<String> {
                 digits.extend(characters[group_start..group_end].iter());
                 index = group_end;
             }
-            push_digits(&mut tokens, &digits);
+            let mut multiplier = 1_u128;
+            let mut suffix_start = index;
+            while suffix_start < characters.len() && characters[suffix_start].is_whitespace() {
+                suffix_start += 1;
+            }
+            if let Some((scale, suffix_end)) = numeric_scale(&characters, suffix_start) {
+                multiplier = scale;
+                index = suffix_end;
+            }
+            push_scaled_digits(&mut tokens, &digits, multiplier);
+            continue;
+        }
+        if is_cjk_numeral(character) {
+            let start = index;
+            while index < characters.len() && is_cjk_numeral(characters[index]) {
+                index += 1;
+            }
+            if start > 0 && characters[start - 1] == '第' {
+                continue;
+            }
+            if index - start == 1
+                && !single_cjk_numeral_has_numeric_context(&characters, start, index)
+            {
+                continue;
+            }
+            if let Some(value) = parse_cjk_number(&characters[start..index]) {
+                tokens.push(value.to_string());
+            }
             continue;
         }
         let marker = match character {
@@ -252,20 +316,280 @@ fn factual_tokens(text: &str) -> Vec<String> {
         }
         index += 1;
     }
+    tokens.extend(english_number_tokens(text));
     tokens.sort();
     tokens
 }
 
-fn push_digits(tokens: &mut Vec<String>, digits: &str) {
+fn push_scaled_digits(tokens: &mut Vec<String>, digits: &str, multiplier: u128) {
     if digits.is_empty() {
         return;
     }
     let normalized = digits.trim_start_matches('0');
-    tokens.push(if normalized.is_empty() {
-        "0".to_owned()
+    let normalized = if normalized.is_empty() {
+        "0"
     } else {
-        normalized.to_owned()
+        normalized
+    };
+    let value = normalized.parse::<u128>().ok();
+    tokens.push(
+        value
+            .and_then(|value| value.checked_mul(multiplier))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| normalized.to_owned()),
+    );
+}
+
+fn numeric_scale(characters: &[char], start: usize) -> Option<(u128, usize)> {
+    let cjk = characters.get(start).copied().and_then(|character| {
+        let scale = match character {
+            '百' => 100,
+            '千' => 1_000,
+            '万' => 10_000,
+            '亿' => 100_000_000,
+            _ => return None,
+        };
+        Some((scale, start + 1))
     });
+    if cjk.is_some() {
+        return cjk;
+    }
+    let mut end = start;
+    while end < characters.len() && characters[end].is_ascii_alphabetic() {
+        end += 1;
+    }
+    let word = characters[start..end]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let scale = match word.as_str() {
+        "hundred" => 100,
+        "thousand" => 1_000,
+        "million" => 1_000_000,
+        "billion" => 1_000_000_000,
+        "trillion" => 1_000_000_000_000,
+        _ => return None,
+    };
+    Some((scale, end))
+}
+
+fn is_cjk_numeral(character: char) -> bool {
+    matches!(
+        character,
+        '零' | '〇'
+            | '一'
+            | '二'
+            | '两'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '亿'
+    )
+}
+
+fn single_cjk_numeral_has_numeric_context(characters: &[char], start: usize, end: usize) -> bool {
+    start.checked_sub(1).and_then(|index| characters.get(index)) == Some(&'之')
+        || characters.get(end).is_some_and(|character| {
+            matches!(
+                character,
+                '年' | '月'
+                    | '日'
+                    | '天'
+                    | '岁'
+                    | '个'
+                    | '次'
+                    | '度'
+                    | '元'
+                    | '块'
+                    | '名'
+                    | '人'
+                    | '件'
+                    | '台'
+                    | '架'
+                    | '艘'
+                    | '米'
+                    | '秒'
+                    | '分'
+                    | '点'
+                    | '号'
+            )
+        })
+}
+
+fn parse_cjk_number(characters: &[char]) -> Option<u128> {
+    if characters.is_empty() {
+        return None;
+    }
+    let has_unit = characters
+        .iter()
+        .any(|character| matches!(character, '十' | '百' | '千' | '万' | '亿'));
+    if !has_unit {
+        return characters.iter().try_fold(0_u128, |value, character| {
+            value.checked_mul(10)?.checked_add(cjk_digit(*character)?)
+        });
+    }
+
+    let mut total = 0_u128;
+    let mut section = 0_u128;
+    let mut number = 0_u128;
+    for character in characters {
+        if let Some(digit) = cjk_digit(*character) {
+            number = digit;
+            continue;
+        }
+        let unit = match character {
+            '十' => 10,
+            '百' => 100,
+            '千' => 1_000,
+            '万' => 10_000,
+            '亿' => 100_000_000,
+            _ => return None,
+        };
+        if unit < 10_000 {
+            section = section.checked_add(number.max(1).checked_mul(unit)?)?;
+        } else {
+            let scaled = section.checked_add(number)?.max(1).checked_mul(unit)?;
+            total = total.checked_add(scaled)?;
+            section = 0;
+        }
+        number = 0;
+    }
+    total.checked_add(section)?.checked_add(number)
+}
+
+fn cjk_digit(character: char) -> Option<u128> {
+    match character {
+        '零' | '〇' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn english_number_tokens(text: &str) -> Vec<String> {
+    let words = text
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let Some(_) = english_number_value(&words[index]) else {
+            index += 1;
+            continue;
+        };
+        let start = index;
+        while index < words.len() && english_number_value(&words[index]).is_some() {
+            index += 1;
+        }
+        let phrase = &words[start..index];
+        if phrase.len() == 1 && english_scale(&phrase[0]).is_some() {
+            continue;
+        }
+        if let Some(value) = parse_english_number(phrase) {
+            tokens.push(value.to_string());
+        }
+    }
+    tokens
+}
+
+fn parse_english_number(words: &[String]) -> Option<u128> {
+    if words.len() > 1 && words.iter().all(|word| english_digit(word).is_some()) {
+        return words.iter().try_fold(0_u128, |value, word| {
+            value.checked_mul(10)?.checked_add(english_digit(word)?)
+        });
+    }
+    let mut total = 0_u128;
+    let mut current = 0_u128;
+    for word in words {
+        if let Some(digit) = english_digit(word) {
+            current = current.checked_add(digit)?;
+        } else if let Some(value) = english_small_number(word) {
+            current = current.checked_add(value)?;
+        } else {
+            let scale = english_scale(word)?;
+            if scale == 100 {
+                current = current.max(1).checked_mul(scale)?;
+            } else {
+                total = total.checked_add(current.max(1).checked_mul(scale)?)?;
+                current = 0;
+            }
+        }
+    }
+    total.checked_add(current)
+}
+
+fn english_number_value(word: &str) -> Option<u128> {
+    english_digit(word)
+        .or_else(|| english_small_number(word))
+        .or_else(|| english_scale(word))
+}
+
+fn english_digit(word: &str) -> Option<u128> {
+    match word {
+        "zero" | "oh" => Some(0),
+        "one" => Some(1),
+        "two" => Some(2),
+        "three" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        _ => None,
+    }
+}
+
+fn english_small_number(word: &str) -> Option<u128> {
+    match word {
+        "ten" => Some(10),
+        "eleven" => Some(11),
+        "twelve" => Some(12),
+        "thirteen" => Some(13),
+        "fourteen" => Some(14),
+        "fifteen" => Some(15),
+        "sixteen" => Some(16),
+        "seventeen" => Some(17),
+        "eighteen" => Some(18),
+        "nineteen" => Some(19),
+        "twenty" => Some(20),
+        "thirty" => Some(30),
+        "forty" => Some(40),
+        "fifty" => Some(50),
+        "sixty" => Some(60),
+        "seventy" => Some(70),
+        "eighty" => Some(80),
+        "ninety" => Some(90),
+        _ => None,
+    }
+}
+
+fn english_scale(word: &str) -> Option<u128> {
+    match word {
+        "hundred" => Some(100),
+        "thousand" => Some(1_000),
+        "million" => Some(1_000_000),
+        "billion" => Some(1_000_000_000),
+        "trillion" => Some(1_000_000_000_000),
+        _ => None,
+    }
 }
 
 fn display_tokens(tokens: &[String]) -> String {
@@ -364,6 +688,66 @@ mod tests {
             FinalValidationPolicy::default(),
         )
         .expect("valid final output");
+    }
+
+    #[test]
+    fn final_validation_normalizes_english_and_chinese_number_expressions() {
+        let pairs = [
+            ("it's nearly 20,000 years old.", "将近有两万年的历史了。"),
+            (
+                "For 100,000 years, our civilization flourished.",
+                "十万年来，我们的文明繁荣昌盛。",
+            ),
+            ("For 33 years, we prepared.", "三十三年间，我们一直在准备。"),
+            (
+                "We'll make a second gun run on a heading of two, one-two degrees.",
+                "我们将在航向212度进行第二轮扫射。",
+            ),
+            ("This is Badger Zero-One.", "这里是獾01。"),
+            (
+                "one of your surveillance drones is a 12 million dollar piece of equipment",
+                "你的监视无人机之一是价值1200万美元的设备",
+            ),
+        ];
+        let source = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (source, _))| segment(&(index + 1).to_string(), source, None))
+            .collect::<Vec<_>>();
+        let translated = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, translated))| segment(&(index + 1).to_string(), translated, None))
+            .collect::<Vec<_>>();
+
+        validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect("semantically equal number expressions should pass");
+    }
+
+    #[test]
+    fn final_validation_still_rejects_a_real_number_change_after_normalization() {
+        let source = vec![segment("1", "The repair costs 12 million dollars.", None)];
+        let translated = vec![segment("1", "维修费用为一千三百万美元。", None)];
+
+        let error = validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("12 million must not equal 13 million");
+
+        assert!(error.to_string().contains("expected [12000000]"));
+        assert!(error.to_string().contains("got [13000000]"));
     }
 
     #[test]

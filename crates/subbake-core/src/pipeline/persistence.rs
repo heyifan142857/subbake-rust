@@ -68,6 +68,10 @@ impl PipelinePersistence<'_> {
             snapshot.reviewed_segments = store
                 .load_batch_segments(BatchShardKind::Reviewed, snapshot.review_batches_completed)?;
         }
+        if snapshot.validation_completed {
+            snapshot.finalized_segments =
+                store.load_batch_segments(BatchShardKind::Finalized, 1)?;
+        }
         *memory = snapshot.memory.clone();
         Ok(snapshot)
     }

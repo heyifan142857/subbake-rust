@@ -208,7 +208,6 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
     struct RankedCandidate {
         candidate: TerminologyCandidate,
         count: usize,
-        words: usize,
         acronym: bool,
         honorific: bool,
     }
@@ -243,19 +242,26 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                 index += 1;
                 continue;
             }
+            // Subtitle lines capitalize ordinary dialogue starters. Do not
+            // let them absorb a following proper noun ("Meet Alice") or
+            // become a recurring pseudo-name ("I'm", "Please", "Wait").
+            if index == 0 && is_common_sentence_initial(word) {
+                index += 1;
+                continue;
+            }
             let mut end = index + 1;
             while end < words.len() && end - index < 4 {
                 if !words[end]
                     .chars()
                     .next()
                     .is_some_and(|ch| ch.is_ascii_uppercase())
+                    || is_common_sentence_initial(words[end])
                 {
                     break;
                 }
                 end += 1;
             }
             let source = words[index..end].join(" ");
-            let word_count = end - index;
             candidates
                 .entry(source.to_ascii_lowercase())
                 .and_modify(|candidate| candidate.count += 1)
@@ -266,7 +272,6 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                         align_as_name: false,
                     },
                     count: 1,
-                    words: word_count,
                     acronym: is_acronym,
                     honorific: false,
                 });
@@ -283,7 +288,6 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                         align_as_name: true,
                     },
                     count: 1,
-                    words: 1,
                     acronym: false,
                     honorific: true,
                 });
@@ -291,17 +295,18 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
     }
     let mut ranked = candidates
         .into_values()
+        // A capitalized phrase seen once is weak evidence in subtitles: it is
+        // usually just the beginning of a sentence. Require recurrence for
+        // Latin-script terms and names; Japanese honorific syntax is strong
+        // enough evidence on its own.
         .filter(|candidate| {
             candidate.honorific
-                || candidate.acronym
-                || (candidate.words > 1
-                    && candidate
+                || (candidate.count > 1
+                    && !candidate
                         .candidate
                         .source
                         .split_whitespace()
-                        .next()
-                        .is_some_and(|word| !is_common_sentence_initial(word)))
-                || (candidate.count > 1 && !is_common_sentence_initial(&candidate.candidate.source))
+                        .any(is_common_sentence_initial))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
@@ -371,8 +376,14 @@ fn is_japanese_name_character(character: char) -> bool {
 }
 
 fn is_common_sentence_initial(value: &str) -> bool {
+    let normalized = value
+        .trim_matches(|character: char| {
+            !character.is_alphanumeric() && character != '\'' && character != '’'
+        })
+        .replace('’', "'")
+        .to_ascii_lowercase();
     matches!(
-        value.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         "a" | "an"
             | "and"
             | "are"
@@ -380,51 +391,125 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "at"
             | "but"
             | "can"
+            | "can't"
+            | "cannot"
+            | "come"
+            | "could"
+            | "couldn't"
+            | "did"
+            | "didn't"
             | "do"
+            | "does"
+            | "doesn't"
+            | "don't"
             | "for"
             | "from"
+            | "get"
+            | "give"
+            | "go"
+            | "good"
+            | "got"
             | "he"
+            | "he'd"
+            | "he'll"
+            | "he's"
             | "her"
             | "here"
+            | "here's"
+            | "hey"
             | "his"
+            | "hold"
             | "how"
+            | "how's"
             | "i"
+            | "i'd"
+            | "i'll"
+            | "i'm"
+            | "i've"
             | "if"
             | "in"
             | "is"
+            | "isn't"
             | "it"
+            | "it'll"
+            | "it's"
             | "its"
+            | "just"
+            | "keep"
+            | "let"
+            | "let's"
+            | "listen"
+            | "look"
+            | "make"
+            | "maybe"
+            | "meet"
             | "my"
             | "no"
             | "not"
+            | "now"
             | "of"
             | "official"
             | "oh"
+            | "okay"
             | "on"
             | "or"
             | "our"
+            | "please"
+            | "right"
             | "she"
+            | "she'd"
+            | "she'll"
+            | "she's"
             | "so"
+            | "sorry"
+            | "stop"
+            | "sure"
+            | "take"
+            | "tell"
             | "that"
+            | "that's"
             | "the"
             | "their"
             | "then"
             | "there"
+            | "there's"
             | "these"
             | "they"
+            | "they'd"
+            | "they'll"
+            | "they're"
+            | "they've"
             | "this"
             | "those"
             | "to"
+            | "wait"
             | "we"
+            | "we'd"
+            | "we'll"
+            | "we're"
+            | "we've"
+            | "well"
             | "what"
+            | "what's"
             | "when"
+            | "when's"
             | "where"
+            | "where's"
             | "who"
+            | "who's"
             | "why"
+            | "why's"
             | "will"
+            | "won't"
             | "with"
+            | "would"
+            | "wouldn't"
             | "yes"
             | "you"
+            | "you'd"
+            | "you'll"
+            | "you're"
+            | "you've"
             | "your"
     )
 }

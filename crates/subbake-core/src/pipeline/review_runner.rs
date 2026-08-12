@@ -94,7 +94,7 @@ where
                         &reviewed_segments,
                     )?;
                 }
-                pipeline.save_run_state(translation_batches, *review_position, true, usage)?;
+                pipeline.save_run_state(translation_batches, *review_position, false, usage)?;
                 pipeline.report(
                     "FINAL_REVIEW",
                     TaskState::Running,
@@ -129,7 +129,12 @@ where
         })?;
     }
     pipeline.cancellation.check()?;
-    pipeline.save_run_state(translation_batches, review_batches, true, usage)?;
+    pipeline.save_run_state(
+        translation_batches,
+        review_batches,
+        resume.validation_completed,
+        usage,
+    )?;
     Ok(ReviewRun {
         output: outcome.output,
         stats: outcome.stats,

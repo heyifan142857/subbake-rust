@@ -41,6 +41,10 @@ pub struct TranslationToolOutcome {
     pub resumed_translation_batches: usize,
     pub resumed_review_batches: usize,
     pub translation_memory_hits: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh_runtime: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_dir: Option<PathBuf>,
 }
 
 fn is_false(value: &bool) -> bool {

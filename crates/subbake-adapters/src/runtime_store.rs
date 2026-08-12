@@ -27,6 +27,7 @@ impl FileRuntimeStore {
         let root = match kind {
             BatchShardKind::Translated => &self.paths.translated_batches_dir,
             BatchShardKind::Reviewed => &self.paths.reviewed_batches_dir,
+            BatchShardKind::Finalized => &self.paths.finalized_batches_dir,
         };
         root.join(format!("{batch_index:04}.json"))
     }
@@ -73,6 +74,7 @@ impl RuntimeStore for FileRuntimeStore {
             &self.paths.failures_dir,
             &self.paths.translated_batches_dir,
             &self.paths.reviewed_batches_dir,
+            &self.paths.finalized_batches_dir,
             &self.paths.agent_logs_dir,
         ] {
             fs::create_dir_all(directory).map_err(storage_error)?;
@@ -647,7 +649,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(loaded, state);
-        assert_eq!(value["version"], 3);
+        assert_eq!(value["version"], 4);
         assert_eq!(value["translation_batches_completed"], 1);
         assert!(value.get("translated_segments").is_none());
         assert!(value.get("pipeline_fingerprint").is_none());

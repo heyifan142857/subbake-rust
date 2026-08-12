@@ -202,6 +202,8 @@ mod tests {
                 resumed_translation_batches: 0,
                 resumed_review_batches: 0,
                 translation_memory_hits: 0,
+                fresh_runtime: false,
+                runtime_dir: None,
             }),
         );
         let json = feedback.json();

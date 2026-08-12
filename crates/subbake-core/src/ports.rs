@@ -466,6 +466,7 @@ impl DashboardSink for NoopDashboard {}
 pub enum BatchShardKind {
     Translated,
     Reviewed,
+    Finalized,
 }
 
 pub trait RuntimeStore {

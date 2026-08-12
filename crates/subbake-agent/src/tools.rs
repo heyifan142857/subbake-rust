@@ -285,6 +285,12 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         "replace an existing output; defaults to false",
     ),
     arg(
+        "fresh_runtime",
+        BooleanArg,
+        false,
+        "use a unique empty runtime for this call, disabling Resume, request cache, translation memory, and accumulated glossary reuse",
+    ),
+    arg(
         "max_requests",
         IntegerArg,
         false,
@@ -306,6 +312,12 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
     ),
     arg("recursive", BooleanArg, false, "include nested directories"),
     arg("overwrite", BooleanArg, false, "replace existing outputs"),
+    arg(
+        "fresh_runtime",
+        BooleanArg,
+        false,
+        "use a unique empty runtime for this call, disabling Resume, request cache, translation memory, and accumulated glossary reuse",
+    ),
     arg(
         "source_language",
         StringArg,
@@ -1062,6 +1074,7 @@ mod tests {
             "output_format",
             "output_path",
             "overwrite",
+            "fresh_runtime",
         ] {
             assert!(translate_names.contains(&expected));
         }
