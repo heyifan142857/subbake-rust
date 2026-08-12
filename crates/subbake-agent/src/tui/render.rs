@@ -601,11 +601,20 @@ fn render_config_editor(
         };
         format!("{}: {}  ·  Enter accept  Esc cancel", id.label(), shown)
     } else {
-        "Tab focus  ↑↓ navigate  Enter edit  Space/←→ toggle  Del inherit  Ctrl+S save  Esc/q close"
-            .to_owned()
+        let field_help = editor.selected_field().map_or_else(
+            || "Select a configuration field".to_owned(),
+            |id| {
+                let key = id.toml_key();
+                id.hint()
+                    .map_or(key.clone(), |hint| format!("{key}  ·  {hint}"))
+            },
+        );
+        format!(
+            "{field_help}\nTab focus  ↑↓ navigate  Enter edit  Space/←→ toggle  Del inherit  Ctrl+S save  Esc/q close"
+        )
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         vertical[2],
     );
 

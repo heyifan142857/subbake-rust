@@ -91,6 +91,20 @@ macro_rules! config_fields {
             pub const fn path(self) -> &'static [&'static str] {
                 match self { $(Self::$variant => &[$($path),+]),+ }
             }
+
+            pub fn toml_key(self) -> String {
+                self.path().join(".")
+            }
+
+            pub const fn hint(self) -> Option<&'static str> {
+                match self {
+                    Self::ProviderModel => Some("Model used for translation requests"),
+                    Self::TranscriptionModel => Some("Whisper model name, for example large-v3-turbo"),
+                    Self::WhisperBinaryPath => Some("Path to an existing whisper-cli executable; the installer is optional"),
+                    Self::WhisperModelsDir => Some("Directory containing ggml-*.bin or ggml-*.gguf models"),
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -99,7 +113,7 @@ config_fields! {
     ActiveProfile => (Profile, "Active profile", ConfigFieldKind::Profile, ["profile"]),
     Translator => (Provider, "Backend reference", ConfigFieldKind::Text, ["translator"]),
     ProviderId => (Provider, "Provider id", ConfigFieldKind::Text, ["backend", "id"]),
-    ProviderModel => (Provider, "Model", ConfigFieldKind::Text, ["backend", "model"]),
+    ProviderModel => (Provider, "Translation model", ConfigFieldKind::Text, ["backend", "model"]),
     ProviderApiFormat => (Provider, "API format", ConfigFieldKind::Choice(API_FORMATS), ["backend", "api_format"]),
     ProviderBaseUrl => (Provider, "Base URL", ConfigFieldKind::Text, ["backend", "base_url"]),
     ProviderEndpointUrl => (Provider, "Endpoint URL", ConfigFieldKind::Text, ["backend", "endpoint_url"]),
@@ -149,8 +163,8 @@ config_fields! {
     PreserveSourceContainer => (Output, "Preserve source container", ConfigFieldKind::Boolean, ["output", "preserve_source_container"]),
     RuntimeDir => (Storage, "Runtime directory", ConfigFieldKind::Text, ["storage", "runtime_dir"]),
     GlossaryPath => (Storage, "Glossary path", ConfigFieldKind::Text, ["storage", "glossary_path"]),
-    WhisperBinaryPath => (Storage, "Whisper binary", ConfigFieldKind::Text, ["storage", "whisper_binary_path"]),
-    WhisperModelsDir => (Storage, "Whisper models directory", ConfigFieldKind::Text, ["storage", "whisper_models_dir"]),
+    WhisperBinaryPath => (Transcription, "whisper-cli path", ConfigFieldKind::Text, ["storage", "whisper_binary_path"]),
+    WhisperModelsDir => (Transcription, "Whisper models directory", ConfigFieldKind::Text, ["storage", "whisper_models_dir"]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +580,100 @@ mod tests {
                 "duplicate field path: {:?}",
                 id.path()
             );
+        }
+    }
+
+    #[test]
+    fn snapshot_exposes_translation_and_external_whisper_configuration() {
+        let config = ConfigFile::parse(
+            r#"
+            version = 2
+            default_profile = "work"
+
+            [backends.remote]
+            id = "openai"
+            model = "translator-v1"
+            api_format = "openai_chat"
+
+            [profiles.work]
+            translator = "remote"
+
+            [profiles.work.transcription]
+            model = "large-v3-turbo"
+
+            [profiles.work.storage]
+            whisper_binary_path = "/opt/whisper/bin/whisper-cli"
+            whisper_models_dir = "/opt/whisper/models"
+            "#,
+        )
+        .expect("parse config");
+        let snapshot = build_snapshot(PathBuf::from("subbake.toml"), &config, None, Vec::new())
+            .expect("build snapshot");
+
+        let field = |id| {
+            snapshot
+                .fields
+                .iter()
+                .find(|field| field.id == id)
+                .expect("registered field")
+        };
+        assert_eq!(field(ConfigFieldId::ProviderModel).value, "translator-v1");
+        assert_eq!(
+            field(ConfigFieldId::TranscriptionModel).value,
+            "large-v3-turbo"
+        );
+        assert_eq!(
+            field(ConfigFieldId::WhisperBinaryPath).value,
+            "/opt/whisper/bin/whisper-cli"
+        );
+        assert_eq!(
+            field(ConfigFieldId::WhisperModelsDir).value,
+            "/opt/whisper/models"
+        );
+        assert_eq!(
+            ConfigFieldId::WhisperBinaryPath.section(),
+            ConfigSection::Transcription
+        );
+        assert_eq!(
+            ConfigFieldId::WhisperBinaryPath.toml_key(),
+            "storage.whisper_binary_path"
+        );
+    }
+
+    #[test]
+    fn tui_changes_write_translation_model_and_external_whisper_paths() {
+        let cases = [
+            (
+                ConfigFieldId::ProviderModel,
+                "translator-v2",
+                vec!["backend", "model"],
+            ),
+            (
+                ConfigFieldId::TranscriptionModel,
+                "large-v3-turbo-q8_0",
+                vec!["transcription", "model"],
+            ),
+            (
+                ConfigFieldId::WhisperBinaryPath,
+                "/usr/local/bin/whisper-cli",
+                vec!["storage", "whisper_binary_path"],
+            ),
+            (
+                ConfigFieldId::WhisperModelsDir,
+                "/srv/whisper-models",
+                vec!["storage", "whisper_models_dir"],
+            ),
+        ];
+
+        for (id, value, expected_path) in cases {
+            let update = ConfigChange {
+                id,
+                value: Some(value.to_owned()),
+            }
+            .into_update()
+            .expect("convert TUI change");
+            assert_eq!(update.path, expected_path);
+            assert_eq!(update.value, Some(ConfigScalar::String(value.to_owned())));
         }
     }
 }

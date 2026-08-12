@@ -36,7 +36,7 @@ cargo install --path crates/subbake-cli
 cargo install --path crates/subbake-cli --no-default-features
 ```
 
-如需本地转写，再安装 whisper.cpp 和模型：
+如需本地转写，可以让 SubBake 安装 whisper.cpp 和模型：
 
 ```bash
 sbake whisper install
@@ -49,6 +49,11 @@ sbake whisper model base
 sbake transcribe movie.mp4 --model base --language Auto
 sbake pipeline movie.mp4 --transcribe-model base --target-language zh-Hans
 ```
+
+安装器不是必需的。如果机器上已有 `whisper-cli` 和 GGML/GGUF 模型，可在配置中
+直接指定可执行文件和模型目录，SubBake 不会再要求使用内置安装流程。
+超过 12 分钟的音频会自动按 10 分钟核心窗口转录；相邻窗口各保留 30 秒重叠，
+避免边界切断对白。合并后若有效字幕明显未覆盖媒体尾部，任务会失败且不会写入残缺结果。
 
 ## 配置
 
@@ -72,6 +77,13 @@ translator = "openai"
 mode = "turbo"
 source_language = "English"
 target_language = "Simplified Chinese"
+
+[profiles.default.transcription]
+model = "large-v3-turbo"
+
+[profiles.default.storage]
+whisper_binary_path = "/opt/whisper.cpp/build/bin/whisper-cli"
+whisper_models_dir = "/opt/whisper.cpp/models"
 ```
 
 ```bash
@@ -80,7 +92,9 @@ sbake provider check --profile default
 ```
 
 使用 `--config` 指定其他配置文件，使用 `--profile` 切换 profile。翻译模式可选
-`economy`、`turbo` 或 `cinema`。
+`economy`、`turbo` 或 `cinema`。翻译模型由 `[backends.<名称>].model` 指定；如需只为
+某个 profile 覆盖模型，可写入 `[profiles.<名称>.backend].model`。交互式界面中输入
+`/config` 也可以编辑翻译模型、Whisper 模型、`whisper-cli` 路径和模型目录。
 
 ## 使用
 

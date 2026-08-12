@@ -2,6 +2,7 @@
 //
 // Orchestration: ffmpeg audio extraction (video-only) → backend transcribe → render.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
@@ -25,6 +26,11 @@ use crate::whisper::{
     default_whisper_binary_path_for, default_whisper_models_dir_for, installed_models_in,
     verify_whisper_cli,
 };
+
+const LONG_AUDIO_THRESHOLD_MS: u64 = 12 * 60 * 1_000;
+const TRANSCRIPTION_CHUNK_MS: u64 = 10 * 60 * 1_000;
+const TRANSCRIPTION_OVERLAP_MS: u64 = 30 * 1_000;
+const MAX_UNCOVERED_TRAILING_MS: u64 = 30 * 60 * 1_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -102,6 +108,8 @@ pub struct WhisperCppTranscriber {
     extra_args: Vec<String>,
     progress: SharedProgress,
     threads: usize,
+    progress_start: u64,
+    progress_end: u64,
 }
 
 impl WhisperCppTranscriber {
@@ -112,12 +120,24 @@ impl WhisperCppTranscriber {
             extra_args,
             progress: std::sync::Arc::new(NoopProgress),
             threads: default_whisper_threads(),
+            progress_start: 0,
+            progress_end: 100,
         }
     }
 
     fn with_progress(mut self, progress: SharedProgress) -> Self {
         self.progress = progress;
         self
+    }
+
+    fn with_progress_window(mut self, start: u64, end: u64) -> Self {
+        self.progress_start = start.min(100);
+        self.progress_end = end.clamp(self.progress_start, 100);
+        self
+    }
+
+    fn mapped_progress(&self, current: u64) -> u64 {
+        self.progress_start + current.min(100) * (self.progress_end - self.progress_start) / 100
     }
 }
 
@@ -197,7 +217,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
                 self.progress.emit(ProgressEvent::running(
                     TaskKind::Transcription,
                     "TRANSCRIBE",
-                    current,
+                    self.mapped_progress(current),
                     Some(100),
                     ProgressUnit::Percent,
                 ));
@@ -214,7 +234,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
             self.progress.emit(ProgressEvent::running(
                 TaskKind::Transcription,
                 "TRANSCRIBE",
-                100,
+                self.progress_end,
                 Some(100),
                 ProgressUnit::Percent,
             ));
@@ -372,19 +392,28 @@ pub fn transcribe_media_cancellable_with_progress(
     } = resolve_whisper_model(&request.settings)?;
     let binary = locate_whisper_binary(&request.settings)?;
     verify_whisper_cli(&binary, cancellation)?;
-    let transcriber =
-        WhisperCppTranscriber::new(binary, model_path, Vec::new()).with_progress(progress.clone());
-    let mut doc = transcriber.transcribe_cancellable(
-        prepared_audio.path(),
+    let mut doc = transcribe_prepared_audio(
+        &binary,
+        &model_path,
+        &prepared_audio,
         request.settings.language.as_deref(),
         fmt,
+        &request.settings,
         cancellation,
+        &progress,
     )?;
+    let raw_last_timestamp = last_timed_end_ms(&doc);
     let cleanup = if request.settings.filter_hallucinations {
         clean_transcription_document(&mut doc)
     } else {
         TranscriptionCleanupStats::default()
     };
+    validate_transcription_coverage(
+        &doc,
+        raw_last_timestamp,
+        prepared_audio.duration_ms(),
+        cleanup,
+    )?;
 
     check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
@@ -439,6 +468,320 @@ fn clean_transcription_document(document: &mut SubtitleDocument) -> Transcriptio
     stats
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptionChunk {
+    input_start_ms: u64,
+    input_end_ms: u64,
+    core_start_ms: u64,
+    core_end_ms: u64,
+}
+
+fn transcription_chunks(duration_ms: u64) -> Vec<TranscriptionChunk> {
+    if duration_ms <= LONG_AUDIO_THRESHOLD_MS {
+        return vec![TranscriptionChunk {
+            input_start_ms: 0,
+            input_end_ms: duration_ms,
+            core_start_ms: 0,
+            core_end_ms: duration_ms,
+        }];
+    }
+    let mut chunks = Vec::new();
+    let mut core_start_ms = 0;
+    while core_start_ms < duration_ms {
+        let core_end_ms = (core_start_ms + TRANSCRIPTION_CHUNK_MS).min(duration_ms);
+        chunks.push(TranscriptionChunk {
+            input_start_ms: core_start_ms.saturating_sub(TRANSCRIPTION_OVERLAP_MS),
+            input_end_ms: (core_end_ms + TRANSCRIPTION_OVERLAP_MS).min(duration_ms),
+            core_start_ms,
+            core_end_ms,
+        });
+        core_start_ms = core_end_ms;
+    }
+    chunks
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_prepared_audio(
+    binary: &Path,
+    model_path: &Path,
+    prepared_audio: &PreparedAudio,
+    language: Option<&str>,
+    output_format: TranscriptionFormat,
+    settings: &TranscriptionSettings,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<SubtitleDocument> {
+    let Some(duration_ms) = prepared_audio.duration_ms() else {
+        return WhisperCppTranscriber::new(
+            binary.to_path_buf(),
+            model_path.to_path_buf(),
+            Vec::new(),
+        )
+        .with_progress(progress.clone())
+        .transcribe_cancellable(
+            prepared_audio.path(),
+            language,
+            output_format,
+            cancellation,
+        );
+    };
+    let chunks = transcription_chunks(duration_ms);
+    if chunks.len() == 1 {
+        return WhisperCppTranscriber::new(
+            binary.to_path_buf(),
+            model_path.to_path_buf(),
+            Vec::new(),
+        )
+        .with_progress(progress.clone())
+        .transcribe_cancellable(
+            prepared_audio.path(),
+            language,
+            output_format,
+            cancellation,
+        );
+    }
+
+    transcribe_long_audio(
+        binary,
+        model_path,
+        prepared_audio.path(),
+        language,
+        output_format,
+        settings,
+        cancellation,
+        progress,
+        &chunks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_long_audio(
+    binary: &Path,
+    model_path: &Path,
+    audio_path: &Path,
+    language: Option<&str>,
+    output_format: TranscriptionFormat,
+    settings: &TranscriptionSettings,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+    chunks: &[TranscriptionChunk],
+) -> AdapterResult<SubtitleDocument> {
+    let runtime_dir = settings
+        .runtime_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".subbake"));
+    let chunk_root = runtime_dir.join("tmp").join("transcription");
+    fs::create_dir_all(&chunk_root).map_err(|source| {
+        AdapterError::external_io(
+            "create transcription chunk root",
+            Some(chunk_root.clone()),
+            source,
+        )
+    })?;
+    let chunk_dir = unique_audio_temp_dir(&chunk_root)?;
+    let whisper_format = if output_format == TranscriptionFormat::Txt {
+        TranscriptionFormat::Srt
+    } else {
+        output_format
+    };
+    let mut merged: Option<SubtitleDocument> = None;
+
+    for (index, chunk) in chunks.iter().copied().enumerate() {
+        check_cancelled(cancellation)?;
+        let chunk_path = chunk_dir.path().join(format!("chunk-{index:04}.wav"));
+        extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
+        let progress_start = (index as u64 * 100) / chunks.len() as u64;
+        let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
+        let transcriber = WhisperCppTranscriber::new(
+            binary.to_path_buf(),
+            model_path.to_path_buf(),
+            vec!["--max-context".to_owned(), "0".to_owned()],
+        )
+        .with_progress(progress.clone())
+        .with_progress_window(progress_start, progress_end);
+        let mut document = transcriber.transcribe_cancellable(
+            &chunk_path,
+            language,
+            whisper_format,
+            cancellation,
+        )?;
+        let _ = fs::remove_file(&chunk_path);
+        select_and_shift_chunk_segments(
+            &mut document.segments,
+            chunk,
+            index + 1 == chunks.len(),
+            whisper_format,
+        );
+        if let Some(output) = &mut merged {
+            output.segments.extend(document.segments);
+        } else {
+            merged = Some(document);
+        }
+    }
+
+    let mut document = merged.ok_or_else(|| {
+        AdapterError::invalid_input("long-audio transcription produced no chunks")
+    })?;
+    for (index, segment) in document.segments.iter_mut().enumerate() {
+        let id = (index + 1).to_string();
+        segment.id.clone_from(&id);
+        segment.identifier = (whisper_format == TranscriptionFormat::Srt).then_some(id);
+    }
+    if output_format == TranscriptionFormat::Txt {
+        document.format = "txt".to_owned();
+    }
+    Ok(document)
+}
+
+fn extract_audio_chunk(
+    source: &Path,
+    destination: &Path,
+    chunk: TranscriptionChunk,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
+    let start = format_seconds(chunk.input_start_ms);
+    let duration = format_seconds(chunk.input_end_ms - chunk.input_start_ms);
+    let output = run_command_cancellable(
+        Command::new("ffmpeg").args([
+            "-nostdin",
+            "-hide_banner",
+            "-y",
+            "-loglevel",
+            "error",
+            "-ss",
+            &start,
+            "-i",
+            &source.to_string_lossy(),
+            "-t",
+            &duration,
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            &destination.to_string_lossy(),
+        ]),
+        cancellation,
+        "extract transcription chunk",
+    )?;
+    if !output.status.success() || !destination.is_file() {
+        return Err(AdapterError::ChildProcess {
+            program: "ffmpeg",
+            status: output.status.code(),
+            message: child_diagnostics(&output, "failed to extract transcription chunk"),
+        });
+    }
+    Ok(())
+}
+
+fn format_seconds(milliseconds: u64) -> String {
+    format!("{}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
+}
+
+fn select_and_shift_chunk_segments(
+    segments: &mut Vec<SubtitleSegment>,
+    chunk: TranscriptionChunk,
+    is_last: bool,
+    format: TranscriptionFormat,
+) {
+    let separator = if format == TranscriptionFormat::Vtt {
+        '.'
+    } else {
+        ','
+    };
+    let mut selected = Vec::new();
+    for mut segment in segments.drain(..) {
+        let Some(start) = segment.start.as_deref().and_then(parse_timestamp_ms) else {
+            continue;
+        };
+        let Some(end) = segment.end.as_deref().and_then(parse_timestamp_ms) else {
+            continue;
+        };
+        let global_start = start.saturating_add(chunk.input_start_ms);
+        let global_end = end.saturating_add(chunk.input_start_ms);
+        let midpoint = global_start.saturating_add(global_end.saturating_sub(global_start) / 2);
+        let in_core = midpoint >= chunk.core_start_ms
+            && (midpoint < chunk.core_end_ms || (is_last && midpoint <= chunk.core_end_ms));
+        if in_core {
+            segment.start = Some(format_timestamp_ms(global_start, separator));
+            segment.end = Some(format_timestamp_ms(global_end, separator));
+            selected.push(segment);
+        }
+    }
+    *segments = selected;
+}
+
+fn parse_timestamp_ms(value: &str) -> Option<u64> {
+    let normalized = value.trim().replace(',', ".");
+    let mut parts = normalized.split(':');
+    let hours = parts.next()?.parse::<u64>().ok()?;
+    let minutes = parts.next()?.parse::<u64>().ok()?;
+    let seconds_part = parts.next()?;
+    if parts.next().is_some() || minutes >= 60 {
+        return None;
+    }
+    let (seconds, fraction) = seconds_part.split_once('.').unwrap_or((seconds_part, "0"));
+    let seconds = seconds.parse::<u64>().ok()?;
+    if seconds >= 60 {
+        return None;
+    }
+    let mut milliseconds = fraction.chars().take(3).collect::<String>();
+    while milliseconds.len() < 3 {
+        milliseconds.push('0');
+    }
+    Some((((hours * 60 + minutes) * 60 + seconds) * 1_000) + milliseconds.parse::<u64>().ok()?)
+}
+
+fn format_timestamp_ms(milliseconds: u64, separator: char) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = (milliseconds / 60_000) % 60;
+    let seconds = (milliseconds / 1_000) % 60;
+    let fraction = milliseconds % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}{separator}{fraction:03}")
+}
+
+fn last_timed_end_ms(document: &SubtitleDocument) -> Option<u64> {
+    document
+        .segments
+        .iter()
+        .filter_map(|segment| segment.end.as_deref().and_then(parse_timestamp_ms))
+        .max()
+}
+
+fn validate_transcription_coverage(
+    document: &SubtitleDocument,
+    raw_last_timestamp: Option<u64>,
+    duration_ms: Option<u64>,
+    cleanup: TranscriptionCleanupStats,
+) -> AdapterResult<()> {
+    let Some(duration_ms) = duration_ms.filter(|duration| *duration > LONG_AUDIO_THRESHOLD_MS)
+    else {
+        return Ok(());
+    };
+    let last_timestamp = last_timed_end_ms(document).unwrap_or(0);
+    let trailing_gap = duration_ms.saturating_sub(last_timestamp);
+    if trailing_gap <= MAX_UNCOVERED_TRAILING_MS {
+        return Ok(());
+    }
+    Err(AdapterError::invalid_input(format!(
+        "transcription is incomplete: the media is {}, but the last retained cue ends at {} ({} missing at the end); raw output reached {} and cleanup removed {} repeated cues. No output was written. This usually indicates a Whisper hallucination loop",
+        display_duration(duration_ms),
+        display_duration(last_timestamp),
+        display_duration(trailing_gap),
+        raw_last_timestamp.map_or_else(|| "no timed cue".to_owned(), display_duration),
+        cleanup.removed_repeated,
+    )))
+}
+
+fn display_duration(milliseconds: u64) -> String {
+    let total_seconds = milliseconds / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -446,26 +789,33 @@ fn clean_transcription_document(document: &mut SubtitleDocument) -> Transcriptio
 #[derive(Debug)]
 struct PreparedAudio {
     path: PathBuf,
+    duration_ms: Option<u64>,
     _temporary_dir: Option<AudioTempDirectory>,
 }
 
 impl PreparedAudio {
-    fn borrowed(path: &Path) -> Self {
+    fn borrowed(path: &Path, duration_ms: Option<u64>) -> Self {
         Self {
             path: path.to_path_buf(),
+            duration_ms,
             _temporary_dir: None,
         }
     }
 
-    fn temporary(path: PathBuf, directory: AudioTempDirectory) -> Self {
+    fn temporary(path: PathBuf, duration_ms: Option<u64>, directory: AudioTempDirectory) -> Self {
         Self {
             path,
+            duration_ms,
             _temporary_dir: Some(directory),
         }
     }
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn duration_ms(&self) -> Option<u64> {
+        self.duration_ms
     }
 }
 
@@ -510,6 +860,7 @@ fn prepare_audio_with_programs(
 ) -> AdapterResult<PreparedAudio> {
     check_cancelled(cancellation)?;
     if is_wav_ext(media_path) {
+        let duration_ms = wav_duration_ms(media_path);
         let mut done = ProgressEvent::running(
             TaskKind::Transcription,
             "PREPARE_AUDIO",
@@ -519,7 +870,7 @@ fn prepare_audio_with_programs(
         );
         done.state = TaskState::Completed;
         progress.emit(done);
-        return Ok(PreparedAudio::borrowed(media_path));
+        return Ok(PreparedAudio::borrowed(media_path, duration_ms));
     }
 
     let audio_info = probe_audio_info(ffprobe, media_path, cancellation)?;
@@ -614,7 +965,7 @@ fn prepare_audio_with_programs(
     );
     done.state = TaskState::Completed;
     progress.emit(done);
-    Ok(PreparedAudio::temporary(output, temp_dir))
+    Ok(PreparedAudio::temporary(output, duration_ms, temp_dir))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -775,6 +1126,40 @@ fn is_wav_ext(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
 }
 
+fn wav_duration_ms(path: &Path) -> Option<u64> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != b"RIFF" || &header[8..] != b"WAVE" {
+        return None;
+    }
+    let mut byte_rate = None;
+    loop {
+        let mut chunk_header = [0_u8; 8];
+        file.read_exact(&mut chunk_header).ok()?;
+        let chunk_size = u32::from_le_bytes(chunk_header[4..].try_into().ok()?) as u64;
+        match &chunk_header[..4] {
+            b"fmt " if chunk_size >= 12 => {
+                let mut format = [0_u8; 12];
+                file.read_exact(&mut format).ok()?;
+                byte_rate = Some(u32::from_le_bytes(format[8..12].try_into().ok()?) as u64);
+                file.seek(SeekFrom::Current((chunk_size - 12) as i64))
+                    .ok()?;
+            }
+            b"data" => {
+                let rate = byte_rate.filter(|rate| *rate > 0)?;
+                return Some(chunk_size.saturating_mul(1_000) / rate);
+            }
+            _ => {
+                file.seek(SeekFrom::Current(chunk_size as i64)).ok()?;
+            }
+        }
+        if chunk_size % 2 == 1 {
+            file.seek(SeekFrom::Current(1)).ok()?;
+        }
+    }
+}
+
 fn locate_whisper_binary(settings: &TranscriptionSettings) -> AdapterResult<PathBuf> {
     let p = settings
         .whisper_binary_path
@@ -783,9 +1168,10 @@ fn locate_whisper_binary(settings: &TranscriptionSettings) -> AdapterResult<Path
     if p.exists() {
         Ok(p)
     } else {
-        Err(AdapterError::invalid_input(
-            "whisper.cpp binary not found. Run `sbake whisper install` first.",
-        ))
+        Err(AdapterError::invalid_input(format!(
+            "whisper-cli not found at `{}`; set `storage.whisper_binary_path` to an existing executable or run `sbake whisper install`",
+            p.display()
+        )))
     }
 }
 
@@ -803,7 +1189,11 @@ fn resolve_whisper_model(settings: &TranscriptionSettings) -> AdapterResult<Reso
         .unwrap_or_else(|| default_whisper_models_dir_for(None));
     let mut installed = if models_dir.is_dir() {
         installed_models_in(&models_dir).map_err(|source| {
-            AdapterError::external_io("list installed whisper models", Some(models_dir), source)
+            AdapterError::external_io(
+                "list installed whisper models",
+                Some(models_dir.clone()),
+                source,
+            )
         })?
     } else {
         Vec::new()
@@ -825,17 +1215,18 @@ fn resolve_whisper_model(settings: &TranscriptionSettings) -> AdapterResult<Reso
             })
             .ok_or_else(|| {
                 AdapterError::invalid_input(format!(
-                    "model `{requested}` is not installed; installed models: {}. Run `sbake whisper model {requested}`.",
-                    display_model_names(&installed_names)
+                    "model `{requested}` was not found in `{}`; available models: {}. Set `storage.whisper_models_dir` to your existing model directory or run `sbake whisper model {requested}`.",
+                    models_dir.display(), display_model_names(&installed_names)
                 ))
             });
     }
 
     let selected = match installed.as_slice() {
         [] => {
-            return Err(AdapterError::invalid_input(
-                "no whisper.cpp models are installed. Run `sbake whisper model list`, then `sbake whisper model <NAME>`.",
-            ));
+            return Err(AdapterError::invalid_input(format!(
+                "no Whisper models were found in `{}`; set `storage.whisper_models_dir` to a directory containing ggml-*.bin or ggml-*.gguf files, or run `sbake whisper model list` followed by `sbake whisper model <NAME>`",
+                models_dir.display()
+            )));
         }
         [only] => only,
         many => {
@@ -1020,6 +1411,129 @@ mod tests {
         assert_eq!(stats.removed_empty_or_silence, 1);
         assert_eq!(stats.removed_repeated, 1);
         assert_eq!(document.segments.len(), 2);
+    }
+
+    #[test]
+    fn long_audio_chunks_overlap_without_hard_cutting_the_core_boundary() {
+        let chunks = transcription_chunks(25 * 60 * 1_000);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0],
+            TranscriptionChunk {
+                input_start_ms: 0,
+                input_end_ms: 630_000,
+                core_start_ms: 0,
+                core_end_ms: 600_000,
+            }
+        );
+        assert_eq!(
+            chunks[1],
+            TranscriptionChunk {
+                input_start_ms: 570_000,
+                input_end_ms: 1_230_000,
+                core_start_ms: 600_000,
+                core_end_ms: 1_200_000,
+            }
+        );
+        assert_eq!(chunks[2].input_start_ms, 1_170_000);
+        assert_eq!(chunks[2].core_end_ms, 1_500_000);
+    }
+
+    #[test]
+    fn overlap_merge_keeps_cross_boundary_dialogue_once() {
+        let mut left = vec![timed_segment(
+            "left",
+            "crossing dialogue",
+            "00:09:58,000",
+            "00:10:03,000",
+        )];
+        select_and_shift_chunk_segments(
+            &mut left,
+            TranscriptionChunk {
+                input_start_ms: 0,
+                input_end_ms: 630_000,
+                core_start_ms: 0,
+                core_end_ms: 600_000,
+            },
+            false,
+            TranscriptionFormat::Srt,
+        );
+        assert!(left.is_empty());
+
+        let mut right = vec![timed_segment(
+            "right",
+            "crossing dialogue",
+            "00:00:28,000",
+            "00:00:33,000",
+        )];
+        select_and_shift_chunk_segments(
+            &mut right,
+            TranscriptionChunk {
+                input_start_ms: 570_000,
+                input_end_ms: 1_230_000,
+                core_start_ms: 600_000,
+                core_end_ms: 1_200_000,
+            },
+            false,
+            TranscriptionFormat::Srt,
+        );
+        assert_eq!(right.len(), 1);
+        assert_eq!(right[0].start.as_deref(), Some("00:09:58,000"));
+        assert_eq!(right[0].end.as_deref(), Some("00:10:03,000"));
+    }
+
+    #[test]
+    fn incomplete_long_transcription_is_rejected_before_rendering() {
+        let document = SubtitleDocument {
+            path: PathBuf::from("whisper.srt"),
+            format: "srt".to_owned(),
+            segments: vec![timed_segment(
+                "1",
+                "last usable line",
+                "00:16:50,000",
+                "00:17:00,000",
+            )],
+            header: None,
+            passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
+        };
+        let error = validate_transcription_coverage(
+            &document,
+            Some(8_500_000),
+            Some(8_582_000),
+            TranscriptionCleanupStats {
+                removed_empty_or_silence: 0,
+                removed_repeated: 250,
+            },
+        )
+        .expect_err("truncated long transcription must fail");
+        let message = error.to_string();
+        assert!(message.contains("transcription is incomplete"));
+        assert!(message.contains("cleanup removed 250 repeated cues"));
+    }
+
+    #[test]
+    fn wav_duration_reads_pcm_header_without_external_tools() {
+        let root = t("wav-duration");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("audio.wav");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&32_036_u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&32_000_u32.to_le_bytes());
+        bytes.resize(bytes.len() + 32_000, 0);
+        fs::write(&path, bytes).expect("write wav");
+        assert_eq!(wav_duration_ms(&path), Some(1_000));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1347,7 +1861,7 @@ mod tests {
         .expect_err("media without audio must fail");
         let message = error.to_string();
 
-        assert!(message.contains("contains no audio stream"));
+        assert!(message.contains("contains no audio stream"), "{message}");
         assert!(!marker.exists());
         assert!(!runtime_dir.join("tmp/transcription").exists());
         let _ = fs::remove_dir_all(root);
@@ -1420,7 +1934,7 @@ mod tests {
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp version: fake-1"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints" >&2
+  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
   exit 0
 fi
 output=""
@@ -1501,6 +2015,17 @@ fi
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("subbake-transcription-{l}-{n}"))
+    }
+
+    fn timed_segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            start: Some(start.to_owned()),
+            end: Some(end.to_owned()),
+            identifier: Some(id.to_owned()),
+            settings: None,
+        }
     }
 
     fn model_dir(label: &str, models: &[&str]) -> PathBuf {
