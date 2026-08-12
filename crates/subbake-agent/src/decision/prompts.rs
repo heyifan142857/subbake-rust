@@ -7,17 +7,11 @@ pub(super) fn build_native_messages(
     input: &str,
     loop_state: &AgentTaskLoop,
     dialogue: Option<&str>,
-    legacy_pending: Option<&str>,
     effective_defaults: &str,
 ) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(system_contract(false, false, effective_defaults)),
-        ChatMessage::user(user_context(
-            input,
-            dialogue,
-            legacy_pending,
-            Some((loop_state, None)),
-        )),
+        ChatMessage::user(user_context(input, dialogue, Some((loop_state, None)))),
     ]
 }
 
@@ -25,7 +19,6 @@ pub(super) fn build_json_messages(
     input: &str,
     loop_state: &AgentTaskLoop,
     dialogue: Option<&str>,
-    legacy_pending: Option<&str>,
     tools_enabled: bool,
     repair_error: Option<&str>,
     effective_defaults: &str,
@@ -35,7 +28,6 @@ pub(super) fn build_json_messages(
         ChatMessage::user(user_context(
             input,
             dialogue,
-            legacy_pending,
             Some((loop_state, repair_error)),
         )),
     ]
@@ -84,14 +76,9 @@ fn system_contract(json_fallback: bool, tools_disabled: bool, effective_defaults
 fn user_context(
     input: &str,
     dialogue: Option<&str>,
-    legacy_pending: Option<&str>,
     loop_data: Option<(&AgentTaskLoop, Option<&str>)>,
 ) -> String {
     let mut user = format!("Current user request:\n{input}");
-    if let Some(pending) = legacy_pending {
-        user.push_str("\n\nOne-time context restored from an older session:\n");
-        user.push_str(pending);
-    }
     if let Some(dialogue) = dialogue {
         user.push_str("\n\nRecent dialogue:\n");
         user.push_str(dialogue);
@@ -123,7 +110,6 @@ mod tests {
         let messages = build_json_messages(
             "翻译目录下所有字幕",
             &AgentTaskLoop::default(),
-            None,
             None,
             true,
             None,

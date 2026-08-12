@@ -220,28 +220,6 @@ pub(crate) fn execute_local_tool(
                 format_file_list(&rank_subtitle_candidates(files, query, project_root)),
             )
         }
-        ToolExecutor::CreateFile => {
-            let operation = guard.create_file(
-                &required_path(args, "path")?,
-                optional_string(args, "content", ""),
-            )?;
-            mutation("create", operation)
-        }
-        ToolExecutor::AppendFile => {
-            let operation = guard.append_file(
-                &required_path(args, "path")?,
-                optional_string(args, "content", ""),
-            )?;
-            mutation("append", operation)
-        }
-        ToolExecutor::ReplaceInFile => {
-            let operation = guard.replace_in_file(
-                &required_path(args, "path")?,
-                optional_string(args, "old", ""),
-                optional_string(args, "new", ""),
-            )?;
-            mutation("replace", operation)
-        }
         ToolExecutor::RenamePath => {
             let operation =
                 guard.rename_path(&required_path(args, "from")?, &required_path(args, "to")?)?;
@@ -1351,10 +1329,11 @@ mod tests {
     fn local_mutation_returns_undo_bookkeeping_data() {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("note.txt"), "hello").expect("write source");
         let guard = FileGuard::new(root.clone());
         let outcome = execute_local_tool(
-            ToolExecutor::CreateFile,
-            &json!({"path": "note.txt", "content": "hello"}),
+            ToolExecutor::RenamePath,
+            &json!({"from": "note.txt", "to": "renamed.txt"}),
             &guard,
             &root,
         )

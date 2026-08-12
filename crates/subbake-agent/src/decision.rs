@@ -5,6 +5,7 @@
 //! execution result is fed back until the model returns a final response.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use serde_json::{Value as JsonValue, json};
 use subbake_core::entities::Usage;
@@ -22,7 +23,6 @@ use crate::event::{
     PendingToolCall, PendingToolExchange, ToolCallDraft,
 };
 use crate::profile_coordinator::ProfileCoordinator;
-use crate::tool_execution::render_tool_outcome;
 use crate::tools::{
     ToolValidationError, find_tool_spec, model_visible_tool_names, model_visible_tool_specs,
     validate_tool_call,
@@ -116,7 +116,6 @@ impl AgentEngine {
     pub fn run_line(&mut self, input: &str, backend: &mut dyn LlmBackend) -> AgentResult<String> {
         self.check_cancelled()?;
         let dialogue = self.dialogue_context_summary(12);
-        let legacy_pending = self.take_legacy_pending_action()?;
         let effective_defaults = self.effective_defaults_summary()?;
         self.record_if_active(EventKind::User {
             text: input.to_owned(),
@@ -125,7 +124,6 @@ impl AgentEngine {
         let state = AgentTurnState {
             input: input.to_owned(),
             dialogue,
-            legacy_pending,
             effective_defaults,
             task: AgentTaskLoop::default(),
             legacy_mode: backend.native_tool_support() == NativeToolSupport::Unsupported,
@@ -150,7 +148,6 @@ impl AgentEngine {
                 &state.input,
                 &state.task,
                 state.dialogue.as_deref(),
-                state.legacy_pending.as_deref(),
                 &mut native_turn,
                 &mut state.legacy_mode,
                 true,
@@ -231,7 +228,6 @@ impl AgentEngine {
             &state.input,
             &state.task,
             state.dialogue.as_deref(),
-            state.legacy_pending.as_deref(),
             &mut native_turn,
             &mut state.legacy_mode,
             false,
@@ -263,7 +259,6 @@ impl AgentEngine {
         input: &str,
         task: &AgentTaskLoop,
         dialogue: Option<&str>,
-        legacy_pending: Option<&str>,
         native_turn: &mut Option<NativeTurn>,
         legacy_mode: &mut bool,
         tools_enabled: bool,
@@ -297,7 +292,6 @@ impl AgentEngine {
                     input,
                     task,
                     dialogue,
-                    legacy_pending,
                     effective_defaults,
                 ))
                 .with_tools(definitions, choice)
@@ -327,7 +321,6 @@ impl AgentEngine {
             input,
             task,
             dialogue,
-            legacy_pending,
             tools_enabled,
             None,
             effective_defaults,
@@ -392,11 +385,6 @@ impl AgentEngine {
             })
             .collect::<Vec<_>>();
         if !planned.is_empty() {
-            for call in &planned {
-                if let Some(observer) = self.observer.as_mut() {
-                    observer.on_tool_call(&call.tool_name, &call.arguments);
-                }
-            }
             self.store_plan("", planned)?;
             return Ok(ProcessedCalls::Planned);
         }
@@ -415,9 +403,6 @@ impl AgentEngine {
                 && let crate::command_policy::CommandApproval::AskUser(reason) =
                     crate::command_policy::classify(&call.arguments)
             {
-                if let Some(observer) = self.observer.as_mut() {
-                    observer.on_tool_call(&call.name, &call.arguments);
-                }
                 return Ok(ProcessedCalls::AwaitingCommandApproval {
                     call,
                     reason,
@@ -425,9 +410,8 @@ impl AgentEngine {
                     remaining_calls: calls.into(),
                 });
             }
-            if let Some(observer) = self.observer.as_mut() {
-                observer.on_tool_call(&call.name, &call.arguments);
-            }
+            let activity_id = new_activity_id();
+            let started = self.start_tool_activity(&activity_id, &call.name, &call.arguments)?;
             let call_key = CallKey::new(&call.name, &call.arguments);
             let feedback = match find_tool_spec(&call.name) {
                 None => ToolFeedback::failure(
@@ -438,7 +422,7 @@ impl AgentEngine {
                 ),
                 Some(spec) if !spec.model_visible => ToolFeedback::failure(
                     &call.name,
-                    format!("tool `{}` is compatibility-only and unavailable", call.name),
+                    format!("tool `{}` is not available to the model", call.name),
                     "unknown_tool",
                     available_tools.clone(),
                 ),
@@ -466,13 +450,24 @@ impl AgentEngine {
                             if spec.mutates_with(&call.arguments) {
                                 completed_mutations.insert(call_key.clone());
                             }
-                            let observation = render_tool_outcome(&outcome);
-                            if let Some(observer) = self.observer.as_mut() {
-                                observer.on_observation(&observation);
-                            }
+                            self.complete_tool_activity(
+                                &activity_id,
+                                &call.name,
+                                &call.arguments,
+                                &outcome,
+                                started,
+                            )?;
                             ToolFeedback::success(&call.name, outcome)
                         }
-                        Err(error) if error.is_cancelled() => return Err(error),
+                        Err(error) if error.is_cancelled() => {
+                            self.cancel_tool_activity(
+                                &activity_id,
+                                &call.name,
+                                &call.arguments,
+                                started,
+                            )?;
+                            return Err(error);
+                        }
                         Err(error) => {
                             let category = error.tool_failure_category();
                             ToolFeedback::failure(
@@ -485,6 +480,16 @@ impl AgentEngine {
                     },
                 },
             };
+            if !feedback.success {
+                self.fail_tool_activity(
+                    &activity_id,
+                    &call.name,
+                    &call.arguments,
+                    feedback.error_category.as_deref().unwrap_or("execution"),
+                    feedback.error.as_deref().unwrap_or("the tool call failed"),
+                    started,
+                )?;
+            }
             let recorded = self.record_tool_feedback(
                 &call,
                 &call_key,
@@ -542,15 +547,6 @@ impl AgentEngine {
             .as_deref()
             .unwrap_or("the tool call failed")
             .to_owned();
-        if let Some(observer) = self.observer.as_mut() {
-            observer.on_error(&format!("{}: {error}", call.name));
-        }
-        self.record_if_active(EventKind::ToolFailure {
-            tool_name: call.name.clone(),
-            category: category.clone(),
-            error: error.clone(),
-        })?;
-
         let exact = FailureKey {
             call: call_key.clone(),
             category: category.clone(),
@@ -618,7 +614,9 @@ impl AgentEngine {
             .as_ref()
             .and_then(|session| session.pending_agent_turn.clone())
         else {
-            return self.handle_legacy_command_decision(decision, &pending.tool_call);
+            return Err(AgentError::invalid_state(
+                "command approval is missing its persisted agent turn",
+            ));
         };
 
         let mut state = AgentTurnState::from_pending(persisted_turn);
@@ -626,11 +624,41 @@ impl AgentEngine {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let call_id = if pending.call_id.is_empty() {
+            "json-tool-call".to_owned()
+        } else {
+            pending.call_id.clone()
+        };
+        let activity_id = new_activity_id();
+        let mut started = None;
         let feedback = match decision {
             crate::engine::CommandDecision::Approve => {
+                let activity_started = self.start_tool_activity(
+                    &activity_id,
+                    &pending.tool_call.tool_name,
+                    &pending.tool_call.arguments,
+                )?;
+                started = Some(activity_started);
                 match self.run_tool(&pending.tool_call.tool_name, &pending.tool_call.arguments) {
-                    Ok(outcome) => ToolFeedback::success(&pending.tool_call.tool_name, outcome),
-                    Err(error) if error.is_cancelled() => return Err(error),
+                    Ok(outcome) => {
+                        self.complete_tool_activity(
+                            &activity_id,
+                            &pending.tool_call.tool_name,
+                            &pending.tool_call.arguments,
+                            &outcome,
+                            activity_started,
+                        )?;
+                        ToolFeedback::success(&pending.tool_call.tool_name, outcome)
+                    }
+                    Err(error) if error.is_cancelled() => {
+                        self.cancel_tool_activity(
+                            &activity_id,
+                            &pending.tool_call.tool_name,
+                            &pending.tool_call.arguments,
+                            activity_started,
+                        )?;
+                        return Err(error);
+                    }
                     Err(error) => {
                         let category = error.tool_failure_category();
                         ToolFeedback::failure(
@@ -649,11 +677,18 @@ impl AgentEngine {
                 available_tools,
             ),
         };
-        let call_id = if pending.call_id.is_empty() {
-            "json-tool-call".to_owned()
-        } else {
-            pending.call_id.clone()
-        };
+        if !feedback.success
+            && let Some(activity_started) = started
+        {
+            self.fail_tool_activity(
+                &activity_id,
+                &pending.tool_call.tool_name,
+                &pending.tool_call.arguments,
+                feedback.error_category.as_deref().unwrap_or("execution"),
+                feedback.error.as_deref().unwrap_or("the tool call failed"),
+                activity_started,
+            )?;
+        }
         let call = ModelToolCall {
             id: call_id,
             name: pending.tool_call.tool_name.clone(),
@@ -761,31 +796,6 @@ impl AgentEngine {
         }
     }
 
-    fn handle_legacy_command_decision(
-        &mut self,
-        decision: crate::engine::CommandDecision,
-        call: &ToolCallDraft,
-    ) -> AgentResult<String> {
-        let result = match decision {
-            crate::engine::CommandDecision::Approve => {
-                render_tool_outcome(&self.run_tool(&call.tool_name, &call.arguments)?)
-            }
-            crate::engine::CommandDecision::Reject => "Rejected pending command.".to_owned(),
-        };
-        self.session
-            .as_mut()
-            .ok_or_else(|| AgentError::invalid_state("no active session"))?
-            .pending_command_approval = None;
-        self.record(match decision {
-            crate::engine::CommandDecision::Approve => EventKind::CommandApproved,
-            crate::engine::CommandDecision::Reject => EventKind::CommandRejected,
-        })?;
-        self.record_if_active(EventKind::Assistant {
-            text: result.clone(),
-        })?;
-        Ok(result)
-    }
-
     fn clear_pending_agent_turn(&mut self) -> AgentResult<()> {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
@@ -794,22 +804,6 @@ impl AgentEngine {
             self.save()?;
         }
         Ok(())
-    }
-
-    fn take_legacy_pending_action(&mut self) -> AgentResult<Option<String>> {
-        let Some(session) = self.session.as_mut() else {
-            return Ok(None);
-        };
-        let pending = session.pending_action.take().map(|pending| {
-            format!(
-                "intent: {}\nrequest: {}\nTreat the current message as a continuation only when that preserves the older request's meaning.",
-                pending.intent, pending.request
-            )
-        });
-        if pending.is_some() {
-            self.save()?;
-        }
-        Ok(pending)
     }
 
     fn dialogue_context_summary(&self, limit: usize) -> Option<String> {
@@ -886,12 +880,150 @@ impl AgentEngine {
     ) -> AgentResult<subbake_core::AgentToolOutcome> {
         crate::tool_runner::ToolRunner::run(self, name, args)
     }
+
+    pub(crate) fn run_observed_tool(
+        &mut self,
+        name: &str,
+        args: &JsonValue,
+    ) -> AgentResult<subbake_core::AgentToolOutcome> {
+        let activity_id = new_activity_id();
+        let started = self.start_tool_activity(&activity_id, name, args)?;
+        match self.run_tool(name, args) {
+            Ok(outcome) => {
+                self.complete_tool_activity(&activity_id, name, args, &outcome, started)?;
+                Ok(outcome)
+            }
+            Err(error) if error.is_cancelled() => {
+                self.cancel_tool_activity(&activity_id, name, args, started)?;
+                Err(error)
+            }
+            Err(error) => {
+                self.fail_tool_activity(
+                    &activity_id,
+                    name,
+                    args,
+                    &error.tool_failure_category(),
+                    &error.to_string(),
+                    started,
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn start_tool_activity(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &JsonValue,
+    ) -> AgentResult<Instant> {
+        let activity = crate::tool_presentation::running_activity(name, arguments);
+        self.record_if_active(EventKind::ToolStarted {
+            call_id: call_id.to_owned(),
+            tool_name: name.to_owned(),
+            headline: activity.headline,
+            detail: activity.detail,
+        })?;
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tool_call(call_id, name, arguments);
+        }
+        Ok(Instant::now())
+    }
+
+    fn complete_tool_activity(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &JsonValue,
+        outcome: &subbake_core::AgentToolOutcome,
+        started: Instant,
+    ) -> AgentResult<()> {
+        let duration_ms = elapsed_millis(started);
+        let activity = crate::tool_presentation::completed_activity(
+            name,
+            arguments,
+            outcome,
+            std::time::Duration::from_millis(duration_ms),
+        );
+        let result = self.record_if_active(EventKind::ToolCompleted {
+            call_id: call_id.to_owned(),
+            tool_name: name.to_owned(),
+            headline: activity.headline,
+            detail: activity.detail,
+            duration_ms,
+        });
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tool_success(call_id, name, arguments, outcome);
+        }
+        result
+    }
+
+    fn fail_tool_activity(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &JsonValue,
+        category: &str,
+        error: &str,
+        started: Instant,
+    ) -> AgentResult<()> {
+        let activity = crate::tool_presentation::failed_activity(name, arguments, error);
+        let result = self.record_if_active(EventKind::ToolFailed {
+            call_id: call_id.to_owned(),
+            tool_name: name.to_owned(),
+            headline: activity.headline,
+            detail: activity.detail,
+            category: category.to_owned(),
+            error: error.to_owned(),
+            duration_ms: elapsed_millis(started),
+        });
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tool_failure(call_id, name, arguments, error);
+        }
+        result
+    }
+
+    fn cancel_tool_activity(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &JsonValue,
+        started: Instant,
+    ) -> AgentResult<()> {
+        let activity = crate::tool_presentation::running_activity(name, arguments);
+        let result = self.record_if_active(EventKind::ToolCancelled {
+            call_id: call_id.to_owned(),
+            tool_name: name.to_owned(),
+            headline: activity.headline,
+            detail: activity.detail,
+            duration_ms: elapsed_millis(started),
+        });
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_tool_cancelled(call_id, name);
+        }
+        result
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn new_activity_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_ACTIVITY_ID: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = NEXT_ACTIVITY_ID.fetch_add(1, Ordering::Relaxed);
+    format!("activity-{nanos:x}-{sequence:x}")
 }
 
 struct AgentTurnState {
     input: String,
     dialogue: Option<String>,
-    legacy_pending: Option<String>,
     effective_defaults: String,
     task: AgentTaskLoop,
     legacy_mode: bool,
@@ -910,7 +1042,6 @@ impl AgentTurnState {
         PendingAgentTurn {
             input: self.input.clone(),
             dialogue: self.dialogue.clone(),
-            legacy_pending: self.legacy_pending.clone(),
             effective_defaults: self.effective_defaults.clone(),
             exchanges: self
                 .task
@@ -964,7 +1095,6 @@ impl AgentTurnState {
         Self {
             input: pending.input,
             dialogue: pending.dialogue,
-            legacy_pending: pending.legacy_pending,
             effective_defaults: pending.effective_defaults,
             task: AgentTaskLoop {
                 exchanges: pending
@@ -1672,7 +1802,7 @@ mod tests {
             resumed
                 .session_events()
                 .iter()
-                .any(|event| { event.kind == "tool_call" && event.text == "list_files" })
+                .any(|event| { event.kind == "tool_completed" && event.text == "list_files" })
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1693,6 +1823,19 @@ mod tests {
                 name: "translate_file".to_owned(),
                 arguments: json!({"path":format!("episode-{index}.srt")}),
             };
+            let started = engine
+                .start_tool_activity(&call.id, &call.name, &call.arguments)
+                .expect("start failed activity");
+            engine
+                .fail_tool_activity(
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                    "timeout",
+                    "provider timed out",
+                    started,
+                )
+                .expect("finish failed activity");
             let recorded = engine
                 .record_tool_feedback(
                     &call,
@@ -1716,10 +1859,35 @@ mod tests {
             engine
                 .session_events()
                 .iter()
-                .filter(|event| event.kind == "tool_failure")
+                .filter(|event| event.kind == "tool_failed")
                 .count(),
             3
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_activity_persists_summary_without_observation_contents() {
+        let root = temp_root("activity-summary-redaction");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("sample.srt"), "private subtitle body").expect("write sample");
+        let mut engine = active_engine(root.clone());
+
+        let outcome = engine
+            .run_observed_tool("read_file", &json!({"path":"sample.srt"}))
+            .expect("read file");
+        assert!(matches!(
+            outcome,
+            subbake_core::AgentToolOutcome::Observation(_)
+        ));
+
+        let session = engine.session.as_ref().expect("session");
+        let saved = std::fs::read_to_string(engine.session_store.path_for(&session.id))
+            .expect("read saved session");
+        assert!(saved.contains("Read sample.srt"));
+        assert!(!saved.contains("private subtitle body"));
+        assert!(!saved.contains("\"outcome\""));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2082,53 +2250,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pending_action_is_used_once_and_cleared() {
-        let root = temp_root("legacy-pending");
-        std::fs::create_dir_all(&root).expect("root");
-        let mut engine = active_engine(root.clone());
-        engine.session.as_mut().expect("session").pending_action =
-            Some(crate::session::PendingAction {
-                intent: "translate".to_owned(),
-                request: "translate the selected subtitle".to_owned(),
-            });
-        let mut backend = JsonSequenceBackend {
-            decisions: VecDeque::from([json!({"action":"respond","text":"continued"})]),
-            prompts: Vec::new(),
-        };
-
-        engine.run_line("movie.srt", &mut backend).expect("run");
-        assert!(
-            backend.prompts[0][1]
-                .content
-                .contains("translate the selected subtitle")
-        );
-        assert!(
-            engine
-                .session
-                .as_ref()
-                .expect("session")
-                .pending_action
-                .is_none()
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resumed_legacy_plan_executes_hidden_tools_and_persists_each_success() {
-        let root = temp_root("legacy-plan");
+    fn resumed_plan_persists_each_success_before_a_later_failure() {
+        let root = temp_root("resumed-plan-progress");
         std::fs::create_dir_all(&root).expect("root");
         let mut engine = active_engine(root.clone());
         engine
             .store_plan(
-                "legacy pending plan",
+                "pending plan",
                 vec![
                     ToolCallDraft {
-                        tool_name: "create_file".to_owned(),
-                        arguments: json!({"path":"legacy.txt","content":"created once"}),
+                        tool_name: "apply_patch".to_owned(),
+                        arguments: json!({"patch":"*** Begin Patch\n*** Add File: created.txt\n+created once\n*** End Patch"}),
                     },
                     ToolCallDraft {
                         tool_name: "rename_path".to_owned(),
-                        arguments: json!({"from":"legacy.txt"}),
+                        arguments: json!({"from":"created.txt"}),
                     },
                 ],
             )
@@ -2141,10 +2277,10 @@ mod tests {
             .expect("resume session");
         resumed
             .approve_plan()
-            .expect_err("second legacy call is intentionally invalid");
+            .expect_err("second call is intentionally invalid");
         assert_eq!(
-            std::fs::read_to_string(root.join("legacy.txt")).expect("created"),
-            "created once"
+            std::fs::read_to_string(root.join("created.txt")).expect("created"),
+            "created once\n"
         );
         let remaining = &resumed
             .session
@@ -2159,10 +2295,10 @@ mod tests {
 
         resumed
             .approve_plan()
-            .expect_err("retry must not repeat the completed create");
+            .expect_err("retry must not repeat the completed patch");
         assert_eq!(
-            std::fs::read_to_string(root.join("legacy.txt")).expect("still once"),
-            "created once"
+            std::fs::read_to_string(root.join("created.txt")).expect("still once"),
+            "created once\n"
         );
         let _ = std::fs::remove_dir_all(root);
     }

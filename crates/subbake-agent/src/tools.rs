@@ -48,9 +48,6 @@ pub(crate) enum ToolExecutor {
     ReadFilePreview,
     ReadFile,
     ApplyPatch,
-    CreateFile,
-    AppendFile,
-    ReplaceInFile,
     RenamePath,
     DeleteFile,
     SwitchProfile,
@@ -440,15 +437,6 @@ const APPLY_PATCH_ARGS: &[ToolArgSpec] = &[arg(
     true,
     "Codex-style patch bounded by Begin Patch and End Patch markers",
 )];
-const WRITE_FILE_ARGS: &[ToolArgSpec] = &[
-    arg("path", StringArg, true, "project-local path"),
-    arg("content", StringArg, false, "file content"),
-];
-const REPLACE_IN_FILE_ARGS: &[ToolArgSpec] = &[
-    arg("path", StringArg, true, "project-local path"),
-    arg("old", StringArg, false, "text to replace"),
-    arg("new", StringArg, false, "replacement text"),
-];
 const RENAME_PATH_ARGS: &[ToolArgSpec] = &[
     arg("from", StringArg, true, "existing path"),
     arg("to", StringArg, true, "new path"),
@@ -697,41 +685,6 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         APPLY_PATCH_ARGS,
         ApplyPatch
     ),
-    // Hidden compatibility tools remain executable for v1 pending plans and
-    // resumed sessions, but new model turns use apply_patch.
-    tool!(
-        "create_file",
-        FileOp,
-        true,
-        false,
-        false,
-        false,
-        "Create a new file.",
-        WRITE_FILE_ARGS,
-        CreateFile
-    ),
-    tool!(
-        "append_file",
-        FileOp,
-        true,
-        false,
-        false,
-        false,
-        "Append content to a file.",
-        WRITE_FILE_ARGS,
-        AppendFile
-    ),
-    tool!(
-        "replace_in_file",
-        FileOp,
-        true,
-        false,
-        false,
-        false,
-        "Replace text in a file.",
-        REPLACE_IN_FILE_ARGS,
-        ReplaceInFile
-    ),
     tool!(
         "rename_path",
         FileOp,
@@ -936,9 +889,8 @@ pub fn validate_tool_call(
 }
 
 /// A tool call that has crossed the registry boundary exactly once. Executors
-/// may still use JSON for compatibility with persisted v1 plans, but they can
-/// no longer receive an unknown tool, extra field, missing required field, or
-/// a value of the wrong primitive type.
+/// still use JSON internally, but they can no longer receive an unknown tool,
+/// extra field, missing required field, or a value of the wrong primitive type.
 pub(crate) struct ValidatedToolCall<'a> {
     spec: &'static ToolSpec,
     arguments: &'a serde_json::Value,
@@ -970,27 +922,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_sees_one_complete_stable_registry_without_legacy_writers() {
+    fn model_sees_one_complete_stable_registry() {
         let names = model_visible_tool_names();
         assert!(names.contains(&"translate_series"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"run_command"));
-        assert!(!names.contains(&"create_file"));
-        assert!(!names.contains(&"append_file"));
-        assert!(!names.contains(&"replace_in_file"));
-    }
-
-    #[test]
-    fn compatibility_writers_remain_registered_and_validatable() {
-        assert!(find_tool_spec("create_file").is_some());
-        assert!(
-            validate_tool_call(
-                "create_file",
-                &serde_json::json!({"path": "note.txt", "content": "hello"})
-            )
-            .is_ok()
-        );
     }
 
     #[test]

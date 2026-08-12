@@ -112,8 +112,8 @@ impl ConversationPresenter {
                 let label = match event.tag() {
                     EventTag::User => "You",
                     EventTag::Assistant | EventTag::AskUser => "Agent",
-                    EventTag::ToolCall => "Tool",
-                    EventTag::ToolFailure | EventTag::Error => "Error",
+                    EventTag::ToolCompleted => "Tool",
+                    EventTag::ToolFailed | EventTag::Error => "Error",
                     _ => return None,
                 };
                 Some(format!("{label}: {}", event.text))
@@ -154,10 +154,10 @@ impl ConversationPresenter {
                     EventTag::User => "User",
                     EventTag::Assistant => "Assistant",
                     EventTag::AskUser => "Assistant question",
-                    EventTag::ToolCall => "Tool",
+                    EventTag::ToolCompleted => "Tool",
                     EventTag::FileOperation => "File operation",
                     EventTag::Plan => "Plan",
-                    EventTag::ToolFailure | EventTag::Error => "Error",
+                    EventTag::ToolFailed | EventTag::Error => "Error",
                     _ => return None,
                 };
                 let text = if event.text.trim().is_empty() {

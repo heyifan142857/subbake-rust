@@ -14,6 +14,7 @@ mod profile_coordinator;
 pub mod session;
 mod session_controller;
 mod tool_execution;
+mod tool_presentation;
 mod tool_runner;
 pub mod tools;
 pub mod tui;

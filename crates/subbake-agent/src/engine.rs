@@ -5,9 +5,11 @@
 //! - Optional `EngineObserver` for streaming output (TUI, CLI, or test)
 //! - Plan mode and approval are explicit state transitions, not side-effect-ridden if/else
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 use subbake_core::ports::{ModelToolResult, ToolContinuation};
-use subbake_core::{CancellationGuard, CancellationToken, SharedProgress};
+use subbake_core::{AgentToolOutcome, CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, ToolCallDraft};
@@ -36,7 +38,32 @@ pub trait EngineObserver: Send {
     fn on_thinking(&mut self, _text: &str) {}
 
     /// A tool is about to be called.
-    fn on_tool_call(&mut self, _name: &str, _arguments: &serde_json::Value) {}
+    fn on_tool_call(&mut self, _call_id: &str, _name: &str, _arguments: &serde_json::Value) {}
+
+    /// A tool completed successfully.
+    fn on_tool_success(
+        &mut self,
+        _call_id: &str,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        outcome: &AgentToolOutcome,
+    ) {
+        self.on_observation(&render_tool_outcome(outcome));
+    }
+
+    /// A tool failed before producing a usable result.
+    fn on_tool_failure(
+        &mut self,
+        _call_id: &str,
+        name: &str,
+        _arguments: &serde_json::Value,
+        error: &str,
+    ) {
+        self.on_error(&format!("{name}: {error}"));
+    }
+
+    /// A running tool was cooperatively cancelled.
+    fn on_tool_cancelled(&mut self, _call_id: &str, _name: &str) {}
 
     /// A tool produced output (observation for the LLM context).
     fn on_observation(&mut self, _text: &str) {}
@@ -52,7 +79,10 @@ pub trait EngineObserver: Send {
 }
 
 /// Observer that prints every engine lifecycle event to stdout.
-pub struct StreamingObserver;
+#[derive(Default)]
+pub struct StreamingObserver {
+    tool_started: HashMap<String, Instant>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanDecision {
@@ -99,15 +129,9 @@ pub fn is_known_slash_command(input: &str) -> bool {
         || command.starts_with("/history ")
 }
 
-impl Default for StreamingObserver {
-    fn default() -> Self {
-        Self
-    }
-}
-
 impl StreamingObserver {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -116,26 +140,55 @@ impl EngineObserver for StreamingObserver {
         println!("  ⎿  {}…", text.lines().next().unwrap_or(text));
     }
 
-    fn on_tool_call(&mut self, name: &str, arguments: &serde_json::Value) {
-        let args = serde_json::to_string(arguments).unwrap_or_default();
-        if args.len() > 120 {
-            println!("  ⚡ {name}  ({args:.120}…)");
-        } else {
-            println!("  ⚡ {name}  {args}");
+    fn on_tool_call(&mut self, call_id: &str, name: &str, arguments: &serde_json::Value) {
+        self.tool_started.insert(call_id.to_owned(), Instant::now());
+        let activity = crate::tool_presentation::running_activity(name, arguments);
+        println!("  • {}", activity.headline);
+        if let Some(detail) = activity.detail {
+            println!("    {detail}");
         }
     }
 
-    fn on_observation(&mut self, text: &str) {
-        let preview = text.lines().next().unwrap_or(text);
-        if preview.len() > 200 {
-            println!("  ◀  {:.200}…", preview);
-        } else {
-            println!("  ◀  {preview}");
+    fn on_tool_success(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+        outcome: &AgentToolOutcome,
+    ) {
+        let elapsed = self
+            .tool_started
+            .remove(call_id)
+            .map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        let activity =
+            crate::tool_presentation::completed_activity(name, arguments, outcome, elapsed);
+        println!("  ✓ {}", activity.headline);
+        if let Some(detail) = activity.detail {
+            println!("    {detail}");
         }
+    }
+
+    fn on_tool_failure(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+        error: &str,
+    ) {
+        self.tool_started.remove(call_id);
+        let activity = crate::tool_presentation::failed_activity(name, arguments, error);
+        eprintln!("  × {}", activity.headline);
+        if let Some(detail) = activity.detail {
+            eprintln!("    {detail}");
+        }
+    }
+
+    fn on_tool_cancelled(&mut self, call_id: &str, _name: &str) {
+        self.tool_started.remove(call_id);
     }
 
     fn on_error(&mut self, error: &str) {
-        eprintln!("  ✖ {error}");
+        eprintln!("  × {error}");
     }
 
     fn on_response(&mut self, text: &str) {
@@ -398,7 +451,7 @@ impl AgentEngine {
                 break;
             };
 
-            let result = self.run_tool(&call.tool_name, &call.arguments)?;
+            let result = self.run_observed_tool(&call.tool_name, &call.arguments)?;
             outputs.push(format!(
                 "{}: {}",
                 call.tool_name,
@@ -451,9 +504,8 @@ impl AgentEngine {
     }
 
     pub fn select_profile(&mut self, name: &str) -> AgentResult<String> {
-        let result = render_tool_outcome(
-            &self.run_tool("switch_profile", &serde_json::json!({"name": name}))?,
-        );
+        let arguments = serde_json::json!({"name": name});
+        let result = render_tool_outcome(&self.run_observed_tool("switch_profile", &arguments)?);
         self.record_if_active(EventKind::Assistant {
             text: result.clone(),
         })?;
@@ -703,7 +755,7 @@ mod error_persistence_tests {
     }
 
     #[test]
-    fn command_approval_is_persisted_and_rejected_independently_from_plans() {
+    fn command_approval_without_a_v2_agent_turn_is_rejected() {
         let root = std::env::temp_dir().join(format!(
             "subbake-agent-command-approval-{}",
             crate::session::iso_now().replace([':', '.'], "-")
@@ -728,11 +780,15 @@ mod error_persistence_tests {
         assert!(!engine.has_pending_plan());
 
         let mut backend = EchoDecisionBackend::new("test");
-        let result = engine
+        let error = engine
             .handle_command_decision(CommandDecision::Reject, &mut backend)
-            .expect("reject command");
-        assert_eq!(result, "Rejected pending command.");
-        assert!(!engine.has_pending_command_approval());
+            .expect_err("incomplete approval state must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("missing its persisted agent turn")
+        );
+        assert!(engine.has_pending_command_approval());
         let _ = std::fs::remove_dir_all(root);
     }
 

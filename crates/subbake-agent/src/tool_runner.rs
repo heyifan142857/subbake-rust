@@ -28,10 +28,6 @@ impl ToolRunner {
                 message: error.to_string(),
             })?;
         let args = call.arguments();
-        engine.record_if_active(EventKind::ToolCall {
-            tool_name: name.to_owned(),
-            arguments: args.clone(),
-        })?;
         let executor = call.executor();
 
         if executor == ToolExecutor::RunCommand {

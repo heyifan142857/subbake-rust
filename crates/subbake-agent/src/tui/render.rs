@@ -36,6 +36,11 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
     };
     let processing = app.interaction_state.is_processing();
     let progress = app.progress.lock().ok().and_then(|value| value.clone());
+    let active_tool = app
+        .active_tool
+        .lock()
+        .ok()
+        .and_then(|activity| activity.clone());
     let ambient_spinner = spinner_frame(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -324,20 +329,39 @@ pub(super) fn draw(app: &mut SubBakeTui) -> io::Result<()> {
         frame.render_widget(Paragraph::new(suggestion_lines), chunks[0]);
 
         if progress_height > 0 {
-            let progress_text = progress
+            let activity = active_tool.as_ref().map(|active| {
+                crate::tool_presentation::running_activity(&active.name, &active.arguments)
+            });
+            let headline = activity.as_ref().map_or_else(
+                || "Working".to_owned(),
+                |activity| activity.headline.clone(),
+            );
+            let detail = progress
                 .as_ref()
                 .map(|(event, started)| format_progress(event, started.elapsed()))
-                .unwrap_or_else(|| format!("{ambient_spinner} Working"));
+                .or_else(|| activity.and_then(|activity| activity.detail))
+                .map_or_else(
+                    || "Esc cancel".to_owned(),
+                    |detail| format!("{detail} · Esc cancel"),
+                );
             frame.render_widget(
                 Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {ambient_spinner} "),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            headline,
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
                     Line::from(Span::styled(
-                        format!("⚡ {progress_text}"),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
-                        "  Esc cancel",
+                        format!("    {detail}"),
                         Style::default().fg(Color::DarkGray),
                     )),
                 ]),

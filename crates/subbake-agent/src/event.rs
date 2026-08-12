@@ -33,14 +33,34 @@ pub enum EventKind {
     AskUser {
         text: String,
     },
-    ToolCall {
+    ToolStarted {
+        call_id: String,
         tool_name: String,
-        arguments: serde_json::Value,
+        headline: String,
+        detail: Option<String>,
     },
-    ToolFailure {
+    ToolCompleted {
+        call_id: String,
         tool_name: String,
+        headline: String,
+        detail: Option<String>,
+        duration_ms: u64,
+    },
+    ToolFailed {
+        call_id: String,
+        tool_name: String,
+        headline: String,
+        detail: Option<String>,
         category: String,
         error: String,
+        duration_ms: u64,
+    },
+    ToolCancelled {
+        call_id: String,
+        tool_name: String,
+        headline: String,
+        detail: Option<String>,
+        duration_ms: u64,
     },
     FinalToolCall {
         tool_name: String,
@@ -111,8 +131,6 @@ pub struct PendingAgentTurn {
     pub input: String,
     #[serde(default)]
     pub dialogue: Option<String>,
-    #[serde(default)]
-    pub legacy_pending: Option<String>,
     pub effective_defaults: String,
     #[serde(default)]
     pub exchanges: Vec<PendingToolExchange>,

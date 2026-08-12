@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use subbake_agent::{
     AgentError, AgentResult, CancellationGuard, CancellationToken, ConfigEditorSnapshot,
-    ConfigFieldId, ConfigFieldView, ProfileChoice, StartupInfo, SubBakeTui, TuiAction,
-    TuiInteraction,
+    ConfigFieldId, ConfigFieldView, EngineObserver, ProfileChoice, StartupInfo, SubBakeTui,
+    TuiAction, TuiInteraction, TuiObserver,
 };
 
 const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
@@ -138,6 +138,13 @@ exit "$status"
     wait_for_action(&action_log, "SubmitText:after cancel", &transcript);
     wait_for_output(&transcript, b"worker recovered", STEP_TIMEOUT);
 
+    send_text(&writer, "inspect file");
+    send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "SubmitText:inspect file", &transcript);
+    wait_for_output(&transcript, b"Reading sample.srt", STEP_TIMEOUT);
+    wait_for_output(&transcript, b"Read sample.srt", STEP_TIMEOUT);
+    wait_for_output(&transcript, b"inspection complete", STEP_TIMEOUT);
+
     send_text(&writer, "/exit");
     send(&writer, ENTER_KEY);
     let status = wait_for_child(&mut child, &transcript);
@@ -174,6 +181,24 @@ exit "$status"
         count_subslice(&output, DSR_QUERY) > 0,
         "the PTY session must exercise a real DSR query"
     );
+    assert!(
+        !output
+            .windows("⚡".len())
+            .any(|window| window == "⚡".as_bytes()),
+        "tool activity must not use the lightning icon"
+    );
+    assert!(
+        !output
+            .windows(br#"{"path":"sample.srt"}"#.len())
+            .any(|window| window == br#"{"path":"sample.srt"}"#),
+        "tool arguments must not be rendered as JSON"
+    );
+    assert!(
+        !output
+            .windows(b"private subtitle body".len())
+            .any(|window| window == b"private subtitle body"),
+        "observation contents must not leak into the activity summary"
+    );
 
     let _ = std::fs::remove_dir_all(test_dir);
 }
@@ -198,9 +223,9 @@ fn pty_child_driver() {
     });
     tui.set_cancellation_token(cancellation);
 
-    tui.run(move |action, guard, _observer| {
+    tui.run(move |action, guard, observer| {
         append_action(&action_log, &action_label(&action))?;
-        scripted_interaction(action, &guard, &action_log)
+        scripted_interaction(action, &guard, &action_log, observer)
     })
     .expect("run TUI PTY scenario");
 }
@@ -209,6 +234,7 @@ fn scripted_interaction(
     action: TuiAction,
     guard: &CancellationGuard,
     action_log: &Path,
+    observer: &mut TuiObserver,
 ) -> AgentResult<TuiInteraction> {
     match action {
         TuiAction::TogglePlan => Ok(TuiInteraction::Message {
@@ -277,6 +303,21 @@ fn scripted_interaction(
         TuiAction::SubmitText(input) if input == "after cancel" => Ok(TuiInteraction::Message {
             message: "worker recovered".to_owned(),
         }),
+        TuiAction::SubmitText(input) if input == "inspect file" => {
+            let arguments = serde_json::json!({"path":"sample.srt"});
+            observer.on_tool_call("pty-read", "read_file_preview", &arguments);
+            thread::sleep(Duration::from_millis(200));
+            let outcome =
+                subbake_core::AgentToolOutcome::Observation(subbake_core::ObservationToolOutcome {
+                    status: subbake_core::ToolExecutionStatus::Observed,
+                    observation: "read_file_preview".to_owned(),
+                    content: "private subtitle body".to_owned(),
+                });
+            observer.on_tool_success("pty-read", "read_file_preview", &arguments, &outcome);
+            Ok(TuiInteraction::Message {
+                message: "inspection complete".to_owned(),
+            })
+        }
         unexpected => Err(AgentError::invalid_input(format!(
             "unexpected PTY test action: {unexpected:?}"
         ))),

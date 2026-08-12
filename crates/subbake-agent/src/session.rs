@@ -1,6 +1,6 @@
 // Agent session — event log (the source of truth for undo, replay, and resume).
 //
-// Version 1 of the persisted agent-session JSON contract. The session JSON
+// Version 2 of the persisted agent-session JSON contract. The session JSON
 // lives at `<project_root>/.subbake/agent/sessions/<id>.json`.
 
 use std::path::PathBuf;
@@ -10,27 +10,19 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, PendingPlan};
 
-pub const SESSION_VERSION: u64 = 1;
+pub const SESSION_VERSION: u64 = 2;
 
-/// An actionable request paused while the agent waits for a user-provided
-/// value, such as a source subtitle path. The string intent keeps this
-/// persisted contract independent from the in-memory tool registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingAction {
-    pub intent: String,
-    pub request: String,
-}
-
-/// Stable discriminants for the v1 wire-format event kinds. `Unknown` keeps
-/// older or future events readable without allowing ad-hoc comparisons in
-/// runtime logic.
+/// Stable discriminants for the v2 wire-format event kinds. `Unknown` keeps
+/// future events readable without allowing ad-hoc comparisons in runtime logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventTag {
     User,
     Assistant,
     AskUser,
-    ToolCall,
-    ToolFailure,
+    ToolStarted,
+    ToolCompleted,
+    ToolFailed,
+    ToolCancelled,
     FinalToolCall,
     FileOperation,
     Plan,
@@ -52,8 +44,10 @@ impl EventTag {
             "user" => Self::User,
             "assistant" => Self::Assistant,
             "ask_user" => Self::AskUser,
-            "tool_call" => Self::ToolCall,
-            "tool_failure" => Self::ToolFailure,
+            "tool_started" => Self::ToolStarted,
+            "tool_completed" => Self::ToolCompleted,
+            "tool_failed" => Self::ToolFailed,
+            "tool_cancelled" => Self::ToolCancelled,
             "final_tool_call" => Self::FinalToolCall,
             "file_operation" => Self::FileOperation,
             "plan" => Self::Plan,
@@ -71,8 +65,8 @@ impl EventTag {
     }
 }
 
-/// The persisted session mode. Serde keeps the v1 JSON representation as the
-/// existing lowercase string while preventing invalid in-memory modes.
+/// The persisted session mode. Serde keeps the compact JSON representation as a
+/// lowercase string while preventing invalid in-memory modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -110,22 +104,74 @@ impl AgentEvent {
             EventKind::User { text } => ("user", text.clone(), serde_json::json!({})),
             EventKind::Assistant { text } => ("assistant", text.clone(), serde_json::json!({})),
             EventKind::AskUser { text } => ("ask_user", text.clone(), serde_json::json!({})),
-            EventKind::ToolCall {
+            EventKind::ToolStarted {
+                call_id,
                 tool_name,
-                arguments,
+                headline,
+                detail,
             } => (
-                "tool_call",
+                "tool_started",
                 tool_name.clone(),
-                serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
+                serde_json::json!({
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "headline": headline,
+                    "detail": detail,
+                }),
             ),
-            EventKind::ToolFailure {
+            EventKind::ToolCompleted {
+                call_id,
                 tool_name,
+                headline,
+                detail,
+                duration_ms,
+            } => (
+                "tool_completed",
+                tool_name.clone(),
+                serde_json::json!({
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "headline": headline,
+                    "detail": detail,
+                    "duration_ms": duration_ms,
+                }),
+            ),
+            EventKind::ToolFailed {
+                call_id,
+                tool_name,
+                headline,
+                detail,
                 category,
                 error,
+                duration_ms,
             } => (
-                "tool_failure",
+                "tool_failed",
                 format!("{tool_name}: {error}"),
-                serde_json::json!({"tool_name": tool_name, "category": category}),
+                serde_json::json!({
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "headline": headline,
+                    "detail": detail,
+                    "category": category,
+                    "duration_ms": duration_ms,
+                }),
+            ),
+            EventKind::ToolCancelled {
+                call_id,
+                tool_name,
+                headline,
+                detail,
+                duration_ms,
+            } => (
+                "tool_cancelled",
+                tool_name.clone(),
+                serde_json::json!({
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "headline": headline,
+                    "detail": detail,
+                    "duration_ms": duration_ms,
+                }),
             ),
             EventKind::FinalToolCall {
                 tool_name,
@@ -174,7 +220,7 @@ impl AgentEvent {
         }
     }
 
-    /// Recover the typed runtime event while keeping unknown future v1 event
+    /// Recover the typed runtime event while keeping unknown future v2 event
     /// kinds readable through the persisted `AgentEvent` representation.
     pub fn typed(&self) -> Option<EventKind> {
         let string = |key: &str| self.data.get(key)?.as_str().map(str::to_owned);
@@ -188,23 +234,59 @@ impl AgentEvent {
             EventTag::AskUser => Some(EventKind::AskUser {
                 text: self.text.clone(),
             }),
-            EventTag::ToolCall => Some(EventKind::ToolCall {
+            EventTag::ToolStarted => Some(EventKind::ToolStarted {
+                call_id: string("call_id")?,
                 tool_name: string("tool_name")?,
-                arguments: self.data.get("arguments")?.clone(),
+                headline: string("headline")?,
+                detail: self
+                    .data
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            }),
+            EventTag::ToolCompleted => Some(EventKind::ToolCompleted {
+                call_id: string("call_id")?,
+                tool_name: string("tool_name")?,
+                headline: string("headline")?,
+                detail: self
+                    .data
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                duration_ms: self.data.get("duration_ms")?.as_u64()?,
             }),
             EventTag::FinalToolCall => Some(EventKind::FinalToolCall {
                 tool_name: string("tool_name")?,
                 arguments: self.data.get("arguments")?.clone(),
             }),
-            EventTag::ToolFailure => {
+            EventTag::ToolFailed => {
                 let tool_name = string("tool_name")?;
                 let prefix = format!("{tool_name}: ");
-                Some(EventKind::ToolFailure {
+                Some(EventKind::ToolFailed {
+                    call_id: string("call_id")?,
                     tool_name,
+                    headline: string("headline")?,
+                    detail: self
+                        .data
+                        .get("detail")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                     category: string("category")?,
                     error: self.text.strip_prefix(&prefix)?.to_owned(),
+                    duration_ms: self.data.get("duration_ms")?.as_u64()?,
                 })
             }
+            EventTag::ToolCancelled => Some(EventKind::ToolCancelled {
+                call_id: string("call_id")?,
+                tool_name: string("tool_name")?,
+                headline: string("headline")?,
+                detail: self
+                    .data
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                duration_ms: self.data.get("duration_ms")?.as_u64()?,
+            }),
             EventTag::FileOperation => serde_json::from_value(self.data.clone())
                 .ok()
                 .map(EventKind::FileOperation),
@@ -249,8 +331,6 @@ pub struct AgentSession {
     pub pending_command_approval: Option<PendingCommandApproval>,
     #[serde(default)]
     pub pending_agent_turn: Option<PendingAgentTurn>,
-    #[serde(default)]
-    pub pending_action: Option<PendingAction>,
     pub events: Vec<AgentEvent>,
 }
 
@@ -271,7 +351,6 @@ impl AgentSession {
             pending_plan: None,
             pending_command_approval: None,
             pending_agent_turn: None,
-            pending_action: None,
             events: Vec::new(),
         }
     }
@@ -315,6 +394,12 @@ impl AgentSessionStore {
 
     pub fn save(&self, session: &AgentSession) -> AgentResult<()> {
         let path = self.path_for(&session.id);
+        if session.version != SESSION_VERSION {
+            return Err(AgentError::invalid_state(format!(
+                "cannot save session version {}; expected version {SESSION_VERSION}",
+                session.version
+            )));
+        }
         if session.events.is_empty() {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -360,14 +445,22 @@ impl AgentSessionStore {
         let path = self.path_for(id);
         let json = std::fs::read_to_string(&path).map_err(|source| AgentError::SessionStorage {
             operation: "read session",
-            path: Some(path),
+            path: Some(path.clone()),
             source,
         })?;
-        serde_json::from_str(&json).map_err(|source| AgentError::SessionData {
-            operation: "parse session",
-            path: self.path_for(id),
-            source,
-        })
+        let session: AgentSession =
+            serde_json::from_str(&json).map_err(|source| AgentError::SessionData {
+                operation: "parse session",
+                path: path.clone(),
+                source,
+            })?;
+        if session.version != SESSION_VERSION {
+            return Err(AgentError::invalid_state(format!(
+                "session `{id}` uses unsupported version {}; expected version {SESSION_VERSION}",
+                session.version
+            )));
+        }
+        Ok(session)
     }
 
     pub fn latest(&self) -> AgentResult<Option<AgentSession>> {
@@ -477,13 +570,13 @@ mod tests {
     }
 
     #[test]
-    fn session_mode_keeps_the_v1_string_wire_shape() {
+    fn session_mode_keeps_the_v2_string_wire_shape() {
         assert_eq!(
             serde_json::to_value(SessionMode::Plan).expect("serialize mode"),
             serde_json::json!("plan")
         );
         assert_eq!(
-            serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read v1 mode"),
+            serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read v2 mode"),
             SessionMode::Chat
         );
     }
@@ -509,86 +602,28 @@ mod tests {
     }
 
     #[test]
-    fn reads_v1_session_without_pending_action() {
-        let session = AgentSession::new("old-session".to_owned());
-        let mut value = serde_json::to_value(session).expect("serialize session");
-        value
-            .as_object_mut()
-            .expect("session object")
-            .remove("pending_action");
+    fn rejects_an_older_session_version() {
+        let dir = std::env::temp_dir().join(format!("subbake-agent-old-version-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+        let mut session = store.create().expect("create session");
+        session.record_event("user", "old", serde_json::json!({}));
+        session.version = 1;
+        let path = store.path_for(&session.id);
+        std::fs::create_dir_all(path.parent().expect("session directory"))
+            .expect("create session directory");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&session).expect("serialize old session"),
+        )
+        .expect("write old session fixture");
 
-        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
+        let error = store
+            .load(&session.id)
+            .expect_err("old session versions must be rejected");
+        assert!(error.to_string().contains("unsupported version 1"));
+        assert!(error.to_string().contains("expected version 2"));
 
-        assert!(loaded.pending_action.is_none());
-    }
-
-    #[test]
-    fn reads_v1_session_without_pending_command_approval() {
-        let session = AgentSession::new("old-session".to_owned());
-        let mut value = serde_json::to_value(session).expect("serialize session");
-        value
-            .as_object_mut()
-            .expect("session object")
-            .remove("pending_command_approval");
-
-        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
-
-        assert!(loaded.pending_command_approval.is_none());
-    }
-
-    #[test]
-    fn reads_v1_session_without_pending_agent_turn() {
-        let session = AgentSession::new("old-session".to_owned());
-        let mut value = serde_json::to_value(session).expect("serialize session");
-        value
-            .as_object_mut()
-            .expect("session object")
-            .remove("pending_agent_turn");
-
-        let loaded: AgentSession = serde_json::from_value(value).expect("read v1 session");
-
-        assert!(loaded.pending_agent_turn.is_none());
-    }
-
-    #[test]
-    fn reads_legacy_command_approval_without_call_id() {
-        let mut session = AgentSession::new("old-session".to_owned());
-        session.pending_command_approval = Some(PendingCommandApproval {
-            tool_call: crate::event::ToolCallDraft {
-                tool_name: "run_command".to_owned(),
-                arguments: serde_json::json!({"command":"printf hello"}),
-            },
-            call_id: "old-call".to_owned(),
-            remaining_tool_calls: Vec::new(),
-            reason: "legacy approval".to_owned(),
-            created_at: "2026-07-21T00:00:00Z".to_owned(),
-        });
-        let mut value = serde_json::to_value(session).expect("serialize session");
-        value["pending_command_approval"]
-            .as_object_mut()
-            .expect("pending approval")
-            .remove("call_id");
-        value["pending_command_approval"]
-            .as_object_mut()
-            .expect("pending approval")
-            .remove("remaining_tool_calls");
-
-        let loaded: AgentSession = serde_json::from_value(value).expect("read legacy approval");
-
-        let pending = loaded.pending_command_approval.expect("pending approval");
-        assert_eq!(pending.call_id, "");
-        assert!(pending.remaining_tool_calls.is_empty());
-    }
-
-    #[test]
-    fn reads_legacy_pending_turn_without_aggregate_failure_counts() {
-        let pending: crate::event::PendingAgentTurn = serde_json::from_value(serde_json::json!({
-            "input":"continue",
-            "effective_defaults":"defaults"
-        }))
-        .expect("read legacy pending turn");
-
-        assert!(pending.aggregate_failure_counts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -662,14 +697,27 @@ mod tests {
     }
 
     #[test]
-    fn typed_events_round_trip_through_the_v1_wire_shape() {
-        let original = EventKind::ToolCall {
+    fn typed_tool_lifecycle_round_trips_through_the_v2_wire_shape() {
+        let started = EventKind::ToolStarted {
+            call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),
-            arguments: serde_json::json!({"path":"sample.srt"}),
+            headline: "Reading sample.srt".to_owned(),
+            detail: None,
         };
-        let persisted = AgentEvent::from_kind(&original);
-        assert_eq!(persisted.kind, "tool_call");
-        assert_eq!(persisted.typed(), Some(original));
+        let persisted = AgentEvent::from_kind(&started);
+        assert_eq!(persisted.kind, "tool_started");
+        assert_eq!(persisted.typed(), Some(started));
+
+        let completed = EventKind::ToolCompleted {
+            call_id: "call-1".to_owned(),
+            tool_name: "read_file".to_owned(),
+            headline: "Read sample.srt".to_owned(),
+            detail: Some("1 line · 0.0s".to_owned()),
+            duration_ms: 42,
+        };
+        let persisted = AgentEvent::from_kind(&completed);
+        assert_eq!(persisted.kind, "tool_completed");
+        assert_eq!(persisted.typed(), Some(completed));
 
         let future = AgentEvent {
             kind: "future_event".to_owned(),

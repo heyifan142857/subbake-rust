@@ -6,7 +6,7 @@
 //! ┌─────────────────────────────────┐
 //! │  Terminal-native scrollback     │
 //! │  [You] translate hello.srt      │
-//! │  ⚡ translate_file ✓             │
+//! │  ✓ Translated hello.srt          │
 //! │  ➔ Translated: out.srt          │
 //! │  ...                            │
 //! ├─────────────────────────────────┤
@@ -42,6 +42,7 @@ mod render;
 mod terminal;
 mod worker;
 
+use history::ActiveTool;
 pub use history::{Msg, MsgStyle, MsgView, TuiObserver};
 use progress::format_progress;
 pub use protocol::{ConfigApplyAfter, StartupInfo, TuiAction, TuiInteraction};
@@ -73,6 +74,7 @@ pub struct SubBakeTui {
     overlay_terminal: Option<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
+    active_tool: std::sync::Arc<std::sync::Mutex<Option<ActiveTool>>>,
     input: InputEditor,
     input_history: Vec<String>,
     running: bool,
@@ -106,6 +108,7 @@ impl SubBakeTui {
             // items for this process lifetime so the commit cursor stays stable.
             msg_view: std::sync::Arc::new(std::sync::Mutex::new(MsgView::new(usize::MAX))),
             progress: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            active_tool: std::sync::Arc::new(std::sync::Mutex::new(None)),
             input: InputEditor::default(),
             input_history: Vec::new(),
             running: true,
@@ -143,7 +146,11 @@ impl SubBakeTui {
     }
 
     pub fn observer(&self) -> TuiObserver {
-        TuiObserver::new(self.msg_view.clone(), self.progress.clone())
+        TuiObserver::new(
+            self.msg_view.clone(),
+            self.progress.clone(),
+            self.active_tool.clone(),
+        )
     }
 
     pub fn set_cancellation_token(&mut self, token: CancellationToken) {
@@ -164,7 +171,7 @@ impl SubBakeTui {
         let marker = match event.state {
             TaskState::Completed => "✓",
             TaskState::Cancelled => "■",
-            TaskState::Failed => "✖",
+            TaskState::Failed => "×",
             _ => return,
         };
         if let Ok(mut view) = self.msg_view.lock() {
@@ -188,6 +195,17 @@ impl SubBakeTui {
                     "──────── resumed session ────────".to_owned(),
                 );
             }
+            let finished_calls = events
+                .iter()
+                .filter_map(|event| match event.typed() {
+                    Some(
+                        crate::event::EventKind::ToolCompleted { call_id, .. }
+                        | crate::event::EventKind::ToolFailed { call_id, .. }
+                        | crate::event::EventKind::ToolCancelled { call_id, .. },
+                    ) => Some(call_id),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
             for event in events {
                 let (style, text) = match event.tag() {
                     crate::session::EventTag::User => (
@@ -197,17 +215,81 @@ impl SubBakeTui {
                     crate::session::EventTag::Assistant | crate::session::EventTag::AskUser => {
                         (MsgStyle::Response, format!("➔ {}", event.text))
                     }
-                    crate::session::EventTag::ToolCall => {
-                        (MsgStyle::ToolCall, format!("⚡ {}", event.text))
+                    crate::session::EventTag::ToolStarted => {
+                        let Some(crate::event::EventKind::ToolStarted {
+                            call_id,
+                            headline,
+                            detail,
+                            ..
+                        }) = event.typed()
+                        else {
+                            continue;
+                        };
+                        if finished_calls.contains(&call_id) {
+                            continue;
+                        }
+                        let activity =
+                            crate::tool_presentation::ToolActivityText { headline, detail };
+                        (
+                            MsgStyle::ToolCancelled,
+                            format_activity_message("■", activity, Some("interrupted")),
+                        )
                     }
-                    crate::session::EventTag::FileOperation => {
-                        (MsgStyle::Observation, format!("◀ {}", event.text))
+                    crate::session::EventTag::ToolCompleted => {
+                        let Some(crate::event::EventKind::ToolCompleted {
+                            headline, detail, ..
+                        }) = event.typed()
+                        else {
+                            continue;
+                        };
+                        let activity =
+                            crate::tool_presentation::ToolActivityText { headline, detail };
+                        (
+                            MsgStyle::ToolCall,
+                            format_activity_message("✓", activity, None),
+                        )
                     }
+                    crate::session::EventTag::FileOperation => continue,
                     crate::session::EventTag::Plan => {
                         (MsgStyle::System, format!("Plan: {}", event.text))
                     }
-                    crate::session::EventTag::ToolFailure | crate::session::EventTag::Error => {
-                        (MsgStyle::Error, format!("✖ {}", event.text))
+                    crate::session::EventTag::ToolFailed => {
+                        let Some(crate::event::EventKind::ToolFailed {
+                            headline, detail, ..
+                        }) = event.typed()
+                        else {
+                            continue;
+                        };
+                        let activity =
+                            crate::tool_presentation::ToolActivityText { headline, detail };
+                        (
+                            MsgStyle::ToolFailure,
+                            format_activity_message("×", activity, None),
+                        )
+                    }
+                    crate::session::EventTag::ToolCancelled => {
+                        let Some(crate::event::EventKind::ToolCancelled {
+                            headline,
+                            detail,
+                            duration_ms,
+                            ..
+                        }) = event.typed()
+                        else {
+                            continue;
+                        };
+                        let activity =
+                            crate::tool_presentation::ToolActivityText { headline, detail };
+                        (
+                            MsgStyle::ToolCancelled,
+                            format_activity_message(
+                                "■",
+                                activity,
+                                Some(&format!("cancelled · {:.1}s", duration_ms as f64 / 1000.0)),
+                            ),
+                        )
+                    }
+                    crate::session::EventTag::Error => {
+                        (MsgStyle::Error, format!("× {}", event.text))
                     }
                     crate::session::EventTag::Cancelled => {
                         (MsgStyle::System, "Cancelled.".to_owned())
@@ -542,20 +624,70 @@ fn terminal_width(value: &str) -> u16 {
 }
 
 fn message_lines(message: &Msg) -> Vec<Line<'static>> {
+    match message.style {
+        MsgStyle::ToolCall => return tool_message_lines(&message.text, "✓", Color::Green),
+        MsgStyle::ToolFailure => return tool_message_lines(&message.text, "×", Color::Red),
+        MsgStyle::ToolCancelled => return tool_message_lines(&message.text, "■", Color::Blue),
+        _ => {}
+    }
     let style = match message.style {
         MsgStyle::User => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
-        MsgStyle::ToolCall => Style::default().fg(Color::Green),
         MsgStyle::Observation => Style::default().fg(Color::DarkGray),
         MsgStyle::Response => Style::default().fg(Color::White),
         MsgStyle::Error => Style::default().fg(Color::Red),
         MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
+        MsgStyle::ToolCall | MsgStyle::ToolFailure | MsgStyle::ToolCancelled => unreachable!(),
     };
     message
         .text
         .split('\n')
         .map(|line| Line::from(Span::styled(line.to_owned(), style)))
+        .collect()
+}
+
+fn format_activity_message(
+    marker: &str,
+    activity: crate::tool_presentation::ToolActivityText,
+    override_detail: Option<&str>,
+) -> String {
+    override_detail
+        .map(str::to_owned)
+        .or(activity.detail)
+        .map_or_else(
+            || format!("  {marker} {}", activity.headline),
+            |detail| format!("  {marker} {}\n    {detail}", activity.headline),
+        )
+}
+
+fn tool_message_lines(text: &str, marker: &str, marker_color: Color) -> Vec<Line<'static>> {
+    text.split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if index > 0 {
+                return Line::from(Span::styled(
+                    line.to_owned(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let prefix = format!("  {marker} ");
+            let headline = line.strip_prefix(&prefix).unwrap_or(line).to_owned();
+            Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(marker_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    headline,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+        })
         .collect()
 }
 
@@ -984,19 +1116,43 @@ mod tests {
     }
 
     #[test]
-    fn file_preview_observation_is_not_added_to_visible_history() {
+    fn file_preview_result_is_summarized_without_its_contents() {
         use crate::engine::EngineObserver;
         let view = std::sync::Arc::new(std::sync::Mutex::new(super::MsgView::new(10)));
         let progress = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let mut observer = super::TuiObserver::new(view.clone(), progress);
+        let active_tool = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut observer = super::TuiObserver::new(view.clone(), progress, active_tool.clone());
         observer.on_tool_call(
+            "call-1",
             "read_file_preview",
             &serde_json::json!({"path":"sample.srt"}),
         );
-        observer.on_observation("subtitle body");
+        assert!(view.lock().expect("view").all().is_empty());
+        assert_eq!(
+            active_tool
+                .lock()
+                .expect("active tool")
+                .as_ref()
+                .map(|activity| activity.name.as_str()),
+            Some("read_file_preview")
+        );
+        let outcome =
+            subbake_core::AgentToolOutcome::Observation(subbake_core::ObservationToolOutcome {
+                status: subbake_core::ToolExecutionStatus::Observed,
+                observation: "read_file_preview".to_owned(),
+                content: "subtitle body".to_owned(),
+            });
+        observer.on_tool_success(
+            "call-1",
+            "read_file_preview",
+            &serde_json::json!({"path":"sample.srt"}),
+            &outcome,
+        );
         let messages = view.lock().expect("view");
         assert_eq!(messages.all().len(), 1);
+        assert!(messages.all()[0].text.contains("Read sample.srt"));
         assert!(!messages.all()[0].text.contains("subtitle body"));
+        assert!(active_tool.lock().expect("active tool").is_none());
     }
 
     #[test]
