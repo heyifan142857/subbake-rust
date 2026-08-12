@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "plan-approval-and-undo",
+  "description": "A planned mutation waits for approval, executes once, and participates in undo.",
+  "initial_files": [
+    { "path": "old.txt", "content": "old\n" }
+  ],
+  "steps": [
+    { "action": "set_plan_mode", "enabled": true },
+    {
+      "action": "user",
+      "input": "更新 old.txt 并添加 new.txt",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "apply_patch",
+          "arguments": {
+            "patch": "*** Begin Patch\n*** Add File: new.txt\n+new\n*** Update File: old.txt\n-old\n+changed\n*** End Patch"
+          }
+        }
+      ]
+    },
+    { "action": "plan_decision", "decision": "approve" },
+    { "action": "undo" }
+  ],
+  "expectations": {
+    "final_response_contains": ["Undone"],
+    "required_calls": [
+      {
+        "name": "apply_patch",
+        "status": "succeeded",
+        "max_count": 1
+      }
+    ],
+    "tool_sequence": ["apply_patch"],
+    "required_events": ["plan", "approve", "undo"],
+    "files": [
+      { "path": "old.txt", "equals": "old\n" },
+      { "path": "new.txt", "exists": false }
+    ],
+    "max_tool_calls": 1,
+    "max_model_steps": 1,
+    "step_limit_reached": false
+  }
+}

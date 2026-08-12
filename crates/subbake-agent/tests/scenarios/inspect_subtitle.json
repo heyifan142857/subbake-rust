@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "id": "inspect-subtitle-before-answering",
+  "description": "The agent inspects the workspace and requested subtitle without mutating it.",
+  "initial_files": [
+    {
+      "path": "episode.srt",
+      "content": "1\n00:00:00,000 --> 00:00:01,000\nHello world\n"
+    }
+  ],
+  "steps": [
+    {
+      "action": "user",
+      "input": "检查 episode.srt 里有什么，不要修改文件",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "list_files",
+          "arguments": { "path": "." }
+        },
+        {
+          "action": "tool_call",
+          "tool_name": "read_file_preview",
+          "arguments": { "path": "episode.srt" }
+        },
+        {
+          "action": "respond",
+          "text": "episode.srt contains one subtitle entry and was not modified."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["not modified"],
+    "required_calls": [
+      {
+        "name": "list_files",
+        "arguments": { "path": "." },
+        "status": "succeeded",
+        "max_count": 1
+      },
+      {
+        "name": "read_file_preview",
+        "arguments": { "path": "episode.srt" },
+        "status": "succeeded",
+        "max_count": 1
+      }
+    ],
+    "forbidden_tools": ["apply_patch", "delete_file", "run_command"],
+    "tool_sequence": ["list_files", "read_file_preview"],
+    "files": [
+      {
+        "path": "episode.srt",
+        "equals": "1\n00:00:00,000 --> 00:00:01,000\nHello world\n"
+      }
+    ],
+    "max_tool_calls": 2,
+    "max_model_steps": 3,
+    "step_limit_reached": false
+  }
+}

@@ -919,6 +919,8 @@ impl<'a> ValidatedToolCall<'a> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -928,6 +930,43 @@ mod tests {
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"run_command"));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_unknown_arguments_are_rejected(argument in "zz_[a-z0-9_]{1,24}") {
+            let error = validate_tool_call(
+                "list_files",
+                &serde_json::json!({argument: "value"}),
+            )
+            .expect_err("generated argument is not in the list_files schema");
+            let is_unexpected_argument = matches!(
+                error,
+                ToolValidationError::UnexpectedArgument { .. }
+            );
+            prop_assert!(is_unexpected_argument);
+        }
+
+        #[test]
+        fn valid_output_aliases_survive_schema_validation(
+            first in "[A-Za-z]",
+            suffix in "[A-Za-z0-9_]{0,20}",
+        ) {
+            let alias = format!("{first}{suffix}");
+            let arguments = serde_json::json!({
+                "command": "printf artifact",
+                "outputs": {alias: "artifact.txt"}
+            });
+            prop_assert!(validate_tool_call("run_command", &arguments).is_ok());
+        }
+
+        #[test]
+        fn path_traversal_arguments_do_not_bypass_the_file_guard(name in "[A-Za-z0-9_-]{1,32}") {
+            let root = std::env::temp_dir().join(format!("subbake-proptest-{}", std::process::id()));
+            let guard = crate::guard::FileGuard::new(root);
+            let traversal = format!("../{name}");
+            prop_assert!(guard.resolve_path(std::path::Path::new(&traversal)).is_err());
+        }
     }
 
     #[test]

@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "id": "live-translate-explicit-output",
+  "description": "The live decision model selects translation with explicit language and output arguments.",
+  "initial_files": [
+    {
+      "path": "episode.srt",
+      "content": "1\n00:00:00,000 --> 00:00:01,000\nHello world\n"
+    }
+  ],
+  "steps": [
+    {
+      "action": "user",
+      "input": "把 episode.srt 翻译成日语，结果必须写到 result.srt。直接完成，不要只告诉我命令。",
+      "decisions": []
+    }
+  ],
+  "expectations": {
+    "required_calls": [
+      {
+        "name": "translate_file",
+        "arguments": {
+          "path": "episode.srt",
+          "output_path": "result.srt"
+        },
+        "status": "succeeded",
+        "max_count": 1
+      }
+    ],
+    "forbidden_tools": ["transcribe_audio", "run_command", "apply_patch"],
+    "files": [
+      {
+        "path": "result.srt",
+        "contains": ["[MOCK-ja] Hello world"]
+      }
+    ],
+    "max_tool_calls": 3,
+    "max_model_steps": 5,
+    "step_limit_reached": false
+  }
+}

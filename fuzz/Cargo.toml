@@ -1,0 +1,31 @@
+[package]
+name = "subbake-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+subbake-agent = { path = "../crates/subbake-agent" }
+subbake-core = { path = "../crates/subbake-core" }
+
+[[bin]]
+name = "subtitle_parsers"
+path = "fuzz_targets/subtitle_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_tool_validation"
+path = "fuzz_targets/agent_tool_validation.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

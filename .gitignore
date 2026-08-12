@@ -2,3 +2,6 @@ AGENTS.md
 target/
 .subbake/
 **/*.rs.bk
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/Cargo.lock

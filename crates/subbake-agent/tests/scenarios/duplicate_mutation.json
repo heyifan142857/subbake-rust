@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "id": "duplicate-mutation-is-not-replayed",
+  "description": "The loop rejects an identical successful mutation within one task.",
+  "initial_files": [],
+  "steps": [
+    {
+      "action": "user",
+      "input": "创建 created.txt，并确保只创建一次",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "apply_patch",
+          "arguments": {
+            "patch": "*** Begin Patch\n*** Add File: created.txt\n+created once\n*** End Patch"
+          }
+        },
+        {
+          "action": "tool_call",
+          "tool_name": "apply_patch",
+          "arguments": {
+            "patch": "*** Begin Patch\n*** Add File: created.txt\n+created once\n*** End Patch"
+          }
+        },
+        {
+          "action": "respond",
+          "text": "created.txt was created exactly once."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["exactly once"],
+    "required_calls": [
+      {
+        "name": "apply_patch",
+        "status": "succeeded",
+        "min_count": 1,
+        "max_count": 1
+      },
+      {
+        "name": "apply_patch",
+        "status": "failed",
+        "min_count": 1,
+        "max_count": 1
+      }
+    ],
+    "tool_sequence": ["apply_patch", "apply_patch"],
+    "files": [
+      { "path": "created.txt", "equals": "created once\n" }
+    ],
+    "max_tool_calls": 2,
+    "max_model_steps": 3,
+    "step_limit_reached": false
+  }
+}

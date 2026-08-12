@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "id": "recover-from-unknown-tool",
+  "description": "An invalid model tool choice becomes feedback and the same turn recovers.",
+  "initial_files": [],
+  "steps": [
+    {
+      "action": "user",
+      "input": "列出当前目录",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "invent_subtitles",
+          "arguments": {}
+        },
+        {
+          "action": "tool_call",
+          "tool_name": "list_files",
+          "arguments": { "path": "." }
+        },
+        {
+          "action": "respond",
+          "text": "Recovered and listed the directory."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["Recovered"],
+    "required_calls": [
+      {
+        "name": "invent_subtitles",
+        "status": "failed",
+        "max_count": 1
+      },
+      {
+        "name": "list_files",
+        "arguments": { "path": "." },
+        "status": "succeeded",
+        "max_count": 1
+      }
+    ],
+    "tool_sequence": ["invent_subtitles", "list_files"],
+    "max_tool_calls": 2,
+    "max_model_steps": 3,
+    "step_limit_reached": false
+  }
+}

@@ -4,6 +4,7 @@ pub mod decision;
 mod discovery;
 pub mod engine;
 pub mod error;
+pub mod evaluation;
 pub mod event;
 pub mod guard;
 mod input_editor;

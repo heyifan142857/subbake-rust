@@ -149,6 +149,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+交互式 Agent 另有数据驱动的确定性场景、可选真实模型回归、属性测试和 fuzz
+入口。评测用例格式、运行方法及质量门槛见
+[`docs/agent-evaluation.md`](docs/agent-evaluation.md)。
+
 ## License
 
 GNU General Public License v3.0（GPL-3.0-only）

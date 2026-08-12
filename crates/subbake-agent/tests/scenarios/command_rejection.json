@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "id": "command-rejection-preserves-workspace",
+  "description": "A command requiring approval is rejected before execution and the model continues.",
+  "initial_files": [],
+  "steps": [
+    {
+      "action": "user",
+      "input": "运行一个复杂 shell 命令",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "run_command",
+          "arguments": {
+            "command": "printf forbidden | tee forbidden.txt"
+          }
+        }
+      ]
+    },
+    {
+      "action": "command_decision",
+      "decision": "reject",
+      "decisions": [
+        {
+          "action": "respond",
+          "text": "The command was not run because the user rejected it."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["not run", "rejected"],
+    "forbidden_tools": ["run_command"],
+    "required_events": ["command_approval_requested", "command_rejected"],
+    "forbidden_events": ["tool_completed"],
+    "files": [
+      { "path": "forbidden.txt", "exists": false }
+    ],
+    "max_tool_calls": 0,
+    "max_model_steps": 2,
+    "step_limit_reached": false
+  }
+}
