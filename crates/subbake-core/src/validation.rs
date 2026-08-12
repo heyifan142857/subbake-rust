@@ -189,8 +189,8 @@ fn validate_final_segment(
         issues.push(format!("line {} has a formatting mismatch", source.id));
     }
 
-    let source_facts = factual_tokens(&source.text);
-    let translated_facts = factual_tokens(&translated.text);
+    let (source_facts, translated_facts) =
+        comparable_factual_tokens(&source.text, &translated.text);
     if source_facts != translated_facts {
         issues.push(format!(
             "line {} changes numbers, dates, amounts, or percentages (expected {}, got {})",
@@ -247,8 +247,36 @@ fn validate_final_segment(
     }
 }
 
-fn factual_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
+#[derive(Debug, Default)]
+struct FactualTokens {
+    strong: Vec<String>,
+    weak: Vec<String>,
+}
+
+fn comparable_factual_tokens(source: &str, translated: &str) -> (Vec<String>, Vec<String>) {
+    let source = factual_tokens(source);
+    let translated = factual_tokens(translated);
+    let mut source_strong = source.strong;
+    let mut translated_strong = translated.strong;
+    promote_matching_weak(&mut source_strong, &source.weak, &translated_strong);
+    promote_matching_weak(&mut translated_strong, &translated.weak, &source_strong);
+    source_strong.sort();
+    translated_strong.sort();
+    (source_strong, translated_strong)
+}
+
+fn promote_matching_weak(strong: &mut Vec<String>, weak: &[String], opposite: &[String]) {
+    for token in weak {
+        let expected = opposite.iter().filter(|value| *value == token).count();
+        let present = strong.iter().filter(|value| *value == token).count();
+        if present < expected {
+            strong.push(token.clone());
+        }
+    }
+}
+
+fn factual_tokens(text: &str) -> FactualTokens {
+    let mut tokens = FactualTokens::default();
     let characters = text.chars().collect::<Vec<_>>();
     let mut index = 0;
     while index < characters.len() {
@@ -271,6 +299,25 @@ fn factual_tokens(text: &str) -> Vec<String> {
                 digits.extend(characters[group_start..group_end].iter());
                 index = group_end;
             }
+            if digits.len() == 1 {
+                let mut sequence = digits.clone();
+                let mut sequence_end = index;
+                while sequence_end + 1 < characters.len()
+                    && characters[sequence_end] == '-'
+                    && characters[sequence_end + 1].is_ascii_digit()
+                    && characters
+                        .get(sequence_end + 2)
+                        .is_none_or(|character| !character.is_ascii_digit())
+                {
+                    sequence.push(characters[sequence_end + 1]);
+                    sequence_end += 2;
+                }
+                if sequence.len() > 1 {
+                    push_scaled_digits(&mut tokens.strong, &sequence, 1);
+                    index = sequence_end;
+                    continue;
+                }
+            }
             let mut multiplier = 1_u128;
             let mut suffix_start = index;
             while suffix_start < characters.len() && characters[suffix_start].is_whitespace() {
@@ -280,7 +327,7 @@ fn factual_tokens(text: &str) -> Vec<String> {
                 multiplier = scale;
                 index = suffix_end;
             }
-            push_scaled_digits(&mut tokens, &digits, multiplier);
+            push_scaled_digits(&mut tokens.strong, &digits, multiplier);
             continue;
         }
         if is_cjk_numeral(character) {
@@ -291,13 +338,35 @@ fn factual_tokens(text: &str) -> Vec<String> {
             if start > 0 && characters[start - 1] == '第' {
                 continue;
             }
+            // A single CJK digit is commonly part of an article, pronoun, or
+            // idiom (一个, 之一, 一天) rather than a hard numeric fact. Treat
+            // it like a standalone English zero-to-nine word and leave exact
+            // digits plus compound/scaled number expressions as strong facts.
+            if index - start == 1 && cjk_digit(characters[start]).is_some() {
+                if let Some(value) = parse_cjk_number(&characters[start..index]) {
+                    tokens.weak.push(value.to_string());
+                }
+                continue;
+            }
             if index - start == 1
-                && !single_cjk_numeral_has_numeric_context(&characters, start, index)
+                && matches!(characters[start], '十' | '百' | '千' | '万' | '亿')
+                && start > 0
+                && matches!(characters[start - 1], '数' | '几')
             {
                 continue;
             }
             if let Some(value) = parse_cjk_number(&characters[start..index]) {
-                tokens.push(value.to_string());
+                let pure_repeated_digits = characters[start..index]
+                    .iter()
+                    .all(|character| cjk_digit(*character).is_some())
+                    && characters[start..index]
+                        .windows(2)
+                        .all(|pair| pair[0] == pair[1]);
+                if pure_repeated_digits {
+                    tokens.weak.push(value.to_string());
+                } else {
+                    tokens.strong.push(value.to_string());
+                }
             }
             continue;
         }
@@ -312,12 +381,13 @@ fn factual_tokens(text: &str) -> Vec<String> {
             _ => None,
         };
         if let Some(marker) = marker {
-            tokens.push(marker.to_owned());
+            tokens.strong.push(marker.to_owned());
         }
         index += 1;
     }
-    tokens.extend(english_number_tokens(text));
-    tokens.sort();
+    let english = english_number_tokens(text);
+    tokens.strong.extend(english.strong);
+    tokens.weak.extend(english.weak);
     tokens
 }
 
@@ -395,35 +465,6 @@ fn is_cjk_numeral(character: char) -> bool {
     )
 }
 
-fn single_cjk_numeral_has_numeric_context(characters: &[char], start: usize, end: usize) -> bool {
-    start.checked_sub(1).and_then(|index| characters.get(index)) == Some(&'之')
-        || characters.get(end).is_some_and(|character| {
-            matches!(
-                character,
-                '年' | '月'
-                    | '日'
-                    | '天'
-                    | '岁'
-                    | '个'
-                    | '次'
-                    | '度'
-                    | '元'
-                    | '块'
-                    | '名'
-                    | '人'
-                    | '件'
-                    | '台'
-                    | '架'
-                    | '艘'
-                    | '米'
-                    | '秒'
-                    | '分'
-                    | '点'
-                    | '号'
-            )
-        })
-}
-
 fn parse_cjk_number(characters: &[char]) -> Option<u128> {
     if characters.is_empty() {
         return None;
@@ -481,13 +522,15 @@ fn cjk_digit(character: char) -> Option<u128> {
     }
 }
 
-fn english_number_tokens(text: &str) -> Vec<String> {
+fn english_number_tokens(text: &str) -> FactualTokens {
     let words = text
-        .split(|character: char| !character.is_ascii_alphabetic())
+        // Keep digit-only tokens as boundaries so `a 12 million` does not
+        // look like the article-plus-scale expression `a million`.
+        .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    let mut tokens = Vec::new();
+    let mut tokens = FactualTokens::default();
     let mut index = 0;
     while index < words.len() {
         let Some(_) = english_number_value(&words[index]) else {
@@ -499,11 +542,25 @@ fn english_number_tokens(text: &str) -> Vec<String> {
             index += 1;
         }
         let phrase = &words[start..index];
-        if phrase.len() == 1 && english_scale(&phrase[0]).is_some() {
-            continue;
+        if phrase.len() == 1 {
+            if let Some(scale) = english_scale(&phrase[0]) {
+                if start > 0 && matches!(words[start - 1].as_str(), "a" | "an") {
+                    tokens.strong.push(scale.to_string());
+                }
+                continue;
+            }
+            if english_number_value(&phrase[0]).is_some_and(|value| value < 10) {
+                // Standalone small number words are too ambiguous in natural
+                // dialogue (one more, one of, split in two, "oh"). Numeric
+                // sequences such as Zero-One remain strong facts.
+                if let Some(value) = parse_english_number(phrase) {
+                    tokens.weak.push(value.to_string());
+                }
+                continue;
+            }
         }
         if let Some(value) = parse_english_number(phrase) {
-            tokens.push(value.to_string());
+            tokens.strong.push(value.to_string());
         }
     }
     tokens
@@ -729,6 +786,98 @@ mod tests {
             FinalValidationPolicy::default(),
         )
         .expect("semantically equal number expressions should pass");
+    }
+
+    #[test]
+    fn final_validation_ignores_ambiguous_small_number_words_and_cjk_articles() {
+        let pairs = [
+            (
+                "This is Coast Guard 6510. We're gonna make one more pass.",
+                "这里是海岸警卫队6510号。我们再飞一圈。",
+            ),
+            (
+                "He'll be an outcast. A freak.",
+                "他会成为被排挤的人，一个异类。",
+            ),
+            (
+                "one of thousands launched into the void",
+                "发射到虚空中的数千艘之一",
+            ),
+            ("We split in two.", "我们一分为二。"),
+            ("Oh, what are you doing?", "哦，你在做什么？"),
+            ("Two weeks leave.", "停职两周。"),
+        ];
+        let source = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (source, _))| segment(&(index + 1).to_string(), source, None))
+            .collect::<Vec<_>>();
+        let translated = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, translated))| segment(&(index + 1).to_string(), translated, None))
+            .collect::<Vec<_>>();
+
+        validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect("ambiguous small-number grammar should not be treated as changed facts");
+    }
+
+    #[test]
+    fn final_validation_treats_article_plus_scale_as_a_strong_number() {
+        let source = vec![segment("1", "the DNA of a billion people", None)];
+        let translated = vec![segment("1", "一亿人的DNA", None)];
+
+        let error = validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("one billion must not equal one hundred million");
+
+        assert!(error.to_string().contains("expected [1000000000]"));
+        assert!(error.to_string().contains("got [100000000]"));
+    }
+
+    #[test]
+    fn final_validation_normalizes_call_signs_but_rejects_dropped_components() {
+        let source = vec![
+            segment("1", "Under-1-2 calling Guardian.", None),
+            segment("2", "Tally-3 target.", None),
+        ];
+        let translated = vec![
+            segment("1", "水下一二呼叫守护者。", None),
+            segment("2", "发现三个目标。", None),
+        ];
+        validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect("equivalent call signs and explicit small quantities should pass");
+
+        let error = validate_final_output(
+            &[segment("1", "Copy, 1-1.", None)],
+            &[segment("1", "收到，一号机。", None)],
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("dropping half of a call sign must still fail");
+        assert!(error.to_string().contains("expected [11]"));
     }
 
     #[test]
