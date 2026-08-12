@@ -724,10 +724,7 @@ fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
             Span::styled("│", border_style),
         ])
     };
-    let title = truncate_with_ellipsis(
-        &format!("  SubBake v{}", env!("CARGO_PKG_VERSION")),
-        inner_width,
-    );
+    let title = truncate_with_ellipsis(&format!("  SubBake v{}", info.version), inner_width);
     let title_padding = " ".repeat(inner_width.saturating_sub(title.chars().count()));
     vec![
         Line::from(Span::styled(
@@ -863,11 +860,11 @@ mod tests {
     };
 
     use super::{
-        EmptyModeChoice, InputMode, Msg, MsgStyle, TuiAction, TuiPicker, VerticalNavigation,
-        empty_mode_choice, history_down, history_lines_height, history_up, is_insert_newline_key,
-        is_profile_name_character, message_lines, picker_viewport, previous_suggestion,
-        push_immediate_response, slash_suggestions, suggestions_for, terminal_width,
-        vertical_navigation,
+        EmptyModeChoice, InputMode, Msg, MsgStyle, StartupInfo, TuiAction, TuiPicker,
+        VerticalNavigation, empty_mode_choice, history_down, history_lines_height, history_up,
+        is_insert_newline_key, is_profile_name_character, message_lines, picker_viewport,
+        previous_suggestion, push_immediate_response, slash_suggestions, startup_panel_lines,
+        suggestions_for, terminal_width, vertical_navigation,
     };
 
     #[test]
@@ -883,6 +880,21 @@ mod tests {
         assert_eq!(terminal_width("hello"), 5);
         assert_eq!(terminal_width("中文"), 4);
         assert_eq!(terminal_width("a中"), 3);
+    }
+
+    #[test]
+    fn startup_panel_uses_the_supplied_application_build_identity() {
+        let info = StartupInfo {
+            version: "0.2.0-alpha.1 (1234abcd, dirty)".to_owned(),
+            ..StartupInfo::default()
+        };
+        let rendered = startup_panel_lines(&info, 80)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("SubBake v0.2.0-alpha.1 (1234abcd, dirty)"));
     }
 
     #[test]

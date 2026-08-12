@@ -3,6 +3,7 @@ use crate::{ConfigChange, ConfigEditorSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupInfo {
+    pub version: String,
     pub provider: String,
     pub model: String,
     pub config: String,
@@ -13,6 +14,7 @@ pub struct StartupInfo {
 impl Default for StartupInfo {
     fn default() -> Self {
         Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             provider: "mock".to_owned(),
             model: "mock-zh".to_owned(),
             config: "Not configured".to_owned(),

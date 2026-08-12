@@ -3,6 +3,7 @@ pub mod commands;
 pub mod error;
 pub mod output;
 mod progress;
+mod version;
 
 pub use error::{CliError, CliResult};
 

@@ -59,7 +59,7 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
             Ok(())
         }
         "--version" | "-V" => {
-            println!("sbake {}", env!("CARGO_PKG_VERSION"));
+            println!("sbake {}", crate::version::build_identity());
             Ok(())
         }
         other => Err(CliError::usage(format!(

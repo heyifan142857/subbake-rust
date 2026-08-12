@@ -61,6 +61,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
     let initial_plan_mode = engine.is_plan_mode();
     let mut tui = SubBakeTui::new()?;
     tui.set_startup_info(StartupInfo {
+        version: crate::version::build_identity(),
         provider: startup_settings.backend.id,
         model: startup_settings.backend.model,
         config: config_path

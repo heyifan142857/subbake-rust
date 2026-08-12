@@ -215,6 +215,7 @@ fn pty_child_driver() {
     let cancellation = CancellationToken::default();
     let mut tui = SubBakeTui::new().expect("initialize TUI inside PTY");
     tui.set_startup_info(StartupInfo {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         provider: "mock".to_owned(),
         model: "pty-model".to_owned(),
         config: "PTY test".to_owned(),
