@@ -387,7 +387,9 @@ fn install_binary(
         write_install_manifest(&staged_dir, &staged_binary, runtime_libraries)?;
         verify_whisper_cli(&staged_binary, cancellation)?;
         emit_install_stage(progress, "COMMIT");
-        commit_staged_install(&staged_dir, &target_dir)?;
+        commit_staged_install(&staged_dir, &target_dir, &binary_path, |installed_binary| {
+            verify_whisper_cli(installed_binary, cancellation).map(|_| ())
+        })?;
         return Ok(());
     }
 
@@ -865,7 +867,12 @@ fn write_install_manifest(
         .map_err(|e| io::Error::other(format!("write install manifest: {e}")))
 }
 
-fn commit_staged_install(staged_dir: &Path, target_dir: &Path) -> AdapterResult<()> {
+fn commit_staged_install(
+    staged_dir: &Path,
+    target_dir: &Path,
+    binary_path: &Path,
+    verify: impl FnOnce(&Path) -> AdapterResult<()>,
+) -> AdapterResult<()> {
     fs::create_dir_all(target_dir).map_err(|source| {
         AdapterError::external_io(
             "create whisper installation directory",
@@ -926,6 +933,10 @@ fn commit_staged_install(staged_dir: &Path, target_dir: &Path) -> AdapterResult<
         }
         temporary.disarm();
         committed.push((destination, backup));
+    }
+    if let Err(error) = verify(binary_path) {
+        rollback_install(&committed);
+        return Err(error);
     }
     for (_, backup) in &committed {
         if let Some(backup) = backup {
@@ -1031,6 +1042,9 @@ fn build_from_source(
         &build_out_dir.to_string_lossy(),
         "-DWHISPER_BUILD_TESTS=OFF",
         "-DWHISPER_BUILD_EXAMPLES=ON",
+        // Managed installs keep the CLI self-contained. A shared source build
+        // otherwise retains a RUNPATH into its temporary CMake directory.
+        "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_CUDA=OFF",
         "-DGGML_METAL=OFF",
         "-DGGML_VULKAN=OFF",
@@ -1040,6 +1054,13 @@ fn build_from_source(
         WhisperBuildVariant::Cpu => {}
         WhisperBuildVariant::Cuda => {
             configure.arg("-DGGML_CUDA=ON");
+            if let Some(toolchain) = compatible_cuda_gnu_toolchain() {
+                configure.args([
+                    format!("-DCMAKE_C_COMPILER={}", toolchain.c),
+                    format!("-DCMAKE_CXX_COMPILER={}", toolchain.cxx),
+                    format!("-DCMAKE_CUDA_HOST_COMPILER={}", toolchain.cxx),
+                ]);
+            }
         }
         WhisperBuildVariant::Metal => {
             configure.arg("-DGGML_METAL=ON");
@@ -1135,7 +1156,9 @@ fn build_from_source(
             emit_install_stage(progress, "VERIFY");
             verify_whisper_cli(&staged_binary, cancellation)?;
             emit_install_stage(progress, "COMMIT");
-            commit_staged_install(&staged_dir, target_dir)?;
+            commit_staged_install(&staged_dir, target_dir, binary_path, |installed_binary| {
+                verify_whisper_cli(installed_binary, cancellation).map(|_| ())
+            })?;
             return Ok(());
         }
     }
@@ -1143,6 +1166,68 @@ fn build_from_source(
     Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
         "built binary not found after cmake build".to_owned(),
     )))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GnuToolchain {
+    c: &'static str,
+    cxx: &'static str,
+}
+
+fn compatible_cuda_gnu_toolchain() -> Option<GnuToolchain> {
+    select_cuda_gnu_toolchain(compiler_major("gcc"), command_succeeds)
+}
+
+fn select_cuda_gnu_toolchain(
+    default_major: Option<u32>,
+    available: impl Fn(&str) -> bool,
+) -> Option<GnuToolchain> {
+    if default_major.is_none_or(|major| major <= 15) {
+        return None;
+    }
+    [
+        GnuToolchain {
+            c: "gcc-15",
+            cxx: "g++-15",
+        },
+        GnuToolchain {
+            c: "gcc-14",
+            cxx: "g++-14",
+        },
+        GnuToolchain {
+            c: "gcc-13",
+            cxx: "g++-13",
+        },
+        GnuToolchain {
+            c: "gcc-12",
+            cxx: "g++-12",
+        },
+    ]
+    .into_iter()
+    .find(|toolchain| available(toolchain.c) && available(toolchain.cxx))
+}
+
+fn compiler_major(program: &str) -> Option<u32> {
+    let output = Command::new(program)
+        .arg("-dumpfullversion")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn command_succeeds(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn unique_temp_dir(prefix: &str) -> io::Result<TemporaryDirectory> {
@@ -1678,6 +1763,22 @@ mod tests {
     }
 
     #[test]
+    fn cuda_source_build_selects_a_supported_versioned_gnu_toolchain() {
+        let selected =
+            select_cuda_gnu_toolchain(Some(16), |program| matches!(program, "gcc-15" | "g++-15"));
+
+        assert_eq!(
+            selected,
+            Some(GnuToolchain {
+                c: "gcc-15",
+                cxx: "g++-15",
+            })
+        );
+        assert_eq!(select_cuda_gnu_toolchain(Some(15), |_| true), None);
+        assert_eq!(select_cuda_gnu_toolchain(None, |_| true), None);
+    }
+
+    #[test]
     fn promote_binary_preserves_requested_destination() {
         let root = temp_root("promote");
         let extracted = root.join("extract").join("bin");
@@ -1775,7 +1876,8 @@ mod tests {
         write_install_manifest(&staged, &staged_binary, vec!["new-library.so".to_owned()])
             .expect("write staged manifest");
 
-        commit_staged_install(&staged, &target).expect("commit staged install");
+        commit_staged_install(&staged, &target, &target.join("whisper-cli"), |_| Ok(()))
+            .expect("commit staged install");
         let binary = fs::read(target.join("whisper-cli")).expect("read installed binary");
         let user = fs::read(target.join("user.txt")).expect("read user file");
         let old_exists = target.join("old-library.so").exists();
@@ -1786,6 +1888,42 @@ mod tests {
         assert_eq!(user, b"keep");
         assert!(!old_exists);
         assert!(new_exists);
+    }
+
+    #[test]
+    fn staged_install_restores_the_previous_files_when_validation_fails() {
+        let root = temp_root("staged-install-rollback");
+        let target = root.join("target");
+        let staged = root.join("staged");
+        fs::create_dir_all(&target).expect("create target");
+        fs::create_dir_all(&staged).expect("create staged");
+        let target_binary = target.join("whisper-cli");
+        fs::write(&target_binary, b"old").expect("write old binary");
+        write_version_file(&target, "v1").expect("write old version");
+        write_install_manifest(&target, &target_binary, Vec::new()).expect("write old manifest");
+
+        let staged_binary = staged.join("whisper-cli");
+        fs::write(&staged_binary, b"broken").expect("write staged binary");
+        write_version_file(&staged, "v2").expect("write staged version");
+        write_install_manifest(&staged, &staged_binary, Vec::new()).expect("write staged manifest");
+
+        let error = commit_staged_install(&staged, &target, &target_binary, |_| {
+            Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
+                "post-install verification failed".to_owned(),
+            )))
+        })
+        .expect_err("invalid installation must roll back");
+        let binary = fs::read(&target_binary).expect("read restored binary");
+        let version = fs::read_to_string(target.join("version.txt")).expect("read old version");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            error
+                .to_string()
+                .contains("post-install verification failed")
+        );
+        assert_eq!(binary, b"old");
+        assert_eq!(version, "v1");
     }
 
     #[test]
