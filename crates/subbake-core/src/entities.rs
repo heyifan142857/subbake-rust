@@ -488,6 +488,11 @@ pub struct PipelineOptions {
     /// cache entries across protocols and relay endpoints.
     pub provider_fingerprint: Option<String>,
     pub reviewer_fingerprint: Option<String>,
+    /// Optional execution contract that isolates Resume state for composed
+    /// workflows such as incremental media pipelines. Standalone subtitle
+    /// translation leaves this unset so its historical fingerprints remain
+    /// stable.
+    pub execution_fingerprint: Option<String>,
     /// Hash of the glossary snapshot frozen after terminology preflight. This
     /// is populated by the pipeline and keeps Resume state tied to the exact
     /// terminology context without persisting glossary contents in run state.
@@ -532,6 +537,7 @@ impl PipelineOptions {
             timeout_seconds: default_timeout_seconds(),
             provider_fingerprint: None,
             reviewer_fingerprint: None,
+            execution_fingerprint: None,
             glossary_fingerprint: None,
             dry_run: false,
             resume: true,

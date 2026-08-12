@@ -18,6 +18,9 @@ pub const PROMPT_CONTRACT_VERSION: u64 = 1;
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 1;
 /// Bump when deterministic final-output validation semantics change.
 pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 1;
+/// Bump when the ordering, buffering, or publication contract of an
+/// incremental pipeline changes.
+pub const PIPELINE_EXECUTION_POLICY_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
@@ -260,7 +263,7 @@ pub fn build_translation_fingerprint(
     options: &PipelineOptions,
     input_signature: &InputSignature,
 ) -> String {
-    stable_hash(&JsonValue::Object(vec![
+    let mut fields = vec![
         (
             "version".to_owned(),
             JsonValue::Number(TRANSLATION_FINGERPRINT_VERSION.to_string()),
@@ -392,7 +395,23 @@ pub fn build_translation_fingerprint(
             "target_language".to_owned(),
             JsonValue::String(options.target_language.clone()),
         ),
-    ]))
+    ];
+    if let Some(execution_fingerprint) = &options.execution_fingerprint {
+        fields.push((
+            "pipeline_execution".to_owned(),
+            JsonValue::Object(vec![
+                (
+                    "version".to_owned(),
+                    JsonValue::Number(PIPELINE_EXECUTION_POLICY_VERSION.to_string()),
+                ),
+                (
+                    "fingerprint".to_owned(),
+                    JsonValue::String(execution_fingerprint.clone()),
+                ),
+            ]),
+        ));
+    }
+    stable_hash(&JsonValue::Object(fields))
 }
 
 fn optional_string(value: &Option<String>) -> JsonValue {
@@ -738,6 +757,19 @@ mod tests {
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_validation, &signature)
+        );
+
+        let mut streaming = baseline.clone();
+        streaming.execution_fingerprint = Some("streaming-v1:turbo".to_owned());
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&streaming, &signature)
+        );
+        let mut different_streaming_policy = streaming.clone();
+        different_streaming_policy.execution_fingerprint = Some("streaming-v1:economy".to_owned());
+        assert_ne!(
+            build_translation_fingerprint(&streaming, &signature),
+            build_translation_fingerprint(&different_streaming_policy, &signature)
         );
     }
 

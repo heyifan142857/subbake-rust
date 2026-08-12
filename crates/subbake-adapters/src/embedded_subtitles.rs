@@ -458,6 +458,7 @@ fn translate_embedded_subtitle_with_programs(
         path: embedded_stream_identity(&request.input_path, source.index, payload_format)?,
         signature: input_signature_from_bytes(&extracted_bytes, None),
         output_path: final_output.clone(),
+        execution_fingerprint: None,
     };
     let translated_path = temporary
         .path()

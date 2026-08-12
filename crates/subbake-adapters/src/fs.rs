@@ -80,6 +80,43 @@ pub fn render_and_write_document(
     Ok(rendered)
 }
 
+pub(crate) fn render_and_write_document_atomic(
+    document: &SubtitleDocument,
+    translations: &[SubtitleSegment],
+    output_path: &Path,
+    options: &RenderOptions,
+) -> AdapterResult<String> {
+    let rendered = render_document(document, translations, options).map_err(AdapterError::from)?;
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| {
+        AdapterError::external_io(
+            "create subtitle output directory",
+            Some(parent.to_path_buf()),
+            source,
+        )
+    })?;
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("subtitle");
+    let temporary = parent.join(format!(".{file_name}.subbake-tmp-{}", std::process::id()));
+    fs::write(&temporary, rendered.as_bytes()).map_err(|source| {
+        AdapterError::external_io("stage rendered subtitle", Some(temporary.clone()), source)
+    })?;
+    fs::rename(&temporary, output_path).map_err(|source| {
+        let _ = fs::remove_file(&temporary);
+        AdapterError::external_io(
+            "publish rendered subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
+    })?;
+    Ok(rendered)
+}
+
 pub fn default_output_path(
     input_path: &Path,
     output_format: Option<&str>,

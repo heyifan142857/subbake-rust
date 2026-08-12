@@ -59,6 +59,7 @@ pub(crate) struct TranslationInputIdentity {
     pub path: PathBuf,
     pub signature: InputSignature,
     pub output_path: PathBuf,
+    pub execution_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,9 +244,12 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .map(|identity| identity.output_path.clone())
         .unwrap_or_else(|| output_path.clone());
     let stable_input_path = stable_runtime_input_path(runtime_input_path)?;
-    let options = request
+    let mut options = request
         .settings
         .to_pipeline_options(stable_input_path.clone(), Some(runtime_output_path));
+    options.execution_fingerprint = identity
+        .as_ref()
+        .and_then(|identity| identity.execution_fingerprint.clone());
     let backend = build_backend(&request.settings.backend_config())?;
     let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
         || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off
