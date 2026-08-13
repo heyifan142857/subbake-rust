@@ -61,15 +61,16 @@ SubBake 会读取 `~/.config/subbake/config.toml` 或项目目录下的 `.subbak
 version = 2
 default_profile = "default"
 
-[backends.openai]
-id = "openai"
-model = "gpt-4.1-mini"
+[backends.primary]
+id = "provider-id"
+model = "translation-model"
 api_format = "openai_chat"
-api_key_env = "OPENAI_API_KEY"
+base_url = "https://api.example.com/v1"
+api_key_env = "SUBBAKE_PROVIDER_API_KEY"
 timeout_seconds = 120
 
 [profiles.default]
-translator = "openai"
+translator = "primary"
 
 [profiles.default.translation]
 mode = "turbo"
@@ -85,7 +86,7 @@ whisper_models_dir = "/opt/whisper.cpp/models"
 ```
 
 ```bash
-export OPENAI_API_KEY="your-api-key"
+export SUBBAKE_PROVIDER_API_KEY="your-api-key"
 sbake provider check --profile default
 ```
 
@@ -140,6 +141,17 @@ sbake resume
 
 `translate` 不会自动转写音视频；没有文本字幕轨时请使用 `pipeline`。完整选项请运行
 `sbake --help` 或 `sbake <COMMAND> --help`。
+
+## 详细文档
+
+完整的英文安装、通用配置、命令、交互式 Agent、翻译模式、媒体字幕、转写、流水线、
+质量检查、内存与运行时管理说明见 [`docs/usage.md`](docs/usage.md)。示例均使用通用
+profile、provider、模型、路径与环境变量占位符，不包含本地配置或凭据。
+
+评测设计与运行方式另见：
+
+- [`docs/agent-evaluation.md`](docs/agent-evaluation.md)
+- [`docs/subtitle-evaluation.md`](docs/subtitle-evaluation.md)
 
 ## 开发
 

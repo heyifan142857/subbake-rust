@@ -4,6 +4,21 @@ Subtitle quality is a separate gate from agent task completion. A release can
 pass agent tool/approval scenarios and still fail translation or transcription
 quality.
 
+## Current implementation status
+
+- The deterministic Rust APIs and regression tests described below are
+  implemented and run in the normal workspace test suite.
+- `sbake qa` exposes reference-free timing/readability checks, and
+  `sbake evaluate` exposes the older reference chrF and mechanical MQM subset.
+  The complete translation-hard-constraint and transcription reports are Rust
+  APIs and are not yet wired into one complete CLI command.
+- `scripts/mt_quality.py`, its optional dependency list, and aligned sample
+  input are implemented. The repository does not contain downloaded COMET or
+  XCOMET weights, a completed model run, or a committed learned-metric score.
+- The human MQM section is an annotation protocol only. No human annotations,
+  adjudication results, or inter-annotator agreement measurements have been
+  produced as part of this implementation.
+
 ## Deterministic translation gate
 
 `subbake_core::evaluate_translation_quality` returns four independent sections:
