@@ -1,4 +1,7 @@
 AGENTS.md
+.env
+.env.*
+!.env.example
 target/
 .subbake/
 **/*.rs.bk

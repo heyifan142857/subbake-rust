@@ -1,11 +1,15 @@
 //! Deterministic offline translation evaluation for regression tracking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::entities::SubtitleDocument;
 use crate::error::{CoreError, CoreResult};
+use crate::formatting::formatting_tokens;
+use crate::quality::{QualityPolicy, QualityReport, inspect_quality};
+use crate::term_matcher::TermMatcher;
+use crate::validation::factual_tokens_match;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationReport {
@@ -20,6 +24,334 @@ pub struct MqmCounts {
     pub critical: usize,
     pub major: usize,
     pub minor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranslationQualityReport {
+    pub version: u64,
+    pub hard_constraints: HardConstraintReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<EvaluationReport>,
+    pub document_consistency: DocumentConsistencyReport,
+    pub readability: QualityReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HardConstraintReport {
+    pub passed: bool,
+    pub checks: usize,
+    pub violations: Vec<HardConstraintViolation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardConstraintKind {
+    SegmentCount,
+    DuplicateId,
+    IdAlignment,
+    Timing,
+    Formatting,
+    FactualToken,
+    RequiredTerm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardConstraintViolation {
+    pub kind: HardConstraintKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsistencyKind {
+    PersonName,
+    Terminology,
+    Pronoun,
+    Honorific,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsistencyRule {
+    pub label: String,
+    pub kind: ConsistencyKind,
+    pub source_terms: Vec<String>,
+    pub allowed_targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentConsistencyReport {
+    pub passed: bool,
+    pub rules_checked: usize,
+    pub violations: Vec<DocumentConsistencyViolation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentConsistencyViolationKind {
+    MissingTarget,
+    VariantDrift,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentConsistencyViolation {
+    pub rule: String,
+    pub kind: ConsistencyKind,
+    pub violation: DocumentConsistencyViolationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
+    pub message: String,
+}
+
+/// Evaluate translation-specific deterministic requirements separately from
+/// reference or model-based semantic scores. `passed` is true only when every
+/// ID, timing, formatting, factual-token, and required-term check passes.
+pub fn evaluate_translation_quality(
+    source: &SubtitleDocument,
+    candidate: &SubtitleDocument,
+    reference: Option<&SubtitleDocument>,
+    required_glossary: &BTreeMap<String, String>,
+    consistency_rules: &[ConsistencyRule],
+    readability_policy: QualityPolicy,
+) -> CoreResult<TranslationQualityReport> {
+    let hard_constraints = evaluate_hard_constraints(source, candidate, required_glossary);
+    let reference = if reference.is_some() && !has_duplicate_ids(candidate) {
+        reference
+            .map(|document| evaluate(candidate, document))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(TranslationQualityReport {
+        version: 1,
+        hard_constraints,
+        reference,
+        document_consistency: evaluate_document_consistency(source, candidate, consistency_rules),
+        readability: inspect_quality(candidate, readability_policy),
+    })
+}
+
+fn evaluate_hard_constraints(
+    source: &SubtitleDocument,
+    candidate: &SubtitleDocument,
+    required_glossary: &BTreeMap<String, String>,
+) -> HardConstraintReport {
+    let mut checks = 1;
+    let mut violations = Vec::new();
+    if source.segments.len() != candidate.segments.len() {
+        push_hard_violation(
+            &mut violations,
+            HardConstraintKind::SegmentCount,
+            None,
+            format!(
+                "expected {} segments, got {}",
+                source.segments.len(),
+                candidate.segments.len()
+            ),
+        );
+    }
+
+    report_duplicate_ids(source, "source", &mut checks, &mut violations);
+    report_duplicate_ids(candidate, "candidate", &mut checks, &mut violations);
+    let candidate_by_id = candidate
+        .segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment))
+        .collect::<BTreeMap<_, _>>();
+    let source_ids = source
+        .segments
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let matcher = TermMatcher::case_insensitive();
+
+    for (position, source_segment) in source.segments.iter().enumerate() {
+        checks += 1;
+        let Some(candidate_segment) = candidate_by_id.get(source_segment.id.as_str()) else {
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::IdAlignment,
+                Some(&source_segment.id),
+                "source ID is missing from candidate",
+            );
+            continue;
+        };
+        if candidate.segments.get(position).map(|segment| &segment.id) != Some(&source_segment.id) {
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::IdAlignment,
+                Some(&source_segment.id),
+                "candidate ID order differs from source",
+            );
+        }
+
+        checks += 4;
+        if source_segment.start != candidate_segment.start
+            || source_segment.end != candidate_segment.end
+        {
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::Timing,
+                Some(&source_segment.id),
+                "start or end timestamp changed",
+            );
+        }
+        if formatting_tokens(&source_segment.text) != formatting_tokens(&candidate_segment.text) {
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::Formatting,
+                Some(&source_segment.id),
+                "subtitle formatting markers changed",
+            );
+        }
+        if !factual_tokens_match(&source_segment.text, &candidate_segment.text) {
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::FactualToken,
+                Some(&source_segment.id),
+                "numbers, dates, amounts, or percentages changed",
+            );
+        }
+        let missing = matcher.missing_required(
+            &source_segment.text,
+            &candidate_segment.text,
+            required_glossary,
+        );
+        if !missing.is_empty() {
+            let pairs = missing
+                .iter()
+                .map(|(source, target)| format!("{source} -> {target}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::RequiredTerm,
+                Some(&source_segment.id),
+                format!("required glossary term is missing: {pairs}"),
+            );
+        }
+    }
+    for candidate_segment in &candidate.segments {
+        if !source_ids.contains(candidate_segment.id.as_str()) {
+            checks += 1;
+            push_hard_violation(
+                &mut violations,
+                HardConstraintKind::IdAlignment,
+                Some(&candidate_segment.id),
+                "candidate contains an unexpected ID",
+            );
+        }
+    }
+    HardConstraintReport {
+        passed: violations.is_empty(),
+        checks,
+        violations,
+    }
+}
+
+fn report_duplicate_ids(
+    document: &SubtitleDocument,
+    role: &str,
+    checks: &mut usize,
+    violations: &mut Vec<HardConstraintViolation>,
+) {
+    let mut seen = BTreeSet::new();
+    for segment in &document.segments {
+        *checks += 1;
+        if !seen.insert(segment.id.as_str()) {
+            push_hard_violation(
+                violations,
+                HardConstraintKind::DuplicateId,
+                Some(&segment.id),
+                format!("{role} contains a duplicate ID"),
+            );
+        }
+    }
+}
+
+fn push_hard_violation(
+    violations: &mut Vec<HardConstraintViolation>,
+    kind: HardConstraintKind,
+    segment_id: Option<&str>,
+    message: impl Into<String>,
+) {
+    violations.push(HardConstraintViolation {
+        kind,
+        segment_id: segment_id.map(ToOwned::to_owned),
+        message: message.into(),
+    });
+}
+
+fn evaluate_document_consistency(
+    source: &SubtitleDocument,
+    candidate: &SubtitleDocument,
+    rules: &[ConsistencyRule],
+) -> DocumentConsistencyReport {
+    let candidate_by_id = candidate
+        .segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment.text.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let matcher = TermMatcher::case_insensitive();
+    let mut violations = Vec::new();
+    for rule in rules {
+        let mut observed = BTreeSet::new();
+        for source_segment in &source.segments {
+            if !rule
+                .source_terms
+                .iter()
+                .any(|term| matcher.contains(&source_segment.text, term))
+            {
+                continue;
+            }
+            let Some(candidate_text) = candidate_by_id.get(source_segment.id.as_str()) else {
+                continue;
+            };
+            let matches = rule
+                .allowed_targets
+                .iter()
+                .filter(|target| matcher.contains(candidate_text, target))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                violations.push(DocumentConsistencyViolation {
+                    rule: rule.label.clone(),
+                    kind: rule.kind,
+                    violation: DocumentConsistencyViolationKind::MissingTarget,
+                    segment_id: Some(source_segment.id.clone()),
+                    message: "no allowed target form appears in the aligned segment".to_owned(),
+                });
+            } else {
+                observed.extend(matches);
+            }
+        }
+        if observed.len() > 1 {
+            violations.push(DocumentConsistencyViolation {
+                rule: rule.label.clone(),
+                kind: rule.kind,
+                violation: DocumentConsistencyViolationKind::VariantDrift,
+                segment_id: None,
+                message: format!(
+                    "multiple target variants were used: {}",
+                    observed.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+    }
+    DocumentConsistencyReport {
+        passed: violations.is_empty(),
+        rules_checked: rules.len(),
+        violations,
+    }
+}
+
+fn has_duplicate_ids(document: &SubtitleDocument) -> bool {
+    let mut ids = BTreeSet::new();
+    document
+        .segments
+        .iter()
+        .any(|segment| !ids.insert(segment.id.as_str()))
 }
 
 /// Compare a produced subtitle against a reference using stable identifiers.
@@ -57,7 +389,9 @@ pub fn evaluate(
         if number_tokens(candidate_line) != number_tokens(&reference_line.text) {
             mqm.major += 1;
         }
-        if formatting_tokens(candidate_line) != formatting_tokens(&reference_line.text) {
+        if legacy_formatting_tokens(candidate_line)
+            != legacy_formatting_tokens(&reference_line.text)
+        {
             mqm.minor += 1;
         }
         candidate_text.push_str(candidate_line);
@@ -136,7 +470,7 @@ fn number_tokens(value: &str) -> Vec<String> {
         .map(ToOwned::to_owned)
         .collect()
 }
-fn formatting_tokens(value: &str) -> Vec<char> {
+fn legacy_formatting_tokens(value: &str) -> Vec<char> {
     value
         .chars()
         .filter(|ch| matches!(ch, '<' | '>' | '{' | '}' | '[' | ']' | '\\'))

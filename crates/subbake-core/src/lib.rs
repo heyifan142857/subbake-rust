@@ -17,6 +17,7 @@ mod review;
 pub mod storage;
 pub mod term_matcher;
 pub mod tool_outcome;
+pub mod transcription_evaluation;
 pub mod validation;
 
 pub use cancellation::{CancellationGuard, CancellationToken};
@@ -31,7 +32,12 @@ pub use entities::{
     TranslationLine, TranslationMode, TranslationPolicy, Usage,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
-pub use evaluation::{EvaluationReport, MqmCounts, evaluate};
+pub use evaluation::{
+    ConsistencyKind, ConsistencyRule, DocumentConsistencyReport, DocumentConsistencyViolation,
+    DocumentConsistencyViolationKind, EvaluationReport, HardConstraintKind, HardConstraintReport,
+    HardConstraintViolation, MqmCounts, TranslationQualityReport, evaluate,
+    evaluate_translation_quality,
+};
 pub use memory::ContextMemory;
 pub use ports::{
     BatchExecutionOptions, GenerationContent, GenerationInput, GenerationRequest,
@@ -52,5 +58,6 @@ pub use tool_outcome::{
     ProfileToolOutcome, SkippedPath, SubtitleEditToolOutcome, ToolExecutionStatus,
     TranscriptionToolOutcome, TranslationToolOutcome, WhisperModelFact, WhisperToolOutcome,
 };
+pub use transcription_evaluation::{TranscriptionEvaluationReport, evaluate_transcription};
 pub use validation::{FinalValidationPolicy, validate_final_output};
 pub mod cancellation;

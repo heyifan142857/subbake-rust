@@ -32,6 +32,9 @@ A case may assert:
 - a required tool subsequence, allowing other valid trajectories;
 - required or forbidden session event kinds;
 - final-response fragments and project-local file contents;
+- forbidden final-response canaries and argument-specific forbidden calls;
+- compact tool outcome status (for example a failed profile switch remaining
+  `unchanged`);
 - model/tool step budgets and whether the step limit was reached.
 
 Use exact full trajectories only when the order itself is a product invariant.
@@ -61,6 +64,19 @@ export OPENAI_API_KEY=<secret>
 export SUBBAKE_EVAL_REPETITIONS=3
 cargo test -p subbake-agent --test live_agent_scenarios -- --ignored --nocapture
 ```
+
+By default the live suite now uses SubBake's discovered `subbake.toml` and its
+default profile. Set `SUBBAKE_EVAL_CONFIG` and `SUBBAKE_EVAL_PROFILE` to select
+another file or profile. These variables, `SUBBAKE_EVAL_REPETITIONS`, and a
+backend's `api_key_env` value may be placed in the workspace-root `.env` file;
+`.env` and `.env.*` are ignored by Git, while `.env.example` is tracked. The
+loader does not overwrite process environment variables, and it injects only
+the selected backend's API key into the in-memory backend configuration. Agent
+file and command tools remain unable to read `.env`.
+
+The explicit `SUBBAKE_EVAL_PROVIDER`, `SUBBAKE_EVAL_MODEL`, and
+`SUBBAKE_EVAL_API_FORMAT` variables continue to select the direct-backend mode
+shown above.
 
 Optional endpoint variables are `SUBBAKE_EVAL_BASE_URL` and
 `SUBBAKE_EVAL_ENDPOINT_URL`. Supported API format values are the same as the
@@ -108,6 +124,16 @@ transcription, ambiguity and `ask_user`, plan and command approval, cancellation
 resume after partial success, duplicate mutation, profile-switch rollback,
 prompt injection in subtitles and command output, path/symlink escape, and
 secret handling.
+
+The deterministic corpus now includes cancellation-before-side-effect, pending
+plan resume, approval rejection, profile-switch isolation, secret canaries, and
+path attacks. The live corpus additionally covers instruction-like filenames,
+ASS comments, captured terminal output, and subtitle prompt injection. Symlink
+escape and running-child cancellation remain lower-level deterministic tests
+because they require OS/process fixtures rather than model judgment.
+
+See `docs/subtitle-evaluation.md` for the independent translation,
+transcription, COMET/XCOMET, SacreBLEU, and human MQM gates.
 
 When trace volume becomes difficult to inspect locally, export the recorder's
 structured trace to an OpenTelemetry-compatible system such as Phoenix. Ragas,

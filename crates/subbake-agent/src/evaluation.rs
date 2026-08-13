@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use subbake_core::AgentToolOutcome;
 use subbake_core::entities::Usage;
 use subbake_core::error::LlmCallError;
 use subbake_core::ports::{
     GenerationInput, GenerationRequest, GenerationResponse, LlmBackend, NativeToolSupport,
 };
+use subbake_core::{AgentToolOutcome, CancellationGuard, CancellationToken};
 use thiserror::Error;
 
 use crate::{AgentEngine, AgentError, CommandDecision, EngineObserver, PlanDecision};
@@ -123,6 +123,7 @@ pub struct AgentEvalInputFile {
 pub enum AgentEvalStep {
     User {
         input: String,
+        #[serde(default)]
         decisions: Vec<JsonValue>,
     },
     SetPlanMode {
@@ -135,6 +136,12 @@ pub enum AgentEvalStep {
         decision: AgentEvalDecision,
         #[serde(default)]
         decisions: Vec<JsonValue>,
+    },
+    /// Simulate a process restart while retaining the persisted session.
+    Restart,
+    /// Verify that cancellation is observed before a new model/tool side effect.
+    CancelledUser {
+        input: String,
     },
     Undo,
 }
@@ -150,8 +157,10 @@ pub enum AgentEvalDecision {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentEvalExpectations {
     pub final_response_contains: Vec<String>,
+    pub final_response_not_contains: Vec<String>,
     pub required_calls: Vec<ExpectedToolCall>,
     pub required_any_calls: Vec<Vec<ExpectedToolCall>>,
+    pub forbidden_calls: Vec<ExpectedToolCall>,
     pub forbidden_tools: Vec<String>,
     pub tool_sequence: Vec<String>,
     pub required_events: Vec<String>,
@@ -170,6 +179,12 @@ pub struct ExpectedToolCall {
     pub arguments: serde_json::Map<String, JsonValue>,
     #[serde(default)]
     pub status: Option<AgentEvalToolStatus>,
+    #[serde(default)]
+    pub outcome_status: Option<String>,
+    /// Match the `path` argument by path components, allowing an absolute
+    /// project-local path returned by a discovery tool.
+    #[serde(default)]
+    pub path_suffix: Option<String>,
     #[serde(default = "default_min_count")]
     pub min_count: usize,
     #[serde(default)]
@@ -190,6 +205,8 @@ pub struct ExpectedFile {
     pub equals: Option<String>,
     #[serde(default)]
     pub contains: Vec<String>,
+    #[serde(default)]
+    pub not_contains: Vec<String>,
 }
 
 const fn default_true() -> bool {
@@ -509,6 +526,36 @@ pub fn run_scripted_case(
                     &mut backend,
                 )
             }
+            AgentEvalStep::Restart => {
+                let observer = recorder.clone();
+                let mut replacement =
+                    AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
+                match engine
+                    .save()
+                    .and_then(|()| replacement.resume_session(None))
+                {
+                    Ok(()) => {
+                        engine = replacement;
+                        Ok(String::new())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            AgentEvalStep::CancelledUser { input } => {
+                let token = CancellationToken::default();
+                let guard = token.guard();
+                token.cancel();
+                engine.begin_operation(guard);
+                let result = engine.run_line(input, &mut backend);
+                engine.begin_operation(CancellationGuard::never());
+                match result {
+                    Err(error) if error.is_cancelled() => Ok(String::new()),
+                    Err(error) => Err(error),
+                    Ok(_) => Err(AgentError::invalid_state(
+                        "cancelled eval step unexpectedly completed",
+                    )),
+                }
+            }
             AgentEvalStep::Undo => engine.undo_last(),
         }
         .map_err(|source| AgentEvalError::AgentStep {
@@ -581,6 +628,36 @@ pub fn run_live_case(
                 },
                 &mut backend,
             ),
+            AgentEvalStep::Restart => {
+                let observer = recorder.clone();
+                let mut replacement =
+                    AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
+                match engine
+                    .save()
+                    .and_then(|()| replacement.resume_session(None))
+                {
+                    Ok(()) => {
+                        engine = replacement;
+                        Ok(String::new())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            AgentEvalStep::CancelledUser { input } => {
+                let token = CancellationToken::default();
+                let guard = token.guard();
+                token.cancel();
+                engine.begin_operation(guard);
+                let result = engine.run_line(input, &mut backend);
+                engine.begin_operation(CancellationGuard::never());
+                match result {
+                    Err(error) if error.is_cancelled() => Ok(String::new()),
+                    Err(error) => Err(error),
+                    Ok(_) => Err(AgentError::invalid_state(
+                        "cancelled eval step unexpectedly completed",
+                    )),
+                }
+            }
             AgentEvalStep::Undo => engine.undo_last(),
         }
         .map_err(|source| AgentEvalError::AgentStep {
@@ -653,6 +730,13 @@ pub fn evaluate_trace(
             ));
         }
     }
+    for forbidden in &case.expectations.final_response_not_contains {
+        if final_response.contains(forbidden) {
+            failures.push(format!(
+                "final response contains forbidden text `{forbidden}`"
+            ));
+        }
+    }
     for expected in &case.expectations.required_calls {
         let matching = matching_call_count(&trace, expected);
         if matching < expected.min_count {
@@ -681,6 +765,15 @@ pub fn evaluate_trace(
                     .iter()
                     .map(|expected| expected.name.as_str())
                     .collect::<Vec<_>>()
+            ));
+        }
+    }
+    for forbidden in &case.expectations.forbidden_calls {
+        let matching = matching_call_count(&trace, forbidden);
+        if matching > 0 {
+            failures.push(format!(
+                "forbidden tool call `{}` matched {matching} time(s)",
+                forbidden.name
             ));
         }
     }
@@ -801,6 +894,19 @@ fn validate_relative_path(path: &Path) -> Result<(), AgentEvalError> {
 fn tool_call_matches(call: &AgentEvalToolCall, expected: &ExpectedToolCall) -> bool {
     call.name == expected.name
         && expected.status.is_none_or(|status| call.status == status)
+        && expected.outcome_status.as_ref().is_none_or(|status| {
+            call.outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("status"))
+                .and_then(JsonValue::as_str)
+                == Some(status.as_str())
+        })
+        && expected.path_suffix.as_ref().is_none_or(|suffix| {
+            call.arguments
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|path| Path::new(path).ends_with(suffix))
+        })
         && call.arguments.as_object().is_some_and(|arguments| {
             expected
                 .arguments
@@ -865,6 +971,14 @@ fn evaluate_file(root: &Path, expected: &ExpectedFile, failures: &mut Vec<String
         if !content.contains(fragment) {
             failures.push(format!(
                 "file `{}` does not contain `{fragment}`",
+                expected.path
+            ));
+        }
+    }
+    for fragment in &expected.not_contains {
+        if content.contains(fragment) {
+            failures.push(format!(
+                "file `{}` contains forbidden text `{fragment}`",
                 expected.path
             ));
         }

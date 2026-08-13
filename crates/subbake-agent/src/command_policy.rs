@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::guard::is_protected_component;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommandApproval {
     AutoRun,
@@ -35,6 +37,11 @@ pub(crate) fn classify(arguments: &Value) -> CommandApproval {
                 .to_owned(),
         );
     }
+    if command_tokens(command).any(token_references_protected_path) {
+        return CommandApproval::Deny(
+            "commands cannot reference protected configuration or credential paths".to_owned(),
+        );
+    }
     if arguments
         .get("outputs")
         .and_then(Value::as_object)
@@ -54,6 +61,16 @@ pub(crate) fn classify(arguments: &Value) -> CommandApproval {
     } else {
         CommandApproval::AskUser("command is not in the strict auto-run set".to_owned())
     }
+}
+
+fn token_references_protected_path(token: &str) -> bool {
+    let token = token.trim_matches(['\'', '"']);
+    std::path::Path::new(token).components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(is_protected_component)
+    })
 }
 
 fn command_tokens(command: &str) -> impl Iterator<Item = &str> {
@@ -128,5 +145,19 @@ mod tests {
             classify(&serde_json::json!({"command":"curl -H 'Authorization: Bearer x' x"})),
             CommandApproval::Deny(_)
         ));
+        for command in [
+            "cat .env",
+            "sed -n 1p '.EnV.Local'",
+            "cat ~/.ssh/id_rsa",
+            "rg API_KEY keys/ID_ED25519",
+        ] {
+            assert!(
+                matches!(
+                    classify(&serde_json::json!({"command": command})),
+                    CommandApproval::Deny(_)
+                ),
+                "{command}"
+            );
+        }
     }
 }

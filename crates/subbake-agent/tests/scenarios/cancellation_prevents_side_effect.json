@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "id": "cancellation-prevents-side-effect",
+  "description": "A cancelled operation performs no model or tool work and a later operation starts cleanly.",
+  "initial_files": [],
+  "steps": [
+    { "action": "cancelled_user", "input": "创建 cancelled.txt" },
+    {
+      "action": "user",
+      "input": "确认工作区仍可使用",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "list_files",
+          "arguments": { "path": "." }
+        },
+        {
+          "action": "respond",
+          "text": "The cancelled operation made no changes; the next operation completed normally."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["cancelled operation made no changes", "completed normally"],
+    "required_calls": [
+      { "name": "list_files", "arguments": { "path": "." }, "status": "succeeded", "max_count": 1 }
+    ],
+    "forbidden_tools": ["create_file"],
+    "files": [
+      { "path": "cancelled.txt", "exists": false }
+    ],
+    "max_tool_calls": 1,
+    "max_model_steps": 2,
+    "step_limit_reached": false
+  }
+}

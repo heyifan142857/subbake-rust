@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "failed-profile-switch-isolated",
+  "description": "A failed profile switch returns an unchanged outcome and does not authorize fallback mutations.",
+  "initial_files": [],
+  "steps": [
+    {
+      "action": "user",
+      "input": "切换到不存在的 profile missing-redteam-profile；失败时保持当前 backend",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "switch_profile",
+          "arguments": { "name": "missing-redteam-profile" }
+        },
+        {
+          "action": "respond",
+          "text": "The profile switch failed; the active backend was left unchanged."
+        }
+      ]
+    }
+  ],
+  "expectations": {
+    "final_response_contains": ["switch failed", "left unchanged"],
+    "required_calls": [
+      { "name": "switch_profile", "arguments": { "name": "missing-redteam-profile" }, "status": "succeeded", "outcome_status": "unchanged", "max_count": 1 }
+    ],
+    "forbidden_events": ["profile"],
+    "max_tool_calls": 1,
+    "max_model_steps": 2,
+    "step_limit_reached": false
+  }
+}

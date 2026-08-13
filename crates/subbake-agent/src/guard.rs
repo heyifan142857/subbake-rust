@@ -44,14 +44,22 @@ impl From<std::io::Error> for FileGuardError {
 }
 
 /// Path components that are never allowed in file operations.
-pub const PROTECTED_PATH_PARTS: [&str; 7] = [
+pub const PROTECTED_PATH_PARTS: [&str; 15] = [
     ".git",
     ".hg",
     ".svn",
+    ".env",
+    ".ssh",
     ".venv",
     "venv",
     ".subbake",
     "__pycache__",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "credentials.json",
+    "service-account.json",
 ];
 
 /// The result of a successful file operation.
@@ -505,7 +513,7 @@ impl FileGuard {
     fn reject_protected_components(&self, path: &Path) -> FileGuardResult<()> {
         for component in path.components() {
             if let Some(name) = component.as_os_str().to_str()
-                && PROTECTED_PATH_PARTS.contains(&name)
+                && is_protected_component(name)
             {
                 return Err(FileGuardError::ProtectedPath {
                     component: name.to_owned(),
@@ -589,6 +597,12 @@ impl FileGuard {
         std::fs::copy(backup_path, target)?;
         Ok(())
     }
+}
+
+pub(crate) fn is_protected_component(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    PROTECTED_PATH_PARTS.contains(&normalized.as_str())
+        || (normalized.starts_with(".env.") && normalized != ".env.example")
 }
 
 fn rollback_committed_files(committed: &[(PathBuf, Option<PathBuf>)]) {
@@ -725,6 +739,26 @@ mod tests {
             .expect_err("should reject");
         assert!(matches!(&err, FileGuardError::ProtectedPath { .. }));
         assert!(err.to_string().contains(".git"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_secret_files_case_insensitively_but_allows_env_examples() {
+        let (root, guard) = setup();
+        for path in [".env", ".EnV.Local", ".SSH/config", "keys/ID_ED25519"] {
+            let error = guard
+                .read_file(Path::new(path))
+                .expect_err("secret path should be rejected before reading");
+            assert!(matches!(error, FileGuardError::ProtectedPath { .. }));
+        }
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join(".env.example"), "TOKEN=replace-me\n").expect("write env example");
+        assert_eq!(
+            guard
+                .read_file(Path::new(".env.example"))
+                .expect("read env example"),
+            "TOKEN=replace-me\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -265,6 +265,11 @@ fn comparable_factual_tokens(source: &str, translated: &str) -> (Vec<String>, Ve
     (source_strong, translated_strong)
 }
 
+pub(crate) fn factual_tokens_match(source: &str, translated: &str) -> bool {
+    let (source, translated) = comparable_factual_tokens(source, translated);
+    source == translated
+}
+
 fn promote_matching_weak(strong: &mut Vec<String>, weak: &[String], opposite: &[String]) {
     for token in weak {
         let expected = opposite.iter().filter(|value| *value == token).count();

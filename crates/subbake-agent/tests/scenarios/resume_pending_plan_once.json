@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "id": "resume-pending-plan-once",
+  "description": "A pending mutating plan survives restart and is applied exactly once after approval.",
+  "initial_files": [],
+  "steps": [
+    { "action": "set_plan_mode", "enabled": true },
+    {
+      "action": "user",
+      "input": "创建 result.txt",
+      "decisions": [
+        {
+          "action": "tool_call",
+          "tool_name": "apply_patch",
+          "arguments": { "patch": "*** Begin Patch\n*** Add File: result.txt\n+one paid operation\n*** End Patch" }
+        }
+      ]
+    },
+    { "action": "restart" },
+    { "action": "plan_decision", "decision": "approve" }
+  ],
+  "expectations": {
+    "final_response_contains": ["Approved and executed plan"],
+    "required_calls": [
+      { "name": "apply_patch", "status": "succeeded", "min_count": 1, "max_count": 1 }
+    ],
+    "required_events": ["plan", "approve"],
+    "files": [
+      { "path": "result.txt", "equals": "one paid operation\n" }
+    ],
+    "max_tool_calls": 1,
+    "max_model_steps": 1,
+    "step_limit_reached": false
+  }
+}
