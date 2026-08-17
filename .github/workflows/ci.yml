@@ -33,7 +33,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
           bwrap --version
+          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user -- true
 
       - name: Check formatting
         run: cargo fmt --check
