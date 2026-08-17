@@ -24,10 +24,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust with lint and format components
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
+      - name: Select stable Rust with lint and format components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+          cargo --version
 
       - name: Install command sandbox dependency
         run: |
