@@ -13,11 +13,11 @@ pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 5;
+pub const PROMPT_CONTRACT_VERSION: u64 = 7;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 4;
 /// Bump when deterministic final-output validation semantics change.
-pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 3;
+pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 4;
 /// Bump when the ordering, buffering, or publication contract of an
 /// incremental pipeline changes.
 pub const PIPELINE_EXECUTION_POLICY_VERSION: u64 = 1;
@@ -735,7 +735,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "1676e025d37d576cac95d4324b42e8a46f4921b6"
+            "28e751aec9f72f642e1c285250af505be1e0b5f7"
         );
     }
 

@@ -285,6 +285,16 @@ fn factual_tokens(text: &str) -> FactualTokens {
     let characters = text.chars().collect::<Vec<_>>();
     let mut index = 0;
     while index < characters.len() {
+        if let Some(end) = cjk_numeric_idiom_end(&characters, index) {
+            index = end;
+            continue;
+        }
+        if let Some((value, end)) = cjk_percentage(&characters, index) {
+            tokens.strong.push("%".to_owned());
+            tokens.strong.push(value);
+            index = end;
+            continue;
+        }
         let character = characters[index];
         if character.is_ascii_digit() {
             let mut digits = String::new();
@@ -303,6 +313,11 @@ fn factual_tokens(text: &str) -> FactualTokens {
                 }
                 digits.extend(characters[group_start..group_end].iter());
                 index = group_end;
+            }
+            if let Some(clock_end) = zero_minute_clock_end(&characters, index) {
+                push_scaled_digits(&mut tokens.strong, &digits, 1);
+                index = clock_end;
+                continue;
             }
             if digits.len() == 1 {
                 let mut sequence = digits.clone();
@@ -347,17 +362,27 @@ fn factual_tokens(text: &str) -> FactualTokens {
             // idiom (一个, 之一, 一天) rather than a hard numeric fact. Treat
             // it like a standalone English zero-to-nine word and leave exact
             // digits plus compound/scaled number expressions as strong facts.
-            if index - start == 1 && cjk_digit(characters[start]).is_some() {
+            if index - start == 1
+                && (cjk_digit(characters[start]).is_some()
+                    || matches!(characters[start], '十' | '百' | '千' | '万' | '亿'))
+            {
                 if let Some(value) = parse_cjk_number(&characters[start..index]) {
                     tokens.weak.push(value.to_string());
                 }
                 continue;
             }
-            if index - start == 1
-                && matches!(characters[start], '十' | '百' | '千' | '万' | '亿')
-                && start > 0
-                && matches!(characters[start - 1], '数' | '几')
+            if index - start > 1
+                && characters[start..index]
+                    .iter()
+                    .all(|character| matches!(character, '十' | '百' | '千' | '万' | '亿'))
+                && characters[start..index].windows(2).all(|pair| {
+                    cjk_unit_value(pair[0]).is_some_and(|left| {
+                        cjk_unit_value(pair[1]).is_some_and(|right| left > right)
+                    })
+                })
             {
+                // Unit-only compounds such as 千百年来 express an
+                // approximate magnitude, not the exact value 1,100.
                 continue;
             }
             if let Some(value) = parse_cjk_number(&characters[start..index]) {
@@ -394,6 +419,62 @@ fn factual_tokens(text: &str) -> FactualTokens {
     tokens.strong.extend(english.strong);
     tokens.weak.extend(english.weak);
     tokens
+}
+
+fn zero_minute_clock_end(characters: &[char], colon: usize) -> Option<usize> {
+    if characters.get(colon..colon + 3) != Some(&[':', '0', '0']) {
+        return None;
+    }
+    let end = colon + 3;
+    characters
+        .get(end)
+        .is_none_or(|character| !character.is_ascii_digit() && *character != ':')
+        .then_some(end)
+}
+
+fn cjk_percentage(characters: &[char], start: usize) -> Option<(String, usize)> {
+    if characters[start..].starts_with(&['百', '分', '百']) {
+        return Some(("100".to_owned(), start + 3));
+    }
+    if !characters[start..].starts_with(&['百', '分', '之']) {
+        return None;
+    }
+    let number_start = start + 3;
+    let mut end = number_start;
+    if characters.get(end).is_some_and(char::is_ascii_digit) {
+        while characters.get(end).is_some_and(char::is_ascii_digit) {
+            end += 1;
+        }
+        let digits = characters[number_start..end].iter().collect::<String>();
+        let normalized = digits.trim_start_matches('0');
+        return Some((
+            if normalized.is_empty() {
+                "0"
+            } else {
+                normalized
+            }
+            .to_owned(),
+            end,
+        ));
+    }
+    while characters
+        .get(end)
+        .is_some_and(|character| is_cjk_numeral(*character))
+    {
+        end += 1;
+    }
+    (end > number_start)
+        .then(|| parse_cjk_number(&characters[number_start..end]))
+        .flatten()
+        .map(|value| (value.to_string(), end))
+}
+
+fn cjk_numeric_idiom_end(characters: &[char], start: usize) -> Option<usize> {
+    // These exact spans use number characters figuratively. Keep this list
+    // deliberately narrow so real quantities remain strong facts.
+    characters[start..]
+        .starts_with(&['半', '斤', '八', '两'])
+        .then_some(start + 4)
 }
 
 fn push_scaled_digits(tokens: &mut Vec<String>, digits: &str, multiplier: u128) {
@@ -523,6 +604,17 @@ fn cjk_digit(character: char) -> Option<u128> {
         '七' => Some(7),
         '八' => Some(8),
         '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn cjk_unit_value(character: char) -> Option<u128> {
+    match character {
+        '十' => Some(10),
+        '百' => Some(100),
+        '千' => Some(1_000),
+        '万' => Some(10_000),
+        '亿' => Some(100_000_000),
         _ => None,
     }
 }
@@ -791,6 +883,65 @@ mod tests {
             FinalValidationPolicy::default(),
         )
         .expect("semantically equal number expressions should pass");
+    }
+
+    #[test]
+    fn final_validation_normalizes_clock_hours_cjk_percentages_and_numeric_idioms() {
+        let pairs = [
+            ("Some of y'all ain't gonna see 3:00.", "有些人活不到三点。"),
+            (
+                "It will be 100% honesty and clear communication.",
+                "我们会百分之百坦诚，清楚沟通。",
+            ),
+            ("Takes one to know one.", "半斤八两。"),
+            ("The battery is at 80%.", "电量为百分之八十。"),
+            ("We need 100% honesty.", "我们要百分百坦诚。"),
+            ("It has existed for millennia.", "它已经存在千百年了。"),
+            ("Tenssica.", "十西卡。"),
+        ];
+        let source = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (source, _))| segment(&(index + 1).to_string(), source, None))
+            .collect::<Vec<_>>();
+        let translated = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, translated))| segment(&(index + 1).to_string(), translated, None))
+            .collect::<Vec<_>>();
+
+        validate_final_output(
+            &source,
+            &translated,
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect("equivalent time, percentage, and idiom expressions should pass");
+
+        let error = validate_final_output(
+            &[segment("1", "Meet me at 3:30.", None)],
+            &[segment("1", "三点见。", None)],
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("dropping non-zero clock minutes must still fail");
+        assert!(error.to_string().contains("expected [3, 30]"));
+
+        let error = validate_final_output(
+            &[segment("1", "Ten people arrived.", None)],
+            &[segment("1", "一百个人来了。", None)],
+            &BTreeMap::new(),
+            "English",
+            "Chinese",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("a real ten-to-one-hundred change must still fail");
+        assert!(error.to_string().contains("expected [10]"));
+        assert!(error.to_string().contains("got [100]"));
     }
 
     #[test]

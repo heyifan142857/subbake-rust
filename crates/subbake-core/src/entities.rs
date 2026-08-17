@@ -152,8 +152,12 @@ pub fn translation_readability_defaults(
         .to_ascii_lowercase();
     let cjk = matches!(language.as_str(), "zh" | "ja" | "ko");
     TranslationReadabilityDefaults {
-        max_characters_per_second: Some(if cjk { 10.0 } else { 17.0 }),
-        max_characters_per_line: Some(if cjk { 20 } else { 42 }),
+        // CJK subtitle references are much denser than prose, especially on
+        // sub-second cues. These hard safety rails sit just above the observed
+        // maxima of the local five-episode reference corpus; stricter editorial
+        // targets belong in QA because translation cannot retime source cues.
+        max_characters_per_second: Some(if cjk { 23.0 } else { 17.0 }),
+        max_characters_per_line: Some(if cjk { 32 } else { 42 }),
         max_lines: Some(2),
     }
 }
@@ -694,6 +698,15 @@ mod tests {
         assert!(!TranslationPolicy::for_mode(TranslationMode::Economy).scene_aware_batching);
         assert!(!TranslationPolicy::for_mode(TranslationMode::Turbo).scene_aware_batching);
         assert!(TranslationPolicy::for_mode(TranslationMode::Cinema).scene_aware_batching);
+    }
+
+    #[test]
+    fn cinema_uses_cjk_readability_safety_rails_above_reference_maxima() {
+        let defaults = translation_readability_defaults(TranslationMode::Cinema, "zh-Hans");
+
+        assert_eq!(defaults.max_characters_per_second, Some(23.0));
+        assert_eq!(defaults.max_characters_per_line, Some(32));
+        assert_eq!(defaults.max_lines, Some(2));
     }
 
     #[test]

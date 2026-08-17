@@ -4188,6 +4188,20 @@ mod tests {
             segment("8", "Please stop."),
             segment("9", "Clark is here."),
             segment("10", "Where is Clark?"),
+            segment("11", "All right."),
+            segment("12", "All done."),
+            segment("13", "Big mistake."),
+            segment("14", "Big deal."),
+            segment("15", "Yeah, sure."),
+            segment("16", "Yeah, okay."),
+            segment("17", "Y-you heard me."),
+            segment("18", "Y-you know that."),
+            segment("19", "I-I heard you."),
+            segment("20", "I-I know that."),
+            segment("21", "Ow, stop."),
+            segment("22", "Ow, that hurts."),
+            segment("23", "Dad, wait."),
+            segment("24", "Dad, listen."),
         ]);
         let sources = candidates
             .iter()
@@ -4201,6 +4215,75 @@ mod tests {
 
         assert_eq!(sources, vec!["Clark"]);
         assert_eq!(aligned, vec!["Clark"]);
+    }
+
+    #[test]
+    fn terminology_candidates_normalize_stuttered_names_and_drop_stuttered_starters() {
+        let sources = extract_terminology_candidates(&[
+            segment("1", "M-Morty, wait."),
+            segment("2", "Morty, listen."),
+            segment("3", "Je-Jessica left."),
+            segment("4", "Jessica returned."),
+            segment("5", "W-what happened?"),
+            segment("6", "W-what now?"),
+        ])
+        .into_iter()
+        .map(|candidate| candidate.source)
+        .collect::<Vec<_>>();
+
+        assert!(sources.contains(&"Morty".to_owned()));
+        assert!(sources.contains(&"Jessica".to_owned()));
+        assert!(!sources.iter().any(|source| source.contains('-')));
+        assert!(!sources.contains(&"What".to_owned()));
+    }
+
+    #[test]
+    fn terminology_payload_omits_ordinary_and_stuttered_latin_spans() {
+        let candidates = vec![TerminologyCandidate {
+            source: "Morty".to_owned(),
+            context: "Morty arrived.".to_owned(),
+            align_as_name: true,
+        }];
+        let parsed = parse_terminology_payload(
+            &serde_json::json!({
+                "entries": [
+                    {"source": "All", "target": "全"},
+                    {"source": "Big", "target": "大"},
+                    {"source": "Summer", "target": "夏茉"}
+                ],
+                "entities": [
+                    {
+                        "canonical_source": "Morty",
+                        "kind": "person",
+                        "variants": [
+                            {"source": "Morty", "target": "莫蒂"},
+                            {"source": "M-Morty", "target": "莫-莫蒂"},
+                            {"source": "Morty's", "target": "莫蒂的"}
+                        ]
+                    },
+                    {
+                        "canonical_source": "All",
+                        "kind": "person",
+                        "variants": [{"source": "All", "target": "全"}]
+                    }
+                ]
+            }),
+            &candidates,
+            &[
+                segment("1", "All right, Morty."),
+                segment("2", "Big mistake, M-Morty."),
+                segment("3", "Summer left."),
+                segment("4", "Morty's ready."),
+            ],
+        )
+        .expect("ordinary response entries should be safely omitted");
+
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].source, "Summer");
+        assert_eq!(parsed.entities.len(), 1);
+        assert_eq!(parsed.entities[0].canonical_source, "Morty");
+        assert_eq!(parsed.entities[0].variants.len(), 1);
+        assert_eq!(parsed.entities[0].variants[0].source, "Morty");
     }
 
     #[test]

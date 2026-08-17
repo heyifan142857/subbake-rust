@@ -243,7 +243,8 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                 let word = word.trim_matches(|ch: char| {
                     !ch.is_alphanumeric() && ch != '-' && ch != '\'' && ch != '’'
                 });
-                english_possessive_base(word).unwrap_or(word)
+                let word = english_possessive_base(word).unwrap_or(word);
+                english_stutter_base(word).unwrap_or(word)
             })
             .filter(|word| word.len() >= 2)
             .collect::<Vec<_>>();
@@ -400,11 +401,15 @@ fn is_common_sentence_initial(value: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         normalized.as_str(),
-        "a" | "an"
+        "a" | "aah"
+            | "all"
+            | "an"
             | "and"
             | "are"
             | "as"
             | "at"
+            | "aw"
+            | "big"
             | "but"
             | "can"
             | "can't"
@@ -412,13 +417,20 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "come"
             | "could"
             | "couldn't"
+            | "dad"
             | "did"
             | "didn't"
             | "do"
             | "does"
             | "doesn't"
             | "don't"
+            | "eight"
+            | "eleven"
+            | "fifteen"
+            | "five"
             | "for"
+            | "four"
+            | "fourteen"
             | "from"
             | "get"
             | "give"
@@ -435,6 +447,7 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "hey"
             | "his"
             | "hold"
+            | "holy"
             | "how"
             | "how's"
             | "i"
@@ -444,6 +457,7 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "i've"
             | "if"
             | "in"
+            | "have"
             | "is"
             | "isn't"
             | "it"
@@ -459,7 +473,10 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "make"
             | "maybe"
             | "meet"
+            | "mm"
             | "my"
+            | "nine"
+            | "nineteen"
             | "no"
             | "not"
             | "now"
@@ -468,25 +485,33 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "oh"
             | "okay"
             | "on"
+            | "one"
             | "or"
             | "our"
+            | "ow"
             | "please"
             | "right"
+            | "seven"
+            | "seventeen"
             | "she"
             | "she'd"
             | "she'll"
             | "she's"
             | "so"
+            | "some"
             | "sorry"
             | "stop"
             | "sure"
             | "take"
             | "tell"
+            | "ten"
+            | "thank"
             | "that"
             | "that's"
             | "the"
             | "their"
             | "then"
+            | "thirteen"
             | "there"
             | "there's"
             | "these"
@@ -497,7 +522,12 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "they've"
             | "this"
             | "those"
+            | "three"
             | "to"
+            | "twelve"
+            | "twenty"
+            | "two"
+            | "uh"
             | "wait"
             | "we"
             | "we'd"
@@ -513,6 +543,7 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "where's"
             | "who"
             | "who's"
+            | "whoa"
             | "why"
             | "why's"
             | "will"
@@ -520,7 +551,9 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "with"
             | "would"
             | "wouldn't"
+            | "wow"
             | "yes"
+            | "yeah"
             | "you"
             | "you'd"
             | "you'll"
@@ -528,6 +561,42 @@ fn is_common_sentence_initial(value: &str) -> bool {
             | "you've"
             | "your"
     )
+}
+
+fn english_stutter_base(value: &str) -> Option<&str> {
+    let (prefix, base) = value.split_once('-')?;
+    if prefix.is_empty() || base.is_empty() || prefix.chars().count() > 3 {
+        return None;
+    }
+    let prefix = prefix.to_lowercase();
+    let base_lower = base.to_lowercase();
+    if base_lower == prefix {
+        return Some("");
+    }
+    base_lower.starts_with(&prefix).then_some(base)
+}
+
+fn contains_english_stutter(value: &str) -> bool {
+    value.split_whitespace().any(|word| {
+        let word =
+            word.trim_matches(|character: char| !character.is_alphanumeric() && character != '-');
+        english_stutter_base(word).is_some()
+    })
+}
+
+fn is_ordinary_latin_document_span(value: &str) -> bool {
+    let Some(first) = value.split_whitespace().next() else {
+        return true;
+    };
+    value
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+        && (is_common_sentence_initial(first) || contains_english_stutter(value))
+}
+
+fn is_redundant_possessive(value: &str, canonical: &str) -> bool {
+    english_possessive_base(value)
+        .is_some_and(|base| base.trim().eq_ignore_ascii_case(canonical.trim()))
 }
 
 fn build_messages(
@@ -580,6 +649,13 @@ pub(super) fn parse_payload(
                 "terminology entry contains an empty source or target".to_owned(),
             ));
         }
+        if is_ordinary_latin_document_span(source)
+            || candidates
+                .iter()
+                .any(|candidate| is_redundant_possessive(source, &candidate.source))
+        {
+            continue;
+        }
         let canonical_source = candidates
             .iter()
             .find(|candidate| candidate.source.eq_ignore_ascii_case(source))
@@ -595,13 +671,24 @@ pub(super) fn parse_payload(
             target: target.to_owned(),
         });
     }
-    let entities = serde_json::from_value::<Vec<TerminologyEntity>>(payload["entities"].clone())
-        .unwrap_or_default();
-    for entity in &entities {
-        if entity.canonical_source.trim().is_empty() || entity.variants.is_empty() {
+    let raw_entities =
+        serde_json::from_value::<Vec<TerminologyEntity>>(payload["entities"].clone())
+            .unwrap_or_default();
+    let mut entities = Vec::new();
+    for mut entity in raw_entities {
+        if entity.canonical_source.trim().is_empty() {
             return Err(CoreError::InvalidTranslation(
                 "terminology entity is missing a canonical source or variants".to_owned(),
             ));
+        }
+        let canonical_source = entity.canonical_source.clone();
+        entity.variants.retain(|variant| {
+            let source = variant.source.trim();
+            !is_ordinary_latin_document_span(source)
+                && !is_redundant_possessive(source, &canonical_source)
+        });
+        if entity.variants.is_empty() {
+            continue;
         }
         for variant in &entity.variants {
             if variant.target.trim().is_empty()
@@ -616,6 +703,7 @@ pub(super) fn parse_payload(
                 )));
             }
         }
+        entities.push(entity);
     }
     Ok(TerminologyPreflightResult {
         entries: parsed,

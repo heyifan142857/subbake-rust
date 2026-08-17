@@ -8,3 +8,9 @@ target/
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/Cargo.lock
+
+# Local subtitle corpora used for manual translation and batching tests.
+/local-subtitle-corpus/
+
+# Project-local agent guidance is maintained outside the repository history.
+/AGENTS.md

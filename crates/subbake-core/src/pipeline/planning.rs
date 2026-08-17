@@ -338,7 +338,7 @@ fn starts_new_utterance(text: &str) -> bool {
 
 fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
     let value = value.trim().replace(',', ".");
-    let (clock, milliseconds) = value.rsplit_once('.')?;
+    let (clock, fraction) = value.rsplit_once('.')?;
     let mut parts = clock.split(':').map(str::parse::<usize>);
     let hours = parts.next()?.ok()?;
     let minutes = parts.next()?.ok()?;
@@ -346,7 +346,19 @@ fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
     if parts.next().is_some() {
         return None;
     }
-    let milliseconds = milliseconds.parse::<usize>().ok()?;
+    if fraction.is_empty()
+        || fraction.len() > 3
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let scale = match fraction.len() {
+        1 => 100,
+        2 => 10,
+        3 => 1,
+        _ => return None,
+    };
+    let milliseconds = fraction.parse::<usize>().ok()?.saturating_mul(scale);
     Some((((hours * 60 + minutes) * 60 + seconds) * 1_000) + milliseconds)
 }
 
@@ -562,6 +574,23 @@ mod tests {
             .scene_aware(true)
             .split(&source);
 
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn scene_aware_planner_scales_ass_centiseconds_before_comparing_gaps() {
+        let source = vec![
+            timed_segment("1", "The thought is complete.", "0:00:02.00", "0:00:03.90"),
+            timed_segment("2", "Another begins.", "0:00:04.00", "0:00:05.00"),
+        ];
+
+        let batches = BatchPlanner::new(10, 1_000)
+            .scene_aware(true)
+            .split(&source);
+
+        assert_eq!(subtitle_timestamp_ms("0:00:03.9"), Some(3_900));
+        assert_eq!(subtitle_timestamp_ms("0:00:03.90"), Some(3_900));
+        assert_eq!(subtitle_timestamp_ms("00:00:03,900"), Some(3_900));
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
     }
 

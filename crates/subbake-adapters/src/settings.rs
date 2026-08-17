@@ -1061,7 +1061,7 @@ mod tests {
                     mode: Some(TranslationMode::Cinema),
                     translation_concurrency: Some(7),
                     target_language: Some("zh-Hans".to_owned()),
-                    max_characters_per_line: Some(24),
+                    max_characters_per_line: Some(26),
                     ..TranslationOverrides::default()
                 },
                 ..SettingsOverrides::default()
@@ -1073,8 +1073,8 @@ mod tests {
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Full);
         assert!(settings.translation.online_terminology);
         assert!(!settings.translation.allow_degraded_preflight);
-        assert_eq!(settings.translation.max_characters_per_second, Some(10.0));
-        assert_eq!(settings.translation.max_characters_per_line, Some(24));
+        assert_eq!(settings.translation.max_characters_per_second, Some(23.0));
+        assert_eq!(settings.translation.max_characters_per_line, Some(26));
         assert_eq!(settings.translation.max_lines, Some(2));
     }
 
