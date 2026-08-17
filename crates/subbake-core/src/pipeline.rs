@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry,
-    PipelineOptions, PipelineResult, ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleSegment,
-    TerminologyEntity, TerminologyStats, TranslationLine, Usage,
+    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, ConcurrencyStrategy,
+    FailureLog, GlossaryEntry, PipelineOptions, PipelineResult, ReviewPolicy, ReviewStats,
+    SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment,
+    TerminologyEntity, TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::restore_batch_formatting;
@@ -57,7 +58,7 @@ use translation_runner::{TranslationRun, TranslationRunInput};
 use translation_stage::{PreparedBatch, TranslationPromptContext};
 
 #[cfg(test)]
-use crate::entities::{ReviewPolicy, ReviewReport};
+use crate::entities::ReviewReport;
 #[cfg(test)]
 use support::validate_window_terminology;
 
@@ -274,7 +275,10 @@ where
     }
 
     pub(super) fn effective_translation_concurrency(&self) -> usize {
-        if self.options.mode == crate::entities::TranslationMode::Turbo {
+        if matches!(
+            self.options.policy().concurrency_strategy,
+            ConcurrencyStrategy::AdaptiveQueued { .. }
+        ) {
             self.adaptive_translation_concurrency
         } else {
             self.options.translation_concurrency.max(1)
@@ -282,7 +286,10 @@ where
     }
 
     pub(super) fn note_translation_window_success(&mut self) {
-        if self.options.mode == crate::entities::TranslationMode::Turbo {
+        if matches!(
+            self.options.policy().concurrency_strategy,
+            ConcurrencyStrategy::AdaptiveQueued { .. }
+        ) {
             if std::mem::take(&mut self.translation_window_was_rate_limited) {
                 return;
             }
@@ -294,7 +301,10 @@ where
     }
 
     fn note_translation_rate_limit(&mut self) {
-        if self.options.mode == crate::entities::TranslationMode::Turbo {
+        if matches!(
+            self.options.policy().concurrency_strategy,
+            ConcurrencyStrategy::AdaptiveQueued { .. }
+        ) {
             self.translation_window_was_rate_limited = true;
             self.adaptive_translation_concurrency = self
                 .adaptive_translation_concurrency
@@ -334,21 +344,21 @@ where
             }
         }
 
-        let deduplication =
-            DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
+        let policy = self.options.policy();
+        let deduplication = DeduplicationPlan::new(&document.segments, policy.deduplicate);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-            .scene_aware(self.options.policy().scene_aware_batching)
+            .scene_aware(policy.context_strategy.uses_scene_boundaries())
             .split(deduplication.canonical());
         let source_contexts = BatchPlanner::source_contexts(
             deduplication.canonical(),
             &batches,
-            self.options.mode,
+            policy.context_strategy,
             self.options.batch_token_budget,
         );
         let translation_scene_groups = BatchPlanner::scene_group_ids(&batches);
         let original_batches =
             BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-                .scene_aware(self.options.policy().scene_aware_batching)
+                .scene_aware(policy.context_strategy.uses_scene_boundaries())
                 .split(&document.segments);
         let review_scene_groups = BatchPlanner::scene_group_ids(&original_batches);
         let planned_batches = BatchPlanner::describe(&batches);
@@ -370,8 +380,7 @@ where
                     usage: Usage::default(),
                     mode: self.options.mode,
                     deduplicated_segments: deduplication.duplicates(),
-                    reviewer_fallback: self.options.mode
-                        == crate::entities::TranslationMode::Cinema
+                    reviewer_fallback: self.options.review_policy != ReviewPolicy::Off
                         && self.reviewer.is_none(),
                     dry_run: true,
                     planned_batches,
@@ -533,7 +542,7 @@ where
                 usage,
                 mode: self.options.mode,
                 deduplicated_segments: deduplication.duplicates(),
-                reviewer_fallback: self.options.mode == crate::entities::TranslationMode::Cinema
+                reviewer_fallback: self.options.review_policy != ReviewPolicy::Off
                     && self.reviewer.is_none(),
                 dry_run: false,
                 planned_batches,
@@ -992,14 +1001,15 @@ where
                         messages,
                         split_retry: None,
                     };
-                    let economy_correction_first = self.options.mode
-                        == crate::entities::TranslationMode::Economy
-                        && record_failure
+                    let correct_before_split = matches!(
+                        self.options.policy().structural_recovery_strategy,
+                        StructuralRecoveryStrategy::CorrectBeforeSplit
+                    ) && record_failure
                         && attempt == 1
                         && self.options.retries > 0;
                     if matches!(error, CoreError::InvalidTranslation(_))
                         && batch.len() > 1
-                        && !economy_correction_first
+                        && !correct_before_split
                     {
                         let split = split_index(batch);
                         attempt_log.split_retry = Some(SplitRetryLog {
@@ -1860,7 +1870,7 @@ fn prepare_translation_result(
 }
 
 fn lightweight_name_alignment(options: &PipelineOptions) -> bool {
-    options.mode == crate::entities::TranslationMode::Turbo
+    options.policy().terminology_strategy == TerminologyStrategy::LightweightNames
         && !options.online_terminology
         && !options.preserve_names
 }

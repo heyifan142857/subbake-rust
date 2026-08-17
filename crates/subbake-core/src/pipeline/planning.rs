@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-use crate::entities::{BatchPlanEntry, SubtitleSegment, TranslationMode};
+use crate::entities::{BatchPlanEntry, ContextStrategy, SubtitleSegment};
 use crate::error::{CoreError, CoreResult};
 
 use super::support::contextual_translation_memory_keys;
 use super::translation_stage::SourceBatchContext;
 
-const TURBO_CONTEXT_LINES: usize = 3;
 const MIN_CINEMA_CONTEXT_TOKENS: usize = 128;
 const MAX_CINEMA_CONTEXT_TOKENS: usize = 1_200;
 const HARD_SCENE_GAP_MS: usize = 1_500;
@@ -170,7 +169,7 @@ impl BatchPlanner {
     pub(super) fn source_contexts(
         segments: &[SubtitleSegment],
         batches: &[Vec<SubtitleSegment>],
-        mode: TranslationMode,
+        strategy: ContextStrategy,
         batch_token_budget: usize,
     ) -> Vec<SourceBatchContext> {
         let mut offset = 0usize;
@@ -180,15 +179,14 @@ impl BatchPlanner {
                 let start = offset;
                 let end = start.saturating_add(batch.len()).min(segments.len());
                 offset = end;
-                match mode {
-                    TranslationMode::Economy => SourceBatchContext::default(),
-                    TranslationMode::Turbo => SourceBatchContext {
-                        before: segments[start.saturating_sub(TURBO_CONTEXT_LINES)..start].to_vec(),
-                        after: segments
-                            [end..end.saturating_add(TURBO_CONTEXT_LINES).min(segments.len())]
+                match strategy {
+                    ContextStrategy::SelfContained => SourceBatchContext::default(),
+                    ContextStrategy::FixedNeighbors { lines } => SourceBatchContext {
+                        before: segments[start.saturating_sub(lines)..start].to_vec(),
+                        after: segments[end..end.saturating_add(lines).min(segments.len())]
                             .to_vec(),
                     },
-                    TranslationMode::Cinema => cinema_source_context(
+                    ContextStrategy::SceneAware => cinema_source_context(
                         segments,
                         start,
                         end,
@@ -477,8 +475,12 @@ mod tests {
             .map(<[SubtitleSegment]>::to_vec)
             .collect::<Vec<_>>();
 
-        let contexts =
-            BatchPlanner::source_contexts(&source, &batches, TranslationMode::Turbo, 1_800);
+        let contexts = BatchPlanner::source_contexts(
+            &source,
+            &batches,
+            ContextStrategy::FixedNeighbors { lines: 3 },
+            1_800,
+        );
 
         assert_eq!(ids(&contexts[1].before), ["1", "2"]);
         assert_eq!(ids(&contexts[1].after), ["5", "6", "7"]);
@@ -500,7 +502,7 @@ mod tests {
         ];
 
         let contexts =
-            BatchPlanner::source_contexts(&source, &batches, TranslationMode::Cinema, 1_600);
+            BatchPlanner::source_contexts(&source, &batches, ContextStrategy::SceneAware, 1_600);
 
         assert_eq!(ids(&contexts[1].before), ["1", "2"]);
         assert_eq!(ids(&contexts[1].after), ["5"]);

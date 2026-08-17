@@ -1,4 +1,6 @@
-use crate::entities::{ReviewPolicy, SubtitleSegment, TerminologyStats, Usage};
+use crate::entities::{
+    ConcurrencyStrategy, ReviewPolicy, SubtitleSegment, TerminologyStats, Usage,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
 use crate::progress::TaskState;
@@ -77,16 +79,16 @@ where
         } else {
             1
         };
-        // Turbo keeps the transport saturated across a second queued wave;
-        // adapters still enforce the configured in-flight limit.
-        let window_size = if pipeline.options.mode == crate::entities::TranslationMode::Turbo
-            && pipeline.backend.supports_parallel_generation()
-        {
-            concurrency.saturating_mul(2)
-        } else if pipeline.options.mode == crate::entities::TranslationMode::Cinema {
-            cinema_window_size(stage.next_batch(), concurrency, scene_groups)
-        } else {
-            concurrency
+        let window_size = match pipeline.options.policy().concurrency_strategy {
+            ConcurrencyStrategy::AdaptiveQueued { window_multiplier }
+                if pipeline.backend.supports_parallel_generation() =>
+            {
+                concurrency.saturating_mul(window_multiplier)
+            }
+            ConcurrencyStrategy::SceneAware => {
+                cinema_window_size(stage.next_batch(), concurrency, scene_groups)
+            }
+            ConcurrencyStrategy::Fixed | ConcurrencyStrategy::AdaptiveQueued { .. } => concurrency,
         };
         let mut previous_confirmed = stage.previous_confirmed_context(
             pipeline.options.confirmed_context_lines,

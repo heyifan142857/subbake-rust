@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
-use crate::entities::{PipelineOptions, SubtitleSegment, TranslationLine};
+use crate::entities::{
+    PipelineOptions, PromptCacheStrategy, SubtitleSegment, TerminologyStrategy, TranslationLine,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::protect_formatting;
 use crate::memory::ContextMemory;
@@ -75,7 +77,8 @@ pub(super) fn build_translation_messages(
     } else {
         Vec::new()
     };
-    let lightweight_names = options.mode == crate::entities::TranslationMode::Turbo
+    let lightweight_names = options.policy().terminology_strategy
+        == TerminologyStrategy::LightweightNames
         && !options.online_terminology
         && !options.preserve_names;
     let name_markers = if lightweight_names {
@@ -83,7 +86,7 @@ pub(super) fn build_translation_messages(
     } else {
         Vec::new()
     };
-    if options.policy().include_context {
+    if options.policy().context_strategy.includes_context() {
         context["rules"] = serde_json::Value::Array(
             memory
                 .style_rules
@@ -199,7 +202,7 @@ only when they fit the meaning in the current context.\n{}\n{terminology_rule}",
         }
     );
     vec![
-        if options.mode == crate::entities::TranslationMode::Cinema {
+        if options.policy().prompt_cache_strategy == PromptCacheStrategy::CacheableSystem {
             ChatMessage::cacheable_system(system)
         } else {
             ChatMessage::system(system)

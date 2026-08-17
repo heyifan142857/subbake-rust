@@ -452,9 +452,9 @@ impl Default for ResolvedSettings {
                 review_concurrency: policy.review_concurrency,
                 mode: TranslationMode::Turbo,
                 review_policy: policy.review_policy,
-                terminology_preflight: policy.terminology_preflight,
-                online_terminology: policy.online_terminology,
-                allow_degraded_preflight: policy.allow_degraded_preflight,
+                terminology_preflight: policy.terminology_strategy.preflight_default(),
+                online_terminology: policy.terminology_strategy.online_default(),
+                allow_degraded_preflight: policy.preflight_failure_policy.allows_degraded(),
                 preserve_names: false,
                 max_characters_per_second: None,
                 max_characters_per_line: None,
@@ -903,9 +903,10 @@ impl ResolvedSettings {
         self.translation.translation_concurrency = policy.translation_concurrency;
         self.translation.review_concurrency = policy.review_concurrency;
         self.translation.review_policy = policy.review_policy;
-        self.translation.terminology_preflight = policy.terminology_preflight;
-        self.translation.online_terminology = policy.online_terminology;
-        self.translation.allow_degraded_preflight = policy.allow_degraded_preflight;
+        self.translation.terminology_preflight = policy.terminology_strategy.preflight_default();
+        self.translation.online_terminology = policy.terminology_strategy.online_default();
+        self.translation.allow_degraded_preflight =
+            policy.preflight_failure_policy.allows_degraded();
         self.apply_readability_defaults();
     }
 
@@ -1172,15 +1173,15 @@ mod tests {
         assert_eq!(settings.translation.review_policy, policy.review_policy);
         assert_eq!(
             settings.translation.terminology_preflight,
-            policy.terminology_preflight
+            policy.terminology_strategy.preflight_default()
         );
         assert_eq!(
             settings.translation.online_terminology,
-            policy.online_terminology
+            policy.terminology_strategy.online_default()
         );
         assert_eq!(
             settings.translation.allow_degraded_preflight,
-            policy.allow_degraded_preflight
+            policy.preflight_failure_policy.allows_degraded()
         );
     }
 }

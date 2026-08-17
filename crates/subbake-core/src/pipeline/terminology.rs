@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    GlossaryEntry, PipelineOptions, SubtitleDocument, SubtitleSegment, TerminologyEntity,
-    TerminologyPreflightResult, TerminologyStats, Usage,
+    GlossaryEntry, PipelineOptions, PreflightFailurePolicy, SubtitleDocument, SubtitleSegment,
+    TerminologyEntity, TerminologyPreflightResult, TerminologyStats, TerminologyStrategy, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::memory::{ContextMemory, english_possessive_base};
@@ -53,7 +53,7 @@ where
             return Ok(stats);
         }
         if !self.backend.supports_terminology_preflight() {
-            if !self.options.allow_degraded_preflight {
+            if self.options.preflight_failure_policy() == PreflightFailurePolicy::Fail {
                 return Err(CoreError::UnsupportedCapability(
                     "configured backend does not support strict terminology preflight".to_owned(),
                 ));
@@ -100,7 +100,7 @@ where
                 let document_brief = payload.document_brief;
                 let accepted = accept_entries(self.memory, payload.entries, &mut stats);
                 let accepted_entities = accept_entities(self.memory, payload.entities, &mut stats);
-                if self.options.mode == crate::entities::TranslationMode::Cinema
+                if self.options.policy().terminology_strategy == TerminologyStrategy::Document
                     && !document_brief.trim().is_empty()
                 {
                     let brief = document_brief.trim().chars().take(800).collect::<String>();
@@ -138,7 +138,11 @@ where
                 }
             }
             Err(error @ CoreError::ResourceBudgetExceeded(_)) => return Err(error),
-            Err(error) if !self.options.allow_degraded_preflight => return Err(error),
+            Err(error)
+                if self.options.preflight_failure_policy() == PreflightFailurePolicy::Fail =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 stats.degraded = true;
                 stats.degraded_reason = Some(error.to_string());

@@ -1,4 +1,6 @@
-use crate::entities::{ReviewReport, ReviewStats, SubtitleDocument, SubtitleSegment, Usage};
+use crate::entities::{
+    ConcurrencyStrategy, ReviewReport, ReviewStats, SubtitleDocument, SubtitleSegment, Usage,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
 use crate::progress::TaskState;
@@ -69,14 +71,18 @@ where
                 resumed,
                 usage,
             );
-            let window_size = if pipeline.options.mode == crate::entities::TranslationMode::Turbo
-                && pipeline.review_backend_supports_parallel_generation()
-            {
-                concurrency.saturating_mul(2)
-            } else if pipeline.options.mode == crate::entities::TranslationMode::Cinema {
-                stage.scene_window_size(next_review, concurrency, scene_groups)
-            } else {
-                concurrency
+            let window_size = match pipeline.options.policy().concurrency_strategy {
+                ConcurrencyStrategy::AdaptiveQueued { window_multiplier }
+                    if pipeline.review_backend_supports_parallel_generation() =>
+                {
+                    concurrency.saturating_mul(window_multiplier)
+                }
+                ConcurrencyStrategy::SceneAware => {
+                    stage.scene_window_size(next_review, concurrency, scene_groups)
+                }
+                ConcurrencyStrategy::Fixed | ConcurrencyStrategy::AdaptiveQueued { .. } => {
+                    concurrency
+                }
             };
             let pending = stage.window(next_review, window_size);
             let mut reviewed_window = pipeline.review_window(&pending)?;

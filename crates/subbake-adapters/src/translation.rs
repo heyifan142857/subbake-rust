@@ -259,8 +259,8 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .map(|identity| identity.initial_confirmed_context.clone())
         .unwrap_or_default();
     let backend = build_backend(&request.settings.backend_config())?;
-    let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
-        || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off
+    let needs_reviewer = request.settings.translation.review_policy
+        != subbake_core::ReviewPolicy::Off
         || request.settings.translation.terminology_preflight;
     let reviewer = needs_reviewer
         .then(|| request.settings.reviewer_backend_config())

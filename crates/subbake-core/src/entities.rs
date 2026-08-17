@@ -47,6 +47,77 @@ impl TranslationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextStrategy {
+    SelfContained,
+    FixedNeighbors { lines: usize },
+    SceneAware,
+}
+
+impl ContextStrategy {
+    pub const fn includes_context(self) -> bool {
+        !matches!(self, Self::SelfContained)
+    }
+
+    pub const fn uses_scene_boundaries(self) -> bool {
+        matches!(self, Self::SceneAware)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyStrategy {
+    Fixed,
+    AdaptiveQueued { window_multiplier: usize },
+    SceneAware,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminologyStrategy {
+    Disabled,
+    LightweightNames,
+    Document,
+}
+
+impl TerminologyStrategy {
+    pub const fn preflight_default(self) -> bool {
+        matches!(self, Self::Document)
+    }
+
+    pub const fn online_default(self) -> bool {
+        matches!(self, Self::Document)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralRecoveryStrategy {
+    SplitImmediately,
+    CorrectBeforeSplit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightFailurePolicy {
+    ContinueDegraded,
+    Fail,
+}
+
+impl PreflightFailurePolicy {
+    pub const fn allows_degraded(self) -> bool {
+        matches!(self, Self::ContinueDegraded)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStrategy {
+    Standard,
+    Adjudicated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheStrategy {
+    Standard,
+    CacheableSystem,
+}
+
 /// Fully expanded behavior for a translation mode. Adapters may override the
 /// numeric settings, while the domain keeps the semantic differences here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,14 +130,16 @@ pub struct TranslationPolicy {
     pub confirmed_context_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
-    pub include_context: bool,
-    pub scene_aware_batching: bool,
+    pub context_strategy: ContextStrategy,
+    pub concurrency_strategy: ConcurrencyStrategy,
+    pub terminology_strategy: TerminologyStrategy,
+    pub structural_recovery_strategy: StructuralRecoveryStrategy,
+    pub preflight_failure_policy: PreflightFailurePolicy,
+    pub review_strategy: ReviewStrategy,
+    pub prompt_cache_strategy: PromptCacheStrategy,
     pub compact_wire: bool,
     pub deduplicate: bool,
     pub review_policy: ReviewPolicy,
-    pub terminology_preflight: bool,
-    pub online_terminology: bool,
-    pub allow_degraded_preflight: bool,
 }
 
 impl TranslationPolicy {
@@ -80,14 +153,16 @@ impl TranslationPolicy {
                 confirmed_context_token_budget: 0,
                 translation_concurrency: 3,
                 review_concurrency: 1,
-                include_context: false,
-                scene_aware_batching: false,
+                context_strategy: ContextStrategy::SelfContained,
+                concurrency_strategy: ConcurrencyStrategy::Fixed,
+                terminology_strategy: TerminologyStrategy::Disabled,
+                structural_recovery_strategy: StructuralRecoveryStrategy::CorrectBeforeSplit,
+                preflight_failure_policy: PreflightFailurePolicy::ContinueDegraded,
+                review_strategy: ReviewStrategy::Standard,
+                prompt_cache_strategy: PromptCacheStrategy::Standard,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
-                terminology_preflight: false,
-                online_terminology: false,
-                allow_degraded_preflight: true,
             },
             TranslationMode::Turbo => Self {
                 batch_size: 96,
@@ -97,14 +172,18 @@ impl TranslationPolicy {
                 confirmed_context_token_budget: 800,
                 translation_concurrency: 8,
                 review_concurrency: 4,
-                include_context: true,
-                scene_aware_batching: false,
+                context_strategy: ContextStrategy::FixedNeighbors { lines: 3 },
+                concurrency_strategy: ConcurrencyStrategy::AdaptiveQueued {
+                    window_multiplier: 2,
+                },
+                terminology_strategy: TerminologyStrategy::LightweightNames,
+                structural_recovery_strategy: StructuralRecoveryStrategy::SplitImmediately,
+                preflight_failure_policy: PreflightFailurePolicy::ContinueDegraded,
+                review_strategy: ReviewStrategy::Standard,
+                prompt_cache_strategy: PromptCacheStrategy::Standard,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Off,
-                terminology_preflight: false,
-                online_terminology: false,
-                allow_degraded_preflight: true,
             },
             TranslationMode::Cinema => Self {
                 batch_size: 48,
@@ -114,14 +193,16 @@ impl TranslationPolicy {
                 confirmed_context_token_budget: 1_000,
                 translation_concurrency: 4,
                 review_concurrency: 3,
-                include_context: true,
-                scene_aware_batching: true,
+                context_strategy: ContextStrategy::SceneAware,
+                concurrency_strategy: ConcurrencyStrategy::SceneAware,
+                terminology_strategy: TerminologyStrategy::Document,
+                structural_recovery_strategy: StructuralRecoveryStrategy::SplitImmediately,
+                preflight_failure_policy: PreflightFailurePolicy::Fail,
+                review_strategy: ReviewStrategy::Adjudicated,
+                prompt_cache_strategy: PromptCacheStrategy::CacheableSystem,
                 compact_wire: true,
                 deduplicate: true,
                 review_policy: ReviewPolicy::Full,
-                terminology_preflight: true,
-                online_terminology: true,
-                allow_degraded_preflight: false,
             },
         }
     }
@@ -617,9 +698,9 @@ impl PipelineOptions {
             source_language: default_source_language(),
             retries: DEFAULT_RETRIES,
             review_policy: policy.review_policy,
-            terminology_preflight: policy.terminology_preflight,
-            online_terminology: policy.online_terminology,
-            allow_degraded_preflight: policy.allow_degraded_preflight,
+            terminology_preflight: policy.terminology_strategy.preflight_default(),
+            online_terminology: policy.terminology_strategy.online_default(),
+            allow_degraded_preflight: policy.preflight_failure_policy.allows_degraded(),
             preserve_names: false,
             max_characters_per_second: None,
             max_characters_per_line: None,
@@ -644,6 +725,14 @@ impl PipelineOptions {
 
     pub const fn policy(&self) -> TranslationPolicy {
         TranslationPolicy::for_mode(self.mode)
+    }
+
+    pub const fn preflight_failure_policy(&self) -> PreflightFailurePolicy {
+        if self.allow_degraded_preflight {
+            PreflightFailurePolicy::ContinueDegraded
+        } else {
+            PreflightFailurePolicy::Fail
+        }
     }
 }
 
@@ -695,9 +784,78 @@ mod tests {
 
     #[test]
     fn only_cinema_uses_scene_aware_batching() {
-        assert!(!TranslationPolicy::for_mode(TranslationMode::Economy).scene_aware_batching);
-        assert!(!TranslationPolicy::for_mode(TranslationMode::Turbo).scene_aware_batching);
-        assert!(TranslationPolicy::for_mode(TranslationMode::Cinema).scene_aware_batching);
+        assert!(
+            !TranslationPolicy::for_mode(TranslationMode::Economy)
+                .context_strategy
+                .uses_scene_boundaries()
+        );
+        assert!(
+            !TranslationPolicy::for_mode(TranslationMode::Turbo)
+                .context_strategy
+                .uses_scene_boundaries()
+        );
+        assert!(
+            TranslationPolicy::for_mode(TranslationMode::Cinema)
+                .context_strategy
+                .uses_scene_boundaries()
+        );
+    }
+
+    #[test]
+    fn mode_strategies_are_fully_expanded_in_one_policy() {
+        let economy = TranslationPolicy::for_mode(TranslationMode::Economy);
+        assert_eq!(economy.context_strategy, ContextStrategy::SelfContained);
+        assert_eq!(economy.concurrency_strategy, ConcurrencyStrategy::Fixed);
+        assert_eq!(economy.terminology_strategy, TerminologyStrategy::Disabled);
+        assert_eq!(
+            economy.structural_recovery_strategy,
+            StructuralRecoveryStrategy::CorrectBeforeSplit
+        );
+        assert_eq!(
+            economy.preflight_failure_policy,
+            PreflightFailurePolicy::ContinueDegraded
+        );
+
+        let turbo = TranslationPolicy::for_mode(TranslationMode::Turbo);
+        assert_eq!(
+            turbo.context_strategy,
+            ContextStrategy::FixedNeighbors { lines: 3 }
+        );
+        assert_eq!(
+            turbo.concurrency_strategy,
+            ConcurrencyStrategy::AdaptiveQueued {
+                window_multiplier: 2
+            }
+        );
+        assert_eq!(
+            turbo.terminology_strategy,
+            TerminologyStrategy::LightweightNames
+        );
+
+        let cinema = TranslationPolicy::for_mode(TranslationMode::Cinema);
+        assert_eq!(cinema.context_strategy, ContextStrategy::SceneAware);
+        assert_eq!(cinema.concurrency_strategy, ConcurrencyStrategy::SceneAware);
+        assert_eq!(cinema.terminology_strategy, TerminologyStrategy::Document);
+        assert_eq!(
+            cinema.preflight_failure_policy,
+            PreflightFailurePolicy::Fail
+        );
+        assert_eq!(cinema.review_strategy, ReviewStrategy::Adjudicated);
+        assert_eq!(
+            cinema.prompt_cache_strategy,
+            PromptCacheStrategy::CacheableSystem
+        );
+    }
+
+    #[test]
+    fn explicit_preflight_override_becomes_the_effective_typed_policy() {
+        let mut options = PipelineOptions::new("sample.srt".into());
+
+        options.allow_degraded_preflight = false;
+        assert_eq!(
+            options.preflight_failure_policy(),
+            PreflightFailurePolicy::Fail
+        );
     }
 
     #[test]
@@ -732,11 +890,17 @@ mod tests {
         );
         assert_eq!(options.review_concurrency, policy.review_concurrency);
         assert_eq!(options.review_policy, policy.review_policy);
-        assert_eq!(options.terminology_preflight, policy.terminology_preflight);
-        assert_eq!(options.online_terminology, policy.online_terminology);
+        assert_eq!(
+            options.terminology_preflight,
+            policy.terminology_strategy.preflight_default()
+        );
+        assert_eq!(
+            options.online_terminology,
+            policy.terminology_strategy.online_default()
+        );
         assert_eq!(
             options.allow_degraded_preflight,
-            policy.allow_degraded_preflight
+            policy.preflight_failure_policy.allows_degraded()
         );
     }
 }

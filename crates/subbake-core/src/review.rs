@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::entities::{PipelineOptions, ReviewResult, SubtitleSegment, TranslationLine};
+use crate::entities::{
+    PipelineOptions, PromptCacheStrategy, ReviewResult, ReviewStrategy, SubtitleSegment,
+    TranslationLine,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
 use crate::ports::ChatMessage;
@@ -353,7 +356,7 @@ pub(crate) fn build_review_messages(
          Return valid JSON only.\n\
          Review {} subtitles.\n\
          Only fix the stated deterministic issues without changing entry structure.",
-        if options.mode == crate::entities::TranslationMode::Cinema {
+        if options.policy().review_strategy == ReviewStrategy::Adjudicated {
             " First form an independent candidate translation for each editable line, then adjudicate it against the supplied candidate; return only the better final replacement when it materially improves fidelity, naturalness, consistency, or subtitle readability. Repeated source text is a consistency signal, not proof of identical meaning: keep translations identical when semantic metadata and local context are equivalent, but preserve justified differences in speaker, register, subtitle purpose, or scene meaning."
         } else {
             ""
@@ -371,7 +374,7 @@ pub(crate) fn build_review_messages(
          REVIEW_JSON_START{payload_json}REVIEW_JSON_END"
     );
     vec![
-        if options.mode == crate::entities::TranslationMode::Cinema {
+        if options.policy().prompt_cache_strategy == PromptCacheStrategy::CacheableSystem {
             ChatMessage::cacheable_system(system)
         } else {
             ChatMessage::system(system)
