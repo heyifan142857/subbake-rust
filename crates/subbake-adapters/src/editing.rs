@@ -117,6 +117,7 @@ fn merge_segments(
             end: segment.end.clone(),
             identifier: segment.identifier.clone(),
             settings: segment.settings.clone(),
+            semantic: segment.semantic.clone(),
         })
         .collect()
 }

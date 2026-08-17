@@ -238,6 +238,27 @@ impl ReviewPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SubtitleSemanticContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl SubtitleSemanticContext {
+    pub fn is_empty(&self) -> bool {
+        self.speaker.is_none()
+            && self.style.is_none()
+            && self.layer.is_none()
+            && self.kind.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleSegment {
     pub id: String,
@@ -246,6 +267,8 @@ pub struct SubtitleSegment {
     pub end: Option<String>,
     pub identifier: Option<String>,
     pub settings: Option<String>,
+    #[serde(default, skip_serializing_if = "SubtitleSemanticContext::is_empty")]
+    pub semantic: SubtitleSemanticContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

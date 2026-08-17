@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::entities::{
     AssDialogueRecord, AssDocumentMetadata, AssRecord, BilingualOrder, SubtitleDocument,
-    SubtitleDocumentMetadata, SubtitleSegment,
+    SubtitleDocumentMetadata, SubtitleSegment, SubtitleSemanticContext,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formats::bilingual_text;
@@ -68,6 +68,13 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
             let start_index = field_index(format, "start", line_index)?;
             let end_index = field_index(format, "end", line_index)?;
             let text_index = field_index(format, "text", line_index)?;
+            let semantic = SubtitleSemanticContext {
+                speaker: event_field(format, &fields, "name"),
+                style: event_field(format, &fields, "style"),
+                layer: event_field(format, &fields, "layer")
+                    .or_else(|| event_field(format, &fields, "marked")),
+                kind: Some(event_kind.to_ascii_lowercase()),
+            };
             let source_text = ass_text_to_model(&fields[text_index]);
             if source_text.trim().is_empty() || is_drawing_dialogue(&fields[text_index]) {
                 records.push(AssRecord::Raw(line.to_owned()));
@@ -81,6 +88,7 @@ pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
                 end: Some(fields[end_index].trim().to_owned()),
                 identifier: None,
                 settings: None,
+                semantic,
             });
             records.push(AssRecord::Dialogue(AssDialogueRecord {
                 segment_id,
@@ -301,6 +309,16 @@ fn field_index(fields: &[String], name: &str, line_index: usize) -> CoreResult<u
                 line_index + 1
             ))
         })
+}
+
+fn event_field(format: &[String], fields: &[String], name: &str) -> Option<String> {
+    format
+        .iter()
+        .position(|field| field == name)
+        .and_then(|index| fields.get(index))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn malformed_line(line_index: usize, line: &str) -> CoreError {
@@ -533,6 +551,15 @@ mod tests {
         let document = parse(Path::new("sample.ass"), SAMPLE).expect("parse ASS");
         assert_eq!(document.segments.len(), 1);
         assert_eq!(document.segments[0].text, "{\\i1}Hello, world{\\i0}\nagain");
+        assert_eq!(
+            document.segments[0].semantic.style.as_deref(),
+            Some("Default")
+        );
+        assert_eq!(document.segments[0].semantic.layer.as_deref(), Some("0"));
+        assert_eq!(
+            document.segments[0].semantic.kind.as_deref(),
+            Some("dialogue")
+        );
 
         let rendered = render(
             &document,
@@ -544,6 +571,26 @@ mod tests {
         .expect("render ASS");
 
         assert_eq!(rendered, SAMPLE);
+    }
+
+    #[test]
+    fn parses_ass_speaker_and_style_as_semantic_context() {
+        let source = SAMPLE
+            .replace(
+                "Format: Layer, Start, End, Style, Text",
+                "Format: Layer, Start, End, Style, Name, Text",
+            )
+            .replace("Default,{\\i1}Hello", "Default,Alice,{\\i1}Hello");
+        let document = parse(Path::new("speaker.ass"), &source).expect("parse ASS speaker");
+
+        assert_eq!(
+            document.segments[0].semantic.speaker.as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            document.segments[0].semantic.style.as_deref(),
+            Some("Default")
+        );
     }
 
     #[test]

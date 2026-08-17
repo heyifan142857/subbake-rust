@@ -337,27 +337,32 @@ fn string_map_json(entries: &[(String, String)]) -> serde_json::Value {
 }
 
 fn segment_json(segment: &SubtitleSegment) -> serde_json::Value {
-    serde_json::Value::Object(
-        [
-            (
-                "id".to_owned(),
-                serde_json::Value::String(segment.id.clone()),
-            ),
-            (
-                "text".to_owned(),
-                serde_json::Value::String(segment.text.clone()),
-            ),
-            ("start".to_owned(), option_string_json(&segment.start)),
-            ("end".to_owned(), option_string_json(&segment.end)),
-            (
-                "identifier".to_owned(),
-                option_string_json(&segment.identifier),
-            ),
-            ("settings".to_owned(), option_string_json(&segment.settings)),
-        ]
-        .into_iter()
-        .collect(),
-    )
+    let mut fields = [
+        (
+            "id".to_owned(),
+            serde_json::Value::String(segment.id.clone()),
+        ),
+        (
+            "text".to_owned(),
+            serde_json::Value::String(segment.text.clone()),
+        ),
+        ("start".to_owned(), option_string_json(&segment.start)),
+        ("end".to_owned(), option_string_json(&segment.end)),
+        (
+            "identifier".to_owned(),
+            option_string_json(&segment.identifier),
+        ),
+        ("settings".to_owned(), option_string_json(&segment.settings)),
+    ]
+    .into_iter()
+    .collect::<serde_json::Map<_, _>>();
+    if !segment.semantic.is_empty() {
+        fields.insert(
+            "semantic".to_owned(),
+            serde_json::to_value(&segment.semantic).unwrap_or_default(),
+        );
+    }
+    serde_json::Value::Object(fields)
 }
 
 fn segment_from_json(value: &serde_json::Value) -> CoreResult<SubtitleSegment> {
@@ -368,6 +373,18 @@ fn segment_from_json(value: &serde_json::Value) -> CoreResult<SubtitleSegment> {
         end: optional_string_from_json(&value["end"]),
         identifier: optional_string_from_json(&value["identifier"]),
         settings: optional_string_from_json(&value["settings"]),
+        semantic: value
+            .get("semantic")
+            .filter(|semantic| !semantic.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                CoreError::DataInvariant(format!(
+                    "runtime subtitle segment has invalid semantic metadata: {error}"
+                ))
+            })?
+            .unwrap_or_default(),
     })
 }
 
@@ -561,6 +578,7 @@ mod tests {
             end: Some("00:00:01,000".to_owned()),
             identifier: Some("1".to_owned()),
             settings: None,
+            semantic: Default::default(),
         };
         let path = store.batch_shard_path(BatchShardKind::Translated, 3);
         store
@@ -572,6 +590,23 @@ mod tests {
         assert!(path.ends_with("0003.json"));
         assert!(content.contains(r#""batch_index":3"#));
         assert!(content.contains(r#""text":"hello""#));
+        assert!(!content.contains(r#""semantic""#));
+    }
+
+    #[test]
+    fn legacy_segment_without_semantic_metadata_remains_readable() {
+        let value = serde_json::json!({
+            "id": "1",
+            "text": "hello",
+            "start": null,
+            "end": null,
+            "identifier": null,
+            "settings": null,
+        });
+
+        let segment = segment_from_json(&value).expect("legacy segment");
+
+        assert!(segment.semantic.is_empty());
     }
 
     #[test]
@@ -587,14 +622,17 @@ mod tests {
             false,
         );
         let store = FileRuntimeStore::new(paths);
-        let first = SubtitleSegment {
+        let mut first = SubtitleSegment {
             id: "1".to_owned(),
             text: "one".to_owned(),
             start: None,
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         };
+        first.semantic.speaker = Some("Alice".to_owned());
+        first.semantic.style = Some("Default".to_owned());
         let second = SubtitleSegment {
             id: "2".to_owned(),
             text: "two".to_owned(),
@@ -602,6 +640,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         };
 
         store
@@ -856,6 +895,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         };
         let attempt = AttemptLog {
             attempt: 1,

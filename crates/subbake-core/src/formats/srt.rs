@@ -236,6 +236,7 @@ fn parse_block(block: &str, cue_index: usize) -> CoreResult<SubtitleSegment> {
         end: Some(timing.end),
         identifier,
         settings: timing.settings,
+        semantic: Default::default(),
     })
 }
 

@@ -247,9 +247,15 @@ Modes are semantic presets rather than branding aliases:
 
 | Mode | Primary goal | Default behavior |
 | --- | --- | --- |
-| `economy` | Cost and throughput | Large self-contained batches, one corrected retry before structural splitting, deduplication, fewer model stages |
-| `turbo` | Latency/quality balance | Adaptive concurrency, neighboring source context, bounded confirmed prior translations, lightweight name alignment |
-| `cinema` | Quality and consistency | Scene-aware scheduling, strict terminology preflight, online terminology, timing-aware full review, language-aware readability defaults |
+| `economy` | Cost and throughput | Large self-contained batches, strict semantic deduplication, one corrected retry before structural splitting, fewer model stages |
+| `turbo` | Latency/quality balance | Adaptive concurrency, strict semantic deduplication, neighboring source context, bounded confirmed prior translations, lightweight name alignment |
+| `cinema` | Quality and consistency | Scene-aware scheduling, strict semantic deduplication, cross-scene repeated-source consistency review, strict terminology preflight, online terminology, timing-aware full review, language-aware readability defaults |
+
+Semantic deduplication requires normalized source text, neighboring source text, and available
+speaker, ASS style/layer, and cue-setting metadata to match. Cinema additionally exposes other
+occurrences of the same source text to the reviewer as read-only consistency context. Equivalent
+occurrences should remain identical, while speaker-, purpose-, register-, or scene-dependent
+differences remain allowed.
 
 Select a mode explicitly when reproducibility matters:
 

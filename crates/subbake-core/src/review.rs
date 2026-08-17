@@ -8,11 +8,27 @@ use crate::term_matcher::TermMatcher;
 use crate::validation::validate_full_alignment;
 
 const REVIEW_CONTEXT_LINES: usize = 3;
+const MAX_EXTERNAL_CONSISTENCY_OCCURRENCES: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewContextLine {
     pub(crate) source: SubtitleSegment,
     pub(crate) translated: SubtitleSegment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewConsistencyOccurrence {
+    pub(crate) source: SubtitleSegment,
+    pub(crate) translated: SubtitleSegment,
+    pub(crate) previous: Option<SubtitleSegment>,
+    pub(crate) next: Option<SubtitleSegment>,
+    pub(crate) editable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewConsistencyGroup {
+    pub(crate) source_key: String,
+    pub(crate) occurrences: Vec<ReviewConsistencyOccurrence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +41,7 @@ pub(crate) struct ReviewBatchPlan {
     pub(crate) candidate_reasons: BTreeMap<String, Vec<String>>,
     pub(crate) before: Vec<ReviewContextLine>,
     pub(crate) after: Vec<ReviewContextLine>,
+    pub(crate) consistency_groups: Vec<ReviewConsistencyGroup>,
 }
 
 pub(crate) fn build_review_plan(
@@ -48,6 +65,7 @@ pub(crate) fn build_review_plan(
     for (batch_index, source) in batches.iter().enumerate() {
         let end = offset + source.len();
         let translated = &translated_segments[offset..end];
+        let consistency_groups = build_consistency_groups(&all_source, translated_segments, source);
         let candidate_reasons = source
             .iter()
             .zip(translated)
@@ -90,6 +108,7 @@ pub(crate) fn build_review_plan(
                     end.saturating_add(REVIEW_CONTEXT_LINES)
                         .min(all_source.len()),
                 ),
+                consistency_groups,
             });
         }
         offset = end;
@@ -108,6 +127,14 @@ pub(crate) fn build_full_review_plan(
         .enumerate()
         .map(|(batch_index, source)| {
             let end = offset + source.len();
+            let consistency_groups =
+                build_consistency_groups(&all_source, translated_segments, source);
+            let consistency_ids = consistency_groups
+                .iter()
+                .flat_map(|group| &group.occurrences)
+                .filter(|occurrence| occurrence.editable)
+                .map(|occurrence| occurrence.source.id.as_str())
+                .collect::<BTreeSet<_>>();
             let plan = ReviewBatchPlan {
                 batch_index: batch_index + 1,
                 start_offset: offset,
@@ -116,7 +143,13 @@ pub(crate) fn build_full_review_plan(
                 reasons: vec!["full review".to_owned()],
                 candidate_reasons: source
                     .iter()
-                    .map(|segment| (segment.id.clone(), vec!["full review".to_owned()]))
+                    .map(|segment| {
+                        let mut reasons = vec!["full review".to_owned()];
+                        if consistency_ids.contains(segment.id.as_str()) {
+                            reasons.push("repeated source consistency".to_owned());
+                        }
+                        (segment.id.clone(), reasons)
+                    })
                     .collect(),
                 before: review_context(
                     &all_source,
@@ -131,11 +164,112 @@ pub(crate) fn build_full_review_plan(
                     end.saturating_add(REVIEW_CONTEXT_LINES)
                         .min(all_source.len()),
                 ),
+                consistency_groups,
             };
             offset = end;
             plan
         })
         .collect()
+}
+
+fn build_consistency_groups(
+    source: &[SubtitleSegment],
+    translated: &[SubtitleSegment],
+    editable: &[SubtitleSegment],
+) -> Vec<ReviewConsistencyGroup> {
+    let editable_ids = editable
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut indices_by_source = BTreeMap::<String, Vec<usize>>::new();
+    for (index, segment) in source.iter().enumerate() {
+        let key = normalize_text(&segment.text);
+        if !key.is_empty() {
+            indices_by_source.entry(key).or_default().push(index);
+        }
+    }
+
+    indices_by_source
+        .into_iter()
+        .filter(|(_, indices)| {
+            indices.len() > 1
+                && indices
+                    .iter()
+                    .any(|index| editable_ids.contains(source[*index].id.as_str()))
+        })
+        .map(|(source_key, indices)| {
+            let mut selected = indices
+                .iter()
+                .copied()
+                .filter(|index| editable_ids.contains(source[*index].id.as_str()))
+                .collect::<Vec<_>>();
+            let external = indices
+                .into_iter()
+                .filter(|index| !editable_ids.contains(source[*index].id.as_str()))
+                .collect::<Vec<_>>();
+            let mut selected_external = BTreeSet::new();
+            let mut seen_translations = BTreeSet::new();
+            for &index in &external {
+                if seen_translations.insert(normalize_text(&translated[index].text))
+                    && selected_external.len() < MAX_EXTERNAL_CONSISTENCY_OCCURRENCES
+                {
+                    selected_external.insert(index);
+                }
+            }
+            let mut external_signatures = BTreeSet::new();
+            for index in external {
+                let signature = consistency_occurrence_signature(source, translated, index);
+                if external_signatures.insert(signature)
+                    && selected_external.len() < MAX_EXTERNAL_CONSISTENCY_OCCURRENCES
+                {
+                    selected_external.insert(index);
+                }
+            }
+            selected.extend(selected_external);
+            selected.sort_unstable();
+            ReviewConsistencyGroup {
+                source_key,
+                occurrences: selected
+                    .into_iter()
+                    .map(|index| ReviewConsistencyOccurrence {
+                        source: source[index].clone(),
+                        translated: translated[index].clone(),
+                        previous: index
+                            .checked_sub(1)
+                            .and_then(|previous| source.get(previous))
+                            .cloned(),
+                        next: source.get(index.saturating_add(1)).cloned(),
+                        editable: editable_ids.contains(source[index].id.as_str()),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn consistency_occurrence_signature(
+    source: &[SubtitleSegment],
+    translated: &[SubtitleSegment],
+    index: usize,
+) -> Vec<String> {
+    let segment = &source[index];
+    vec![
+        normalize_text(&translated[index].text),
+        normalize_text(segment.settings.as_deref().unwrap_or_default()),
+        normalize_text(segment.semantic.speaker.as_deref().unwrap_or_default()),
+        normalize_text(segment.semantic.style.as_deref().unwrap_or_default()),
+        normalize_text(segment.semantic.layer.as_deref().unwrap_or_default()),
+        normalize_text(segment.semantic.kind.as_deref().unwrap_or_default()),
+        index
+            .checked_sub(1)
+            .and_then(|previous| source.get(previous))
+            .map(|segment| normalize_text(&segment.text))
+            .unwrap_or_default(),
+        source
+            .get(index.saturating_add(1))
+            .map(|segment| normalize_text(&segment.text))
+            .unwrap_or_default(),
+    ]
 }
 
 fn review_context(
@@ -183,6 +317,7 @@ pub(crate) fn build_review_messages(
                 "end": source.end,
                 "identifier": source.identifier,
                 "settings": source.settings,
+                "semantic": source.semantic,
                 "reasons": candidate_reasons.get(&source.id),
             })).collect::<Vec<_>>(),
         "context": source.iter().zip(translated).map(|(source, translated)| serde_json::json!({
@@ -193,10 +328,12 @@ pub(crate) fn build_review_messages(
             "end": source.end,
             "identifier": source.identifier,
             "settings": source.settings,
+            "semantic": source.semantic,
             "editable": candidate_reasons.contains_key(&source.id),
         })).collect::<Vec<_>>(),
         "readonly_before": review_context_json(&batch.before),
         "readonly_after": review_context_json(&batch.after),
+        "repeated_source_groups": review_consistency_json(&batch.consistency_groups),
     });
     if !glossary.is_empty() {
         payload["glossary"] = serde_json::Value::Object(
@@ -217,7 +354,7 @@ pub(crate) fn build_review_messages(
          Review {} subtitles.\n\
          Only fix the stated deterministic issues without changing entry structure.",
         if options.mode == crate::entities::TranslationMode::Cinema {
-            " First form an independent candidate translation for each editable line, then adjudicate it against the supplied candidate; return only the better final replacement when it materially improves fidelity, naturalness, consistency, or subtitle readability."
+            " First form an independent candidate translation for each editable line, then adjudicate it against the supplied candidate; return only the better final replacement when it materially improves fidelity, naturalness, consistency, or subtitle readability. Repeated source text is a consistency signal, not proof of identical meaning: keep translations identical when semantic metadata and local context are equivalent, but preserve justified differences in speaker, register, subtitle purpose, or scene meaning."
         } else {
             ""
         },
@@ -227,6 +364,7 @@ pub(crate) fn build_review_messages(
         "TASK_START\nreview_translations\nTASK_END\n\
          Only ids in expected_ids are editable; context is read-only.\n\
          readonly_before and readonly_after are adjacent translated context; never return their ids.\n\
+         repeated_source_groups contains same-source occurrences across the document. Occurrences marked editable may be changed only when their id is in expected_ids; every other occurrence is read-only.\n\
          Prefer minimal edits and omit unchanged lines.\n\
          Return JSON only as {{\"changes\":[{{\"id\":\"<id>\",\"translation\":\"<replacement>\"}}]}}.\n\
          Return an empty changes array when every candidate is already good.\n\
@@ -255,6 +393,33 @@ fn review_context_json(lines: &[ReviewContextLine]) -> serde_json::Value {
                     "end": line.source.end,
                     "identifier": line.source.identifier,
                     "settings": line.source.settings,
+                    "semantic": line.source.semantic,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn review_consistency_json(groups: &[ReviewConsistencyGroup]) -> serde_json::Value {
+    serde_json::Value::Array(
+        groups
+            .iter()
+            .map(|group| {
+                serde_json::json!({
+                    "normalized_source": group.source_key,
+                    "occurrences": group.occurrences.iter().map(|occurrence| serde_json::json!({
+                        "id": occurrence.source.id,
+                        "source": occurrence.source.text,
+                        "translation": occurrence.translated.text,
+                        "start": occurrence.source.start,
+                        "end": occurrence.source.end,
+                        "identifier": occurrence.source.identifier,
+                        "settings": occurrence.source.settings,
+                        "semantic": occurrence.source.semantic,
+                        "previous_source": occurrence.previous.as_ref().map(|line| &line.text),
+                        "next_source": occurrence.next.as_ref().map(|line| &line.text),
+                        "editable": occurrence.editable,
+                    })).collect::<Vec<_>>(),
                 })
             })
             .collect(),
@@ -438,6 +603,7 @@ mod tests {
             end: Some(end.to_owned()),
             identifier: Some(format!("speaker-{id}")),
             settings: Some("align:start".to_owned()),
+            semantic: Default::default(),
         }
     }
 
@@ -481,6 +647,47 @@ mod tests {
         assert_eq!(
             payload["readonly_before"][0]["translation"],
             "translated one"
+        );
+    }
+
+    #[test]
+    fn cinema_review_receives_cross_batch_repeated_source_context() {
+        let mut spoken = segment("1", "Open", "00:00:00,000", "00:00:01,000");
+        spoken.semantic.speaker = Some("Alice".to_owned());
+        spoken.semantic.style = Some("Default".to_owned());
+        let bridge = segment("2", "Later", "00:00:02,000", "00:00:03,000");
+        let mut sign = segment("3", "Open", "00:01:00,000", "00:01:01,000");
+        sign.semantic.style = Some("Sign".to_owned());
+        let source = vec![spoken, bridge, sign];
+        let mut translated = source.clone();
+        translated[0].text = "打开".to_owned();
+        translated[1].text = "稍后".to_owned();
+        translated[2].text = "营业中".to_owned();
+        let batches = vec![source[..2].to_vec(), source[2..].to_vec()];
+        let plan = build_full_review_plan(&batches, &translated);
+        let mut options = PipelineOptions::new("review.ass".into());
+        options.mode = crate::entities::TranslationMode::Cinema;
+
+        let messages = build_review_messages(&options, &plan[0], &ContextMemory::default());
+        let payload = messages[1]
+            .content
+            .split("REVIEW_JSON_START")
+            .nth(1)
+            .and_then(|value| value.split("REVIEW_JSON_END").next())
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .expect("review payload");
+        let group = &payload["repeated_source_groups"][0];
+
+        assert_eq!(group["normalized_source"], "open");
+        assert_eq!(group["occurrences"][0]["semantic"]["speaker"], "Alice");
+        assert_eq!(group["occurrences"][0]["editable"], true);
+        assert_eq!(group["occurrences"][1]["semantic"]["style"], "Sign");
+        assert_eq!(group["occurrences"][1]["translation"], "营业中");
+        assert_eq!(group["occurrences"][1]["editable"], false);
+        assert!(
+            messages[0]
+                .content
+                .contains("not proof of identical meaning")
         );
     }
 }

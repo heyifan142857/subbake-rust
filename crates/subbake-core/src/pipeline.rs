@@ -3025,6 +3025,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             }],
             header: None,
             passthrough_blocks: Vec::new(),
@@ -3078,6 +3079,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             }],
             header: None,
             passthrough_blocks: Vec::new(),
@@ -3107,7 +3109,7 @@ mod tests {
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
         let data = captured.lock().expect("capture lock");
         assert_eq!(data.saved_translation_memory.len(), 1);
-        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v3:"));
+        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v4:"));
         assert_eq!(data.saved_translation_memory[0].1, "[ECHO] hello");
         assert_eq!(data.saved_batches.len(), 1);
         assert_eq!(data.saved_batches[0].1[0].text, "[ECHO] hello");
@@ -3349,6 +3351,7 @@ mod tests {
                     end: None,
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 })
                 .collect(),
             header: None,
@@ -3436,6 +3439,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             }],
             header: None,
             passthrough_blocks: Vec::new(),
@@ -4941,6 +4945,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         }
     }
 

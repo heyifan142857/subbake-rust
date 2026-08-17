@@ -149,6 +149,7 @@ pub fn parse_translation_output(
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         })
         .collect::<Vec<_>>();
     validate_translation_batch(&source, &lines)?;
@@ -232,6 +233,7 @@ mod tests {
                     end: None,
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 },
                 SubtitleSegment {
                     id: "2".to_owned(),
@@ -240,6 +242,7 @@ mod tests {
                     end: None,
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 },
             ],
         }

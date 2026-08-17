@@ -253,6 +253,7 @@ mod tests {
                     end: Some("00:00:01,000".to_owned()),
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 },
                 SubtitleSegment {
                     id: "2".to_owned(),
@@ -261,6 +262,7 @@ mod tests {
                     end: Some("00:00:02,000".to_owned()),
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 },
             ],
             header: None,

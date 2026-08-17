@@ -996,6 +996,7 @@ mod tests {
             end: timing.map(|(_, end)| end.to_owned()),
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         }
     }
 }

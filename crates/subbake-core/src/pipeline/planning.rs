@@ -373,6 +373,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         }
     }
 
@@ -427,6 +428,26 @@ mod tests {
             segment("5", "Fine."),
             segment("6", "We should stay."),
         ];
+
+        let plan = DeduplicationPlan::new(&source, true);
+
+        assert_eq!(plan.canonical(), source);
+        assert_eq!(plan.duplicates(), 0);
+    }
+
+    #[test]
+    fn deduplication_keeps_identical_text_with_different_semantic_metadata() {
+        let mut source = vec![
+            segment("1", "Start"),
+            segment("2", "Open"),
+            segment("3", "End"),
+            segment("4", "Start"),
+            segment("5", "Open"),
+            segment("6", "End"),
+        ];
+        source[1].semantic.speaker = Some("Alice".to_owned());
+        source[1].semantic.style = Some("Default".to_owned());
+        source[4].semantic.style = Some("Sign".to_owned());
 
         let plan = DeduplicationPlan::new(&source, true);
 

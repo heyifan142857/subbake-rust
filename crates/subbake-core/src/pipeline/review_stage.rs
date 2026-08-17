@@ -104,6 +104,19 @@ impl ReviewStage {
                         context.translated = current.clone();
                     }
                 }
+                for occurrence in batch
+                    .consistency_groups
+                    .iter_mut()
+                    .flat_map(|group| &mut group.occurrences)
+                {
+                    if let Some(current) = self
+                        .output
+                        .iter()
+                        .find(|line| line.id == occurrence.translated.id)
+                    {
+                        occurrence.translated = current.clone();
+                    }
+                }
                 (index + 1, batch)
             })
             .collect()
@@ -116,6 +129,7 @@ impl ReviewStage {
         scene_groups: &[usize],
     ) -> usize {
         let mut seen = HashSet::new();
+        let mut seen_consistency_groups = HashSet::new();
         let mut count = 0usize;
         for batch in self.plan.iter().skip(start).take(concurrency.max(1)) {
             let Some(group) = batch
@@ -128,6 +142,19 @@ impl ReviewStage {
             if !seen.insert(*group) {
                 break;
             }
+            if batch
+                .consistency_groups
+                .iter()
+                .any(|group| seen_consistency_groups.contains(&group.source_key))
+            {
+                break;
+            }
+            seen_consistency_groups.extend(
+                batch
+                    .consistency_groups
+                    .iter()
+                    .map(|group| group.source_key.clone()),
+            );
             count += 1;
         }
         count.max(1)
@@ -201,5 +228,76 @@ impl ReviewStage {
             output: self.output,
             changes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entities::{TranslationLine, TranslationMode};
+
+    fn segment(id: &str, text: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+            semantic: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cinema_serializes_shared_consistency_groups_and_refreshes_peer_translations() {
+        let source = vec![
+            segment("1", "Open"),
+            segment("2", "Later"),
+            segment("3", "Open"),
+        ];
+        let mut translated = source.clone();
+        translated[0].text = "打开".to_owned();
+        translated[1].text = "稍后".to_owned();
+        translated[2].text = "营业中".to_owned();
+        let batches = source
+            .iter()
+            .cloned()
+            .map(|line| vec![line])
+            .collect::<Vec<_>>();
+        let mut options = PipelineOptions::new("review.ass".into());
+        options.mode = TranslationMode::Cinema;
+        options.review_policy = ReviewPolicy::Full;
+        let mut stage = ReviewStage::new(
+            &options,
+            &batches,
+            &translated,
+            &ContextMemory::default(),
+            0,
+            &[],
+            0,
+        )
+        .expect("review stage");
+
+        assert_eq!(stage.scene_window_size(0, 3, &[0, 1, 2]), 2);
+        stage
+            .apply(
+                1,
+                &[TranslationLine {
+                    id: "1".to_owned(),
+                    translation: "开启".to_owned(),
+                }],
+                Usage::default(),
+            )
+            .expect("apply first review");
+        let window = stage.window(2, 1);
+        let peer = window[0]
+            .1
+            .consistency_groups
+            .iter()
+            .flat_map(|group| &group.occurrences)
+            .find(|occurrence| occurrence.source.id == "1")
+            .expect("refreshed peer");
+
+        assert_eq!(peer.translated.text, "开启");
     }
 }

@@ -159,6 +159,7 @@ fn parse_cue(block: &str, cue_index: usize) -> Option<SubtitleSegment> {
         end: Some(timing.end),
         identifier,
         settings: timing.settings,
+        semantic: Default::default(),
     })
 }
 

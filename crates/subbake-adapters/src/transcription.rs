@@ -302,6 +302,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
                     end: None,
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                     ..s.clone()
                 })
                 .collect();
@@ -1764,6 +1765,7 @@ mod tests {
                     end: None,
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 })
                 .collect(),
             header: None,
@@ -2388,6 +2390,7 @@ fi
             end: Some(end.to_owned()),
             identifier: Some(id.to_owned()),
             settings: None,
+            semantic: Default::default(),
         }
     }
 

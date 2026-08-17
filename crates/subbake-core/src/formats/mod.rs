@@ -213,6 +213,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             },
             SubtitleSegment {
                 id: "2".to_owned(),
@@ -221,6 +222,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             },
         ];
 

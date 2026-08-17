@@ -18,6 +18,7 @@ pub fn parse(path: &Path, text: &str) -> SubtitleDocument {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         })
         .collect();
 

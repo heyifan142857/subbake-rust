@@ -296,6 +296,7 @@ mod tests {
                     end: Some((*end).to_owned()),
                     identifier: None,
                     settings: None,
+                    semantic: Default::default(),
                 })
                 .collect(),
             header: None,

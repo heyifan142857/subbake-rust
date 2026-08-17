@@ -151,9 +151,17 @@ pub(super) fn build_translation_messages(
             let text = protect_terms(&text, &term_markers);
             let text = protect_names(&text, &name_markers);
             if compact_wire {
-                serde_json::json!([segment.id, text])
+                if let Some(semantic) = segment_semantic_json(segment) {
+                    serde_json::json!([segment.id, text, semantic])
+                } else {
+                    serde_json::json!([segment.id, text])
+                }
             } else {
-                serde_json::json!({"id": segment.id, "text": text})
+                let mut line = serde_json::json!({"id": segment.id, "text": text});
+                if let Some(semantic) = segment_semantic_json(segment) {
+                    line["semantic"] = semantic;
+                }
+                line
             }
         })
         .collect::<Vec<_>>();
@@ -180,6 +188,7 @@ Return exactly one line for every input line, in the same order. Copy each id ex
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
 CONTEXT_JSON.editable_ids is the complete set of ids you may return. CONTEXT_JSON.readonly_source and CONTEXT_JSON.confirmed_previous are read-only context; never return or modify their ids.\n\
 Tokens shaped like ⟦SBK_FMT_<number>⟧ are protected subtitle formatting markers. Copy each marker exactly once and in the original order.\n\
+An optional third item in an input line is read-only semantic metadata such as speaker, style, layer, or cue settings. Use it to distinguish dialogue, signs, lyrics, and role-specific register; never translate or return the metadata.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
 only when they fit the meaning in the current context.\n{}\n{terminology_rule}",
@@ -205,9 +214,28 @@ fn readonly_source_lines(segments: &[SubtitleSegment]) -> serde_json::Value {
     serde_json::Value::Array(
         segments
             .iter()
-            .map(|segment| serde_json::json!({"id": segment.id, "source": segment.text}))
+            .map(|segment| {
+                let mut line = serde_json::json!({"id": segment.id, "source": segment.text});
+                if let Some(semantic) = segment_semantic_json(segment) {
+                    line["semantic"] = semantic;
+                }
+                line
+            })
             .collect(),
     )
+}
+
+fn segment_semantic_json(segment: &SubtitleSegment) -> Option<serde_json::Value> {
+    if segment.semantic.is_empty() && segment.settings.is_none() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "speaker": segment.semantic.speaker,
+        "style": segment.semantic.style,
+        "layer": segment.semantic.layer,
+        "kind": segment.semantic.kind,
+        "cue_settings": segment.settings,
+    }))
 }
 
 pub(super) fn request_hash(
@@ -418,14 +446,11 @@ pub(super) fn contextual_translation_memory_keys(
         .map(|(index, segment)| {
             let previous = index
                 .checked_sub(1)
-                .and_then(|previous| segments.get(previous))
-                .map(|segment| segment.text.as_str());
-            let next = segments
-                .get(index.saturating_add(1))
-                .map(|segment| segment.text.as_str());
+                .and_then(|previous| segments.get(previous));
+            let next = segments.get(index.saturating_add(1));
             (
                 segment.id.clone(),
-                contextual_translation_memory_key(scope, previous, &segment.text, next),
+                contextual_translation_memory_key(scope, previous, segment, next),
             )
         })
         .collect()
@@ -557,29 +582,64 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
 
 fn contextual_translation_memory_key(
     scope: &str,
-    previous: Option<&str>,
-    text: &str,
-    next: Option<&str>,
+    previous: Option<&SubtitleSegment>,
+    segment: &SubtitleSegment,
+    next: Option<&SubtitleSegment>,
 ) -> String {
-    let source = translation_memory_key(text);
+    let source = translation_memory_key(&segment.text);
     if source.is_empty() {
         return String::new();
     }
     let payload = JsonValue::Array(vec![
         JsonValue::String(scope.to_owned()),
         previous
-            .map(translation_memory_key)
-            .map(JsonValue::String)
+            .map(semantic_translation_memory_value)
             .unwrap_or(JsonValue::Null),
-        JsonValue::String(source.clone()),
-        next.map(translation_memory_key)
-            .map(JsonValue::String)
+        semantic_translation_memory_value(segment),
+        next.map(semantic_translation_memory_value)
             .unwrap_or(JsonValue::Null),
     ]);
     format!(
         "ctx-v{TRANSLATION_MEMORY_POLICY_VERSION}:{}:{source}",
         stable_hash(&payload)
     )
+}
+
+fn semantic_translation_memory_value(segment: &SubtitleSegment) -> JsonValue {
+    JsonValue::Object(vec![
+        (
+            "text".to_owned(),
+            JsonValue::String(translation_memory_key(&segment.text)),
+        ),
+        (
+            "cue_settings".to_owned(),
+            normalized_optional_value(segment.settings.as_deref()),
+        ),
+        (
+            "speaker".to_owned(),
+            normalized_optional_value(segment.semantic.speaker.as_deref()),
+        ),
+        (
+            "style".to_owned(),
+            normalized_optional_value(segment.semantic.style.as_deref()),
+        ),
+        (
+            "layer".to_owned(),
+            normalized_optional_value(segment.semantic.layer.as_deref()),
+        ),
+        (
+            "kind".to_owned(),
+            normalized_optional_value(segment.semantic.kind.as_deref()),
+        ),
+    ])
+}
+
+fn normalized_optional_value(value: Option<&str>) -> JsonValue {
+    value
+        .map(translation_memory_key)
+        .filter(|value| !value.is_empty())
+        .map(JsonValue::String)
+        .unwrap_or(JsonValue::Null)
 }
 
 pub(super) fn merge_translation_lines(
@@ -672,10 +732,15 @@ mod tests {
         let first_keys = contextual_translation_memory_keys("/shows/one", &first);
         let second_keys = contextual_translation_memory_keys("/shows/one", &second);
         let other_project = contextual_translation_memory_keys("/shows/two", &first);
+        let mut other_semantics = first.clone();
+        other_semantics[1].semantic.style = Some("Sign".to_owned());
+        let other_semantic_keys =
+            contextual_translation_memory_keys("/shows/one", &other_semantics);
 
-        assert!(first_keys["2"].starts_with("ctx-v3:"));
+        assert!(first_keys["2"].starts_with("ctx-v4:"));
         assert_ne!(first_keys["2"], second_keys["2"]);
         assert_ne!(first_keys["2"], other_project["2"]);
+        assert_ne!(first_keys["2"], other_semantic_keys["2"]);
     }
 
     #[test]
@@ -711,6 +776,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         }];
 
         let transliterated = build_translation_messages(
@@ -775,6 +841,38 @@ mod tests {
     }
 
     #[test]
+    fn translation_prompt_includes_semantic_metadata_without_making_it_editable() {
+        let options = PipelineOptions::new("episode.ass".into());
+        let mut line = segment("1", "Open");
+        line.semantic.speaker = Some("Alice".to_owned());
+        line.semantic.style = Some("Sign".to_owned());
+        line.settings = Some("align:start".to_owned());
+
+        let messages = build_translation_messages(
+            &options,
+            0,
+            &[line],
+            &TranslationPromptContext::default(),
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+            true,
+        );
+
+        assert!(messages[1].content.contains("\"speaker\":\"Alice\""));
+        assert!(messages[1].content.contains("\"style\":\"Sign\""));
+        assert!(
+            messages[1]
+                .content
+                .contains("\"cue_settings\":\"align:start\"")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("never translate or return the metadata")
+        );
+    }
+
+    #[test]
     fn translation_prompt_separates_editable_and_read_only_context() {
         let options = PipelineOptions::new("episode.srt".into());
         let mut memory = ContextMemory::default();
@@ -836,6 +934,7 @@ mod tests {
             end: None,
             identifier: None,
             settings: None,
+            semantic: Default::default(),
         }
     }
 }

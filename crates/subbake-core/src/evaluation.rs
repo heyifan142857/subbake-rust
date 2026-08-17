@@ -496,6 +496,7 @@ mod tests {
                 end: None,
                 identifier: None,
                 settings: None,
+                semantic: Default::default(),
             }],
         }
     }
