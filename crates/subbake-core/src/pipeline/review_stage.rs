@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::entities::{
@@ -92,8 +93,44 @@ impl ReviewStage {
             .enumerate()
             .skip(start)
             .take(concurrency.max(1))
-            .map(|(index, batch)| (index + 1, batch.clone()))
+            .map(|(index, batch)| {
+                let mut batch = batch.clone();
+                for context in batch.before.iter_mut().chain(&mut batch.after) {
+                    if let Some(current) = self
+                        .output
+                        .iter()
+                        .find(|line| line.id == context.translated.id)
+                    {
+                        context.translated = current.clone();
+                    }
+                }
+                (index + 1, batch)
+            })
             .collect()
+    }
+
+    pub fn scene_window_size(
+        &self,
+        start: usize,
+        concurrency: usize,
+        scene_groups: &[usize],
+    ) -> usize {
+        let mut seen = HashSet::new();
+        let mut count = 0usize;
+        for batch in self.plan.iter().skip(start).take(concurrency.max(1)) {
+            let Some(group) = batch
+                .batch_index
+                .checked_sub(1)
+                .and_then(|index| scene_groups.get(index))
+            else {
+                break;
+            };
+            if !seen.insert(*group) {
+                break;
+            }
+            count += 1;
+        }
+        count.max(1)
     }
 
     pub fn apply(

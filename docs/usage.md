@@ -236,8 +236,10 @@ sbake translate episode.srt --no-resume --no-cache
 ```
 
 Useful tuning flags include `--batch-size`, `--batch-token-budget`,
-`--translation-concurrency`, `--retries`, `--glossary`, and
-`--timeout-seconds`. Run `sbake translate --help` for the current flag surface.
+`--request-token-budget`, `--confirmed-context-lines`,
+`--confirmed-context-token-budget`, `--translation-concurrency`, `--retries`,
+`--glossary`, and `--timeout-seconds`. Run `sbake translate --help` for the
+current flag surface.
 
 ### Translation modes
 
@@ -245,9 +247,9 @@ Modes are semantic presets rather than branding aliases:
 
 | Mode | Primary goal | Default behavior |
 | --- | --- | --- |
-| `economy` | Cost and throughput | Large self-contained batches, deduplication, fewer model stages |
-| `turbo` | Latency/quality balance | High concurrency, neighboring source context, confirmed prior translations, lightweight name alignment |
-| `cinema` | Quality and consistency | Smaller scene-aware batches, terminology preflight, online terminology, full review |
+| `economy` | Cost and throughput | Large self-contained batches, one corrected retry before structural splitting, deduplication, fewer model stages |
+| `turbo` | Latency/quality balance | Adaptive concurrency, neighboring source context, bounded confirmed prior translations, lightweight name alignment |
+| `cinema` | Quality and consistency | Scene-aware scheduling, strict terminology preflight, online terminology, timing-aware full review, language-aware readability defaults |
 
 Select a mode explicitly when reproducibility matters:
 
@@ -261,6 +263,13 @@ Explicit profile and CLI settings override preset defaults. All modes retain
 deterministic ID/count alignment, formatting-marker preservation, required
 glossary enforcement, final validation, cancellation, and cache/resume
 isolation.
+
+`request_token_budget` caps the estimated complete prompt plus JSON response and
+splits an oversized batch before a provider side effect. `confirmed_context_lines`
+and `confirmed_context_token_budget` bound rolling translated context. Cinema
+fails when requested terminology preflight is unavailable or fails; set
+`allow_degraded_preflight = true` or pass `--allow-degraded-preflight` to opt in
+to the previous best-effort behavior.
 
 ### Review and readability limits
 

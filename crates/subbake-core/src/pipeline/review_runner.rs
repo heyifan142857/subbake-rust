@@ -19,6 +19,7 @@ pub(super) struct ReviewRun {
 pub(super) struct ReviewBatchInput<'a> {
     pub review_batches: &'a [Vec<SubtitleSegment>],
     pub translation_batches: usize,
+    pub scene_groups: &'a [usize],
 }
 
 pub(super) fn run<B, D>(
@@ -36,6 +37,7 @@ where
 {
     let batches = batch_input.review_batches;
     let translation_batches = batch_input.translation_batches;
+    let scene_groups = batch_input.scene_groups;
     let mut stage = ReviewStage::new(
         &pipeline.options,
         batches,
@@ -71,6 +73,8 @@ where
                 && pipeline.review_backend_supports_parallel_generation()
             {
                 concurrency.saturating_mul(2)
+            } else if pipeline.options.mode == crate::entities::TranslationMode::Cinema {
+                stage.scene_window_size(next_review, concurrency, scene_groups)
             } else {
                 concurrency
             };

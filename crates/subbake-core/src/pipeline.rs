@@ -43,9 +43,9 @@ use planning::{BatchPlanner, DeduplicationPlan};
 use review_runner::{ReviewBatchInput, ReviewRun};
 pub use support::translation_memory_key;
 use support::{
-    build_translation_messages, contextual_translation_memory_keys, is_agent_repairable,
-    is_operational_llm_failure, merge_review_patch, request_hash, translation_memory_scope,
-    update_translation_memory, validate_review_candidate_ids,
+    build_translation_messages, contextual_translation_memory_keys, estimated_request_tokens,
+    is_agent_repairable, is_operational_llm_failure, merge_review_patch, request_hash,
+    translation_memory_scope, update_translation_memory, validate_review_candidate_ids,
 };
 use terminology::TerminologyStage;
 #[cfg(test)]
@@ -53,7 +53,7 @@ use terminology::{
     TerminologyCandidate, extract_candidates as extract_terminology_candidates,
     parse_payload as parse_terminology_payload,
 };
-use translation_runner::TranslationRun;
+use translation_runner::{TranslationRun, TranslationRunInput};
 use translation_stage::{PreparedBatch, TranslationPromptContext};
 
 #[cfg(test)]
@@ -82,6 +82,7 @@ pub struct SubtitlePipeline<B, D> {
     /// Turbo starts conservatively and uses additive increase / multiplicative
     /// decrease when the provider signals pressure.
     adaptive_translation_concurrency: usize,
+    translation_window_was_rate_limited: bool,
     provider_requests: usize,
     provider_tokens: usize,
 }
@@ -111,6 +112,7 @@ where
             cancellation: CancellationGuard::never(),
             progress: None,
             adaptive_translation_concurrency,
+            translation_window_was_rate_limited: false,
             provider_requests: 0,
             provider_tokens: 0,
         }
@@ -281,6 +283,9 @@ where
 
     pub(super) fn note_translation_window_success(&mut self) {
         if self.options.mode == crate::entities::TranslationMode::Turbo {
+            if std::mem::take(&mut self.translation_window_was_rate_limited) {
+                return;
+            }
             self.adaptive_translation_concurrency = self
                 .adaptive_translation_concurrency
                 .saturating_add(1)
@@ -290,6 +295,7 @@ where
 
     fn note_translation_rate_limit(&mut self) {
         if self.options.mode == crate::entities::TranslationMode::Turbo {
+            self.translation_window_was_rate_limited = true;
             self.adaptive_translation_concurrency = self
                 .adaptive_translation_concurrency
                 .saturating_div(2)
@@ -330,9 +336,6 @@ where
 
         let deduplication =
             DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
-        let translation_memory_scope = translation_memory_scope(&self.options);
-        let translation_memory_keys =
-            contextual_translation_memory_keys(&translation_memory_scope, &document.segments);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
             .scene_aware(self.options.policy().scene_aware_batching)
             .split(deduplication.canonical());
@@ -342,10 +345,12 @@ where
             self.options.mode,
             self.options.batch_token_budget,
         );
+        let translation_scene_groups = BatchPlanner::scene_group_ids(&batches);
         let original_batches =
             BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
                 .scene_aware(self.options.policy().scene_aware_batching)
                 .split(&document.segments);
+        let review_scene_groups = BatchPlanner::scene_group_ids(&original_batches);
         let planned_batches = BatchPlanner::describe(&batches);
         let state_path = self
             .store
@@ -403,6 +408,9 @@ where
         // batches may learn advisory terms, but all Resume writes must retain
         // the same semantic-input fingerprint.
         self.options.glossary_fingerprint = Some(build_glossary_fingerprint(&self.memory.glossary));
+        let translation_memory_scope = translation_memory_scope(&self.options);
+        let translation_memory_keys =
+            contextual_translation_memory_keys(&translation_memory_scope, &document.segments);
 
         let resume = self.load_resume_snapshot(&batches)?;
         self.sync_enforced_entities();
@@ -415,11 +423,14 @@ where
         } = translation_runner::run(
             self,
             &translation_document,
-            batches,
-            &resume,
-            &terminology,
-            &translation_memory_keys,
-            &source_contexts,
+            TranslationRunInput {
+                batches,
+                resume: &resume,
+                terminology: &terminology,
+                memory_keys: &translation_memory_keys,
+                source_contexts: &source_contexts,
+                scene_groups: &translation_scene_groups,
+            },
         )?;
         let translated_segments = deduplication.expand(&document.segments, &translated_segments)?;
         let ReviewRun {
@@ -434,6 +445,7 @@ where
             ReviewBatchInput {
                 review_batches: &original_batches,
                 translation_batches: batches.len(),
+                scene_groups: &review_scene_groups,
             },
             &translated_segments,
             &resume,
@@ -794,6 +806,21 @@ where
                     },
                 );
             } else {
+                let estimated = estimated_request_tokens(&messages, batch);
+                if estimated > self.options.request_token_budget {
+                    if batch.len() == 1 {
+                        return Err(CoreError::ResourceBudgetExceeded(format!(
+                            "translation batch {batch_index} needs about {estimated} request tokens, exceeding the per-request limit of {}",
+                            self.options.request_token_budget
+                        )));
+                    }
+                    let split = split_index(batch);
+                    results.insert(
+                        *batch_index,
+                        self.translate_split(*batch_index, batch, prompt_context, split)?,
+                    );
+                    continue;
+                }
                 pending.push((
                     *batch_index,
                     batch.clone(),
@@ -814,7 +841,7 @@ where
             .backend
             .execute_many(
                 requests,
-                BatchExecutionOptions::new(self.options.translation_concurrency),
+                BatchExecutionOptions::new(self.effective_translation_concurrency()),
                 &self.cancellation,
             )
             .map_err(CoreError::from)?;
@@ -854,6 +881,23 @@ where
                             usage: response_usage,
                             cache_key: self.options.use_cache.then_some(hash),
                         },
+                    );
+                }
+                Err(CoreError::Llm(crate::error::LlmCallError::RateLimited { .. })) => {
+                    // The adapter has already exhausted its transport retries. Preserve the
+                    // successful items from this window, reduce Turbo's real in-flight limit,
+                    // and requeue only the throttled batch once through the normal single-call
+                    // path. A second rate limit remains an outer failure.
+                    self.note_translation_rate_limit();
+                    results.insert(
+                        batch_index,
+                        self.translate_batch_impl(
+                            batch_index,
+                            &batch,
+                            &prompt_context,
+                            true,
+                            None,
+                        )?,
                     );
                 }
                 Err(error) => {
@@ -908,6 +952,21 @@ where
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
             }
+            let estimated = estimated_request_tokens(&messages, batch);
+            if estimated > self.options.request_token_budget {
+                if batch.len() > 1 {
+                    return self.translate_split(
+                        batch_index,
+                        batch,
+                        prompt_context,
+                        split_index(batch),
+                    );
+                }
+                return Err(CoreError::ResourceBudgetExceeded(format!(
+                    "translation batch {batch_index} needs about {estimated} request tokens, exceeding the per-request limit of {}",
+                    self.options.request_token_budget
+                )));
+            }
             let request_hash = request_hash(&self.options, CacheStage::Translate, &messages);
             match self.translate_once(batch, &messages, &request_hash) {
                 Ok(result) => return Ok(result),
@@ -933,9 +992,14 @@ where
                         messages,
                         split_retry: None,
                     };
+                    let economy_correction_first = self.options.mode
+                        == crate::entities::TranslationMode::Economy
+                        && record_failure
+                        && attempt == 1
+                        && self.options.retries > 0;
                     if matches!(error, CoreError::InvalidTranslation(_))
-                        && self.options.mode != crate::entities::TranslationMode::Economy
                         && batch.len() > 1
+                        && !economy_correction_first
                     {
                         let split = split_index(batch);
                         attempt_log.split_retry = Some(SplitRetryLog {
@@ -1118,14 +1182,7 @@ where
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
-            let mut messages = build_review_messages(
-                &self.options,
-                &batch.source,
-                &batch.translated,
-                &batch.reasons,
-                &batch.candidate_reasons,
-                &self.memory,
-            );
+            let mut messages = build_review_messages(&self.options, batch, &self.memory);
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
             }
@@ -1181,14 +1238,7 @@ where
         let mut output = HashMap::new();
         let mut pending = Vec::new();
         for (index, batch) in batches {
-            let messages = build_review_messages(
-                &self.options,
-                &batch.source,
-                &batch.translated,
-                &batch.reasons,
-                &batch.candidate_reasons,
-                &self.memory,
-            );
+            let messages = build_review_messages(&self.options, batch, &self.memory);
             let hash = request_hash(&self.options, CacheStage::Review, &messages);
             let cached = if self.options.use_cache {
                 self.store
@@ -2118,6 +2168,62 @@ mod tests {
         }
     }
 
+    struct AdaptiveParallelBackend {
+        limits: Arc<Mutex<Vec<usize>>>,
+        batch_calls: usize,
+        single_retries: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for AdaptiveParallelBackend {
+        fn supports_parallel_generation(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "adaptive-parallel"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            self.single_retries.fetch_add(1, Ordering::SeqCst);
+            EchoBackend.execute(request, cancellation)
+        }
+
+        fn execute_many(
+            &mut self,
+            requests: Vec<GenerationRequest>,
+            options: BatchExecutionOptions,
+            cancellation: &CancellationGuard,
+        ) -> Result<Vec<Result<GenerationResponse, LlmCallError>>, LlmCallError> {
+            self.limits
+                .lock()
+                .map_err(|_| LlmCallError::Transport("limits lock poisoned".to_owned()))?
+                .push(options.max_concurrency);
+            self.batch_calls += 1;
+            Ok(requests
+                .into_iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    if self.batch_calls == 1 && index == 0 {
+                        Err(LlmCallError::RateLimited {
+                            message: "scripted pressure".to_owned(),
+                            retry_after_ms: Some(1),
+                        })
+                    } else {
+                        EchoBackend.execute(request, cancellation)
+                    }
+                })
+                .collect())
+        }
+    }
+
     struct CountingBackend {
         calls: Arc<AtomicUsize>,
         fail_on_call: Option<usize>,
@@ -2525,6 +2631,37 @@ mod tests {
         call_sizes: Arc<Mutex<Vec<usize>>>,
     }
 
+    struct BatchSizeCaptureBackend {
+        call_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LlmBackend for BatchSizeCaptureBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "batch-size-capture"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let response = EchoBackend.execute(request, cancellation)?;
+            let (payload, usage) = response.into_json()?;
+            let size = payload["lines"].as_array().map(Vec::len).ok_or_else(|| {
+                LlmCallError::InvalidResponse("missing translation lines".to_owned())
+            })?;
+            self.call_sizes
+                .lock()
+                .map_err(|_| LlmCallError::Transport("call sizes lock poisoned".to_owned()))?
+                .push(size);
+            Ok(GenerationResponse::json(payload, usage))
+        }
+    }
+
     impl LlmBackend for StructuralFailureBackend {
         fn provider_name(&self) -> &str {
             "test"
@@ -2846,6 +2983,37 @@ mod tests {
     }
 
     #[test]
+    fn turbo_rate_limit_requeues_only_failed_batch_and_reduces_real_concurrency() {
+        let limits = Arc::new(Mutex::new(Vec::new()));
+        let single_retries = Arc::new(AtomicUsize::new(0));
+        let mut options = PipelineOptions::new("adaptive.txt".into());
+        options.batch_size = 1;
+        options.translation_concurrency = 8;
+        options.resume = false;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(
+            AdaptiveParallelBackend {
+                limits: Arc::clone(&limits),
+                batch_calls: 0,
+                single_retries: Arc::clone(&single_retries),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline
+            .run_document(&document(
+                "adaptive.txt",
+                &["one", "two", "three", "four", "five"],
+            ))
+            .expect("adaptive retry succeeds");
+
+        assert_eq!(run.translated_segments.len(), 5);
+        assert_eq!(single_retries.load(Ordering::SeqCst), 1);
+        assert_eq!(*limits.lock().expect("limits lock"), vec![2, 1]);
+    }
+
+    #[test]
     fn pipeline_translates_document_batches() {
         let document = SubtitleDocument {
             path: "clip.txt".into(),
@@ -2939,7 +3107,7 @@ mod tests {
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
         let data = captured.lock().expect("capture lock");
         assert_eq!(data.saved_translation_memory.len(), 1);
-        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v2:"));
+        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v3:"));
         assert_eq!(data.saved_translation_memory[0].1, "[ECHO] hello");
         assert_eq!(data.saved_batches.len(), 1);
         assert_eq!(data.saved_batches[0].1[0].text, "[ECHO] hello");
@@ -3010,6 +3178,8 @@ mod tests {
         let source = document("/shows/one/clip.txt", &["Fine."]);
         let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
         same_scope_options.resume = false;
+        same_scope_options.glossary_fingerprint =
+            Some(build_glossary_fingerprint(&BTreeMap::new()));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&same_scope_options),
             &source.segments,
@@ -3075,12 +3245,16 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_checks_required_glossary_on_translation_memory_hits() {
+    fn changed_required_glossary_invalidates_translation_memory_before_lookup() {
         let source = document("/shows/one/terms.txt", &["The Lord is here."]);
         let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
         options.glossary_path = Some("glossary.json".into());
         options.resume = false;
         options.agent = false;
+        options.glossary_fingerprint = Some(build_glossary_fingerprint(&BTreeMap::from([(
+            "Lord".to_owned(),
+            "领主".to_owned(),
+        )])));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&options),
             &source.segments,
@@ -3103,23 +3277,15 @@ mod tests {
             ),
             data: captured,
         };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut pipeline = SubtitlePipeline::new(
-            CountingBackend {
-                calls: Arc::clone(&calls),
-                fail_on_call: Some(1),
-            },
-            NoopDashboard,
-            options,
-        )
-        .with_store(Box::new(store));
+        let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, NoopDashboard, options)
+            .with_store(Box::new(store));
 
-        let error = pipeline
+        let run = pipeline
             .run_document(&source)
-            .expect_err("invalid TM term must fail final validation");
+            .expect("changed glossary retranslates instead of using stale memory");
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(error.to_string().contains("`Lord` -> `勋爵`"));
+        assert_eq!(run.result.translation_memory_hits, 0);
+        assert_eq!(run.translated_segments[0].text, "勋爵来了。");
     }
 
     #[test]
@@ -3380,6 +3546,93 @@ mod tests {
                 .iter()
                 .all(|segment| segment.text.starts_with("[SPLIT]"))
         );
+    }
+
+    #[test]
+    fn economy_retries_one_corrected_large_batch_then_splits_structural_failure() {
+        let document = document("economy-split.txt", &["one", "two", "three", "four"]);
+        let mut options = PipelineOptions::new("economy-split.txt".into());
+        options.mode = crate::entities::TranslationMode::Economy;
+        options.batch_size = 8;
+        options.batch_token_budget = 10_000;
+        options.review_policy = ReviewPolicy::Off;
+        options.retries = 1;
+        options.agent = false;
+        let call_sizes = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            StructuralFailureBackend {
+                call_sizes: Arc::clone(&call_sizes),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline
+            .run_document(&document)
+            .expect("economy split succeeds");
+
+        assert_eq!(
+            *call_sizes.lock().expect("call sizes lock"),
+            vec![4, 4, 2, 1, 1, 2, 1, 1]
+        );
+        assert_eq!(run.translated_segments.len(), 4);
+    }
+
+    #[test]
+    fn complete_request_budget_splits_before_provider_side_effect() {
+        let source = [
+            "a".repeat(400),
+            "b".repeat(400),
+            "c".repeat(400),
+            "d".repeat(400),
+        ];
+        let source = source.iter().map(String::as_str).collect::<Vec<_>>();
+        let document = document("request-budget.txt", &source);
+        let mut options = PipelineOptions::new("request-budget.txt".into());
+        options.mode = crate::entities::TranslationMode::Economy;
+        options.batch_size = 8;
+        options.batch_token_budget = 10_000;
+        options.resume = false;
+        options.use_cache = false;
+        let full_messages = build_translation_messages(
+            &options,
+            1,
+            &document.segments,
+            &TranslationPromptContext::default(),
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+            false,
+        );
+        let one_messages = build_translation_messages(
+            &options,
+            1,
+            &document.segments[..1],
+            &TranslationPromptContext::default(),
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+            false,
+        );
+        let full_estimate = estimated_request_tokens(&full_messages, &document.segments);
+        let one_estimate = estimated_request_tokens(&one_messages, &document.segments[..1]);
+        assert!(full_estimate > one_estimate);
+        options.request_token_budget = one_estimate.saturating_add(32);
+        let call_sizes = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            BatchSizeCaptureBackend {
+                call_sizes: Arc::clone(&call_sizes),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline
+            .run_document(&document)
+            .expect("oversized request is split");
+
+        let sizes = call_sizes.lock().expect("call sizes lock");
+        assert!(!sizes.contains(&4));
+        assert_eq!(sizes.iter().sum::<usize>(), 4);
+        assert_eq!(run.translated_segments.len(), 4);
     }
 
     #[test]
@@ -4146,6 +4399,23 @@ mod tests {
 
         assert_eq!(run.result.terminology.candidates, 0);
         assert_eq!(preflight_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cinema_strict_preflight_rejects_unsupported_backend_before_translation() {
+        let mut options = PipelineOptions::new("strict-preflight.txt".into());
+        options.mode = crate::entities::TranslationMode::Cinema;
+        options.terminology_preflight = true;
+        options.allow_degraded_preflight = false;
+        options.resume = false;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+
+        let error = pipeline
+            .run_document(&document("strict-preflight.txt", &["hello"]))
+            .expect_err("strict preflight must reject unsupported capability");
+
+        assert!(matches!(error, CoreError::UnsupportedCapability(_)));
     }
 
     #[test]

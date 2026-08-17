@@ -7,7 +7,10 @@ use crate::formatting::protect_formatting;
 use crate::memory::ContextMemory;
 use crate::ports::{CacheStage, ChatMessage};
 use crate::review::ReviewBatchPlan;
-use crate::storage::{JsonValue, build_request_hash, build_request_hash_v2, stable_hash};
+use crate::storage::{
+    FINAL_VALIDATION_POLICY_VERSION, JsonValue, PROMPT_CONTRACT_VERSION,
+    TRANSLATION_MEMORY_POLICY_VERSION, build_request_hash, build_request_hash_v2, stable_hash,
+};
 use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
@@ -23,6 +26,27 @@ const REVIEW_ROUTING_CACHE_VERSION: u64 = 2;
 
 pub(super) fn duration_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(super) fn estimated_request_tokens(
+    messages: &[ChatMessage],
+    batch: &[SubtitleSegment],
+) -> usize {
+    let prompt = messages
+        .iter()
+        .map(|message| super::planning::estimated_text_tokens(&message.content).saturating_add(6))
+        .sum::<usize>();
+    let anticipated_response = batch
+        .iter()
+        .map(|segment| {
+            super::planning::estimated_text_tokens(&segment.text)
+                .saturating_mul(3)
+                .div_ceil(2)
+                .saturating_add(12)
+        })
+        .sum::<usize>()
+        .saturating_add(64);
+    prompt.saturating_add(anticipated_response)
 }
 
 pub(super) fn build_translation_messages(
@@ -417,13 +441,118 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         .provider_fingerprint
         .clone()
         .unwrap_or_else(|| format!("{}:{}", options.provider, options.model));
-    format!(
-        "project={project_scope}|mode={}|backend={backend_scope}|source={}|target={}|preserve_names={}",
-        options.mode.as_str(),
-        options.source_language,
-        options.target_language,
-        options.preserve_names,
-    )
+    stable_hash(&JsonValue::Object(vec![
+        (
+            "version".to_owned(),
+            JsonValue::Number(TRANSLATION_MEMORY_POLICY_VERSION.to_string()),
+        ),
+        (
+            "prompt_contract".to_owned(),
+            JsonValue::Number(PROMPT_CONTRACT_VERSION.to_string()),
+        ),
+        (
+            "final_validation_policy".to_owned(),
+            JsonValue::Number(FINAL_VALIDATION_POLICY_VERSION.to_string()),
+        ),
+        (
+            "project".to_owned(),
+            JsonValue::String(project_scope.into_owned()),
+        ),
+        (
+            "mode".to_owned(),
+            JsonValue::String(options.mode.as_str().to_owned()),
+        ),
+        ("backend".to_owned(), JsonValue::String(backend_scope)),
+        (
+            "reviewer".to_owned(),
+            options
+                .reviewer_fingerprint
+                .clone()
+                .map(JsonValue::String)
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "source_language".to_owned(),
+            JsonValue::String(options.source_language.clone()),
+        ),
+        (
+            "target_language".to_owned(),
+            JsonValue::String(options.target_language.clone()),
+        ),
+        (
+            "batch_size".to_owned(),
+            JsonValue::Number(options.batch_size.to_string()),
+        ),
+        (
+            "batch_token_budget".to_owned(),
+            JsonValue::Number(options.batch_token_budget.to_string()),
+        ),
+        (
+            "request_token_budget".to_owned(),
+            JsonValue::Number(options.request_token_budget.to_string()),
+        ),
+        (
+            "translation_concurrency".to_owned(),
+            JsonValue::Number(options.translation_concurrency.to_string()),
+        ),
+        (
+            "confirmed_context_lines".to_owned(),
+            JsonValue::Number(options.confirmed_context_lines.to_string()),
+        ),
+        (
+            "confirmed_context_token_budget".to_owned(),
+            JsonValue::Number(options.confirmed_context_token_budget.to_string()),
+        ),
+        (
+            "review_policy".to_owned(),
+            JsonValue::String(options.review_policy.as_str().to_owned()),
+        ),
+        (
+            "terminology_preflight".to_owned(),
+            JsonValue::Bool(options.terminology_preflight),
+        ),
+        (
+            "online_terminology".to_owned(),
+            JsonValue::Bool(options.online_terminology),
+        ),
+        (
+            "allow_degraded_preflight".to_owned(),
+            JsonValue::Bool(options.allow_degraded_preflight),
+        ),
+        (
+            "preserve_names".to_owned(),
+            JsonValue::Bool(options.preserve_names),
+        ),
+        (
+            "glossary".to_owned(),
+            options
+                .glossary_fingerprint
+                .clone()
+                .map(JsonValue::String)
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "max_characters_per_second".to_owned(),
+            options
+                .max_characters_per_second
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "max_characters_per_line".to_owned(),
+            options
+                .max_characters_per_line
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "max_lines".to_owned(),
+            options
+                .max_lines
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        ),
+    ]))
 }
 
 fn contextual_translation_memory_key(
@@ -447,7 +576,10 @@ fn contextual_translation_memory_key(
             .map(JsonValue::String)
             .unwrap_or(JsonValue::Null),
     ]);
-    format!("ctx-v2:{}:{source}", stable_hash(&payload))
+    format!(
+        "ctx-v{TRANSLATION_MEMORY_POLICY_VERSION}:{}:{source}",
+        stable_hash(&payload)
+    )
 }
 
 pub(super) fn merge_translation_lines(
@@ -541,9 +673,30 @@ mod tests {
         let second_keys = contextual_translation_memory_keys("/shows/one", &second);
         let other_project = contextual_translation_memory_keys("/shows/two", &first);
 
-        assert!(first_keys["2"].starts_with("ctx-v2:"));
+        assert!(first_keys["2"].starts_with("ctx-v3:"));
         assert_ne!(first_keys["2"], second_keys["2"]);
         assert_ne!(first_keys["2"], other_project["2"]);
+    }
+
+    #[test]
+    fn translation_memory_scope_covers_behavior_and_frozen_glossary() {
+        let mut baseline = PipelineOptions::new("/shows/one/episode.srt".into());
+        baseline.provider_fingerprint = Some("translator-route".to_owned());
+        baseline.glossary_fingerprint = Some("glossary-one".to_owned());
+        let scope = translation_memory_scope(&baseline);
+
+        let mut changed_glossary = baseline.clone();
+        changed_glossary.glossary_fingerprint = Some("glossary-two".to_owned());
+        assert_ne!(scope, translation_memory_scope(&changed_glossary));
+
+        let mut changed_concurrency = baseline.clone();
+        changed_concurrency.translation_concurrency += 1;
+        assert_ne!(scope, translation_memory_scope(&changed_concurrency));
+
+        let mut changed_review = baseline.clone();
+        changed_review.review_policy = crate::entities::ReviewPolicy::Full;
+        changed_review.reviewer_fingerprint = Some("reviewer-route".to_owned());
+        assert_ne!(scope, translation_memory_scope(&changed_review));
     }
 
     #[test]

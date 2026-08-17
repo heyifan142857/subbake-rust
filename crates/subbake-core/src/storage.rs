@@ -8,14 +8,14 @@ use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 4;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 15;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 16;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 3;
+pub const PROMPT_CONTRACT_VERSION: u64 = 4;
 /// Bump when translation-memory keying, lookup, or application semantics change.
-pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 2;
+pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 3;
 /// Bump when deterministic final-output validation semantics change.
 pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 3;
 /// Bump when the ordering, buffering, or publication contract of an
@@ -350,12 +350,36 @@ pub fn build_translation_fingerprint(
             JsonValue::Number(options.batch_token_budget.to_string()),
         ),
         (
+            "request_token_budget".to_owned(),
+            JsonValue::Number(options.request_token_budget.to_string()),
+        ),
+        (
+            "translation_concurrency".to_owned(),
+            JsonValue::Number(options.translation_concurrency.to_string()),
+        ),
+        (
+            "review_concurrency".to_owned(),
+            JsonValue::Number(options.review_concurrency.to_string()),
+        ),
+        (
+            "confirmed_context_lines".to_owned(),
+            JsonValue::Number(options.confirmed_context_lines.to_string()),
+        ),
+        (
+            "confirmed_context_token_budget".to_owned(),
+            JsonValue::Number(options.confirmed_context_token_budget.to_string()),
+        ),
+        (
             "terminology_preflight".to_owned(),
             JsonValue::Bool(options.terminology_preflight),
         ),
         (
             "online_terminology".to_owned(),
             JsonValue::Bool(options.online_terminology),
+        ),
+        (
+            "allow_degraded_preflight".to_owned(),
+            JsonValue::Bool(options.allow_degraded_preflight),
         ),
         (
             "preserve_names".to_owned(),
@@ -711,7 +735,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "e656fb19329ab20448310d5eba755fa42d4936fe"
+            "8edc5c85641c0e1c12b9c93eb2e42572df84484b"
         );
     }
 
@@ -786,6 +810,20 @@ mod tests {
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_validation, &signature)
+        );
+
+        let mut changed_translation_concurrency = baseline.clone();
+        changed_translation_concurrency.translation_concurrency += 1;
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_translation_concurrency, &signature)
+        );
+
+        let mut changed_review_concurrency = baseline.clone();
+        changed_review_concurrency.review_concurrency += 1;
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_review_concurrency, &signature)
         );
 
         let mut seeded_context = baseline.clone();

@@ -140,12 +140,16 @@ config_fields! {
     SubtitleStreamIndex => (Translation, "Subtitle stream index", ConfigFieldKind::Integer, ["translation", "subtitle_stream_index"]),
     BatchSize => (Translation, "Batch size", ConfigFieldKind::Integer, ["translation", "batch_size"]),
     BatchTokenBudget => (Translation, "Batch token budget", ConfigFieldKind::Integer, ["translation", "batch_token_budget"]),
+    RequestTokenBudget => (Translation, "Request token budget", ConfigFieldKind::Integer, ["translation", "request_token_budget"]),
+    ConfirmedContextLines => (Translation, "Confirmed context lines", ConfigFieldKind::Integer, ["translation", "confirmed_context_lines"]),
+    ConfirmedContextTokenBudget => (Translation, "Confirmed context token budget", ConfigFieldKind::Integer, ["translation", "confirmed_context_token_budget"]),
     TranslationConcurrency => (Translation, "Translation concurrency", ConfigFieldKind::Integer, ["translation", "translation_concurrency"]),
     ReviewConcurrency => (Translation, "Review concurrency", ConfigFieldKind::Integer, ["translation", "review_concurrency"]),
     TranslationMode => (Translation, "Translation mode", ConfigFieldKind::Choice(TRANSLATION_MODES), ["translation", "mode"]),
     ReviewPolicy => (Translation, "Review policy", ConfigFieldKind::Choice(REVIEW_POLICIES), ["translation", "review_policy"]),
     TerminologyPreflight => (Translation, "Terminology preflight", ConfigFieldKind::Boolean, ["translation", "terminology_preflight"]),
     OnlineTerminology => (Translation, "Online terminology", ConfigFieldKind::Boolean, ["translation", "online_terminology"]),
+    AllowDegradedPreflight => (Translation, "Allow degraded preflight", ConfigFieldKind::Boolean, ["translation", "allow_degraded_preflight"]),
     PreserveNames => (Translation, "Preserve names", ConfigFieldKind::Boolean, ["translation", "preserve_names"]),
     DryRun => (Translation, "Dry run", ConfigFieldKind::Boolean, ["translation", "dry_run"]),
     Resume => (Translation, "Resume", ConfigFieldKind::Boolean, ["translation", "resume"]),
@@ -381,6 +385,14 @@ fn effective_value(
         }
         ConfigFieldId::BatchSize => resolved.translation.batch_size.to_string(),
         ConfigFieldId::BatchTokenBudget => resolved.translation.batch_token_budget.to_string(),
+        ConfigFieldId::RequestTokenBudget => resolved.translation.request_token_budget.to_string(),
+        ConfigFieldId::ConfirmedContextLines => {
+            resolved.translation.confirmed_context_lines.to_string()
+        }
+        ConfigFieldId::ConfirmedContextTokenBudget => resolved
+            .translation
+            .confirmed_context_token_budget
+            .to_string(),
         ConfigFieldId::TranslationConcurrency => {
             resolved.translation.translation_concurrency.to_string()
         }
@@ -391,6 +403,9 @@ fn effective_value(
             resolved.translation.terminology_preflight.to_string()
         }
         ConfigFieldId::OnlineTerminology => resolved.translation.online_terminology.to_string(),
+        ConfigFieldId::AllowDegradedPreflight => {
+            resolved.translation.allow_degraded_preflight.to_string()
+        }
         ConfigFieldId::PreserveNames => resolved.translation.preserve_names.to_string(),
         ConfigFieldId::DryRun => resolved.translation.dry_run.to_string(),
         ConfigFieldId::Resume => resolved.translation.resume.to_string(),
@@ -485,6 +500,14 @@ fn has_override(id: ConfigFieldId, settings: &SettingsOverrides) -> bool {
         ConfigFieldId::SubtitleStreamIndex => settings.translation.subtitle_stream_index.is_some(),
         ConfigFieldId::BatchSize => settings.translation.batch_size.is_some(),
         ConfigFieldId::BatchTokenBudget => settings.translation.batch_token_budget.is_some(),
+        ConfigFieldId::RequestTokenBudget => settings.translation.request_token_budget.is_some(),
+        ConfigFieldId::ConfirmedContextLines => {
+            settings.translation.confirmed_context_lines.is_some()
+        }
+        ConfigFieldId::ConfirmedContextTokenBudget => settings
+            .translation
+            .confirmed_context_token_budget
+            .is_some(),
         ConfigFieldId::TranslationConcurrency => {
             settings.translation.translation_concurrency.is_some()
         }
@@ -493,6 +516,9 @@ fn has_override(id: ConfigFieldId, settings: &SettingsOverrides) -> bool {
         ConfigFieldId::ReviewPolicy => settings.translation.review_policy.is_some(),
         ConfigFieldId::TerminologyPreflight => settings.translation.terminology_preflight.is_some(),
         ConfigFieldId::OnlineTerminology => settings.translation.online_terminology.is_some(),
+        ConfigFieldId::AllowDegradedPreflight => {
+            settings.translation.allow_degraded_preflight.is_some()
+        }
         ConfigFieldId::PreserveNames => settings.translation.preserve_names.is_some(),
         ConfigFieldId::DryRun => settings.translation.dry_run.is_some(),
         ConfigFieldId::Resume => settings.translation.resume.is_some(),

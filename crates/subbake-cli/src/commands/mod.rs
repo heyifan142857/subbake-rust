@@ -204,11 +204,18 @@ Options:
       --bilingual-font-scale <N>   Scale bilingual ASS fonts (default: 1.0)
       --online-terminology         Merge comprehensive terminology while translating (default in cinema)
       --no-online-terminology      Disable incremental terminology responses
+      --allow-degraded-preflight   Continue when terminology preflight fails
+      --strict-preflight           Fail when requested terminology preflight is unavailable or fails
       --preserve-names             Keep names in source spelling; disable Turbo name alignment
       --transliterate-names        Transliterate personal names (default)
       --preserve-source-container  Write a separate translated media file
       --in-place-container         Atomically replace the source media (default)
       --mode <MODE>               Translation mode: economy, turbo, or cinema
+      --request-token-budget <N>  Limit estimated prompt plus response tokens per request
+      --confirmed-context-lines <N>
+                                   Maximum confirmed lines carried into a later batch
+      --confirmed-context-token-budget <N>
+                                   Token budget for confirmed translation context
       --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
       --max-characters-per-second <N>

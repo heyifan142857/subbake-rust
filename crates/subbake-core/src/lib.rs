@@ -30,7 +30,7 @@ pub use entities::{
     ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
     SubtitleDocumentMetadata, SubtitleSegment, TerminologyEntity, TerminologyKind,
     TerminologyPreflightResult, TerminologyStats, TranslationLine, TranslationMode,
-    TranslationPolicy, Usage,
+    TranslationPolicy, TranslationReadabilityDefaults, Usage, translation_readability_defaults,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use evaluation::{

@@ -150,6 +150,23 @@ impl BatchPlanner {
             .collect()
     }
 
+    pub(super) fn scene_group_ids(batches: &[Vec<SubtitleSegment>]) -> Vec<usize> {
+        let mut group = 0usize;
+        batches
+            .iter()
+            .enumerate()
+            .map(|(index, batch)| {
+                if index > 0
+                    && let (Some(previous), Some(next)) = (batches[index - 1].last(), batch.first())
+                    && scene_boundary(Some(previous), next)
+                {
+                    group = group.saturating_add(1);
+                }
+                group
+            })
+            .collect()
+    }
+
     pub(super) fn source_contexts(
         segments: &[SubtitleSegment],
         batches: &[Vec<SubtitleSegment>],
@@ -333,7 +350,7 @@ fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
     Some((((hours * 60 + minutes) * 60 + seconds) * 1_000) + milliseconds)
 }
 
-fn estimated_text_tokens(text: &str) -> usize {
+pub(super) fn estimated_text_tokens(text: &str) -> usize {
     let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |(ascii, other), ch| {
         if ch.is_ascii() {
             (ascii + 1, other)
@@ -466,6 +483,32 @@ mod tests {
             .scene_aware(true)
             .split(&[first, second]);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    #[test]
+    fn scene_groups_keep_token_splits_serial_and_separate_timed_scenes() {
+        let batches = vec![
+            vec![timed_segment(
+                "1",
+                "scene one a",
+                "00:00:00,000",
+                "00:00:01,000",
+            )],
+            vec![timed_segment(
+                "2",
+                "scene one b",
+                "00:00:01,100",
+                "00:00:02,000",
+            )],
+            vec![timed_segment(
+                "3",
+                "scene two",
+                "00:00:04,000",
+                "00:00:05,000",
+            )],
+        ];
+
+        assert_eq!(BatchPlanner::scene_group_ids(&batches), [0, 0, 1]);
     }
 
     #[test]

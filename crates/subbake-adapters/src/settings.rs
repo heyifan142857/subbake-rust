@@ -67,12 +67,16 @@ pub struct TranslationDomainSettings {
     pub subtitle_stream_index: Option<usize>,
     pub batch_size: usize,
     pub batch_token_budget: usize,
+    pub request_token_budget: usize,
+    pub confirmed_context_lines: usize,
+    pub confirmed_context_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub mode: TranslationMode,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
     pub online_terminology: bool,
+    pub allow_degraded_preflight: bool,
     pub preserve_names: bool,
     pub max_characters_per_second: Option<f64>,
     pub max_characters_per_line: Option<usize>,
@@ -140,6 +144,9 @@ pub struct TranslationOverrides {
     pub subtitle_stream_index: Option<usize>,
     pub batch_size: Option<usize>,
     pub batch_token_budget: Option<usize>,
+    pub request_token_budget: Option<usize>,
+    pub confirmed_context_lines: Option<usize>,
+    pub confirmed_context_token_budget: Option<usize>,
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
     pub mode: Option<TranslationMode>,
@@ -148,6 +155,7 @@ pub struct TranslationOverrides {
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
     pub online_terminology: Option<bool>,
+    pub allow_degraded_preflight: Option<bool>,
     pub preserve_names: Option<bool>,
     pub max_characters_per_second: Option<f64>,
     pub max_characters_per_line: Option<usize>,
@@ -237,6 +245,11 @@ impl SettingsOverrides {
                 subtitle_stream_index: settings.translation.subtitle_stream_index,
                 batch_size: Some(settings.translation.batch_size),
                 batch_token_budget: Some(settings.translation.batch_token_budget),
+                request_token_budget: Some(settings.translation.request_token_budget),
+                confirmed_context_lines: Some(settings.translation.confirmed_context_lines),
+                confirmed_context_token_budget: Some(
+                    settings.translation.confirmed_context_token_budget,
+                ),
                 translation_concurrency: Some(settings.translation.translation_concurrency),
                 review_concurrency: Some(settings.translation.review_concurrency),
                 mode: Some(settings.translation.mode),
@@ -244,6 +257,7 @@ impl SettingsOverrides {
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
                 online_terminology: Some(settings.translation.online_terminology),
+                allow_degraded_preflight: Some(settings.translation.allow_degraded_preflight),
                 preserve_names: Some(settings.translation.preserve_names),
                 max_characters_per_second: settings.translation.max_characters_per_second,
                 max_characters_per_line: settings.translation.max_characters_per_line,
@@ -316,6 +330,9 @@ impl TranslationOverrides {
             subtitle_stream_index,
             batch_size,
             batch_token_budget,
+            request_token_budget,
+            confirmed_context_lines,
+            confirmed_context_token_budget,
             translation_concurrency,
             review_concurrency,
             mode,
@@ -323,6 +340,7 @@ impl TranslationOverrides {
             review_policy,
             terminology_preflight,
             online_terminology,
+            allow_degraded_preflight,
             preserve_names,
             max_characters_per_second,
             max_characters_per_line,
@@ -427,12 +445,16 @@ impl Default for ResolvedSettings {
                 subtitle_stream_index: None,
                 batch_size: policy.batch_size,
                 batch_token_budget: policy.batch_token_budget,
+                request_token_budget: policy.request_token_budget,
+                confirmed_context_lines: policy.confirmed_context_lines,
+                confirmed_context_token_budget: policy.confirmed_context_token_budget,
                 translation_concurrency: policy.translation_concurrency,
                 review_concurrency: policy.review_concurrency,
                 mode: TranslationMode::Turbo,
                 review_policy: policy.review_policy,
                 terminology_preflight: policy.terminology_preflight,
                 online_terminology: policy.online_terminology,
+                allow_degraded_preflight: policy.allow_degraded_preflight,
                 preserve_names: false,
                 max_characters_per_second: None,
                 max_characters_per_line: None,
@@ -522,6 +544,9 @@ impl ResolvedSettings {
             subtitle_stream_index,
             batch_size,
             batch_token_budget,
+            request_token_budget,
+            confirmed_context_lines,
+            confirmed_context_token_budget,
             translation_concurrency,
             review_concurrency,
             mode,
@@ -529,6 +554,7 @@ impl ResolvedSettings {
             review_policy,
             terminology_preflight,
             online_terminology,
+            allow_degraded_preflight,
             preserve_names,
             max_characters_per_second,
             max_characters_per_line,
@@ -555,7 +581,8 @@ impl ResolvedSettings {
         if let Some(value) = auto_approve_commands {
             self.agent.auto_approve_commands = value;
         }
-        if let Some(value) = mode {
+        let selected_mode = mode;
+        if let Some(value) = selected_mode {
             self.apply_mode_defaults(value);
         }
         if fast_mode == Some(true) {
@@ -567,6 +594,9 @@ impl ResolvedSettings {
         if let Some(value) = target_language {
             self.translation.target_language = value;
         }
+        if selected_mode.is_some() {
+            self.apply_readability_defaults();
+        }
         if let Some(value) = subtitle_stream_index {
             self.translation.subtitle_stream_index = Some(value);
         }
@@ -575,6 +605,15 @@ impl ResolvedSettings {
         }
         if let Some(value) = batch_token_budget {
             self.translation.batch_token_budget = value;
+        }
+        if let Some(value) = request_token_budget {
+            self.translation.request_token_budget = value;
+        }
+        if let Some(value) = confirmed_context_lines {
+            self.translation.confirmed_context_lines = value;
+        }
+        if let Some(value) = confirmed_context_token_budget {
+            self.translation.confirmed_context_token_budget = value;
         }
         if let Some(value) = translation_concurrency {
             self.translation.translation_concurrency = value;
@@ -590,6 +629,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = online_terminology {
             self.translation.online_terminology = value;
+        }
+        if let Some(value) = allow_degraded_preflight {
+            self.translation.allow_degraded_preflight = value;
         }
         if let Some(value) = preserve_names {
             self.translation.preserve_names = value;
@@ -743,6 +785,10 @@ impl ResolvedSettings {
                 self.translation.batch_token_budget,
             ),
             (
+                "translation.request_token_budget",
+                self.translation.request_token_budget,
+            ),
+            (
                 "translation.translation_concurrency",
                 self.translation.translation_concurrency,
             ),
@@ -800,6 +846,9 @@ impl ResolvedSettings {
         options.target_language = self.translation.target_language.clone();
         options.batch_size = self.translation.batch_size;
         options.batch_token_budget = self.translation.batch_token_budget;
+        options.request_token_budget = self.translation.request_token_budget;
+        options.confirmed_context_lines = self.translation.confirmed_context_lines;
+        options.confirmed_context_token_budget = self.translation.confirmed_context_token_budget;
         options.translation_concurrency = self.translation.translation_concurrency;
         options.review_concurrency = self.translation.review_concurrency;
         options.bilingual = self.output.bilingual;
@@ -809,6 +858,7 @@ impl ResolvedSettings {
         options.review_policy = self.translation.review_policy;
         options.terminology_preflight = self.translation.terminology_preflight;
         options.online_terminology = self.translation.online_terminology;
+        options.allow_degraded_preflight = self.translation.allow_degraded_preflight;
         options.preserve_names = self.translation.preserve_names;
         options.max_characters_per_second = self.translation.max_characters_per_second;
         options.max_characters_per_line = self.translation.max_characters_per_line;
@@ -847,11 +897,26 @@ impl ResolvedSettings {
         self.translation.mode = mode;
         self.translation.batch_size = policy.batch_size;
         self.translation.batch_token_budget = policy.batch_token_budget;
+        self.translation.request_token_budget = policy.request_token_budget;
+        self.translation.confirmed_context_lines = policy.confirmed_context_lines;
+        self.translation.confirmed_context_token_budget = policy.confirmed_context_token_budget;
         self.translation.translation_concurrency = policy.translation_concurrency;
         self.translation.review_concurrency = policy.review_concurrency;
         self.translation.review_policy = policy.review_policy;
         self.translation.terminology_preflight = policy.terminology_preflight;
         self.translation.online_terminology = policy.online_terminology;
+        self.translation.allow_degraded_preflight = policy.allow_degraded_preflight;
+        self.apply_readability_defaults();
+    }
+
+    fn apply_readability_defaults(&mut self) {
+        let defaults = subbake_core::translation_readability_defaults(
+            self.translation.mode,
+            &self.translation.target_language,
+        );
+        self.translation.max_characters_per_second = defaults.max_characters_per_second;
+        self.translation.max_characters_per_line = defaults.max_characters_per_line;
+        self.translation.max_lines = defaults.max_lines;
     }
 }
 
@@ -995,6 +1060,8 @@ mod tests {
                 translation: TranslationOverrides {
                     mode: Some(TranslationMode::Cinema),
                     translation_concurrency: Some(7),
+                    target_language: Some("zh-Hans".to_owned()),
+                    max_characters_per_line: Some(24),
                     ..TranslationOverrides::default()
                 },
                 ..SettingsOverrides::default()
@@ -1005,6 +1072,10 @@ mod tests {
         assert_eq!(settings.translation.translation_concurrency, 7);
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Full);
         assert!(settings.translation.online_terminology);
+        assert!(!settings.translation.allow_degraded_preflight);
+        assert_eq!(settings.translation.max_characters_per_second, Some(10.0));
+        assert_eq!(settings.translation.max_characters_per_line, Some(24));
+        assert_eq!(settings.translation.max_lines, Some(2));
     }
 
     #[test]
@@ -1079,6 +1150,18 @@ mod tests {
             policy.batch_token_budget
         );
         assert_eq!(
+            settings.translation.request_token_budget,
+            policy.request_token_budget
+        );
+        assert_eq!(
+            settings.translation.confirmed_context_lines,
+            policy.confirmed_context_lines
+        );
+        assert_eq!(
+            settings.translation.confirmed_context_token_budget,
+            policy.confirmed_context_token_budget
+        );
+        assert_eq!(
             settings.translation.translation_concurrency,
             policy.translation_concurrency
         );
@@ -1094,6 +1177,10 @@ mod tests {
         assert_eq!(
             settings.translation.online_terminology,
             policy.online_terminology
+        );
+        assert_eq!(
+            settings.translation.allow_degraded_preflight,
+            policy.allow_degraded_preflight
         );
     }
 }

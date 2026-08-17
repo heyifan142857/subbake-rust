@@ -53,6 +53,10 @@ impl TranslationMode {
 pub struct TranslationPolicy {
     pub batch_size: usize,
     pub batch_token_budget: usize,
+    /// Hard estimate for the complete prompt plus anticipated JSON response.
+    pub request_token_budget: usize,
+    pub confirmed_context_lines: usize,
+    pub confirmed_context_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub include_context: bool,
@@ -62,6 +66,7 @@ pub struct TranslationPolicy {
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
     pub online_terminology: bool,
+    pub allow_degraded_preflight: bool,
 }
 
 impl TranslationPolicy {
@@ -70,6 +75,9 @@ impl TranslationPolicy {
             TranslationMode::Economy => Self {
                 batch_size: 160,
                 batch_token_budget: 6_000,
+                request_token_budget: 14_000,
+                confirmed_context_lines: 0,
+                confirmed_context_token_budget: 0,
                 translation_concurrency: 3,
                 review_concurrency: 1,
                 include_context: false,
@@ -79,10 +87,14 @@ impl TranslationPolicy {
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: false,
                 online_terminology: false,
+                allow_degraded_preflight: true,
             },
             TranslationMode::Turbo => Self {
                 batch_size: 96,
                 batch_token_budget: 2_400,
+                request_token_budget: 10_000,
+                confirmed_context_lines: 12,
+                confirmed_context_token_budget: 800,
                 translation_concurrency: 8,
                 review_concurrency: 4,
                 include_context: true,
@@ -92,10 +104,14 @@ impl TranslationPolicy {
                 review_policy: ReviewPolicy::Off,
                 terminology_preflight: false,
                 online_terminology: false,
+                allow_degraded_preflight: true,
             },
             TranslationMode::Cinema => Self {
                 batch_size: 48,
                 batch_token_budget: 1_600,
+                request_token_budget: 10_000,
+                confirmed_context_lines: 16,
+                confirmed_context_token_budget: 1_000,
                 translation_concurrency: 4,
                 review_concurrency: 3,
                 include_context: true,
@@ -105,8 +121,40 @@ impl TranslationPolicy {
                 review_policy: ReviewPolicy::Full,
                 terminology_preflight: true,
                 online_terminology: true,
+                allow_degraded_preflight: false,
             },
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TranslationReadabilityDefaults {
+    pub max_characters_per_second: Option<f64>,
+    pub max_characters_per_line: Option<usize>,
+    pub max_lines: Option<usize>,
+}
+
+pub fn translation_readability_defaults(
+    mode: TranslationMode,
+    target_language: &str,
+) -> TranslationReadabilityDefaults {
+    if mode != TranslationMode::Cinema {
+        return TranslationReadabilityDefaults {
+            max_characters_per_second: None,
+            max_characters_per_line: None,
+            max_lines: None,
+        };
+    }
+    let language = target_language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let cjk = matches!(language.as_str(), "zh" | "ja" | "ko");
+    TranslationReadabilityDefaults {
+        max_characters_per_second: Some(if cjk { 10.0 } else { 17.0 }),
+        max_characters_per_line: Some(if cjk { 20 } else { 42 }),
+        max_lines: Some(2),
     }
 }
 
@@ -465,6 +513,9 @@ pub struct PipelineOptions {
     pub model: String,
     pub batch_size: usize,
     pub batch_token_budget: usize,
+    pub request_token_budget: usize,
+    pub confirmed_context_lines: usize,
+    pub confirmed_context_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub mode: TranslationMode,
@@ -478,6 +529,7 @@ pub struct PipelineOptions {
     pub terminology_preflight: bool,
     /// Ask translation batches to emit and consume incremental terminology.
     pub online_terminology: bool,
+    pub allow_degraded_preflight: bool,
     /// Keep personal names in their source spelling instead of translating or
     /// transliterating them into the target language.
     pub preserve_names: bool,
@@ -525,6 +577,9 @@ impl PipelineOptions {
             model: default_model(),
             batch_size: policy.batch_size,
             batch_token_budget: policy.batch_token_budget,
+            request_token_budget: policy.request_token_budget,
+            confirmed_context_lines: policy.confirmed_context_lines,
+            confirmed_context_token_budget: policy.confirmed_context_token_budget,
             translation_concurrency: policy.translation_concurrency,
             review_concurrency: policy.review_concurrency,
             mode: TranslationMode::Turbo,
@@ -537,6 +592,7 @@ impl PipelineOptions {
             review_policy: policy.review_policy,
             terminology_preflight: policy.terminology_preflight,
             online_terminology: policy.online_terminology,
+            allow_degraded_preflight: policy.allow_degraded_preflight,
             preserve_names: false,
             max_characters_per_second: None,
             max_characters_per_line: None,
@@ -625,6 +681,15 @@ mod tests {
         assert_eq!(options.mode, TranslationMode::Turbo);
         assert_eq!(options.batch_size, policy.batch_size);
         assert_eq!(options.batch_token_budget, policy.batch_token_budget);
+        assert_eq!(options.request_token_budget, policy.request_token_budget);
+        assert_eq!(
+            options.confirmed_context_lines,
+            policy.confirmed_context_lines
+        );
+        assert_eq!(
+            options.confirmed_context_token_budget,
+            policy.confirmed_context_token_budget
+        );
         assert_eq!(
             options.translation_concurrency,
             policy.translation_concurrency
@@ -633,5 +698,9 @@ mod tests {
         assert_eq!(options.review_policy, policy.review_policy);
         assert_eq!(options.terminology_preflight, policy.terminology_preflight);
         assert_eq!(options.online_terminology, policy.online_terminology);
+        assert_eq!(
+            options.allow_degraded_preflight,
+            policy.allow_degraded_preflight
+        );
     }
 }

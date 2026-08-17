@@ -185,7 +185,11 @@ impl TranslationStage {
         &self.output
     }
 
-    pub fn previous_confirmed_context(&self) -> Vec<ConfirmedTranslationContext> {
+    pub fn previous_confirmed_context(
+        &self,
+        max_lines: usize,
+        token_budget: usize,
+    ) -> Vec<ConfirmedTranslationContext> {
         let Some(previous_index) = self.next_batch.checked_sub(1) else {
             return Vec::new();
         };
@@ -193,7 +197,7 @@ impl TranslationStage {
             return Vec::new();
         };
         let translated_start = self.output.len().saturating_sub(source.len());
-        source
+        let context = source
             .iter()
             .zip(&self.output[translated_start..])
             .map(|(source, translated)| ConfirmedTranslationContext {
@@ -201,12 +205,37 @@ impl TranslationStage {
                 source: source.text.clone(),
                 translation: translated.text.clone(),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        bounded_confirmed_context(&context, max_lines, token_budget)
     }
 
     pub fn finish(self) -> Vec<SubtitleSegment> {
         self.output
     }
+}
+
+pub(super) fn bounded_confirmed_context(
+    context: &[ConfirmedTranslationContext],
+    max_lines: usize,
+    token_budget: usize,
+) -> Vec<ConfirmedTranslationContext> {
+    if max_lines == 0 || token_budget == 0 {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    let mut tokens = 0usize;
+    for line in context.iter().rev().take(max_lines) {
+        let estimate = super::planning::estimated_text_tokens(&line.source)
+            .saturating_add(super::planning::estimated_text_tokens(&line.translation))
+            .saturating_add(8);
+        if !selected.is_empty() && tokens.saturating_add(estimate) > token_budget {
+            break;
+        }
+        selected.push(line.clone());
+        tokens = tokens.saturating_add(estimate);
+    }
+    selected.reverse();
+    selected
 }
 
 #[cfg(test)]
@@ -262,5 +291,30 @@ mod tests {
         );
         assert_eq!(stage.memory_hits(), 1);
         assert!(stage.is_complete());
+    }
+
+    #[test]
+    fn confirmed_context_keeps_only_the_recent_bounded_tail() {
+        let context = (1..=20)
+            .map(|id| ConfirmedTranslationContext {
+                id: id.to_string(),
+                source: format!("source {id}"),
+                translation: format!("translation {id}"),
+            })
+            .collect::<Vec<_>>();
+
+        let bounded = bounded_confirmed_context(&context, 12, 10_000);
+
+        assert_eq!(bounded.len(), 12);
+        assert_eq!(bounded.first().map(|line| line.id.as_str()), Some("9"));
+        assert_eq!(bounded.last().map(|line| line.id.as_str()), Some("20"));
+
+        let token_bounded = bounded_confirmed_context(&context, 12, 30);
+        assert!(!token_bounded.is_empty());
+        assert!(token_bounded.len() < 12);
+        assert_eq!(
+            token_bounded.last().map(|line| line.id.as_str()),
+            Some("20")
+        );
     }
 }

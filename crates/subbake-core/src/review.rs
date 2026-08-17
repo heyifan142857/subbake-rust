@@ -7,6 +7,14 @@ use crate::ports::ChatMessage;
 use crate::term_matcher::TermMatcher;
 use crate::validation::validate_full_alignment;
 
+const REVIEW_CONTEXT_LINES: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewContextLine {
+    pub(crate) source: SubtitleSegment,
+    pub(crate) translated: SubtitleSegment,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewBatchPlan {
     pub(crate) batch_index: usize,
@@ -15,6 +23,8 @@ pub(crate) struct ReviewBatchPlan {
     pub(crate) translated: Vec<SubtitleSegment>,
     pub(crate) reasons: Vec<String>,
     pub(crate) candidate_reasons: BTreeMap<String, Vec<String>>,
+    pub(crate) before: Vec<ReviewContextLine>,
+    pub(crate) after: Vec<ReviewContextLine>,
 }
 
 pub(crate) fn build_review_plan(
@@ -24,6 +34,7 @@ pub(crate) fn build_review_plan(
     source_language: &str,
     target_language: &str,
 ) -> Vec<ReviewBatchPlan> {
+    let all_source = batches.iter().flatten().cloned().collect::<Vec<_>>();
     let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (source, translated) in batches.iter().flatten().zip(translated_segments) {
         translations_by_source
@@ -66,6 +77,19 @@ pub(crate) fn build_review_plan(
                 translated: translated.to_vec(),
                 reasons,
                 candidate_reasons,
+                before: review_context(
+                    &all_source,
+                    translated_segments,
+                    offset.saturating_sub(REVIEW_CONTEXT_LINES),
+                    offset,
+                ),
+                after: review_context(
+                    &all_source,
+                    translated_segments,
+                    end,
+                    end.saturating_add(REVIEW_CONTEXT_LINES)
+                        .min(all_source.len()),
+                ),
             });
         }
         offset = end;
@@ -77,6 +101,7 @@ pub(crate) fn build_full_review_plan(
     batches: &[Vec<SubtitleSegment>],
     translated_segments: &[SubtitleSegment],
 ) -> Vec<ReviewBatchPlan> {
+    let all_source = batches.iter().flatten().cloned().collect::<Vec<_>>();
     let mut offset = 0;
     batches
         .iter()
@@ -93,6 +118,19 @@ pub(crate) fn build_full_review_plan(
                     .iter()
                     .map(|segment| (segment.id.clone(), vec!["full review".to_owned()]))
                     .collect(),
+                before: review_context(
+                    &all_source,
+                    translated_segments,
+                    offset.saturating_sub(REVIEW_CONTEXT_LINES),
+                    offset,
+                ),
+                after: review_context(
+                    &all_source,
+                    translated_segments,
+                    end,
+                    end.saturating_add(REVIEW_CONTEXT_LINES)
+                        .min(all_source.len()),
+                ),
             };
             offset = end;
             plan
@@ -100,14 +138,29 @@ pub(crate) fn build_full_review_plan(
         .collect()
 }
 
-pub(crate) fn build_review_messages(
-    options: &PipelineOptions,
+fn review_context(
     source: &[SubtitleSegment],
     translated: &[SubtitleSegment],
-    reasons: &[String],
-    candidate_reasons: &BTreeMap<String, Vec<String>>,
+    start: usize,
+    end: usize,
+) -> Vec<ReviewContextLine> {
+    source[start..end]
+        .iter()
+        .cloned()
+        .zip(translated[start..end].iter().cloned())
+        .map(|(source, translated)| ReviewContextLine { source, translated })
+        .collect()
+}
+
+pub(crate) fn build_review_messages(
+    options: &PipelineOptions,
+    batch: &ReviewBatchPlan,
     memory: &ContextMemory,
 ) -> Vec<ChatMessage> {
+    let source = &batch.source;
+    let translated = &batch.translated;
+    let reasons = &batch.reasons;
+    let candidate_reasons = &batch.candidate_reasons;
     let texts = source
         .iter()
         .chain(translated)
@@ -126,14 +179,24 @@ pub(crate) fn build_review_messages(
                 "id": source.id,
                 "source": source.text,
                 "translation": translated.text,
+                "start": source.start,
+                "end": source.end,
+                "identifier": source.identifier,
+                "settings": source.settings,
                 "reasons": candidate_reasons.get(&source.id),
             })).collect::<Vec<_>>(),
         "context": source.iter().zip(translated).map(|(source, translated)| serde_json::json!({
             "id": source.id,
             "source": source.text,
             "translation": translated.text,
+            "start": source.start,
+            "end": source.end,
+            "identifier": source.identifier,
+            "settings": source.settings,
             "editable": candidate_reasons.contains_key(&source.id),
         })).collect::<Vec<_>>(),
+        "readonly_before": review_context_json(&batch.before),
+        "readonly_after": review_context_json(&batch.after),
     });
     if !glossary.is_empty() {
         payload["glossary"] = serde_json::Value::Object(
@@ -163,6 +226,7 @@ pub(crate) fn build_review_messages(
     let user = format!(
         "TASK_START\nreview_translations\nTASK_END\n\
          Only ids in expected_ids are editable; context is read-only.\n\
+         readonly_before and readonly_after are adjacent translated context; never return their ids.\n\
          Prefer minimal edits and omit unchanged lines.\n\
          Return JSON only as {{\"changes\":[{{\"id\":\"<id>\",\"translation\":\"<replacement>\"}}]}}.\n\
          Return an empty changes array when every candidate is already good.\n\
@@ -176,6 +240,25 @@ pub(crate) fn build_review_messages(
         },
         ChatMessage::user(user),
     ]
+}
+
+fn review_context_json(lines: &[ReviewContextLine]) -> serde_json::Value {
+    serde_json::Value::Array(
+        lines
+            .iter()
+            .map(|line| {
+                serde_json::json!({
+                    "id": line.source.id,
+                    "source": line.source.text,
+                    "translation": line.translated.text,
+                    "start": line.source.start,
+                    "end": line.source.end,
+                    "identifier": line.source.identifier,
+                    "settings": line.source.settings,
+                })
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn parse_review_payload(payload: &serde_json::Value) -> CoreResult<ReviewResult> {
@@ -341,4 +424,63 @@ fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
     }
     let milliseconds = milliseconds.parse::<usize>().ok()?;
     Some((((hours * 60 + minutes) * 60 + seconds) * 1_000) + milliseconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            start: Some(start.to_owned()),
+            end: Some(end.to_owned()),
+            identifier: Some(format!("speaker-{id}")),
+            settings: Some("align:start".to_owned()),
+        }
+    }
+
+    #[test]
+    fn cinema_review_receives_timing_metadata_and_adjacent_readonly_context() {
+        let source = [
+            segment("1", "one", "00:00:00,000", "00:00:01,000"),
+            segment("2", "two", "00:00:02,000", "00:00:03,000"),
+            segment("3", "three", "00:00:04,000", "00:00:05,000"),
+        ];
+        let translated = source
+            .iter()
+            .map(|line| {
+                let mut line = line.clone();
+                line.text = format!("translated {}", line.text);
+                line
+            })
+            .collect::<Vec<_>>();
+        let batches = source
+            .iter()
+            .cloned()
+            .map(|line| vec![line])
+            .collect::<Vec<_>>();
+        let plan = build_full_review_plan(&batches, &translated);
+        let mut options = PipelineOptions::new("review.srt".into());
+        options.mode = crate::entities::TranslationMode::Cinema;
+
+        let messages = build_review_messages(&options, &plan[1], &ContextMemory::default());
+        let payload = messages[1]
+            .content
+            .split("REVIEW_JSON_START")
+            .nth(1)
+            .and_then(|value| value.split("REVIEW_JSON_END").next())
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .expect("review payload");
+
+        assert_eq!(payload["lines"][0]["start"], "00:00:02,000");
+        assert_eq!(payload["lines"][0]["identifier"], "speaker-2");
+        assert_eq!(payload["readonly_before"][0]["id"], "1");
+        assert_eq!(payload["readonly_after"][0]["id"], "3");
+        assert_eq!(
+            payload["readonly_before"][0]["translation"],
+            "translated one"
+        );
+    }
 }

@@ -4,11 +4,13 @@ use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
 use crate::progress::TaskState;
 use crate::storage::ResumeSnapshot;
 use crate::validation::validate_full_alignment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::SubtitlePipeline;
 use super::support::validate_window_terminology;
-use super::translation_stage::{SourceBatchContext, TranslationPromptContext, TranslationStage};
+use super::translation_stage::{
+    SourceBatchContext, TranslationPromptContext, TranslationStage, bounded_confirmed_context,
+};
 
 pub(super) struct TranslationRun {
     pub batches: Vec<Vec<SubtitleSegment>>,
@@ -16,19 +18,32 @@ pub(super) struct TranslationRun {
     pub usage: Usage,
 }
 
+pub(super) struct TranslationRunInput<'a> {
+    pub batches: Vec<Vec<SubtitleSegment>>,
+    pub resume: &'a ResumeSnapshot,
+    pub terminology: &'a TerminologyStats,
+    pub memory_keys: &'a HashMap<String, String>,
+    pub source_contexts: &'a [SourceBatchContext],
+    pub scene_groups: &'a [usize],
+}
+
 pub(super) fn run<B, D>(
     pipeline: &mut SubtitlePipeline<B, D>,
     document: &crate::entities::SubtitleDocument,
-    batches: Vec<Vec<SubtitleSegment>>,
-    resume: &ResumeSnapshot,
-    terminology: &TerminologyStats,
-    memory_keys: &HashMap<String, String>,
-    source_contexts: &[SourceBatchContext],
+    input: TranslationRunInput<'_>,
 ) -> CoreResult<TranslationRun>
 where
     B: LlmBackend,
     D: DashboardSink,
 {
+    let TranslationRunInput {
+        batches,
+        resume,
+        terminology,
+        memory_keys,
+        source_contexts,
+        scene_groups,
+    } = input;
     pipeline.report(
         "TRANSLATE",
         if resume.translation_batches_completed > 0 {
@@ -68,12 +83,21 @@ where
             && pipeline.backend.supports_parallel_generation()
         {
             concurrency.saturating_mul(2)
+        } else if pipeline.options.mode == crate::entities::TranslationMode::Cinema {
+            cinema_window_size(stage.next_batch(), concurrency, scene_groups)
         } else {
             concurrency
         };
-        let mut previous_confirmed = stage.previous_confirmed_context();
+        let mut previous_confirmed = stage.previous_confirmed_context(
+            pipeline.options.confirmed_context_lines,
+            pipeline.options.confirmed_context_token_budget,
+        );
         if previous_confirmed.is_empty() {
-            previous_confirmed = pipeline.options.initial_confirmed_context.clone();
+            previous_confirmed = bounded_confirmed_context(
+                &pipeline.options.initial_confirmed_context,
+                pipeline.options.confirmed_context_lines,
+                pipeline.options.confirmed_context_token_budget,
+            );
         }
         let mut prepared = stage.prepare_window(
             window_size,
@@ -206,4 +230,30 @@ where
         segments: stage.finish(),
         usage,
     })
+}
+
+fn cinema_window_size(start: usize, concurrency: usize, scene_groups: &[usize]) -> usize {
+    let mut seen = HashSet::new();
+    let mut count = 0usize;
+    for group in scene_groups.iter().skip(start).take(concurrency.max(1)) {
+        if !seen.insert(*group) {
+            break;
+        }
+        count += 1;
+    }
+    count.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cinema_window_size;
+
+    #[test]
+    fn cinema_window_never_contains_two_batches_from_the_same_scene() {
+        let groups = [0, 0, 1, 1, 2];
+
+        assert_eq!(cinema_window_size(0, 4, &groups), 1);
+        assert_eq!(cinema_window_size(1, 4, &groups), 2);
+        assert_eq!(cinema_window_size(3, 4, &groups), 2);
+    }
 }

@@ -811,6 +811,18 @@ fn parse_translation_setting_option(
         "--batch-token-budget" => {
             overrides.translation.batch_token_budget = Some(parse_batch_size(args, index, option)?)
         }
+        "--request-token-budget" => {
+            overrides.translation.request_token_budget =
+                Some(parse_batch_size(args, index, option)?)
+        }
+        "--confirmed-context-lines" => {
+            overrides.translation.confirmed_context_lines =
+                Some(parse_nonnegative_usize(args, index, option)?)
+        }
+        "--confirmed-context-token-budget" => {
+            overrides.translation.confirmed_context_token_budget =
+                Some(parse_nonnegative_usize(args, index, option)?)
+        }
         "--translation-concurrency" => {
             overrides.translation.translation_concurrency =
                 Some(parse_batch_size(args, index, option)?)
@@ -842,6 +854,8 @@ fn parse_translation_setting_option(
         "--bilingual" => overrides.output.bilingual = Some(true),
         "--online-terminology" => overrides.translation.online_terminology = Some(true),
         "--no-online-terminology" => overrides.translation.online_terminology = Some(false),
+        "--allow-degraded-preflight" => overrides.translation.allow_degraded_preflight = Some(true),
+        "--strict-preflight" => overrides.translation.allow_degraded_preflight = Some(false),
         "--preserve-names" => overrides.translation.preserve_names = Some(true),
         "--transliterate-names" => overrides.translation.preserve_names = Some(false),
         "--preserve-source-container" => overrides.output.preserve_source_container = Some(true),
@@ -1038,6 +1052,13 @@ mod tests {
             "2".to_owned(),
             "--batch-token-budget".to_owned(),
             "1800".to_owned(),
+            "--request-token-budget".to_owned(),
+            "9000".to_owned(),
+            "--confirmed-context-lines".to_owned(),
+            "10".to_owned(),
+            "--confirmed-context-token-budget".to_owned(),
+            "700".to_owned(),
+            "--strict-preflight".to_owned(),
             "--max-characters-per-second".to_owned(),
             "18.5".to_owned(),
             "--max-characters-per-line".to_owned(),
@@ -1055,6 +1076,13 @@ mod tests {
         assert_eq!(parsed.settings.translation.translation_concurrency, 3);
         assert_eq!(parsed.settings.translation.review_concurrency, 2);
         assert_eq!(parsed.settings.translation.batch_token_budget, 1_800);
+        assert_eq!(parsed.settings.translation.request_token_budget, 9_000);
+        assert_eq!(parsed.settings.translation.confirmed_context_lines, 10);
+        assert_eq!(
+            parsed.settings.translation.confirmed_context_token_budget,
+            700
+        );
+        assert!(!parsed.settings.translation.allow_degraded_preflight);
         assert_eq!(
             parsed.settings.translation.max_characters_per_second,
             Some(18.5)

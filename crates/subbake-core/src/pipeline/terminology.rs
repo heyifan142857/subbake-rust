@@ -48,7 +48,19 @@ where
             candidates: candidates.len(),
             ..TerminologyStats::default()
         };
-        if !self.options.terminology_preflight || !self.backend.supports_terminology_preflight() {
+        if !self.options.terminology_preflight {
+            self.report(TaskState::Skipped, 0, candidates.len(), Usage::default());
+            return Ok(stats);
+        }
+        if !self.backend.supports_terminology_preflight() {
+            if !self.options.allow_degraded_preflight {
+                return Err(CoreError::UnsupportedCapability(
+                    "configured backend does not support strict terminology preflight".to_owned(),
+                ));
+            }
+            stats.degraded = true;
+            stats.degraded_reason =
+                Some("configured backend does not support terminology preflight".to_owned());
             self.report(TaskState::Skipped, 0, candidates.len(), Usage::default());
             return Ok(stats);
         }
@@ -126,6 +138,7 @@ where
                 }
             }
             Err(error @ CoreError::ResourceBudgetExceeded(_)) => return Err(error),
+            Err(error) if !self.options.allow_degraded_preflight => return Err(error),
             Err(error) => {
                 stats.degraded = true;
                 stats.degraded_reason = Some(error.to_string());
