@@ -10,8 +10,8 @@ use subbake_core::storage::{
     stable_hash,
 };
 use subbake_core::{
-    CancellationGuard, NoopProgress, PipelineResult, SharedProgress, SubtitleDocument,
-    SubtitleDocumentMetadata, SubtitleSegment, TranslationMode, Usage,
+    CancellationGuard, ConfirmedTranslationContext, NoopProgress, PipelineResult, SharedProgress,
+    SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment, TranslationMode, Usage,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -492,6 +492,7 @@ fn consume_translation_chunks(
     let mut aggregate = empty_pipeline_result(request, store);
     let mut group_index = 0usize;
     let mut chunk_count = 0usize;
+    let mut confirmed_context = Vec::new();
 
     for chunk in receiver {
         cancellation.check().map_err(AdapterError::from)?;
@@ -507,7 +508,15 @@ fn consume_translation_chunks(
                 store,
                 cancellation,
                 progress.clone(),
+                &confirmed_context,
             )?;
+            if strategy == MediaPipelineStrategy::TurboImmediate {
+                confirmed_context = confirmed_translation_tail(
+                    &pending,
+                    &translated.segments,
+                    request.settings.translation.batch_size,
+                );
+            }
             translated_segments.extend(translated.segments);
             add_group_result(&mut aggregate, &translated.shard);
             group_index += 1;
@@ -522,6 +531,7 @@ fn consume_translation_chunks(
             store,
             cancellation,
             progress,
+            &confirmed_context,
         )?;
         translated_segments.extend(translated.segments);
         add_group_result(&mut aggregate, &translated.shard);
@@ -558,6 +568,7 @@ fn translate_chunk_group(
     store: &StreamingPipelineStore,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    initial_confirmed_context: &[ConfirmedTranslationContext],
 ) -> AdapterResult<TranslatedGroup> {
     let first_chunk = chunks
         .first()
@@ -634,6 +645,7 @@ fn translate_chunk_group(
     let mut settings = request.settings.clone();
     settings.output.bilingual = false;
     settings.output.format = Some(format.to_owned());
+    settings.storage.runtime_dir = Some(store.root.join("translation_runtime"));
     let outcome = translate_subtitle_cancellable_with_progress_and_identity(
         TranslationRequest {
             input_path: source_path.clone(),
@@ -652,6 +664,7 @@ fn translate_chunk_group(
                 "{}:group:{index}:chunks:{first_chunk}-{last_chunk}",
                 store.fingerprint
             )),
+            initial_confirmed_context: initial_confirmed_context.to_vec(),
         }),
     )?;
     let translated = read_document(&translated_path)?;
@@ -680,6 +693,28 @@ fn translate_chunk_group(
         segments: translated.segments,
         shard,
     })
+}
+
+fn confirmed_translation_tail(
+    chunks: &[StableTranscriptionChunk],
+    translated: &[SubtitleSegment],
+    limit: usize,
+) -> Vec<ConfirmedTranslationContext> {
+    let source = chunks
+        .iter()
+        .flat_map(|chunk| &chunk.segments)
+        .collect::<Vec<_>>();
+    let keep = source.len().min(translated.len()).min(limit.max(1));
+    source
+        .iter()
+        .zip(translated)
+        .skip(source.len().saturating_sub(keep))
+        .map(|(source, translated)| ConfirmedTranslationContext {
+            id: source.id.clone(),
+            source: source.text.clone(),
+            translation: translated.text.clone(),
+        })
+        .collect()
 }
 
 fn validate_group_alignment(
@@ -964,7 +999,6 @@ mod tests {
     #[test]
     fn modes_select_expected_media_strategy() {
         let mut settings = TranslationSettings::default();
-        settings.translation.terminology_preflight = false;
         settings.translation.mode = TranslationMode::Turbo;
         assert_eq!(
             media_pipeline_strategy(&settings),
@@ -979,6 +1013,14 @@ mod tests {
         assert_eq!(
             media_pipeline_strategy(&settings),
             MediaPipelineStrategy::Sequential
+        );
+    }
+
+    #[test]
+    fn default_settings_select_turbo_immediate_media_strategy() {
+        assert_eq!(
+            media_pipeline_strategy(&TranslationSettings::default()),
+            MediaPipelineStrategy::TurboImmediate
         );
     }
 
@@ -1007,6 +1049,29 @@ mod tests {
         let chunks = vec![test_chunk(0, 2), test_chunk(1, 1)];
         assert!(!economy_buffer_ready(&chunks[..1], &request));
         assert!(economy_buffer_ready(&chunks, &request));
+    }
+
+    #[test]
+    fn confirmed_translation_tail_preserves_source_and_translation_order() {
+        let chunks = vec![test_chunk(0, 2), test_chunk(1, 2)];
+        let translated = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.segments)
+            .enumerate()
+            .map(|(index, source)| {
+                let mut translated = source.clone();
+                translated.text = format!("translated {index}");
+                translated
+            })
+            .collect::<Vec<_>>();
+
+        let tail = confirmed_translation_tail(&chunks, &translated, 3);
+
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].id, chunks[0].segments[1].id);
+        assert_eq!(tail[0].translation, "translated 1");
+        assert_eq!(tail[2].id, chunks[1].segments[1].id);
+        assert_eq!(tail[2].translation, "translated 3");
     }
 
     #[test]

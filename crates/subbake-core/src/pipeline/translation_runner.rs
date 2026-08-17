@@ -7,7 +7,7 @@ use crate::validation::validate_full_alignment;
 use std::collections::HashMap;
 
 use super::SubtitlePipeline;
-use super::support::{update_translation_memory, validate_window_terminology};
+use super::support::validate_window_terminology;
 use super::translation_stage::{SourceBatchContext, TranslationPromptContext, TranslationStage};
 
 pub(super) struct TranslationRun {
@@ -71,7 +71,10 @@ where
         } else {
             concurrency
         };
-        let previous_confirmed = stage.previous_confirmed_context();
+        let mut previous_confirmed = stage.previous_confirmed_context();
+        if previous_confirmed.is_empty() {
+            previous_confirmed = pipeline.options.initial_confirmed_context.clone();
+        }
         let mut prepared = stage.prepare_window(
             window_size,
             pipeline.options.use_cache,
@@ -146,14 +149,6 @@ where
                 pipeline.commit_terminology_updates(&result.terminology_updates);
             }
             pipeline.translation_memory_hits = stage.memory_hits();
-            if pipeline.options.use_cache {
-                update_translation_memory(
-                    &mut pipeline.translation_memory,
-                    memory_keys,
-                    &applied.source,
-                    &applied.translated,
-                );
-            }
             if let Some(store) = pipeline.store.as_ref() {
                 pipeline.cancellation.check()?;
                 store.save_glossary(
@@ -169,15 +164,6 @@ where
                     applied.index + 1,
                     &applied.translated,
                 )?;
-                if pipeline.options.use_cache {
-                    store.save_translation_memory(
-                        &pipeline
-                            .translation_memory
-                            .iter()
-                            .map(|(key, text)| (key.clone(), text.clone()))
-                            .collect::<Vec<_>>(),
-                    )?;
-                }
             }
             pipeline.cancellation.check()?;
             pipeline.save_run_state(

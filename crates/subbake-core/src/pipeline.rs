@@ -44,7 +44,8 @@ use review_runner::{ReviewBatchInput, ReviewRun};
 pub use support::translation_memory_key;
 use support::{
     build_translation_messages, contextual_translation_memory_keys, is_agent_repairable,
-    is_operational_llm_failure, merge_review_patch, request_hash, validate_review_candidate_ids,
+    is_operational_llm_failure, merge_review_patch, request_hash, translation_memory_scope,
+    update_translation_memory, validate_review_candidate_ids,
 };
 use terminology::TerminologyStage;
 #[cfg(test)]
@@ -329,12 +330,7 @@ where
 
         let deduplication =
             DeduplicationPlan::new(&document.segments, self.options.policy().deduplicate);
-        let translation_memory_scope = self
-            .options
-            .input_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_string_lossy();
+        let translation_memory_scope = translation_memory_scope(&self.options);
         let translation_memory_keys =
             contextual_translation_memory_keys(&translation_memory_scope, &document.segments);
         let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
@@ -484,6 +480,24 @@ where
             &self.options.target_language,
             final_validation_policy,
         )?;
+        if self.options.use_cache {
+            update_translation_memory(
+                &mut self.translation_memory,
+                &translation_memory_keys,
+                &document.segments,
+                &output,
+            );
+            if let Some(store) = self.store.as_ref() {
+                self.cancellation.check()?;
+                store.save_translation_memory(
+                    &self
+                        .translation_memory
+                        .iter()
+                        .map(|(key, text)| (key.clone(), text.clone()))
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+        }
         if let Some(store) = self.store.as_ref() {
             self.cancellation.check()?;
             store.save_batch_segments(BatchShardKind::Finalized, 1, &output)?;
@@ -539,6 +553,8 @@ where
             cancellation: &self.cancellation,
             progress: self.progress.as_deref(),
             cache_hits: &mut self.cache_hits,
+            provider_requests: &mut self.provider_requests,
+            provider_tokens: &mut self.provider_tokens,
         }
         .run(document)
     }
@@ -2409,6 +2425,7 @@ mod tests {
 
     struct PreflightBackend {
         contexts: Arc<Mutex<Vec<serde_json::Value>>>,
+        preflight_requests: Arc<AtomicUsize>,
     }
 
     impl LlmBackend for PreflightBackend {
@@ -2436,6 +2453,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             if prompt.contains("TERMINOLOGY_JSON_START") {
+                self.preflight_requests.fetch_add(1, Ordering::SeqCst);
                 let body = prompt
                     .split("TERMINOLOGY_JSON_START")
                     .nth(1)
@@ -2921,7 +2939,7 @@ mod tests {
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
         let data = captured.lock().expect("capture lock");
         assert_eq!(data.saved_translation_memory.len(), 1);
-        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v1:"));
+        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v2:"));
         assert_eq!(data.saved_translation_memory[0].1, "[ECHO] hello");
         assert_eq!(data.saved_batches.len(), 1);
         assert_eq!(data.saved_batches[0].1[0].text, "[ECHO] hello");
@@ -2990,7 +3008,13 @@ mod tests {
     #[test]
     fn contextual_translation_memory_is_scoped_and_ignores_legacy_keys() {
         let source = document("/shows/one/clip.txt", &["Fine."]);
-        let key = contextual_translation_memory_keys("/shows/one", &source.segments)["1"].clone();
+        let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
+        same_scope_options.resume = false;
+        let key = contextual_translation_memory_keys(
+            &translation_memory_scope(&same_scope_options),
+            &source.segments,
+        )["1"]
+            .clone();
         let captured = Arc::new(Mutex::new(CapturedStoreData {
             loaded_translation_memory: vec![
                 (key, "好的。".to_owned()),
@@ -3010,8 +3034,6 @@ mod tests {
             ),
             data: Arc::clone(&captured),
         };
-        let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
-        same_scope_options.resume = false;
         let same_scope_calls = Arc::new(AtomicUsize::new(0));
         let mut same_scope = SubtitlePipeline::new(
             CountingBackend {
@@ -3055,7 +3077,15 @@ mod tests {
     #[test]
     fn final_validation_checks_required_glossary_on_translation_memory_hits() {
         let source = document("/shows/one/terms.txt", &["The Lord is here."]);
-        let key = contextual_translation_memory_keys("/shows/one", &source.segments)["1"].clone();
+        let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
+        options.glossary_path = Some("glossary.json".into());
+        options.resume = false;
+        options.agent = false;
+        let key = contextual_translation_memory_keys(
+            &translation_memory_scope(&options),
+            &source.segments,
+        )["1"]
+            .clone();
         let captured = Arc::new(Mutex::new(CapturedStoreData {
             loaded_translation_memory: vec![(key, "领主来了。".to_owned())],
             loaded_glossary: vec![("Lord".to_owned(), "勋爵".to_owned())],
@@ -3074,10 +3104,6 @@ mod tests {
             data: captured,
         };
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
-        options.glossary_path = Some("glossary.json".into());
-        options.resume = false;
-        options.agent = false;
         let mut pipeline = SubtitlePipeline::new(
             CountingBackend {
                 calls: Arc::clone(&calls),
@@ -3716,6 +3742,7 @@ mod tests {
                 "entries": [{"source": "Axe Gang", "target": "斧头帮"}]
             }),
             &candidates,
+            &[segment("1", "The Axe Gang is here.")],
         )
         .expect("valid terminology");
         assert_eq!(parsed.entries[0].target, "斧头帮");
@@ -3750,6 +3777,11 @@ mod tests {
                 }]
             }),
             &alias_candidates,
+            &[
+                segment("1", "Joey Zasa arrived."),
+                segment("2", "Joey left."),
+                segment("3", "Zasa sent them."),
+            ],
         )
         .expect("entity aliases");
         assert_eq!(aliases.entities[0].variants[1].target, "乔伊");
@@ -3760,9 +3792,42 @@ mod tests {
                 "entries": [{"source": "Unknown", "target": "未知"}]
             }),
             &candidates,
+            &[segment("1", "The Axe Gang is here.")],
         )
         .expect_err("unknown source rejected");
         assert!(error.to_string().contains("unknown source"));
+    }
+
+    #[test]
+    fn terminology_payload_accepts_exact_spans_from_non_latin_document_samples() {
+        let segments = vec![
+            segment("1", "量子航行系统已经启动。"),
+            segment("2", "量子航行系统发生故障。"),
+        ];
+        let parsed = parse_terminology_payload(
+            &serde_json::json!({
+                "entries": [{"source": "量子航行系统", "target": "quantum navigation system"}]
+            }),
+            &[],
+            &segments,
+        )
+        .expect("document sample term");
+
+        assert_eq!(parsed.entries[0].source, "量子航行系统");
+    }
+
+    #[test]
+    fn terminology_candidates_support_unicode_title_case() {
+        let candidates = extract_terminology_candidates(&[
+            segment("1", "Алиса вернулась."),
+            segment("2", "Алиса ждала."),
+        ]);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == "Алиса")
+        );
     }
 
     #[test]
@@ -3968,10 +4033,12 @@ mod tests {
         options.batch_size = 1;
         options.resume = false;
         options.mode = crate::entities::TranslationMode::Cinema;
+        options.terminology_preflight = true;
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             PreflightBackend {
                 contexts: Arc::clone(&contexts),
+                preflight_requests: Arc::new(AtomicUsize::new(0)),
             },
             NoopDashboard,
             options,
@@ -3980,7 +4047,11 @@ mod tests {
         let run = pipeline.run_document(&document).expect("translated");
         let contexts = contexts.lock().expect("contexts lock");
 
-        assert!(run.result.terminology.entries_added >= 2);
+        assert!(
+            run.result.terminology.entries_added >= 2,
+            "terminology stats: {:?}",
+            run.result.terminology
+        );
         assert_eq!(contexts.len(), 4);
         assert!(contexts.iter().all(|context| {
             context["terminology_hints"]
@@ -3988,6 +4059,93 @@ mod tests {
                 .is_some_and(|map| !map.is_empty())
                 && context.get("glossary").is_none()
         }));
+    }
+
+    #[test]
+    fn explicit_turbo_terminology_preflight_runs_before_translation() {
+        let document = document("terms.txt", &["Meet Alice now.", "Alice returned."]);
+        let mut options = PipelineOptions::new("terms.txt".into());
+        options.batch_size = 1;
+        options.resume = false;
+        options.mode = crate::entities::TranslationMode::Turbo;
+        options.terminology_preflight = true;
+        options.preserve_names = true;
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let preflight_requests = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            PreflightBackend {
+                contexts: Arc::clone(&contexts),
+                preflight_requests: Arc::clone(&preflight_requests),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("translated");
+        let contexts = contexts.lock().expect("contexts lock");
+
+        assert!(run.result.terminology.entries_added >= 1);
+        assert_eq!(preflight_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts.iter().all(|context| {
+            context["terminology_hints"]
+                .as_object()
+                .is_some_and(|map| !map.is_empty())
+        }));
+    }
+
+    #[test]
+    fn terminology_preflight_consumes_the_shared_request_budget() {
+        let document = document("terms.txt", &["Meet Alice now.", "Alice returned."]);
+        let mut options = PipelineOptions::new("terms.txt".into());
+        options.resume = false;
+        options.mode = crate::entities::TranslationMode::Cinema;
+        options.terminology_preflight = true;
+        options.preserve_names = true;
+        options.max_requests = Some(1);
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            PreflightBackend {
+                contexts: Arc::clone(&contexts),
+                preflight_requests: Arc::new(AtomicUsize::new(0)),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let error = pipeline
+            .run_document(&document)
+            .expect_err("translation must stop after the preflight request");
+
+        assert!(error.to_string().contains("request limit is 1"));
+        assert!(contexts.lock().expect("contexts lock").is_empty());
+    }
+
+    #[test]
+    fn cinema_preflight_runs_for_non_latin_documents_without_heuristic_candidates() {
+        let document = document("terms.txt", &["量子航行系统启动。", "推进器正常。"]);
+        let mut options = PipelineOptions::new("terms.txt".into());
+        options.resume = false;
+        options.mode = crate::entities::TranslationMode::Cinema;
+        options.terminology_preflight = true;
+        options.preserve_names = true;
+        options.source_language = "zh-Hans".to_owned();
+        options.target_language = "zh-Hans".to_owned();
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let preflight_requests = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            PreflightBackend {
+                contexts,
+                preflight_requests: Arc::clone(&preflight_requests),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("translated");
+
+        assert_eq!(run.result.terminology.candidates, 0);
+        assert_eq!(preflight_requests.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4142,6 +4300,19 @@ mod tests {
         options.review_policy = ReviewPolicy::Full;
         let translation_calls = Arc::new(AtomicUsize::new(0));
         let review_calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
+        let store = CapturedStore {
+            paths: build_runtime_paths(
+                std::path::Path::new("review.txt"),
+                std::path::Path::new("/workspace/review.txt"),
+                None,
+                None,
+                "Auto",
+                "Chinese",
+                false,
+            ),
+            data: Arc::clone(&captured),
+        };
         let mut pipeline = SubtitlePipeline::new(
             ReviewBackend {
                 translation_calls: Arc::clone(&translation_calls),
@@ -4150,7 +4321,8 @@ mod tests {
             },
             NoopDashboard,
             options,
-        );
+        )
+        .with_store(Box::new(store));
 
         let run = pipeline.run_document(&document).expect("reviewed run");
 
@@ -4161,6 +4333,14 @@ mod tests {
         assert_eq!(
             run.translated_segments[0].text,
             "[REVIEWED] [ECHO] Meet Alice now."
+        );
+        let data = captured.lock().expect("capture lock");
+        assert_eq!(
+            data.saved_translation_memory
+                .iter()
+                .find(|(key, _)| key.ends_with(":meet alice now."))
+                .map(|(_, text)| text.as_str()),
+            Some("[REVIEWED] [ECHO] Meet Alice now.")
         );
     }
 
@@ -4253,6 +4433,40 @@ mod tests {
             contexts
                 .iter()
                 .all(|context| context.get("recent").is_none())
+        );
+    }
+
+    #[test]
+    fn composed_translation_uses_initial_confirmed_context_for_its_first_window() {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut options = PipelineOptions::new("next-chunk.txt".into());
+        options.batch_size = 1;
+        options.terminology_preflight = false;
+        options.preserve_names = true;
+        options.resume = false;
+        options.use_cache = false;
+        options.initial_confirmed_context = vec![crate::ConfirmedTranslationContext {
+            id: "previous".to_owned(),
+            source: "Previous line.".to_owned(),
+            translation: "上一句。".to_owned(),
+        }];
+        let mut pipeline = SubtitlePipeline::new(
+            ContextCaptureBackend {
+                contexts: Arc::clone(&contexts),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        pipeline
+            .run_document(&document("next-chunk.txt", &["Next line."]))
+            .expect("contextual run");
+
+        let contexts = contexts.lock().expect("context lock");
+        assert_eq!(contexts[0]["confirmed_previous"][0]["id"], "previous");
+        assert_eq!(
+            contexts[0]["confirmed_previous"][0]["translation"],
+            "上一句。"
         );
     }
 

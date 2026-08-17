@@ -7,19 +7,24 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use subbake_core::formats::RenderOptions;
-use subbake_core::overnight::{OvernightBatch, parse_translation_output, plan_translation};
+use subbake_core::overnight::{
+    OVERNIGHT_TRANSLATION_CONTRACT_VERSION, OvernightBatch, OvernightPlanOptions,
+    finalize_translation_output, parse_translation_output, plan_translation,
+};
+use subbake_core::ports::RuntimeStore;
 use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
-use subbake_core::{CancellationGuard, SubtitleSegment};
+use subbake_core::{CancellationGuard, FinalValidationPolicy};
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
-    render_and_write_document, stable_runtime_input_path,
+    render_and_write_document_atomic, stable_runtime_input_path,
 };
 use crate::llm_backends::{OpenAiBatchClient, OpenAiBatchStatus, build_openai_batch_client};
+use crate::runtime_store::FileRuntimeStore;
 use crate::settings::TranslationSettings;
 
-const MANIFEST_VERSION: u64 = 1;
+const MANIFEST_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OvernightSubmitRequest {
@@ -69,6 +74,8 @@ pub struct OvernightCollectOutcome {
 #[serde(deny_unknown_fields)]
 struct OvernightManifest {
     version: u64,
+    #[serde(default = "legacy_translation_contract_version")]
+    translation_contract_version: u64,
     job_id: String,
     input_file_id: String,
     endpoint: String,
@@ -80,6 +87,16 @@ struct OvernightManifest {
     input_signature: InputSignature,
     source_language: String,
     target_language: String,
+    #[serde(default)]
+    required_glossary: BTreeMap<String, String>,
+    #[serde(default)]
+    preserve_names: bool,
+    #[serde(default)]
+    max_characters_per_second: Option<f64>,
+    #[serde(default)]
+    max_characters_per_line: Option<usize>,
+    #[serde(default)]
+    max_lines: Option<usize>,
     bilingual: bool,
     #[serde(default = "default_bilingual_font_scale")]
     bilingual_font_scale: f64,
@@ -130,17 +147,32 @@ pub fn submit_overnight(
         &request.settings.translation.target_language,
         true,
     );
+    let runtime_store = FileRuntimeStore::new(runtime.clone());
+    runtime_store.ensure_layout().map_err(AdapterError::from)?;
+    let required_glossary = if request.settings.glossary_path().is_some() {
+        runtime_store
+            .load_glossary()
+            .map_err(AdapterError::from)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
     let prefix = format!(
         "subbake-{}",
         &input_signature.sha1[..12.min(input_signature.sha1.len())]
     );
     let batches = plan_translation(
         &document,
-        &request.settings.translation.source_language,
-        &request.settings.translation.target_language,
-        request.settings.translation.batch_size,
-        request.settings.translation.batch_token_budget,
-        &prefix,
+        &OvernightPlanOptions {
+            source_language: &request.settings.translation.source_language,
+            target_language: &request.settings.translation.target_language,
+            batch_size: request.settings.translation.batch_size,
+            batch_token_budget: request.settings.translation.batch_token_budget,
+            id_prefix: &prefix,
+            required_glossary: &required_glossary,
+            preserve_names: request.settings.translation.preserve_names,
+        },
     )?;
     let backend_config = request.settings.backend_config();
     let client = build_openai_batch_client(&backend_config, backend_config.timeout_seconds)?;
@@ -152,6 +184,7 @@ pub fn submit_overnight(
     )?;
     let manifest = OvernightManifest {
         version: MANIFEST_VERSION,
+        translation_contract_version: OVERNIGHT_TRANSLATION_CONTRACT_VERSION,
         job_id: status.id.clone(),
         input_file_id: status.input_file_id.clone(),
         endpoint: client.endpoint_path().to_owned(),
@@ -163,6 +196,11 @@ pub fn submit_overnight(
         input_signature,
         source_language: request.settings.translation.source_language,
         target_language: request.settings.translation.target_language,
+        required_glossary,
+        preserve_names: request.settings.translation.preserve_names,
+        max_characters_per_second: request.settings.translation.max_characters_per_second,
+        max_characters_per_line: request.settings.translation.max_characters_per_line,
+        max_lines: request.settings.translation.max_lines,
         bilingual: request.settings.output.bilingual,
         bilingual_font_scale: request.settings.output.bilingual_font_scale,
         output_format: request.settings.output.format,
@@ -239,10 +277,22 @@ pub fn collect_overnight(
     let document = read_document(&manifest.input_path)?;
     let raw = client.download_output(output_file_id, cancellation)?;
     let translations = parse_output_lines(&client, &manifest, &raw)?;
-    let translated = apply_lines(&document.segments, &translations)?;
+    let translated = finalize_translation_output(
+        &document,
+        translations,
+        &manifest.required_glossary,
+        &manifest.source_language,
+        &manifest.target_language,
+        FinalValidationPolicy {
+            max_characters_per_second: manifest.max_characters_per_second,
+            max_characters_per_line: manifest.max_characters_per_line,
+            max_lines: manifest.max_lines,
+        },
+    )
+    .map_err(AdapterError::from)?;
     let render_options = RenderOptions::new(manifest.bilingual, manifest.output_format.clone())
         .with_bilingual_font_scale(manifest.bilingual_font_scale);
-    render_and_write_document(
+    render_and_write_document_atomic(
         &document,
         &translated,
         &manifest.output_path,
@@ -332,30 +382,6 @@ fn parse_output_lines(
     Ok(result)
 }
 
-fn apply_lines(
-    source: &[SubtitleSegment],
-    lines: &[subbake_core::TranslationLine],
-) -> AdapterResult<Vec<SubtitleSegment>> {
-    let translations = lines
-        .iter()
-        .map(|line| (line.id.as_str(), line.translation.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    source
-        .iter()
-        .map(|segment| {
-            let translation = translations.get(segment.id.as_str()).ok_or_else(|| {
-                AdapterError::invalid_input(format!(
-                    "overnight output omitted subtitle id `{}`",
-                    segment.id
-                ))
-            })?;
-            let mut translated = segment.clone();
-            translated.text = (*translation).to_owned();
-            Ok(translated)
-        })
-        .collect()
-}
-
 fn client_for_manifest(
     settings: &TranslationSettings,
     manifest: &OvernightManifest,
@@ -405,13 +431,23 @@ fn read_manifest(path: &Path) -> AdapterResult<OvernightManifest> {
             context: "decode overnight manifest",
             source,
         })?;
-    if manifest.version != MANIFEST_VERSION {
+    if !matches!(manifest.version, 1 | MANIFEST_VERSION) {
         return Err(AdapterError::invalid_input(format!(
             "unsupported overnight manifest version {}",
             manifest.version
         )));
     }
+    if manifest.translation_contract_version > OVERNIGHT_TRANSLATION_CONTRACT_VERSION {
+        return Err(AdapterError::invalid_input(format!(
+            "unsupported overnight translation contract version {}",
+            manifest.translation_contract_version
+        )));
+    }
     Ok(manifest)
+}
+
+const fn legacy_translation_contract_version() -> u64 {
+    1
 }
 
 fn write_manifest(path: &Path, manifest: &OvernightManifest) -> AdapterResult<()> {
@@ -470,5 +506,7 @@ mod compatibility_tests {
         .expect("legacy overnight manifest");
 
         assert_eq!(manifest.bilingual_font_scale, 1.0);
+        assert_eq!(manifest.translation_contract_version, 1);
+        assert!(manifest.required_glossary.is_empty());
     }
 }

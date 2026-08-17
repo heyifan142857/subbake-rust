@@ -13,9 +13,9 @@ pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 3;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 2;
+pub const PROMPT_CONTRACT_VERSION: u64 = 3;
 /// Bump when translation-memory keying, lookup, or application semantics change.
-pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 1;
+pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 2;
 /// Bump when deterministic final-output validation semantics change.
 pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 3;
 /// Bump when the ordering, buffering, or publication contract of an
@@ -243,7 +243,7 @@ pub fn build_runtime_paths(
         reviewed_batches_dir: run_dir.join("reviewed_batches"),
         finalized_batches_dir: run_dir.join("finalized_batches"),
         translation_memory_path: root_dir.join(format!(
-            "translation_memory.v4.{language_pair}.{translation_memory_mode}.json"
+            "translation_memory.v5.{language_pair}.{translation_memory_mode}.json"
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
         review_report_path: run_dir.join("review_report.json"),
@@ -417,6 +417,27 @@ pub fn build_translation_fingerprint(
                     JsonValue::String(execution_fingerprint.clone()),
                 ),
             ]),
+        ));
+    }
+    if !options.initial_confirmed_context.is_empty() {
+        fields.push((
+            "initial_confirmed_context".to_owned(),
+            JsonValue::Array(
+                options
+                    .initial_confirmed_context
+                    .iter()
+                    .map(|line| {
+                        JsonValue::Object(vec![
+                            ("id".to_owned(), JsonValue::String(line.id.clone())),
+                            ("source".to_owned(), JsonValue::String(line.source.clone())),
+                            (
+                                "translation".to_owned(),
+                                JsonValue::String(line.translation.clone()),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
         ));
     }
     stable_hash(&JsonValue::Object(fields))
@@ -690,7 +711,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "b94b681466becf1247cb7df972317cc724bea95e"
+            "e656fb19329ab20448310d5eba755fa42d4936fe"
         );
     }
 
@@ -765,6 +786,18 @@ mod tests {
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_validation, &signature)
+        );
+
+        let mut seeded_context = baseline.clone();
+        seeded_context.initial_confirmed_context =
+            vec![crate::entities::ConfirmedTranslationContext {
+                id: "previous".to_owned(),
+                source: "Previous line.".to_owned(),
+                translation: "上一句。".to_owned(),
+            }];
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&seeded_context, &signature)
         );
 
         let mut streaming = baseline.clone();
@@ -851,7 +884,7 @@ mod tests {
             paths
                 .translation_memory_path
                 .to_string_lossy()
-                .contains("translation_memory.v4.auto-zh-hans.standard.json")
+                .contains("translation_memory.v5.auto-zh-hans.standard.json")
         );
     }
 

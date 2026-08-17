@@ -25,11 +25,12 @@ pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
     AgentLog, AgentRepairRecord, AssDialogueRecord, AssDocumentMetadata, AssRecord, AttemptLog,
-    BatchPlanEntry, BatchTranslationResult, BilingualOrder, FailureLog, GlossaryEntry,
-    PassthroughBlock, PipelineOptions, PipelineResult, ReviewChange, ReviewPolicy, ReviewReport,
-    ReviewStats, SplitRetryLog, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
-    TerminologyEntity, TerminologyKind, TerminologyPreflightResult, TerminologyStats,
-    TranslationLine, TranslationMode, TranslationPolicy, Usage,
+    BatchPlanEntry, BatchTranslationResult, BilingualOrder, ConfirmedTranslationContext,
+    FailureLog, GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, ReviewChange,
+    ReviewPolicy, ReviewReport, ReviewStats, SplitRetryLog, SubtitleDocument,
+    SubtitleDocumentMetadata, SubtitleSegment, TerminologyEntity, TerminologyKind,
+    TerminologyPreflightResult, TerminologyStats, TranslationLine, TranslationMode,
+    TranslationPolicy, Usage,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use evaluation::{

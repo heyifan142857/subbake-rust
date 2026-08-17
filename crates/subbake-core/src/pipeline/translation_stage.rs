@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::entities::{SubtitleSegment, TranslationLine};
+use crate::entities::{ConfirmedTranslationContext, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 
 use super::BatchWithUsage;
@@ -10,13 +10,6 @@ use super::support::{apply_lines, merge_translation_lines};
 pub(super) struct SourceBatchContext {
     pub before: Vec<SubtitleSegment>,
     pub after: Vec<SubtitleSegment>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ConfirmedTranslationContext {
-    pub id: String,
-    pub source: String,
-    pub translation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -48,7 +41,6 @@ pub(super) struct PreparedBatch {
 
 pub(super) struct AppliedBatch {
     pub index: usize,
-    pub source: Vec<SubtitleSegment>,
     pub translated: Vec<SubtitleSegment>,
     pub result: Option<BatchWithUsage>,
 }
@@ -180,7 +172,6 @@ impl TranslationStage {
         self.next_batch += 1;
         Ok(AppliedBatch {
             index: prepared.index,
-            source,
             translated,
             result,
         })
@@ -236,10 +227,10 @@ mod tests {
     #[test]
     fn prepares_and_applies_translation_memory_hits_in_order() {
         let batches = vec![vec![segment("1", "Hello"), segment("2", "world")]];
-        let memory_key = "ctx-v1:test:hello".to_owned();
+        let memory_key = "ctx-v2:test:hello".to_owned();
         let memory_keys = HashMap::from([
             ("1".to_owned(), memory_key.clone()),
-            ("2".to_owned(), "ctx-v1:test:world".to_owned()),
+            ("2".to_owned(), "ctx-v2:test:world".to_owned()),
         ]);
         let mut stage = TranslationStage::new(batches, 0, Vec::new(), memory_keys).expect("stage");
         let memory = HashMap::from([(memory_key, "Bonjour".to_owned())]);

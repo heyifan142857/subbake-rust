@@ -9,6 +9,8 @@ use super::translation_stage::SourceBatchContext;
 const TURBO_CONTEXT_LINES: usize = 3;
 const MIN_CINEMA_CONTEXT_TOKENS: usize = 128;
 const MAX_CINEMA_CONTEXT_TOKENS: usize = 1_200;
+const HARD_SCENE_GAP_MS: usize = 1_500;
+const SOFT_SCENE_GAP_MS: usize = 900;
 
 pub(super) struct DeduplicationPlan {
     canonical: Vec<SubtitleSegment>,
@@ -275,7 +277,46 @@ fn scene_boundary(previous: Option<&SubtitleSegment>, next: &SubtitleSegment) ->
     else {
         return false;
     };
-    start.saturating_sub(end) >= 1_500
+    let gap = start.saturating_sub(end);
+    gap >= HARD_SCENE_GAP_MS
+        || (gap >= SOFT_SCENE_GAP_MS
+            && ends_complete_utterance(&previous.text)
+            && starts_new_utterance(&next.text))
+}
+
+fn ends_complete_utterance(text: &str) -> bool {
+    text.trim_end_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '”' | '’' | '」' | '』' | ')' | ']' | '}'
+            )
+    })
+    .chars()
+    .last()
+    .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？' | '…'))
+}
+
+fn starts_new_utterance(text: &str) -> bool {
+    let text = text.trim_start();
+    let first = text
+        .trim_start_matches(|character: char| {
+            matches!(
+                character,
+                '-' | '—' | '"' | '\'' | '“' | '‘' | '(' | '[' | '{'
+            )
+        })
+        .chars()
+        .next();
+    first.is_some_and(|character| {
+        character.is_uppercase()
+            || matches!(
+                character,
+                '\u{3040}'..='\u{30ff}'
+                    | '\u{3400}'..='\u{9fff}'
+                    | '\u{ac00}'..='\u{d7af}'
+            )
+    })
 }
 
 fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
@@ -425,6 +466,39 @@ mod tests {
             .scene_aware(true)
             .split(&[first, second]);
         assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    #[test]
+    fn scene_aware_planner_uses_sentence_cues_for_medium_timing_gaps() {
+        let source = vec![
+            timed_segment(
+                "1",
+                "The conversation is over.",
+                "00:00:00,000",
+                "00:00:01,000",
+            ),
+            timed_segment("2", "A new morning begins.", "00:00:01,950", "00:00:03,000"),
+        ];
+
+        let batches = BatchPlanner::new(10, 1_000)
+            .scene_aware(true)
+            .split(&source);
+
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    #[test]
+    fn scene_aware_planner_keeps_short_continuations_together() {
+        let source = vec![
+            timed_segment("1", "Wait", "00:00:00,000", "00:00:01,000"),
+            timed_segment("2", "for me.", "00:00:01,950", "00:00:03,000"),
+        ];
+
+        let batches = BatchPlanner::new(10, 1_000)
+            .scene_aware(true)
+            .split(&source);
+
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
     }
 
     fn timed_segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {

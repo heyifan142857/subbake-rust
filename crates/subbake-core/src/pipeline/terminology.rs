@@ -12,6 +12,7 @@ use crate::ports::{
     RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
+use crate::term_matcher::TermMatcher;
 
 pub(super) struct TerminologyStage<'a, B, D> {
     pub backend: &'a mut B,
@@ -22,6 +23,8 @@ pub(super) struct TerminologyStage<'a, B, D> {
     pub cancellation: &'a CancellationGuard,
     pub progress: Option<&'a dyn ProgressSink>,
     pub cache_hits: &'a mut usize,
+    pub provider_requests: &'a mut usize,
+    pub provider_tokens: &'a mut usize,
 }
 
 impl<B, D> TerminologyStage<'_, B, D>
@@ -45,18 +48,14 @@ where
             candidates: candidates.len(),
             ..TerminologyStats::default()
         };
-        if !self.options.terminology_preflight
-            || !self.options.policy().document_preflight
-            || candidates.is_empty()
-            || !self.backend.supports_terminology_preflight()
-        {
+        if !self.options.terminology_preflight || !self.backend.supports_terminology_preflight() {
             self.report(TaskState::Skipped, 0, candidates.len(), Usage::default());
             return Ok(stats);
         }
 
         self.report(TaskState::Running, 0, candidates.len(), Usage::default());
         let existing = self.memory.glossary.clone();
-        let messages = build_messages(self.options, &candidates);
+        let messages = build_messages(self.options, &candidates, &document.segments);
         let hash = super::support::request_hash(self.options, CacheStage::Terminology, &messages);
         let cached = if self.options.use_cache {
             self.store
@@ -71,7 +70,7 @@ where
             *self.cache_hits += 1;
             Ok(response)
         } else {
-            self.generate(&messages, &candidates)
+            self.generate(&messages, &candidates, &document.segments)
         };
 
         match result {
@@ -126,6 +125,7 @@ where
                     )?;
                 }
             }
+            Err(error @ CoreError::ResourceBudgetExceeded(_)) => return Err(error),
             Err(error) => {
                 stats.degraded = true;
                 stats.degraded_reason = Some(error.to_string());
@@ -146,10 +146,12 @@ where
         &mut self,
         messages: &[crate::ports::ChatMessage],
         candidates: &[TerminologyCandidate],
+        segments: &[SubtitleSegment],
     ) -> CoreResult<BackendJsonResult> {
         let mut last_error = None;
         for _ in 0..=self.options.retries {
             self.cancellation.check()?;
+            reserve_provider_request(self.options, self.provider_requests, *self.provider_tokens)?;
             let response = self
                 .backend
                 .execute(
@@ -160,12 +162,19 @@ where
                 .and_then(|response| response.into_json().map_err(CoreError::from))
                 .and_then(|(json, usage)| {
                     Ok(BackendJsonResult {
-                        payload: BackendPayload::Terminology(parse_payload(&json, candidates)?),
+                        payload: BackendPayload::Terminology(parse_payload(
+                            &json, candidates, segments,
+                        )?),
                         usage,
                     })
                 });
             match response {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    *self.provider_tokens = self
+                        .provider_tokens
+                        .saturating_add(value.usage.total_tokens);
+                    return Ok(value);
+                }
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
                 Err(error) if super::support::is_operational_llm_failure(&error) => {
                     return Err(error);
@@ -228,16 +237,13 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
         let mut index = 0;
         while index < words.len() {
             let word = words[index];
-            let is_title = word
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-                && word.chars().skip(1).any(|ch| ch.is_ascii_lowercase());
-            let is_acronym = word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 2
+            let is_title = word.chars().next().is_some_and(char::is_uppercase)
+                && word.chars().skip(1).any(char::is_lowercase);
+            let is_acronym = word.chars().filter(|ch| ch.is_alphabetic()).count() >= 2
                 && word
                     .chars()
-                    .filter(|ch| ch.is_ascii_alphabetic())
-                    .all(|ch| ch.is_ascii_uppercase());
+                    .filter(|ch| ch.is_alphabetic())
+                    .all(char::is_uppercase);
             if !is_title && !is_acronym {
                 index += 1;
                 continue;
@@ -251,10 +257,7 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
             }
             let mut end = index + 1;
             while end < words.len() && end - index < 4 {
-                if !words[end]
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
+                if !words[end].chars().next().is_some_and(char::is_uppercase)
                     || is_common_sentence_initial(words[end])
                 {
                     break;
@@ -517,6 +520,7 @@ fn is_common_sentence_initial(value: &str) -> bool {
 fn build_messages(
     options: &PipelineOptions,
     candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
 ) -> Vec<crate::ports::ChatMessage> {
     let payload = serde_json::json!({
         "source_language": options.source_language,
@@ -525,6 +529,7 @@ fn build_messages(
             "source": candidate.source,
             "context": candidate.context,
         })).collect::<Vec<_>>(),
+        "document_samples": document_samples(segments),
     });
     let payload = serde_json::to_string(&payload).unwrap_or_default();
     let name_policy = if options.preserve_names {
@@ -534,7 +539,7 @@ fn build_messages(
     };
     vec![
         crate::ports::ChatMessage::system(format!(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact candidate\",\"target\":\"canonical translation\"}}],\"entities\":[{{\"canonical_source\":\"canonical entity name\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact candidate\",\"target\":\"natural translation of that source form\"}}]}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Group aliases of one entity while preserving the natural granularity of each source form. {name_policy} Copy every source form exactly from a candidate. Omit ordinary sentence-initial words and uncertain non-name entries. The brief must be short and advisory; never invent plot facts."
+            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact source span\",\"target\":\"canonical translation\"}}],\"entities\":[{{\"canonical_source\":\"canonical entity name\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact source span\",\"target\":\"natural translation of that source form\"}}]}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Group aliases of one entity while preserving the natural granularity of each source form. {name_policy} Copy every source form exactly from a supplied candidate or a document sample. For languages without case or whitespace cues, use recurring exact spans from the samples. Omit ordinary words and uncertain entries. The brief must be short and advisory; never invent plot facts."
         )),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
@@ -545,6 +550,7 @@ fn build_messages(
 pub(super) fn parse_payload(
     payload: &serde_json::Value,
     candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
 ) -> CoreResult<TerminologyPreflightResult> {
     let entries = payload
         .get("entries")
@@ -561,16 +567,18 @@ pub(super) fn parse_payload(
                 "terminology entry contains an empty source or target".to_owned(),
             ));
         }
-        let Some(candidate) = candidates
+        let canonical_source = candidates
             .iter()
             .find(|candidate| candidate.source.eq_ignore_ascii_case(source))
-        else {
+            .map(|candidate| candidate.source.clone())
+            .or_else(|| source_span_in_document(source, segments));
+        let Some(canonical_source) = canonical_source else {
             return Err(CoreError::InvalidTranslation(format!(
                 "terminology response contains unknown source `{source}`"
             )));
         };
         parsed.push(GlossaryEntry {
-            source: candidate.source.clone(),
+            source: canonical_source,
             target: target.to_owned(),
         });
     }
@@ -584,9 +592,10 @@ pub(super) fn parse_payload(
         }
         for variant in &entity.variants {
             if variant.target.trim().is_empty()
-                || !candidates
+                || (!candidates
                     .iter()
                     .any(|candidate| candidate.source.eq_ignore_ascii_case(variant.source.trim()))
+                    && source_span_in_document(variant.source.trim(), segments).is_none())
             {
                 return Err(CoreError::InvalidTranslation(format!(
                     "terminology entity contains unknown or empty variant `{}`",
@@ -603,6 +612,61 @@ pub(super) fn parse_payload(
             .unwrap_or_default()
             .to_owned(),
     })
+}
+
+fn document_samples(segments: &[SubtitleSegment]) -> Vec<serde_json::Value> {
+    const MAX_SAMPLES: usize = 48;
+    const MAX_SAMPLE_CHARS: usize = 240;
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let count = segments.len().min(MAX_SAMPLES);
+    (0..count)
+        .map(|sample| {
+            let index = if count == 1 {
+                0
+            } else {
+                sample.saturating_mul(segments.len().saturating_sub(1)) / (count - 1)
+            };
+            let segment = &segments[index];
+            serde_json::json!({
+                "id": segment.id,
+                "source": segment.text.chars().take(MAX_SAMPLE_CHARS).collect::<String>(),
+            })
+        })
+        .collect()
+}
+
+fn source_span_in_document(source: &str, segments: &[SubtitleSegment]) -> Option<String> {
+    (!source.is_empty()).then_some(())?;
+    segments.iter().find_map(|segment| {
+        TermMatcher::case_insensitive()
+            .contains(&segment.text, source)
+            .then(|| source.to_owned())
+    })
+}
+
+fn reserve_provider_request(
+    options: &PipelineOptions,
+    provider_requests: &mut usize,
+    provider_tokens: usize,
+) -> CoreResult<()> {
+    if let Some(limit) = options.max_requests
+        && provider_requests.saturating_add(1) > limit
+    {
+        return Err(CoreError::ResourceBudgetExceeded(format!(
+            "request limit is {limit}; {provider_requests} request(s) already used and 1 more required"
+        )));
+    }
+    if let Some(limit) = options.max_tokens
+        && provider_tokens >= limit
+    {
+        return Err(CoreError::ResourceBudgetExceeded(format!(
+            "token limit is {limit}; {provider_tokens} token(s) already used"
+        )));
+    }
+    *provider_requests = provider_requests.saturating_add(1);
+    Ok(())
 }
 
 fn accept_entities(

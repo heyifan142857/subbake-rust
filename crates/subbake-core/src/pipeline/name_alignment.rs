@@ -118,6 +118,7 @@ pub(super) fn reconcile_batch(
             let chosen = required
                 .get(&key)
                 .or_else(|| memory.name_translations.get(&key))
+                .or_else(|| memory.glossary.get(&marker.source))
                 .cloned()
                 .unwrap_or(marker.target);
             memory
@@ -156,6 +157,7 @@ pub(super) fn reconcile_batch(
         let chosen = required
             .get(&key)
             .or_else(|| memory.name_translations.get(&key))
+            .or_else(|| memory.glossary.get(source_form))
             .cloned()
             .unwrap_or_else(|| proposed.to_owned());
         memory
@@ -419,6 +421,25 @@ mod tests {
         .expect("second batch");
 
         assert_eq!(second.lines[0].translation, "玛丽走了。");
+    }
+
+    #[test]
+    fn persisted_advisory_glossary_rehydrates_name_alignment() {
+        let mut memory = ContextMemory::new();
+        memory.load_glossary(&[("Mary".to_owned(), "玛丽".to_owned())]);
+        let mut translated = result(&[("1", "⟦N0⟧玛莉⟦/N0⟧走了。")]);
+
+        reconcile_batch(
+            &[segment("1", "Mary left.")],
+            &mut translated,
+            &mut memory,
+            &BTreeMap::new(),
+            &candidates(),
+            "zh-Hans",
+        )
+        .expect("persisted name alignment");
+
+        assert_eq!(translated.lines[0].translation, "玛丽走了。");
     }
 
     #[test]

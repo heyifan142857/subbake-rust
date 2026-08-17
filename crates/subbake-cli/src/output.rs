@@ -120,7 +120,11 @@ fn translation_text(result: &PipelineResult, output_path: &Path) -> String {
     if result.reviewer_fallback {
         output.push_str("Review: reviewer backend unavailable; translator was used as fallback\n");
     }
-    if result.terminology.candidates > 0 {
+    if result.terminology.candidates > 0
+        || result.terminology.entries_added > 0
+        || result.terminology.degraded
+        || result.terminology.usage != subbake_core::Usage::default()
+    {
         output.push_str(&format!(
             "Terminology: {} candidate(s), {} added, {} conflict(s) omitted{}\n",
             result.terminology.candidates,

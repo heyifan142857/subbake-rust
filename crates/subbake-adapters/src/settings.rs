@@ -2,10 +2,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
-    BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_TOKEN_BUDGET,
-    DEFAULT_MODEL, DEFAULT_PROVIDER, DEFAULT_RETRIES, DEFAULT_REVIEW_CONCURRENCY,
-    DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, DEFAULT_TRANSLATION_CONCURRENCY,
-    PipelineOptions, ReviewPolicy, TranslationMode,
+    BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_MODEL, DEFAULT_PROVIDER,
+    DEFAULT_RETRIES, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, PipelineOptions,
+    ReviewPolicy, TranslationMode,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -396,6 +395,7 @@ impl StorageOverrides {
 
 impl Default for ResolvedSettings {
     fn default() -> Self {
+        let policy = subbake_core::TranslationPolicy::for_mode(TranslationMode::Turbo);
         Self {
             output: OutputSettings {
                 format: None,
@@ -425,14 +425,14 @@ impl Default for ResolvedSettings {
                 source_language: DEFAULT_SOURCE_LANGUAGE.to_owned(),
                 target_language: DEFAULT_TARGET_LANGUAGE.to_owned(),
                 subtitle_stream_index: None,
-                batch_size: DEFAULT_BATCH_SIZE,
-                batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
-                translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
-                review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
+                batch_size: policy.batch_size,
+                batch_token_budget: policy.batch_token_budget,
+                translation_concurrency: policy.translation_concurrency,
+                review_concurrency: policy.review_concurrency,
                 mode: TranslationMode::Turbo,
-                review_policy: ReviewPolicy::Off,
-                terminology_preflight: true,
-                online_terminology: false,
+                review_policy: policy.review_policy,
+                terminology_preflight: policy.terminology_preflight,
+                online_terminology: policy.online_terminology,
                 preserve_names: false,
                 max_characters_per_second: None,
                 max_characters_per_line: None,
@@ -1065,5 +1065,35 @@ mod tests {
         let error = settings.validate().expect_err("invalid scale must fail");
 
         assert!(error.to_string().contains("bilingual_font_scale"));
+    }
+
+    #[test]
+    fn resolved_defaults_match_the_turbo_policy() {
+        let settings = ResolvedSettings::default();
+        let policy = subbake_core::TranslationPolicy::for_mode(TranslationMode::Turbo);
+
+        assert_eq!(settings.translation.mode, TranslationMode::Turbo);
+        assert_eq!(settings.translation.batch_size, policy.batch_size);
+        assert_eq!(
+            settings.translation.batch_token_budget,
+            policy.batch_token_budget
+        );
+        assert_eq!(
+            settings.translation.translation_concurrency,
+            policy.translation_concurrency
+        );
+        assert_eq!(
+            settings.translation.review_concurrency,
+            policy.review_concurrency
+        );
+        assert_eq!(settings.translation.review_policy, policy.review_policy);
+        assert_eq!(
+            settings.translation.terminology_preflight,
+            policy.terminology_preflight
+        );
+        assert_eq!(
+            settings.translation.online_terminology,
+            policy.online_terminology
+        );
     }
 }

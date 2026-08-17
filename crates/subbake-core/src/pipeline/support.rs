@@ -14,8 +14,10 @@ use super::BatchWithUsage;
 use super::name_alignment::{protect_names, select_markers as select_name_markers};
 use super::online_terminology::{protect_terms, select_markers as select_term_markers};
 #[cfg(test)]
-use super::translation_stage::{ConfirmedTranslationContext, SourceBatchContext};
+use super::translation_stage::SourceBatchContext;
 use super::translation_stage::{PreparedBatch, TranslationPromptContext};
+#[cfg(test)]
+use crate::entities::ConfirmedTranslationContext;
 
 const REVIEW_ROUTING_CACHE_VERSION: u64 = 2;
 
@@ -405,6 +407,25 @@ pub(super) fn contextual_translation_memory_keys(
         .collect()
 }
 
+pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
+    let project_scope = options
+        .input_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_string_lossy();
+    let backend_scope = options
+        .provider_fingerprint
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", options.provider, options.model));
+    format!(
+        "project={project_scope}|mode={}|backend={backend_scope}|source={}|target={}|preserve_names={}",
+        options.mode.as_str(),
+        options.source_language,
+        options.target_language,
+        options.preserve_names,
+    )
+}
+
 fn contextual_translation_memory_key(
     scope: &str,
     previous: Option<&str>,
@@ -426,7 +447,7 @@ fn contextual_translation_memory_key(
             .map(JsonValue::String)
             .unwrap_or(JsonValue::Null),
     ]);
-    format!("ctx-v1:{}:{source}", stable_hash(&payload))
+    format!("ctx-v2:{}:{source}", stable_hash(&payload))
 }
 
 pub(super) fn merge_translation_lines(
@@ -520,7 +541,7 @@ mod tests {
         let second_keys = contextual_translation_memory_keys("/shows/one", &second);
         let other_project = contextual_translation_memory_keys("/shows/two", &first);
 
-        assert!(first_keys["2"].starts_with("ctx-v1:"));
+        assert!(first_keys["2"].starts_with("ctx-v2:"));
         assert_ne!(first_keys["2"], second_keys["2"]);
         assert_ne!(first_keys["2"], other_project["2"]);
     }

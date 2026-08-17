@@ -11,7 +11,10 @@ use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::NoopDashboard;
 use subbake_core::ports::RuntimeStore;
 use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
-use subbake_core::{CancellationGuard, CoreError, NoopProgress, PipelineResult, SharedProgress};
+use subbake_core::{
+    CancellationGuard, ConfirmedTranslationContext, CoreError, NoopProgress, PipelineResult,
+    SharedProgress,
+};
 
 use crate::embedded_subtitles::{
     default_embedded_translation_output_path, is_supported_subtitle_container_path,
@@ -60,6 +63,7 @@ pub(crate) struct TranslationInputIdentity {
     pub signature: InputSignature,
     pub output_path: PathBuf,
     pub execution_fingerprint: Option<String>,
+    pub initial_confirmed_context: Vec<ConfirmedTranslationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -250,6 +254,10 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     options.execution_fingerprint = identity
         .as_ref()
         .and_then(|identity| identity.execution_fingerprint.clone());
+    options.initial_confirmed_context = identity
+        .as_ref()
+        .map(|identity| identity.initial_confirmed_context.clone())
+        .unwrap_or_default();
     let backend = build_backend(&request.settings.backend_config())?;
     let needs_reviewer = request.settings.translation.mode == subbake_core::TranslationMode::Cinema
         || request.settings.translation.review_policy != subbake_core::ReviewPolicy::Off

@@ -459,6 +459,7 @@ fn translate_embedded_subtitle_with_programs(
         signature: input_signature_from_bytes(&extracted_bytes, None),
         output_path: final_output.clone(),
         execution_fingerprint: None,
+        initial_confirmed_context: Vec::new(),
     };
     let translated_path = temporary
         .path()

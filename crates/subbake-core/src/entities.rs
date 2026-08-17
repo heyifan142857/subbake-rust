@@ -55,7 +55,6 @@ pub struct TranslationPolicy {
     pub batch_token_budget: usize,
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
-    pub document_preflight: bool,
     pub include_context: bool,
     pub scene_aware_batching: bool,
     pub compact_wire: bool,
@@ -73,7 +72,6 @@ impl TranslationPolicy {
                 batch_token_budget: 6_000,
                 translation_concurrency: 3,
                 review_concurrency: 1,
-                document_preflight: false,
                 include_context: false,
                 scene_aware_batching: false,
                 compact_wire: true,
@@ -87,7 +85,6 @@ impl TranslationPolicy {
                 batch_token_budget: 2_400,
                 translation_concurrency: 8,
                 review_concurrency: 4,
-                document_preflight: false,
                 include_context: true,
                 scene_aware_batching: false,
                 compact_wire: true,
@@ -101,7 +98,6 @@ impl TranslationPolicy {
                 batch_token_budget: 1_600,
                 translation_concurrency: 4,
                 review_concurrency: 3,
-                document_preflight: true,
                 include_context: true,
                 scene_aware_batching: true,
                 compact_wire: true,
@@ -370,6 +366,13 @@ pub struct TranslationLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedTranslationContext {
+    pub id: String,
+    pub source: String,
+    pub translation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchTranslationResult {
     pub lines: Vec<TranslationLine>,
     #[serde(default)]
@@ -497,6 +500,9 @@ pub struct PipelineOptions {
     /// is populated by the pipeline and keeps Resume state tied to the exact
     /// terminology context without persisting glossary contents in run state.
     pub glossary_fingerprint: Option<String>,
+    /// Confirmed translations immediately preceding a composed translation
+    /// shard. Standalone document translation leaves this empty.
+    pub initial_confirmed_context: Vec<ConfirmedTranslationContext>,
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
@@ -510,16 +516,17 @@ pub struct PipelineOptions {
 
 impl PipelineOptions {
     pub fn new(input_path: PathBuf) -> Self {
+        let policy = TranslationPolicy::for_mode(TranslationMode::Turbo);
         Self {
             input_path,
             output_path: None,
             output_format: None,
             provider: default_provider(),
             model: default_model(),
-            batch_size: DEFAULT_BATCH_SIZE,
-            batch_token_budget: DEFAULT_BATCH_TOKEN_BUDGET,
-            translation_concurrency: DEFAULT_TRANSLATION_CONCURRENCY,
-            review_concurrency: DEFAULT_REVIEW_CONCURRENCY,
+            batch_size: policy.batch_size,
+            batch_token_budget: policy.batch_token_budget,
+            translation_concurrency: policy.translation_concurrency,
+            review_concurrency: policy.review_concurrency,
             mode: TranslationMode::Turbo,
             bilingual: false,
             bilingual_order: BilingualOrder::default(),
@@ -527,9 +534,9 @@ impl PipelineOptions {
             target_language: default_target_language(),
             source_language: default_source_language(),
             retries: DEFAULT_RETRIES,
-            review_policy: ReviewPolicy::Off,
-            terminology_preflight: true,
-            online_terminology: false,
+            review_policy: policy.review_policy,
+            terminology_preflight: policy.terminology_preflight,
+            online_terminology: policy.online_terminology,
             preserve_names: false,
             max_characters_per_second: None,
             max_characters_per_line: None,
@@ -539,6 +546,7 @@ impl PipelineOptions {
             reviewer_fingerprint: None,
             execution_fingerprint: None,
             glossary_fingerprint: None,
+            initial_confirmed_context: Vec::new(),
             dry_run: false,
             resume: true,
             use_cache: true,
@@ -610,10 +618,20 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_defaults_disable_online_terminology() {
+    fn pipeline_defaults_match_the_turbo_policy() {
         let options = PipelineOptions::new("sample.srt".into());
+        let policy = TranslationPolicy::for_mode(TranslationMode::Turbo);
 
         assert_eq!(options.mode, TranslationMode::Turbo);
-        assert!(!options.online_terminology);
+        assert_eq!(options.batch_size, policy.batch_size);
+        assert_eq!(options.batch_token_budget, policy.batch_token_budget);
+        assert_eq!(
+            options.translation_concurrency,
+            policy.translation_concurrency
+        );
+        assert_eq!(options.review_concurrency, policy.review_concurrency);
+        assert_eq!(options.review_policy, policy.review_policy);
+        assert_eq!(options.terminology_preflight, policy.terminology_preflight);
+        assert_eq!(options.online_terminology, policy.online_terminology);
     }
 }
