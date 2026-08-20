@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::entities::SubtitleDocument;
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::formatting_tokens;
+use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::quality::{QualityPolicy, QualityReport, inspect_quality};
 use crate::term_matcher::TermMatcher;
-use crate::validation::factual_tokens_match;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationReport {
@@ -205,7 +205,10 @@ fn evaluate_hard_constraints(
                 "subtitle formatting markers changed",
             );
         }
-        if !factual_tokens_match(&source_segment.text, &candidate_segment.text) {
+        if matches!(
+            compare_number_facts(&source_segment.text, &candidate_segment.text),
+            NumberFactComparison::HardMismatch { .. }
+        ) {
             push_hard_violation(
                 &mut violations,
                 HardConstraintKind::FactualToken,
@@ -386,7 +389,10 @@ pub fn evaluate(
         if candidate_line.trim().is_empty() {
             mqm.major += 1;
         }
-        if number_tokens(candidate_line) != number_tokens(&reference_line.text) {
+        if matches!(
+            compare_number_facts(candidate_line, &reference_line.text),
+            NumberFactComparison::HardMismatch { .. }
+        ) {
             mqm.major += 1;
         }
         if legacy_formatting_tokens(candidate_line)
@@ -463,13 +469,6 @@ fn grams(text: &str, n: usize) -> BTreeMap<String, usize> {
 fn normalize(value: &str) -> String {
     value.split_whitespace().collect::<String>()
 }
-fn number_tokens(value: &str) -> Vec<String> {
-    value
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
 fn legacy_formatting_tokens(value: &str) -> Vec<char> {
     value
         .chars()
@@ -506,5 +505,49 @@ mod tests {
         assert_eq!(report.exact_matches, 1);
         assert!((report.chrf - 1.0).abs() < f64::EPSILON);
         assert_eq!(report.mqm, MqmCounts::default());
+    }
+
+    #[test]
+    fn offline_evaluation_penalizes_only_hard_number_mismatches() {
+        let uncertain = evaluate(
+            &document("看看这些乱七八糟的东西。"),
+            &document("Look at all this mess."),
+        )
+        .expect("evaluate ambiguous expression");
+        assert_eq!(uncertain.mqm.major, 0);
+
+        let hard = evaluate(&document("她十三岁。"), &document("She is 12 years old."))
+            .expect("evaluate explicit number change");
+        assert_eq!(hard.mqm.major, 1);
+    }
+
+    #[test]
+    fn hard_constraint_evaluation_uses_the_same_number_fact_boundary() {
+        let uncertain = evaluate_translation_quality(
+            &document("Look at all this mess."),
+            &document("看看这些乱七八糟的东西。"),
+            None,
+            &BTreeMap::new(),
+            &[],
+            QualityPolicy::default(),
+        )
+        .expect("evaluate ambiguous hard constraint");
+        assert!(uncertain.hard_constraints.passed);
+
+        let hard = evaluate_translation_quality(
+            &document("She is 12 years old."),
+            &document("她十三岁。"),
+            None,
+            &BTreeMap::new(),
+            &[],
+            QualityPolicy::default(),
+        )
+        .expect("evaluate explicit hard constraint");
+        assert!(
+            hard.hard_constraints
+                .violations
+                .iter()
+                .any(|violation| { violation.kind == HardConstraintKind::FactualToken })
+        );
     }
 }

@@ -2814,6 +2814,68 @@ mod tests {
         repair_ids: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
+    struct AmbiguousCjkOutputBackend {
+        repair_calls: Arc<AtomicUsize>,
+    }
+
+    impl LlmBackend for AmbiguousCjkOutputBackend {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "ambiguous-cjk-output"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            cancellation.check().map_err(LlmCallError::from)?;
+            let messages = request_messages(request)?;
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if prompt.contains("AGENT_REPAIR_JSON_START") {
+                self.repair_calls.fetch_add(1, Ordering::SeqCst);
+                return Err(LlmCallError::InvalidResponse(
+                    "ambiguous CJK output must not request final repair".to_owned(),
+                ));
+            }
+            let body = prompt
+                .split("BATCH_JSON_START")
+                .nth(1)
+                .and_then(|value| value.split("BATCH_JSON_END").next())
+                .ok_or_else(|| LlmCallError::InvalidResponse("missing batch payload".to_owned()))?;
+            let payload: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| LlmCallError::InvalidResponse(error.to_string()))?;
+            let lines = payload["lines"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|line| {
+                    serde_json::json!({
+                        "id": line["id"],
+                        "translation": "看看这些乱七八糟的东西。",
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(GenerationResponse::json(
+                serde_json::json!({"lines": lines}),
+                Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                    requests: 1,
+                    ..Usage::default()
+                },
+            ))
+        }
+    }
+
     impl LlmBackend for FinalValidationRepairBackend {
         fn provider_name(&self) -> &str {
             "test"
@@ -3792,6 +3854,31 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_cjk_number_glyphs_publish_without_final_validation_repair() {
+        let document = document("ambiguous-cjk.srt", &["Look at all this crazy stuff."]);
+        let mut options = PipelineOptions::new("ambiguous-cjk.srt".into());
+        options.review_policy = ReviewPolicy::Off;
+        options.terminology_preflight = false;
+        options.online_terminology = false;
+        let repair_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            AmbiguousCjkOutputBackend {
+                repair_calls: Arc::clone(&repair_calls),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline
+            .run_document(&document)
+            .expect("ambiguous expression should publish directly");
+
+        assert_eq!(repair_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(run.translated_segments[0].text, "看看这些乱七八糟的东西。");
+        assert!(run.result.agent_repairs.is_empty());
+    }
+
+    #[test]
     fn agent_repair_reports_missing_log_path_without_a_runtime_store() {
         let document = document("agent-no-store.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-no-store.txt".into());
@@ -3958,9 +4045,15 @@ mod tests {
             "zh-Hans",
         );
 
-        assert_eq!(plan.len(), 1);
+        assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].source[0].id, "2");
         assert_eq!(plan[0].reasons, vec!["formatting mismatch"]);
+        assert_eq!(plan[1].source[0].id, "3");
+        assert!(
+            plan[1].reasons[0].contains("ambiguous number expression"),
+            "{:?}",
+            plan[1].reasons
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::entities::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
+use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::ports::ChatMessage;
 use crate::term_matcher::TermMatcher;
 use crate::validation::{FinalValidationPolicy, final_validation_issues, validate_full_alignment};
@@ -423,7 +424,7 @@ pub(crate) fn build_review_messages(
             format!(
                 "You are SubBake's targeted deterministic subtitle repair reviewer.\n\
                  Return valid JSON only.\n\
-                 Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording.",
+                 Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording. Ambiguous number-expression candidates require verification, not automatic rewriting; preserve idioms and lexicalized expressions when they do not state a numeric fact.",
                 options.target_language
             ),
             "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\"}]}",
@@ -602,8 +603,12 @@ fn line_review_reasons(
     if formatting_tokens(&source.text) != formatting_tokens(&translated.text) {
         reasons.push("formatting mismatch".to_owned());
     }
-    if number_tokens(&source.text) != number_tokens(&translated.text) {
-        reasons.push("number mismatch".to_owned());
+    match compare_number_facts(&source.text, &translated.text) {
+        NumberFactComparison::HardMismatch { .. } => reasons.push("number mismatch".to_owned()),
+        NumberFactComparison::Uncertain => reasons.push(
+            "ambiguous number expression; verify the fact without rewriting idioms".to_owned(),
+        ),
+        NumberFactComparison::Match => {}
     }
     if has_readability_risk(translated) {
         reasons.push("subtitle readability risk".to_owned());
@@ -644,22 +649,6 @@ fn formatting_tokens(text: &str) -> Vec<String> {
         }
     }
     tokens.sort();
-    tokens
-}
-
-fn number_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
     tokens
 }
 
@@ -854,6 +843,45 @@ mod tests {
         );
         assert!(targeted_messages[1].content.contains("smallest change"));
         assert!(!targeted_messages[1].content.contains("\"category\""));
+        assert!(
+            targeted_messages[0]
+                .content
+                .contains("preserve idioms and lexicalized expressions")
+        );
+    }
+
+    #[test]
+    fn targeted_review_distinguishes_hard_and_ambiguous_number_candidates() {
+        let source = vec![
+            segment(
+                "1",
+                "Look at all this mess.",
+                "00:00:00,000",
+                "00:00:01,000",
+            ),
+            segment("2", "She is 12 years old.", "00:00:01,000", "00:00:02,000"),
+        ];
+        let translated = vec![
+            segment(
+                "1",
+                "看看这些乱七八糟的东西。",
+                "00:00:00,000",
+                "00:00:01,000",
+            ),
+            segment("2", "她十三岁。", "00:00:01,000", "00:00:02,000"),
+        ];
+
+        let plan = build_review_plan(
+            &[source],
+            &translated,
+            &ContextMemory::default(),
+            "English",
+            "Chinese",
+        );
+
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].candidate_reasons["1"][0].contains("ambiguous number expression"));
+        assert_eq!(plan[0].candidate_reasons["2"], vec!["number mismatch"]);
     }
 
     #[test]

@@ -464,9 +464,9 @@ mod tests {
 
     #[test]
     fn targeted_review_derives_auditable_deterministic_reason() {
-        let source = vec![segment("1", "Version 2")];
+        let source = vec![segment("1", "Version 12")];
         let mut translated = source.clone();
-        translated[0].text = "版本二".to_owned();
+        translated[0].text = "版本十三".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
         options.review_policy = ReviewPolicy::Targeted;
@@ -490,7 +490,7 @@ mod tests {
                 1,
                 &[TranslationLine {
                     id: "1".to_owned(),
-                    translation: "版本2".to_owned(),
+                    translation: "版本12".to_owned(),
                 }],
                 &[],
                 Usage::default(),

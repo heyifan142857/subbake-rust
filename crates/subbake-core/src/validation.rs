@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::formatting_tokens;
+use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::term_matcher::TermMatcher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -189,9 +190,11 @@ fn validate_final_segment(
         issues.push(format!("line {} has a formatting mismatch", source.id));
     }
 
-    let (source_facts, translated_facts) =
-        comparable_factual_tokens(&source.text, &translated.text);
-    if source_facts != translated_facts {
+    if let NumberFactComparison::HardMismatch {
+        left: source_facts,
+        right: translated_facts,
+    } = compare_number_facts(&source.text, &translated.text)
+    {
         issues.push(format!(
             "line {} changes numbers, dates, amounts, or percentages (expected {}, got {})",
             source.id,
@@ -244,505 +247,6 @@ fn validate_final_segment(
                 source.id
             ));
         }
-    }
-}
-
-#[derive(Debug, Default)]
-struct FactualTokens {
-    strong: Vec<String>,
-    weak: Vec<String>,
-}
-
-fn comparable_factual_tokens(source: &str, translated: &str) -> (Vec<String>, Vec<String>) {
-    let source = factual_tokens(source);
-    let translated = factual_tokens(translated);
-    let mut source_strong = source.strong;
-    let mut translated_strong = translated.strong;
-    promote_matching_weak(&mut source_strong, &source.weak, &translated_strong);
-    promote_matching_weak(&mut translated_strong, &translated.weak, &source_strong);
-    source_strong.sort();
-    translated_strong.sort();
-    (source_strong, translated_strong)
-}
-
-pub(crate) fn factual_tokens_match(source: &str, translated: &str) -> bool {
-    let (source, translated) = comparable_factual_tokens(source, translated);
-    source == translated
-}
-
-fn promote_matching_weak(strong: &mut Vec<String>, weak: &[String], opposite: &[String]) {
-    for token in weak {
-        let expected = opposite.iter().filter(|value| *value == token).count();
-        let present = strong.iter().filter(|value| *value == token).count();
-        if present < expected {
-            strong.push(token.clone());
-        }
-    }
-}
-
-fn factual_tokens(text: &str) -> FactualTokens {
-    let mut tokens = FactualTokens::default();
-    let characters = text.chars().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < characters.len() {
-        if let Some(end) = cjk_numeric_idiom_end(&characters, index) {
-            index = end;
-            continue;
-        }
-        if let Some((value, end)) = cjk_percentage(&characters, index) {
-            tokens.strong.push("%".to_owned());
-            tokens.strong.push(value);
-            index = end;
-            continue;
-        }
-        let character = characters[index];
-        if character.is_ascii_digit() {
-            let mut digits = String::new();
-            while index < characters.len() && characters[index].is_ascii_digit() {
-                digits.push(characters[index]);
-                index += 1;
-            }
-            while index < characters.len() && matches!(characters[index], ',' | '.') {
-                let group_start = index + 1;
-                let mut group_end = group_start;
-                while group_end < characters.len() && characters[group_end].is_ascii_digit() {
-                    group_end += 1;
-                }
-                if group_end.saturating_sub(group_start) != 3 {
-                    break;
-                }
-                digits.extend(characters[group_start..group_end].iter());
-                index = group_end;
-            }
-            if let Some(clock_end) = zero_minute_clock_end(&characters, index) {
-                push_scaled_digits(&mut tokens.strong, &digits, 1);
-                index = clock_end;
-                continue;
-            }
-            if digits.len() == 1 {
-                let mut sequence = digits.clone();
-                let mut sequence_end = index;
-                while sequence_end + 1 < characters.len()
-                    && characters[sequence_end] == '-'
-                    && characters[sequence_end + 1].is_ascii_digit()
-                    && characters
-                        .get(sequence_end + 2)
-                        .is_none_or(|character| !character.is_ascii_digit())
-                {
-                    sequence.push(characters[sequence_end + 1]);
-                    sequence_end += 2;
-                }
-                if sequence.len() > 1 {
-                    push_scaled_digits(&mut tokens.strong, &sequence, 1);
-                    index = sequence_end;
-                    continue;
-                }
-            }
-            let mut multiplier = 1_u128;
-            let mut suffix_start = index;
-            while suffix_start < characters.len() && characters[suffix_start].is_whitespace() {
-                suffix_start += 1;
-            }
-            if let Some((scale, suffix_end)) = numeric_scale(&characters, suffix_start) {
-                multiplier = scale;
-                index = suffix_end;
-            }
-            push_scaled_digits(&mut tokens.strong, &digits, multiplier);
-            continue;
-        }
-        if is_cjk_numeral(character) {
-            let start = index;
-            while index < characters.len() && is_cjk_numeral(characters[index]) {
-                index += 1;
-            }
-            if start > 0 && characters[start - 1] == '第' {
-                continue;
-            }
-            // A single CJK digit is commonly part of an article, pronoun, or
-            // idiom (一个, 之一, 一天) rather than a hard numeric fact. Treat
-            // it like a standalone English zero-to-nine word and leave exact
-            // digits plus compound/scaled number expressions as strong facts.
-            if index - start == 1
-                && (cjk_digit(characters[start]).is_some()
-                    || matches!(characters[start], '十' | '百' | '千' | '万' | '亿'))
-            {
-                if let Some(value) = parse_cjk_number(&characters[start..index]) {
-                    tokens.weak.push(value.to_string());
-                }
-                continue;
-            }
-            if index - start > 1
-                && characters[start..index]
-                    .iter()
-                    .all(|character| matches!(character, '十' | '百' | '千' | '万' | '亿'))
-                && characters[start..index].windows(2).all(|pair| {
-                    cjk_unit_value(pair[0]).is_some_and(|left| {
-                        cjk_unit_value(pair[1]).is_some_and(|right| left > right)
-                    })
-                })
-            {
-                // Unit-only compounds such as 千百年来 express an
-                // approximate magnitude, not the exact value 1,100.
-                continue;
-            }
-            if let Some(value) = parse_cjk_number(&characters[start..index]) {
-                let pure_repeated_digits = characters[start..index]
-                    .iter()
-                    .all(|character| cjk_digit(*character).is_some())
-                    && characters[start..index]
-                        .windows(2)
-                        .all(|pair| pair[0] == pair[1]);
-                if pure_repeated_digits {
-                    tokens.weak.push(value.to_string());
-                } else {
-                    tokens.strong.push(value.to_string());
-                }
-            }
-            continue;
-        }
-        let marker = match character {
-            '%' | '％' => Some("%"),
-            '$' => Some("$"),
-            '€' => Some("€"),
-            '£' => Some("£"),
-            '¥' | '￥' => Some("¥"),
-            '₩' => Some("₩"),
-            '₹' => Some("₹"),
-            _ => None,
-        };
-        if let Some(marker) = marker {
-            tokens.strong.push(marker.to_owned());
-        }
-        index += 1;
-    }
-    let english = english_number_tokens(text);
-    tokens.strong.extend(english.strong);
-    tokens.weak.extend(english.weak);
-    tokens
-}
-
-fn zero_minute_clock_end(characters: &[char], colon: usize) -> Option<usize> {
-    if characters.get(colon..colon + 3) != Some(&[':', '0', '0']) {
-        return None;
-    }
-    let end = colon + 3;
-    characters
-        .get(end)
-        .is_none_or(|character| !character.is_ascii_digit() && *character != ':')
-        .then_some(end)
-}
-
-fn cjk_percentage(characters: &[char], start: usize) -> Option<(String, usize)> {
-    if characters[start..].starts_with(&['百', '分', '百']) {
-        return Some(("100".to_owned(), start + 3));
-    }
-    if !characters[start..].starts_with(&['百', '分', '之']) {
-        return None;
-    }
-    let number_start = start + 3;
-    let mut end = number_start;
-    if characters.get(end).is_some_and(char::is_ascii_digit) {
-        while characters.get(end).is_some_and(char::is_ascii_digit) {
-            end += 1;
-        }
-        let digits = characters[number_start..end].iter().collect::<String>();
-        let normalized = digits.trim_start_matches('0');
-        return Some((
-            if normalized.is_empty() {
-                "0"
-            } else {
-                normalized
-            }
-            .to_owned(),
-            end,
-        ));
-    }
-    while characters
-        .get(end)
-        .is_some_and(|character| is_cjk_numeral(*character))
-    {
-        end += 1;
-    }
-    (end > number_start)
-        .then(|| parse_cjk_number(&characters[number_start..end]))
-        .flatten()
-        .map(|value| (value.to_string(), end))
-}
-
-fn cjk_numeric_idiom_end(characters: &[char], start: usize) -> Option<usize> {
-    // These exact spans use number characters figuratively. Keep this list
-    // deliberately narrow so real quantities remain strong facts.
-    characters[start..]
-        .starts_with(&['半', '斤', '八', '两'])
-        .then_some(start + 4)
-}
-
-fn push_scaled_digits(tokens: &mut Vec<String>, digits: &str, multiplier: u128) {
-    if digits.is_empty() {
-        return;
-    }
-    let normalized = digits.trim_start_matches('0');
-    let normalized = if normalized.is_empty() {
-        "0"
-    } else {
-        normalized
-    };
-    let value = normalized.parse::<u128>().ok();
-    tokens.push(
-        value
-            .and_then(|value| value.checked_mul(multiplier))
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| normalized.to_owned()),
-    );
-}
-
-fn numeric_scale(characters: &[char], start: usize) -> Option<(u128, usize)> {
-    let cjk = characters.get(start).copied().and_then(|character| {
-        let scale = match character {
-            '百' => 100,
-            '千' => 1_000,
-            '万' => 10_000,
-            '亿' => 100_000_000,
-            _ => return None,
-        };
-        Some((scale, start + 1))
-    });
-    if cjk.is_some() {
-        return cjk;
-    }
-    let mut end = start;
-    while end < characters.len() && characters[end].is_ascii_alphabetic() {
-        end += 1;
-    }
-    let word = characters[start..end]
-        .iter()
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let scale = match word.as_str() {
-        "hundred" => 100,
-        "thousand" => 1_000,
-        "million" => 1_000_000,
-        "billion" => 1_000_000_000,
-        "trillion" => 1_000_000_000_000,
-        _ => return None,
-    };
-    Some((scale, end))
-}
-
-fn is_cjk_numeral(character: char) -> bool {
-    matches!(
-        character,
-        '零' | '〇'
-            | '一'
-            | '二'
-            | '两'
-            | '三'
-            | '四'
-            | '五'
-            | '六'
-            | '七'
-            | '八'
-            | '九'
-            | '十'
-            | '百'
-            | '千'
-            | '万'
-            | '亿'
-    )
-}
-
-fn parse_cjk_number(characters: &[char]) -> Option<u128> {
-    if characters.is_empty() {
-        return None;
-    }
-    let has_unit = characters
-        .iter()
-        .any(|character| matches!(character, '十' | '百' | '千' | '万' | '亿'));
-    if !has_unit {
-        return characters.iter().try_fold(0_u128, |value, character| {
-            value.checked_mul(10)?.checked_add(cjk_digit(*character)?)
-        });
-    }
-
-    let mut total = 0_u128;
-    let mut section = 0_u128;
-    let mut number = 0_u128;
-    for character in characters {
-        if let Some(digit) = cjk_digit(*character) {
-            number = digit;
-            continue;
-        }
-        let unit = match character {
-            '十' => 10,
-            '百' => 100,
-            '千' => 1_000,
-            '万' => 10_000,
-            '亿' => 100_000_000,
-            _ => return None,
-        };
-        if unit < 10_000 {
-            section = section.checked_add(number.max(1).checked_mul(unit)?)?;
-        } else {
-            let scaled = section.checked_add(number)?.max(1).checked_mul(unit)?;
-            total = total.checked_add(scaled)?;
-            section = 0;
-        }
-        number = 0;
-    }
-    total.checked_add(section)?.checked_add(number)
-}
-
-fn cjk_digit(character: char) -> Option<u128> {
-    match character {
-        '零' | '〇' => Some(0),
-        '一' => Some(1),
-        '二' | '两' => Some(2),
-        '三' => Some(3),
-        '四' => Some(4),
-        '五' => Some(5),
-        '六' => Some(6),
-        '七' => Some(7),
-        '八' => Some(8),
-        '九' => Some(9),
-        _ => None,
-    }
-}
-
-fn cjk_unit_value(character: char) -> Option<u128> {
-    match character {
-        '十' => Some(10),
-        '百' => Some(100),
-        '千' => Some(1_000),
-        '万' => Some(10_000),
-        '亿' => Some(100_000_000),
-        _ => None,
-    }
-}
-
-fn english_number_tokens(text: &str) -> FactualTokens {
-    let words = text
-        // Keep digit-only tokens as boundaries so `a 12 million` does not
-        // look like the article-plus-scale expression `a million`.
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    let mut tokens = FactualTokens::default();
-    let mut index = 0;
-    while index < words.len() {
-        let Some(_) = english_number_value(&words[index]) else {
-            index += 1;
-            continue;
-        };
-        let start = index;
-        while index < words.len() && english_number_value(&words[index]).is_some() {
-            index += 1;
-        }
-        let phrase = &words[start..index];
-        if phrase.len() == 1 {
-            if let Some(scale) = english_scale(&phrase[0]) {
-                if start > 0 && matches!(words[start - 1].as_str(), "a" | "an") {
-                    tokens.strong.push(scale.to_string());
-                }
-                continue;
-            }
-            if english_number_value(&phrase[0]).is_some_and(|value| value < 10) {
-                // Standalone small number words are too ambiguous in natural
-                // dialogue (one more, one of, split in two, "oh"). Numeric
-                // sequences such as Zero-One remain strong facts.
-                if let Some(value) = parse_english_number(phrase) {
-                    tokens.weak.push(value.to_string());
-                }
-                continue;
-            }
-        }
-        if let Some(value) = parse_english_number(phrase) {
-            tokens.strong.push(value.to_string());
-        }
-    }
-    tokens
-}
-
-fn parse_english_number(words: &[String]) -> Option<u128> {
-    if words.len() > 1 && words.iter().all(|word| english_digit(word).is_some()) {
-        return words.iter().try_fold(0_u128, |value, word| {
-            value.checked_mul(10)?.checked_add(english_digit(word)?)
-        });
-    }
-    let mut total = 0_u128;
-    let mut current = 0_u128;
-    for word in words {
-        if let Some(digit) = english_digit(word) {
-            current = current.checked_add(digit)?;
-        } else if let Some(value) = english_small_number(word) {
-            current = current.checked_add(value)?;
-        } else {
-            let scale = english_scale(word)?;
-            if scale == 100 {
-                current = current.max(1).checked_mul(scale)?;
-            } else {
-                total = total.checked_add(current.max(1).checked_mul(scale)?)?;
-                current = 0;
-            }
-        }
-    }
-    total.checked_add(current)
-}
-
-fn english_number_value(word: &str) -> Option<u128> {
-    english_digit(word)
-        .or_else(|| english_small_number(word))
-        .or_else(|| english_scale(word))
-}
-
-fn english_digit(word: &str) -> Option<u128> {
-    match word {
-        "zero" | "oh" => Some(0),
-        "one" => Some(1),
-        "two" => Some(2),
-        "three" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        _ => None,
-    }
-}
-
-fn english_small_number(word: &str) -> Option<u128> {
-    match word {
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" => Some(12),
-        "thirteen" => Some(13),
-        "fourteen" => Some(14),
-        "fifteen" => Some(15),
-        "sixteen" => Some(16),
-        "seventeen" => Some(17),
-        "eighteen" => Some(18),
-        "nineteen" => Some(19),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "sixty" => Some(60),
-        "seventy" => Some(70),
-        "eighty" => Some(80),
-        "ninety" => Some(90),
-        _ => None,
-    }
-}
-
-fn english_scale(word: &str) -> Option<u128> {
-    match word {
-        "hundred" => Some(100),
-        "thousand" => Some(1_000),
-        "million" => Some(1_000_000),
-        "billion" => Some(1_000_000_000),
-        "trillion" => Some(1_000_000_000_000),
-        _ => None,
     }
 }
 
@@ -983,6 +487,44 @@ mod tests {
             FinalValidationPolicy::default(),
         )
         .expect("ambiguous small-number grammar should not be treated as changed facts");
+    }
+
+    #[test]
+    fn final_validation_does_not_block_ambiguous_cjk_number_glyphs() {
+        for (index, text) in ["乱七八糟", "十万火急", "万一", "三三两两", "七八个人"]
+            .into_iter()
+            .enumerate()
+        {
+            validate_final_output(
+                &[segment(
+                    &(index + 1).to_string(),
+                    "There is no explicit numeric fact here.",
+                    None,
+                )],
+                &[segment(&(index + 1).to_string(), text, None)],
+                &BTreeMap::new(),
+                "English",
+                "Chinese",
+                FinalValidationPolicy::default(),
+            )
+            .unwrap_or_else(|error| panic!("{text} should be uncertain, not hard: {error}"));
+        }
+    }
+
+    #[test]
+    fn final_validation_still_blocks_explicit_cjk_quantity_changes() {
+        let error = validate_final_output(
+            &[segment("1", "十二岁", None)],
+            &[segment("1", "13 years old", None)],
+            &BTreeMap::new(),
+            "Chinese",
+            "English",
+            FinalValidationPolicy::default(),
+        )
+        .expect_err("an explicit age change must remain a hard mismatch");
+
+        assert!(error.to_string().contains("expected [12]"));
+        assert!(error.to_string().contains("got [13]"));
     }
 
     #[test]
