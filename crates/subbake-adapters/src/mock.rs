@@ -221,6 +221,7 @@ fn review_translations(prompt: &str) -> CoreResult<ReviewResult> {
     Ok(ReviewResult {
         lines,
         review_notes: "Mock targeted review completed.".to_owned(),
+        annotations: Vec::new(),
     })
 }
 

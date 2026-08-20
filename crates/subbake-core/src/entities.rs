@@ -469,6 +469,40 @@ pub struct ReviewStats {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewIssueKind {
+    Accuracy,
+    Omission,
+    Terminology,
+    Consistency,
+    Register,
+    Fluency,
+    Readability,
+    DeterministicRepair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAnnotation {
+    pub id: String,
+    pub category: ReviewIssueKind,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRouteKind {
+    ConfiguredReviewer,
+    TranslatorFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRoute {
+    pub kind: ReviewRouteKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewChange {
     pub batch: usize,
@@ -476,14 +510,21 @@ pub struct ReviewChange {
     pub reasons: Vec<String>,
     pub before: String,
     pub after: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<ReviewIssueKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewReport {
+    pub version: u64,
     pub terminology: TerminologyStats,
     pub review: ReviewStats,
     pub changes: Vec<ReviewChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<ReviewRoute>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,6 +586,8 @@ pub struct ReviewResult {
     pub lines: Vec<TranslationLine>,
     #[serde(default)]
     pub review_notes: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<ReviewAnnotation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

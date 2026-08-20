@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::entities::{
-    PipelineOptions, PromptCacheStrategy, ReviewResult, ReviewStrategy, SubtitleSegment,
-    TranslationLine,
+    PipelineOptions, PromptCacheStrategy, ReviewAnnotation, ReviewIssueKind, ReviewPolicy,
+    ReviewResult, ReviewStrategy, SubtitleSegment, TranslationLine,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
 use crate::ports::ChatMessage;
 use crate::term_matcher::TermMatcher;
-use crate::validation::validate_full_alignment;
+use crate::validation::{FinalValidationPolicy, final_validation_issues, validate_full_alignment};
 
 const REVIEW_CONTEXT_LINES: usize = 3;
 const MAX_EXTERNAL_CONSISTENCY_OCCURRENCES: usize = 6;
@@ -293,6 +293,7 @@ pub(crate) fn build_review_messages(
     options: &PipelineOptions,
     batch: &ReviewBatchPlan,
     memory: &ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
 ) -> Vec<ChatMessage> {
     let source = &batch.source;
     let translated = &batch.translated;
@@ -304,9 +305,37 @@ pub(crate) fn build_review_messages(
         .map(|segment| segment.text.as_str())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
-    let glossary = memory.select_relevant_glossary(&texts);
+    let required_entries = required_glossary.iter().collect::<Vec<_>>();
+    let required_terms = required_entries
+        .iter()
+        .map(|(source, _)| source.as_str())
+        .collect::<Vec<_>>();
+    let glossary = memory
+        .select_relevant_glossary(&texts)
+        .into_iter()
+        .filter(|(source, _)| {
+            TermMatcher::case_insensitive()
+                .matching_indices(source, &required_terms)
+                .is_empty()
+                && required_terms
+                    .iter()
+                    .all(|required| !TermMatcher::case_insensitive().contains(required, source))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut required_indices = BTreeSet::new();
+    for segment in source {
+        required_indices.extend(
+            TermMatcher::case_insensitive().matching_indices(&segment.text, &required_terms),
+        );
+    }
+    let selected_required = required_indices
+        .into_iter()
+        .filter_map(|index| required_entries.get(index).copied())
+        .map(|(source, target)| (source.clone(), target.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut payload = serde_json::json!({
         "tgt": options.target_language,
+        "policy": options.review_policy.as_str(),
         "reasons": reasons,
         "expected_count": candidate_reasons.len(),
         "expected_ids": candidate_reasons.keys().collect::<Vec<_>>(),
@@ -322,6 +351,18 @@ pub(crate) fn build_review_messages(
                 "settings": source.settings,
                 "semantic": source.semantic,
                 "reasons": candidate_reasons.get(&source.id),
+                "deterministic_issues": final_validation_issues(
+                    std::slice::from_ref(source),
+                    std::slice::from_ref(translated),
+                    required_glossary,
+                    &options.source_language,
+                    &options.target_language,
+                    FinalValidationPolicy {
+                        max_characters_per_second: options.max_characters_per_second,
+                        max_characters_per_line: options.max_characters_per_line,
+                        max_lines: options.max_lines,
+                    },
+                ).unwrap_or_default().into_iter().map(|issue| issue.message).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         "context": source.iter().zip(translated).map(|(source, translated)| serde_json::json!({
             "id": source.id,
@@ -339,8 +380,16 @@ pub(crate) fn build_review_messages(
         "repeated_source_groups": review_consistency_json(&batch.consistency_groups),
     });
     if !glossary.is_empty() {
-        payload["glossary"] = serde_json::Value::Object(
+        payload["terminology_hints"] = serde_json::Value::Object(
             glossary
+                .into_iter()
+                .map(|(source, target)| (source, serde_json::Value::String(target)))
+                .collect(),
+        );
+    }
+    if !selected_required.is_empty() {
+        payload["required_glossary"] = serde_json::Value::Object(
+            selected_required
                 .into_iter()
                 .map(|(source, target)| (source, serde_json::Value::String(target)))
                 .collect(),
@@ -351,26 +400,44 @@ pub(crate) fn build_review_messages(
             serde_json::to_value(&memory.terminology_entities).unwrap_or_default();
     }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
-    let system = format!(
-        "You are performing a targeted subtitle QA review.{}\n\
-         Return valid JSON only.\n\
-         Review {} subtitles.\n\
-         Only fix the stated deterministic issues without changing entry structure.",
-        if options.policy().review_strategy == ReviewStrategy::Adjudicated {
-            " First form an independent candidate translation for each editable line, then adjudicate it against the supplied candidate; return only the better final replacement when it materially improves fidelity, naturalness, consistency, or subtitle readability. Repeated source text is a consistency signal, not proof of identical meaning: keep translations identical when semantic metadata and local context are equivalent, but preserve justified differences in speaker, register, subtitle purpose, or scene meaning."
-        } else {
-            ""
-        },
-        options.target_language
-    );
+    let (system, response_shape, instructions) = match options.review_policy {
+        ReviewPolicy::Full => (
+            format!(
+                "You are SubBake's final subtitle revision adjudicator.\n\
+                 Return valid JSON only.\n\
+                 Review {} subtitles for material improvements in meaning accuracy, omissions, terminology, cross-document consistency, speaker register, natural fluency, and subtitle readability.\n\
+                 First resolve every deterministic_issues entry. Treat required_glossary values as mandatory exact targets; terminology_hints are advisory and never override them.\n\
+                 Preserve facts, numbers, formatting markers, required terminology, tone, humor, emotion, profanity, and intentionally incomplete phrasing across cue boundaries.\n\
+                 Do not replace a sound translation with a merely different synonym.{}",
+                options.target_language,
+                if options.policy().review_strategy == ReviewStrategy::Adjudicated {
+                    " Independently determine the intended translation for each editable line before comparing it with the supplied candidate, then keep whichever is materially better."
+                } else {
+                    ""
+                }
+            ),
+            "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\",\"category\":\"<category>\",\"rationale\":\"<short reason>\"}]}",
+            "Return a change for every listed deterministic issue. For all other lines, change one only when the replacement materially improves it. category must be one of accuracy, omission, terminology, consistency, register, fluency, or readability. rationale must be concise and specific. Omit unchanged lines only after checking them.",
+        ),
+        ReviewPolicy::Targeted | ReviewPolicy::Off => (
+            format!(
+                "You are SubBake's targeted deterministic subtitle repair reviewer.\n\
+                 Return valid JSON only.\n\
+                 Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording.",
+                options.target_language
+            ),
+            "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\"}]}",
+            "Make the smallest change that fixes each stated candidate reason. Omit candidates that already satisfy the stated requirement.",
+        ),
+    };
     let user = format!(
         "TASK_START\nreview_translations\nTASK_END\n\
-         Only ids in expected_ids are editable; context is read-only.\n\
+         Only ids in expected_ids are editable; all other content is read-only.\n\
          readonly_before and readonly_after are adjacent translated context; never return their ids.\n\
-         repeated_source_groups contains same-source occurrences across the document. Occurrences marked editable may be changed only when their id is in expected_ids; every other occurrence is read-only.\n\
-         Prefer minimal edits and omit unchanged lines.\n\
-         Return JSON only as {{\"changes\":[{{\"id\":\"<id>\",\"translation\":\"<replacement>\"}}]}}.\n\
-         Return an empty changes array when every candidate is already good.\n\
+         repeated_source_groups contains same-source occurrences across the document. Repeated text is a consistency signal, not proof of identical meaning: preserve justified differences in speaker, register, subtitle purpose, or scene meaning.\n\
+         {instructions}\n\
+         Return JSON only as {response_shape}.\n\
+         Return an empty changes array when no candidate needs replacement.\n\
          REVIEW_JSON_START{payload_json}REVIEW_JSON_END"
     );
     vec![
@@ -429,26 +496,62 @@ fn review_consistency_json(groups: &[ReviewConsistencyGroup]) -> serde_json::Val
     )
 }
 
-pub(crate) fn parse_review_payload(payload: &serde_json::Value) -> CoreResult<ReviewResult> {
-    let lines = payload
+pub(crate) fn parse_review_payload(
+    payload: &serde_json::Value,
+    require_annotations: bool,
+) -> CoreResult<ReviewResult> {
+    let raw_lines = payload
         .get("changes")
         .or_else(|| payload.get("lines"))
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             CoreError::InvalidTranslation("review response missing lines array".to_owned())
-        })?
-        .iter()
-        .map(|line| TranslationLine {
-            id: line["id"].as_str().unwrap_or_default().to_owned(),
+        })?;
+    let mut lines = Vec::with_capacity(raw_lines.len());
+    let mut annotations = Vec::with_capacity(raw_lines.len());
+    for line in raw_lines {
+        let id = line["id"].as_str().unwrap_or_default().to_owned();
+        lines.push(TranslationLine {
+            id: id.clone(),
             translation: line["translation"].as_str().unwrap_or_default().to_owned(),
-        })
-        .collect();
+        });
+        let category = line.get("category");
+        let rationale = line.get("rationale").and_then(serde_json::Value::as_str);
+        if category.is_some() || rationale.is_some() || require_annotations {
+            let category = category
+                .cloned()
+                .ok_or_else(|| {
+                    CoreError::InvalidTranslation(format!(
+                        "full review change for `{id}` is missing category"
+                    ))
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<ReviewIssueKind>(value).map_err(|_| {
+                        CoreError::InvalidTranslation(format!(
+                            "full review change for `{id}` has an invalid category"
+                        ))
+                    })
+                })?;
+            let rationale = rationale.unwrap_or_default().trim();
+            if rationale.is_empty() || rationale.chars().count() > 200 {
+                return Err(CoreError::InvalidTranslation(format!(
+                    "full review change for `{id}` must have a 1-200 character rationale"
+                )));
+            }
+            annotations.push(ReviewAnnotation {
+                id,
+                category,
+                rationale: rationale.to_owned(),
+            });
+        }
+    }
     Ok(ReviewResult {
         lines,
         review_notes: payload["review_notes"]
             .as_str()
             .unwrap_or_default()
             .to_owned(),
+        annotations,
     })
 }
 
@@ -597,6 +700,7 @@ fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::TranslationMode;
 
     fn segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {
         SubtitleSegment {
@@ -634,7 +738,12 @@ mod tests {
         let mut options = PipelineOptions::new("review.srt".into());
         options.mode = crate::entities::TranslationMode::Cinema;
 
-        let messages = build_review_messages(&options, &plan[1], &ContextMemory::default());
+        let messages = build_review_messages(
+            &options,
+            &plan[1],
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+        );
         let payload = messages[1]
             .content
             .split("REVIEW_JSON_START")
@@ -671,7 +780,12 @@ mod tests {
         let mut options = PipelineOptions::new("review.ass".into());
         options.mode = crate::entities::TranslationMode::Cinema;
 
-        let messages = build_review_messages(&options, &plan[0], &ContextMemory::default());
+        let messages = build_review_messages(
+            &options,
+            &plan[0],
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+        );
         let payload = messages[1]
             .content
             .split("REVIEW_JSON_START")
@@ -688,9 +802,86 @@ mod tests {
         assert_eq!(group["occurrences"][1]["translation"], "营业中");
         assert_eq!(group["occurrences"][1]["editable"], false);
         assert!(
-            messages[0]
+            messages[1]
                 .content
                 .contains("not proof of identical meaning")
         );
+    }
+
+    #[test]
+    fn full_and_targeted_review_use_distinct_instructions() {
+        let source = vec![segment(
+            "1",
+            "Leave school again.",
+            "00:00:00,000",
+            "00:00:01,000",
+        )];
+        let mut translated = source.clone();
+        translated[0].text = "再次离开学校。".to_owned();
+        let plan = build_full_review_plan(&[source], &translated);
+
+        let mut full = PipelineOptions::new("review.srt".into());
+        full.mode = TranslationMode::Cinema;
+        full.review_policy = ReviewPolicy::Full;
+        let required_glossary = BTreeMap::from([("school".to_owned(), "学校".to_owned())]);
+        let mut memory = ContextMemory::default();
+        memory.load_glossary(&[("leave school".to_owned(), "退学".to_owned())]);
+        let full_messages = build_review_messages(&full, &plan[0], &memory, &required_glossary);
+        assert!(
+            full_messages[0]
+                .content
+                .contains("final subtitle revision adjudicator")
+        );
+        assert!(
+            full_messages[0]
+                .content
+                .contains("intentionally incomplete phrasing")
+        );
+        assert!(full_messages[1].content.contains("\"category\""));
+        assert!(full_messages[1].content.contains("required_glossary"));
+        assert!(full_messages[1].content.contains("deterministic_issues"));
+        assert!(!full_messages[1].content.contains("退学"));
+        assert!(!full_messages[0].content.contains("targeted subtitle QA"));
+
+        let mut targeted = full;
+        targeted.review_policy = ReviewPolicy::Targeted;
+        let targeted_messages =
+            build_review_messages(&targeted, &plan[0], &memory, &required_glossary);
+        assert!(
+            targeted_messages[0]
+                .content
+                .contains("targeted deterministic")
+        );
+        assert!(targeted_messages[1].content.contains("smallest change"));
+        assert!(!targeted_messages[1].content.contains("\"category\""));
+    }
+
+    #[test]
+    fn full_review_parses_typed_audit_metadata() {
+        let payload = serde_json::json!({
+            "changes": [{
+                "id": "7",
+                "translation": "别再逃课了。",
+                "category": "accuracy",
+                "rationale": "leave school 在此处指逃课"
+            }]
+        });
+
+        let parsed = parse_review_payload(&payload, true).expect("full review payload");
+
+        assert_eq!(parsed.lines[0].id, "7");
+        assert_eq!(parsed.annotations[0].category, ReviewIssueKind::Accuracy);
+        assert_eq!(parsed.annotations[0].rationale, "leave school 在此处指逃课");
+    }
+
+    #[test]
+    fn full_review_rejects_changes_without_audit_metadata() {
+        let payload = serde_json::json!({
+            "changes": [{"id": "7", "translation": "别再逃课了。"}]
+        });
+
+        let error = parse_review_payload(&payload, true).expect_err("metadata is required");
+
+        assert!(error.to_string().contains("missing category"));
     }
 }

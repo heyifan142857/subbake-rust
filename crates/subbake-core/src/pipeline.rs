@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use crate::CancellationGuard;
 use crate::entities::{
     AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, ConcurrencyStrategy,
-    FailureLog, GlossaryEntry, PipelineOptions, PipelineResult, ReviewPolicy, ReviewStats,
-    SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment,
+    FailureLog, GlossaryEntry, PipelineOptions, PipelineResult, ReviewAnnotation, ReviewPolicy,
+    ReviewStats, SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment,
     TerminologyEntity, TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
@@ -358,7 +358,10 @@ where
         let translation_scene_groups = BatchPlanner::scene_group_ids(&batches);
         let original_batches =
             BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-                .scene_aware(policy.context_strategy.uses_scene_boundaries())
+                .scene_aware(
+                    self.options.review_policy != ReviewPolicy::Full
+                        && policy.context_strategy.uses_scene_boundaries(),
+                )
                 .split(&document.segments);
         let review_scene_groups = BatchPlanner::scene_group_ids(&original_batches);
         let planned_batches = BatchPlanner::describe(&batches);
@@ -1192,7 +1195,8 @@ where
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
-            let mut messages = build_review_messages(&self.options, batch, &self.memory);
+            let mut messages =
+                build_review_messages(&self.options, batch, &self.memory, &self.required_glossary);
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
             }
@@ -1248,7 +1252,8 @@ where
         let mut output = HashMap::new();
         let mut pending = Vec::new();
         for (index, batch) in batches {
-            let messages = build_review_messages(&self.options, batch, &self.memory);
+            let messages =
+                build_review_messages(&self.options, batch, &self.memory, &self.required_glossary);
             let hash = request_hash(&self.options, CacheStage::Review, &messages);
             let cached = if self.options.use_cache {
                 self.store
@@ -1272,6 +1277,7 @@ where
                     *index,
                     ReviewWithUsage {
                         lines: result.lines,
+                        annotations: result.annotations,
                         usage: Usage::default(),
                     },
                 );
@@ -1310,7 +1316,8 @@ where
         for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.map_err(CoreError::from).and_then(|response| {
                 let (json, usage) = response.into_json().map_err(CoreError::from)?;
-                let mut result = parse_review_payload(&json)?;
+                let mut result =
+                    parse_review_payload(&json, self.options.review_policy == ReviewPolicy::Full)?;
                 validate_review_candidate_ids(&batch, &result.lines)?;
                 result.lines = merge_review_patch(&batch.translated, &result.lines)?;
                 restore_batch_formatting(&batch.source, &mut result.lines);
@@ -1334,6 +1341,7 @@ where
                         index,
                         ReviewWithUsage {
                             lines: result.lines,
+                            annotations: result.annotations,
                             usage: response_usage,
                         },
                     );
@@ -1370,7 +1378,10 @@ where
             }
             None => {
                 let (payload, usage) = self.execute_review_json(messages)?;
-                let mut review = parse_review_payload(&payload)?;
+                let mut review = parse_review_payload(
+                    &payload,
+                    self.options.review_policy == ReviewPolicy::Full,
+                )?;
                 validate_review_candidate_ids(batch, &review.lines)?;
                 review.lines = merge_review_patch(&batch.translated, &review.lines)?;
                 BackendJsonResult {
@@ -1400,6 +1411,7 @@ where
         };
         Ok(ReviewWithUsage {
             lines: result.lines,
+            annotations: result.annotations,
             usage: if cached {
                 Usage::default()
             } else {
@@ -1484,6 +1496,7 @@ where
         {
             return Ok(ReviewWithUsage {
                 lines: result.lines,
+                annotations: result.annotations,
                 usage: outcome.usage,
             });
         }
@@ -1638,7 +1651,7 @@ where
                     let payload = if stage == "translate" {
                         BackendPayload::Translation(parse_translation_payload(&payload)?)
                     } else {
-                        BackendPayload::Review(parse_review_payload(&payload)?)
+                        BackendPayload::Review(parse_review_payload(&payload, false)?)
                     };
                     Ok(BackendJsonResult { payload, usage })
                 }),
@@ -1886,6 +1899,7 @@ fn marker_candidates<'a>(options: &PipelineOptions, memory: &'a ContextMemory) -
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewWithUsage {
     lines: Vec<TranslationLine>,
+    annotations: Vec<ReviewAnnotation>,
     usage: Usage,
 }
 
@@ -2356,6 +2370,8 @@ mod tests {
                             self.label,
                             line["translation"].as_str().unwrap_or_default()
                         ),
+                        "category": "fluency",
+                        "rationale": "scripted test improvement",
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2425,14 +2441,13 @@ mod tests {
                             "[REVIEWED] {}",
                             line["translation"].as_str().unwrap_or_default()
                         ),
+                        "category": "fluency",
+                        "rationale": "scripted test improvement",
                     })
                 })
                 .collect::<Vec<_>>();
             Ok(GenerationResponse::json(
-                serde_json::json!({
-                    "lines": lines,
-                    "review_notes": "reviewed",
-                }),
+                serde_json::json!({"changes": lines}),
                 Usage {
                     input_tokens: 1,
                     output_tokens: 2,
@@ -2522,6 +2537,8 @@ mod tests {
                     serde_json::json!({
                         "id": line["id"],
                         "translation": translation,
+                        "category": "terminology",
+                        "rationale": "scripted terminology regression",
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3301,7 +3318,7 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_checks_required_glossary_after_review() {
+    fn review_rejects_required_glossary_regression_before_final_validation() {
         let source = document("review-terms.txt", &["The Lord is here."]);
         let captured = Arc::new(Mutex::new(CapturedStoreData {
             loaded_glossary: vec![("Lord".to_owned(), "勋爵".to_owned())],
@@ -3329,21 +3346,20 @@ mod tests {
             .with_store(Box::new(store))
             .with_input_signature(input_signature_from_bytes(b"The Lord is here.\n", Some(1)));
 
-        let error = pipeline
+        let run = pipeline
             .run_document(&source)
-            .expect_err("reviewer must not remove a required term");
+            .expect("unsafe review change should be discarded");
 
-        assert!(error.to_string().contains("final output validation failed"));
-        assert!(error.to_string().contains("`Lord` -> `勋爵`"));
+        assert_eq!(run.translated_segments[0].text, "勋爵来了。");
+        assert_eq!(run.result.review.changed_lines, 0);
         let data = captured.lock().expect("capture lock");
         assert!(
-            !data
-                .saved_state
+            data.saved_state
                 .as_ref()
-                .expect("pre-validation state")
+                .expect("validated state")
                 .validation_completed
         );
-        assert!(data.saved_finalized_batches.is_empty());
+        assert_eq!(data.saved_finalized_batches.len(), 1);
     }
 
     #[test]
@@ -4709,6 +4725,51 @@ mod tests {
                 .map(|(_, text)| text.as_str()),
             Some("[REVIEWED] [ECHO] Meet Alice now.")
         );
+        let report = data.review_reports.last().expect("review report");
+        assert_eq!(report.version, 2);
+        assert_eq!(
+            report.changes[0].category,
+            Some(crate::ReviewIssueKind::Fluency)
+        );
+        assert_eq!(
+            report.route.as_ref().map(|route| route.kind),
+            Some(crate::ReviewRouteKind::TranslatorFallback)
+        );
+    }
+
+    #[test]
+    fn cinema_full_review_uses_batches_independent_of_scene_splits() {
+        let mut document = document("review-scenes.txt", &["First scene.", "Second scene."]);
+        document.segments[0].start = Some("00:00:00,000".to_owned());
+        document.segments[0].end = Some("00:00:01,000".to_owned());
+        document.segments[1].start = Some("00:00:03,000".to_owned());
+        document.segments[1].end = Some("00:00:04,000".to_owned());
+        let mut options = PipelineOptions::new("review-scenes.txt".into());
+        options.mode = crate::TranslationMode::Cinema;
+        options.batch_size = 10;
+        options.batch_token_budget = 1_000;
+        options.terminology_preflight = false;
+        options.review_policy = ReviewPolicy::Full;
+        options.resume = false;
+        options.use_cache = false;
+        let translation_calls = Arc::new(AtomicUsize::new(0));
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SubtitlePipeline::new(
+            ReviewBackend {
+                translation_calls: Arc::clone(&translation_calls),
+                review_calls: Arc::clone(&review_calls),
+                fail_on_review_call: None,
+            },
+            NoopDashboard,
+            options,
+        );
+
+        let run = pipeline.run_document(&document).expect("reviewed run");
+
+        assert_eq!(translation_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(review_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run.result.batches_translated, 2);
+        assert_eq!(run.result.review_batches, 1);
     }
 
     #[test]
@@ -4962,6 +5023,16 @@ mod tests {
                 .iter()
                 .all(|segment| segment.text.starts_with("[REVIEWED]"))
         );
+        assert_eq!(run.result.review.usage.total_tokens, 6);
+        let data = captured.lock().expect("capture lock");
+        let report = data.review_reports.last().expect("resumed review report");
+        assert_eq!(report.changes.len(), 2);
+        assert!(
+            report
+                .changes
+                .iter()
+                .all(|change| change.category == Some(crate::ReviewIssueKind::Fluency))
+        );
     }
 
     #[test]
@@ -5123,6 +5194,16 @@ mod tests {
                 .review_reports
                 .push(report.clone());
             Ok(())
+        }
+
+        fn load_review_report(&self) -> CoreResult<Option<ReviewReport>> {
+            Ok(self
+                .data
+                .lock()
+                .expect("capture lock")
+                .review_reports
+                .last()
+                .cloned())
         }
 
         fn save_batch_segments(

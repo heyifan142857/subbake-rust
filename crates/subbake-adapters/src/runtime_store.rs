@@ -100,6 +100,16 @@ impl RuntimeStore for FileRuntimeStore {
         write_json_verified(&self.paths.review_report_path, &value)
     }
 
+    fn load_review_report(&self) -> CoreResult<Option<ReviewReport>> {
+        if !self.paths.review_report_path.exists() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&self.paths.review_report_path).map_err(storage_error)?;
+        serde_json::from_str(&text).map(Some).map_err(|error| {
+            CoreError::DataInvariant(format!("review report parse failed: {error}"))
+        })
+    }
+
     fn save_batch_segments(
         &self,
         kind: BatchShardKind,
@@ -778,6 +788,7 @@ mod tests {
                     translation: "审校后".to_owned(),
                 }],
                 review_notes: "terminology fixed".to_owned(),
+                annotations: Vec::new(),
             }),
             usage: Usage {
                 input_tokens: 3,
@@ -846,6 +857,7 @@ mod tests {
         );
 
         let report = ReviewReport {
+            version: 2,
             terminology: TerminologyStats {
                 candidates: 1,
                 entries_added: 1,
@@ -863,16 +875,46 @@ mod tests {
                 reasons: vec!["glossary mismatch".to_owned()],
                 before: "帮派".to_owned(),
                 after: "斧头帮".to_owned(),
+                category: None,
+                rationale: None,
             }],
+            route: None,
         };
         store.save_review_report(&report).expect("save report");
         let saved: ReviewReport = serde_json::from_str(
             &fs::read_to_string(&store.paths().review_report_path).expect("read report"),
         )
         .expect("parse report");
+        let loaded = store
+            .load_review_report()
+            .expect("load review report")
+            .expect("saved review report");
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(saved, report);
+        assert_eq!(loaded, report);
+    }
+
+    #[test]
+    fn reads_legacy_review_report_without_audit_fields() {
+        let legacy = serde_json::json!({
+            "terminology": {},
+            "review": {"candidate_lines": 1, "reviewed_lines": 1, "changed_lines": 1},
+            "changes": [{
+                "batch": 1,
+                "id": "1",
+                "reasons": ["full review"],
+                "before": "旧译",
+                "after": "新译"
+            }]
+        });
+
+        let report: ReviewReport = serde_json::from_value(legacy).expect("legacy report");
+
+        assert_eq!(report.version, 0);
+        assert!(report.route.is_none());
+        assert!(report.changes[0].category.is_none());
+        assert!(report.changes[0].rationale.is_none());
     }
 
     #[test]

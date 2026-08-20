@@ -1,14 +1,15 @@
 use crate::entities::{
-    ConcurrencyStrategy, ReviewReport, ReviewStats, SubtitleDocument, SubtitleSegment, Usage,
+    ConcurrencyStrategy, ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, SubtitleDocument,
+    SubtitleSegment, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
 use crate::progress::TaskState;
-use crate::storage::ResumeSnapshot;
+use crate::storage::{REVIEW_REPORT_VERSION, ResumeSnapshot};
 use crate::validation::validate_full_alignment;
 
 use super::SubtitlePipeline;
-use super::review_stage::ReviewStage;
+use super::review_stage::{ReviewResumeInput, ReviewStage};
 
 pub(super) struct ReviewRun {
     pub output: Vec<SubtitleSegment>,
@@ -40,14 +41,47 @@ where
     let batches = batch_input.review_batches;
     let translation_batches = batch_input.translation_batches;
     let scene_groups = batch_input.scene_groups;
+    let restored_report = if resume.review_batches_completed > 0 {
+        pipeline
+            .store
+            .as_ref()
+            .map(|store| store.load_review_report())
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let route = (pipeline.options.review_policy != crate::entities::ReviewPolicy::Off).then(|| {
+        ReviewRoute {
+            kind: if pipeline.reviewer.is_some() {
+                ReviewRouteKind::ConfiguredReviewer
+            } else {
+                ReviewRouteKind::TranslatorFallback
+            },
+            backend_fingerprint: if pipeline.reviewer.is_some() {
+                pipeline.options.reviewer_fingerprint.clone()
+            } else {
+                pipeline.options.provider_fingerprint.clone().or_else(|| {
+                    Some(format!(
+                        "{}:{}",
+                        pipeline.options.provider, pipeline.options.model
+                    ))
+                })
+            },
+        }
+    });
     let mut stage = ReviewStage::new(
         &pipeline.options,
         batches,
         translated,
         &pipeline.memory,
-        resume.review_batches_completed,
-        &resume.reviewed_segments,
-        pipeline.cache_hits,
+        &pipeline.required_glossary,
+        ReviewResumeInput {
+            completed_batches: resume.review_batches_completed,
+            reviewed_segments: &resume.reviewed_segments,
+            report: restored_report.as_ref(),
+            cache_hits_before: pipeline.cache_hits,
+        },
     )?;
     pipeline
         .dashboard
@@ -94,8 +128,12 @@ where
                 })?;
                 usage.add(reviewed.usage);
                 pipeline.dashboard.add_usage(reviewed.usage);
-                let reviewed_segments =
-                    stage.apply(*review_position, &reviewed.lines, reviewed.usage)?;
+                let reviewed_segments = stage.apply(
+                    *review_position,
+                    &reviewed.lines,
+                    &reviewed.annotations,
+                    reviewed.usage,
+                )?;
                 if let Some(store) = pipeline.store.as_ref() {
                     pipeline.cancellation.check()?;
                     store.save_batch_segments(
@@ -103,6 +141,14 @@ where
                         *review_position,
                         &reviewed_segments,
                     )?;
+                    let (review, changes) = stage.snapshot(pipeline.cache_hits);
+                    store.save_review_report(&ReviewReport {
+                        version: REVIEW_REPORT_VERSION,
+                        terminology: terminology.clone(),
+                        review,
+                        changes,
+                        route: route.clone(),
+                    })?;
                 }
                 pipeline.save_run_state(translation_batches, *review_position, false, usage)?;
                 pipeline.report(
@@ -133,9 +179,11 @@ where
     let outcome = stage.finish(pipeline.cache_hits);
     if let Some(store) = pipeline.store.as_ref() {
         store.save_review_report(&ReviewReport {
+            version: REVIEW_REPORT_VERSION,
             terminology: terminology.clone(),
             review: outcome.stats.clone(),
             changes: outcome.changes,
+            route,
         })?;
     }
     pipeline.cancellation.check()?;

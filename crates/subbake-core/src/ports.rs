@@ -477,6 +477,9 @@ pub trait RuntimeStore {
     fn load_glossary(&self) -> CoreResult<Vec<(String, String)>>;
 
     fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()>;
+    fn load_review_report(&self) -> CoreResult<Option<ReviewReport>> {
+        Ok(None)
+    }
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
     fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>>;
