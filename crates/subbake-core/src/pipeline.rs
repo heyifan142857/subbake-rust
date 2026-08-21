@@ -10,6 +10,7 @@ use crate::entities::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::restore_batch_formatting;
+use crate::language_rules::{LanguageRuleRegistry, ResolvedLanguageRules};
 use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
@@ -21,7 +22,7 @@ use crate::recovery::{
     backend_payload_json, build_agent_repair_messages, combine_glossary, parse_translation_payload,
     retry_correction_message, split_index,
 };
-use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
+use crate::review::{ReviewBatchPlan, build_review_messages_with_rules, parse_review_payload};
 use crate::storage::{InputSignature, ResumeSnapshot, build_document_guide_fingerprint};
 use crate::validation::{
     FinalValidationIssue, FinalValidationPolicy, final_validation_error, final_validation_issues,
@@ -42,11 +43,14 @@ mod translation_stage;
 use persistence::PipelinePersistence;
 use planning::{BatchPlanner, DeduplicationPlan};
 use review_runner::{ReviewBatchInput, ReviewRun};
+#[cfg(test)]
+use support::build_translation_messages;
 pub use support::translation_memory_key;
 use support::{
-    build_translation_messages, contextual_translation_memory_keys, estimated_request_tokens,
-    is_agent_repairable, is_operational_llm_failure, merge_review_patch, request_hash,
-    translation_memory_scope, update_translation_memory, validate_review_candidate_ids,
+    build_translation_messages_with_rules, contextual_translation_memory_keys,
+    estimated_request_tokens, is_agent_repairable, is_operational_llm_failure, merge_review_patch,
+    request_hash, translation_memory_scope, update_translation_memory,
+    validate_review_candidate_ids,
 };
 use terminology::TerminologyStage;
 #[cfg(test)]
@@ -67,6 +71,7 @@ pub struct SubtitlePipeline<B, D> {
     reviewer: Option<B>,
     dashboard: D,
     options: PipelineOptions,
+    language_rules: ResolvedLanguageRules,
     memory: ContextMemory,
     /// User glossary entries and accepted proper-name entities are enforced;
     /// automatically learned domain terms remain advisory.
@@ -96,12 +101,15 @@ where
     pub fn new(backend: B, dashboard: D, mut options: PipelineOptions) -> Self {
         options.source_language = normalize_language_name(&options.source_language, true);
         options.target_language = normalize_language_name(&options.target_language, false);
+        let language_rules =
+            LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
         let adaptive_translation_concurrency = options.translation_concurrency.clamp(1, 2);
         Self {
             backend,
             reviewer: None,
             dashboard,
             options,
+            language_rules,
             memory: ContextMemory::new(),
             required_glossary: BTreeMap::new(),
             store: None,
@@ -573,6 +581,7 @@ where
             backend,
             dashboard: &mut self.dashboard,
             options: &self.options,
+            language_rules: &self.language_rules,
             memory: &mut self.memory,
             store: self.store.as_deref(),
             cancellation: &self.cancellation,
@@ -613,19 +622,18 @@ where
     ) -> CoreResult<()> {
         if lightweight_name_alignment(&self.options) {
             let candidates = self.memory.name_candidates.clone();
-            let target_language = self.options.target_language.clone();
             for batch in prepared.iter().filter(|batch| !batch.pending.is_empty()) {
                 let index = batch.index + 1;
                 let result = generated.get_mut(&index).ok_or_else(|| {
                     CoreError::DataInvariant(format!("translation window omitted batch {index}"))
                 })?;
-                if let Err(error) = name_alignment::reconcile_batch(
+                if let Err(error) = name_alignment::reconcile_batch_with_rules(
                     &batch.pending,
                     result,
                     &mut self.memory,
                     &self.required_glossary,
                     &candidates,
-                    &target_language,
+                    &self.language_rules,
                 ) {
                     let mut retried = self.translate_batch_impl(
                         index,
@@ -634,13 +642,13 @@ where
                         true,
                         Some(error),
                     )?;
-                    name_alignment::reconcile_batch(
+                    name_alignment::reconcile_batch_with_rules(
                         &batch.pending,
                         &mut retried,
                         &mut self.memory,
                         &self.required_glossary,
                         &candidates,
-                        &target_language,
+                        &self.language_rules,
                     )
                     .map_err(|retry_error| {
                         CoreError::InvalidTranslation(format!(
@@ -674,13 +682,13 @@ where
                 CoreError::DataInvariant(format!("translation window omitted batch {index}"))
             })?;
             let expected_terminology = !result.terminology_updates.is_empty();
-            if let Err(error) = online_terminology::reconcile_batch(
+            if let Err(error) = online_terminology::reconcile_batch_with_rules(
                 &batch.pending,
                 result,
                 &mut canonical,
                 &mut enforced,
                 &candidates,
-                &self.options.target_language,
+                &self.language_rules,
                 self.options.preserve_names,
             ) {
                 for (source, target) in &enforced {
@@ -700,13 +708,13 @@ where
                         "batch {index} omitted terminology updates after correction"
                     )));
                 }
-                online_terminology::reconcile_batch(
+                online_terminology::reconcile_batch_with_rules(
                     &batch.pending,
                     &mut retried,
                     &mut canonical,
                     &mut enforced,
                     &candidates,
-                    &self.options.target_language,
+                    &self.language_rules,
                     self.options.preserve_names,
                 )
                 .map_err(|retry_error| {
@@ -782,8 +790,8 @@ where
         let mut results = HashMap::new();
         let mut pending = Vec::new();
         for (batch_index, batch, prompt_context) in batches {
-            let messages = build_translation_messages(
-                &self.options,
+            let messages = build_translation_messages_with_rules(
+                (&self.options, &self.language_rules),
                 *batch_index,
                 batch,
                 prompt_context,
@@ -963,8 +971,8 @@ where
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
-            let mut messages = build_translation_messages(
-                &self.options,
+            let mut messages = build_translation_messages_with_rules(
+                (&self.options, &self.language_rules),
                 batch_index,
                 batch,
                 prompt_context,
@@ -1206,8 +1214,13 @@ where
         let mut attempts = Vec::new();
         for attempt in 1..=self.options.retries + 1 {
             self.cancellation.check()?;
-            let mut messages =
-                build_review_messages(&self.options, batch, &self.memory, &self.required_glossary);
+            let mut messages = build_review_messages_with_rules(
+                &self.options,
+                &self.language_rules,
+                batch,
+                &self.memory,
+                &self.required_glossary,
+            );
             if let Some(error) = last_error.as_ref() {
                 messages.push(retry_correction_message(error));
             }
@@ -1263,8 +1276,13 @@ where
         let mut output = HashMap::new();
         let mut pending = Vec::new();
         for (index, batch) in batches {
-            let messages =
-                build_review_messages(&self.options, batch, &self.memory, &self.required_glossary);
+            let messages = build_review_messages_with_rules(
+                &self.options,
+                &self.language_rules,
+                batch,
+                &self.memory,
+                &self.required_glossary,
+            );
             let hash = request_hash(&self.options, CacheStage::Review, &messages);
             let cached = if self.options.use_cache {
                 self.store
@@ -3213,7 +3231,7 @@ mod tests {
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
         let data = captured.lock().expect("capture lock");
         assert_eq!(data.saved_translation_memory.len(), 1);
-        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v4:"));
+        assert!(data.saved_translation_memory[0].0.starts_with("ctx-v5:"));
         assert_eq!(data.saved_translation_memory[0].1, "[ECHO] hello");
         assert_eq!(data.saved_batches.len(), 1);
         assert_eq!(data.saved_batches[0].1[0].text, "[ECHO] hello");
@@ -4280,7 +4298,8 @@ mod tests {
         let segments = vec![
             segment("1", "ヒムロ君がいない?"),
             segment("2", "待ってトキタ先生"),
-            segment("3", "ただの文章です"),
+            segment("3", "山田先輩も来ます"),
+            segment("4", "ただの文章です"),
         ];
 
         let candidates = extract_terminology_candidates(&segments)
@@ -4290,6 +4309,7 @@ mod tests {
 
         assert!(candidates.contains(&"ヒムロ".to_owned()));
         assert!(candidates.contains(&"トキタ".to_owned()));
+        assert!(candidates.contains(&"山田".to_owned()));
         assert!(!candidates.contains(&"文章".to_owned()));
     }
 

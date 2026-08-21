@@ -70,8 +70,9 @@ where
             },
         }
     });
-    let mut stage = ReviewStage::new(
+    let mut stage = ReviewStage::new_with_rules(
         &pipeline.options,
+        &pipeline.language_rules,
         batches,
         translated,
         &pipeline.memory,

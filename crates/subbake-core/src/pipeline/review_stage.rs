@@ -6,9 +6,12 @@ use crate::entities::{
     ReviewStats, SubtitleSegment, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
+#[cfg(test)]
+use crate::language_rules::LanguageRuleRegistry;
+use crate::language_rules::ResolvedLanguageRules;
 use crate::memory::ContextMemory;
 use crate::review::{
-    ReviewBatchPlan, build_full_review_plan, build_review_plan, restore_review_progress,
+    ReviewBatchPlan, build_full_review_plan_with_rules, build_review_plan, restore_review_progress,
 };
 use crate::validation::{FinalValidationPolicy, final_validation_issues};
 
@@ -44,8 +47,31 @@ pub(super) struct ReviewResumeInput<'a> {
 }
 
 impl ReviewStage {
+    #[cfg(test)]
     pub fn new(
         options: &PipelineOptions,
+        batches: &[Vec<SubtitleSegment>],
+        translated: &[SubtitleSegment],
+        memory: &ContextMemory,
+        required_glossary: &BTreeMap<String, String>,
+        resume: ReviewResumeInput<'_>,
+    ) -> CoreResult<Self> {
+        let language_rules =
+            LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+        Self::new_with_rules(
+            options,
+            &language_rules,
+            batches,
+            translated,
+            memory,
+            required_glossary,
+            resume,
+        )
+    }
+
+    pub fn new_with_rules(
+        options: &PipelineOptions,
+        language_rules: &ResolvedLanguageRules,
         batches: &[Vec<SubtitleSegment>],
         translated: &[SubtitleSegment],
         memory: &ContextMemory,
@@ -70,13 +96,9 @@ impl ReviewStage {
                     &options.source_language,
                     &options.target_language,
                 ),
-                ReviewPolicy::Full => build_full_review_plan(
-                    batches,
-                    translated,
-                    memory,
-                    &options.source_language,
-                    &options.target_language,
-                ),
+                ReviewPolicy::Full => {
+                    build_full_review_plan_with_rules(batches, translated, memory, language_rules)
+                }
             }
         };
         let resumed = if plan.is_empty() {

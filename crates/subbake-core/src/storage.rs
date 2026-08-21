@@ -4,19 +4,20 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
+use crate::language_rules::{LANGUAGE_RULES_POLICY_VERSION, LanguageRuleRegistry};
 use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 5;
 pub const REVIEW_REPORT_VERSION: u64 = 2;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 17;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 18;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
-pub const CACHE_VERSION: u64 = 4;
+pub const CACHE_VERSION: u64 = 5;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 11;
+pub const PROMPT_CONTRACT_VERSION: u64 = 12;
 /// Bump when translation-memory keying, lookup, or application semantics change.
-pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 4;
+pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 5;
 /// Bump when deterministic final-output validation semantics change.
 pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 7;
 /// Bump when the ordering, buffering, or publication contract of an
@@ -278,6 +279,8 @@ pub fn build_translation_fingerprint(
     options: &PipelineOptions,
     input_signature: &InputSignature,
 ) -> String {
+    let language_rules =
+        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
     let mut fields = vec![
         (
             "version".to_owned(),
@@ -346,7 +349,15 @@ pub fn build_translation_fingerprint(
                     "final_validation_policy".to_owned(),
                     JsonValue::Number(FINAL_VALIDATION_POLICY_VERSION.to_string()),
                 ),
+                (
+                    "language_rules_policy".to_owned(),
+                    JsonValue::Number(LANGUAGE_RULES_POLICY_VERSION.to_string()),
+                ),
             ]),
+        ),
+        (
+            "language_rules".to_owned(),
+            JsonValue::String(language_rules.semantic_key()),
         ),
         (
             "batch_size".to_owned(),
@@ -742,7 +753,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "8c958562b8093694dcfcae342253b41c9db1fbb5"
+            "31b2d074a3b1e0e84e6ef35005aaad3860a6da83"
         );
     }
 
@@ -917,7 +928,7 @@ mod tests {
 
         assert_eq!(
             build_request_hash("OpenAI", "gpt-test", "translate", messages),
-            "9b328039eed578ad29033181fbee531e0453049d"
+            "4e4686a62417f2a912c8c39f993a416cfb221a12"
         );
     }
 

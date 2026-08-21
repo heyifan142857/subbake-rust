@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+#[cfg(test)]
 use crate::language_rules::LanguageRuleRegistry;
+use crate::language_rules::ResolvedLanguageRules;
 use crate::memory::ContextMemory;
 use crate::term_matcher::TermMatcher;
 
@@ -74,6 +76,7 @@ pub(super) fn validate_markers(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_batch(
     source: &[SubtitleSegment],
     result: &mut BatchWithUsage,
@@ -81,6 +84,25 @@ pub(super) fn reconcile_batch(
     required_glossary: &BTreeMap<String, String>,
     candidates: &[String],
     target_language: &str,
+) -> CoreResult<()> {
+    let language_rules = LanguageRuleRegistry::resolve("Auto", target_language);
+    reconcile_batch_with_rules(
+        source,
+        result,
+        memory,
+        required_glossary,
+        candidates,
+        &language_rules,
+    )
+}
+
+pub(super) fn reconcile_batch_with_rules(
+    source: &[SubtitleSegment],
+    result: &mut BatchWithUsage,
+    memory: &mut ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
+    candidates: &[String],
+    language_rules: &ResolvedLanguageRules,
 ) -> CoreResult<()> {
     let required = required_glossary
         .iter()
@@ -108,8 +130,7 @@ pub(super) fn reconcile_batch(
         for marker in translated {
             clean.push_str(&line.translation[cursor..marker.start]);
             if marker.source == marker.target
-                && LanguageRuleRegistry::resolve("Auto", target_language)
-                    .target_requires_script_change(&marker.source)
+                && language_rules.target_requires_script_change(&marker.source)
             {
                 return Err(CoreError::InvalidTranslation(format!(
                     "personal name `{}` was left in source spelling",

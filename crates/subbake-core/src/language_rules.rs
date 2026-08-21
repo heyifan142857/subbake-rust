@@ -1,8 +1,7 @@
 use crate::entities::{TranslationMode, TranslationReadabilityDefaults};
 use crate::languages::normalize_language_name;
 
-#[cfg(test)]
-const LANGUAGE_RULES_POLICY_VERSION: u64 = 1;
+pub(crate) const LANGUAGE_RULES_POLICY_VERSION: u64 = 2;
 
 pub(crate) trait LanguageRule: Sync {
     fn id(&self) -> &'static str;
@@ -18,6 +17,7 @@ pub(crate) struct JapaneseRules;
 pub(crate) struct ChineseRules;
 pub(crate) struct CjkRules;
 pub(crate) struct EnglishToChineseRules;
+pub(crate) struct JapaneseToChineseRules;
 
 impl LanguageRule for GenericRules {
     fn id(&self) -> &'static str {
@@ -79,20 +79,32 @@ impl LanguageRule for EnglishToChineseRules {
     }
 }
 
+impl LanguageRule for JapaneseToChineseRules {
+    fn id(&self) -> &'static str {
+        "pair-ja-zh"
+    }
+
+    fn applies(&self, source: &str, target: &str) -> bool {
+        source == "ja" && primary_language(target) == "zh"
+    }
+}
+
 static GENERIC_RULES: GenericRules = GenericRules;
 static ENGLISH_RULES: EnglishRules = EnglishRules;
 static JAPANESE_RULES: JapaneseRules = JapaneseRules;
 static CHINESE_RULES: ChineseRules = ChineseRules;
 static CJK_RULES: CjkRules = CjkRules;
 static ENGLISH_TO_CHINESE_RULES: EnglishToChineseRules = EnglishToChineseRules;
+static JAPANESE_TO_CHINESE_RULES: JapaneseToChineseRules = JapaneseToChineseRules;
 
-static REGISTRY: [&dyn LanguageRule; 6] = [
+static REGISTRY: [&dyn LanguageRule; 7] = [
     &GENERIC_RULES,
     &ENGLISH_RULES,
     &JAPANESE_RULES,
     &CHINESE_RULES,
     &CJK_RULES,
     &ENGLISH_TO_CHINESE_RULES,
+    &JAPANESE_TO_CHINESE_RULES,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,22 +134,10 @@ impl LanguageRuleRegistry {
 }
 
 impl ResolvedLanguageRules {
-    #[cfg(test)]
-    pub(crate) fn source(&self) -> &str {
-        &self.source
-    }
-
-    #[cfg(test)]
-    pub(crate) fn target(&self) -> &str {
-        &self.target
-    }
-
-    #[cfg(test)]
     pub(crate) fn has(&self, id: &str) -> bool {
         self.active.iter().any(|(active, _)| *active == id)
     }
 
-    #[cfg(test)]
     pub(crate) fn semantic_key(&self) -> String {
         let rules = self
             .active
@@ -153,6 +153,36 @@ impl ResolvedLanguageRules {
 
     pub(crate) fn supports_english_coreference(&self) -> bool {
         self.source == "en"
+    }
+
+    pub(crate) fn is_cross_language(&self) -> bool {
+        self.source != self.target
+    }
+
+    pub(crate) fn translation_guidance(&self) -> Option<&'static str> {
+        self.has("pair-ja-zh").then_some(
+            "For Japanese-to-Chinese dialogue, resolve honorifics and forms of address from CONTEXT_JSON.document_guide relationships and forms_of_address. Do not mechanically transliterate or uniformly drop Japanese honorifics; choose a context-appropriate Chinese address form and keep it consistent.",
+        )
+    }
+
+    pub(crate) fn document_guide_guidance(&self) -> Option<&'static str> {
+        self.has("pair-ja-zh").then_some(
+            "For Japanese-to-Chinese, record each supported full Japanese honorific or address surface exactly in characters.forms_of_address with its context-appropriate Chinese target, and record only relationships supported by the samples.",
+        )
+    }
+
+    pub(crate) fn review_guidance(&self) -> Option<&'static str> {
+        self.has("pair-ja-zh").then_some(
+            "For Japanese-to-Chinese candidates, verify honorific and form-of-address choices against document_guide relationships and forms_of_address; preserve justified context-sensitive variation.",
+        )
+    }
+
+    pub(crate) fn form_of_address_review_reason(&self) -> &'static str {
+        if self.has("pair-ja-zh") {
+            "Japanese honorific/form-of-address consistency"
+        } else {
+            "form-of-address consistency"
+        }
     }
 
     pub(crate) fn target_requires_non_latin_name(&self) -> bool {
@@ -277,8 +307,17 @@ impl EnglishRules {
 }
 
 impl JapaneseRules {
-    pub(crate) const HONORIFICS: [&str; 8] =
-        ["ちゃん", "さん", "さま", "先生", "博士", "君", "様", "氏"];
+    pub(crate) const HONORIFICS: [&str; 9] = [
+        "ちゃん",
+        "さん",
+        "さま",
+        "先生",
+        "博士",
+        "先輩",
+        "君",
+        "様",
+        "氏",
+    ];
 
     pub(crate) fn honorific_names(text: &str) -> Vec<String> {
         let mut names = Vec::new();
@@ -516,21 +555,35 @@ mod tests {
     #[test]
     fn resolves_registered_rules_in_stable_order() {
         let english_chinese = LanguageRuleRegistry::resolve("English", "zh-Hans");
-        assert_eq!(english_chinese.source(), "en");
-        assert_eq!(english_chinese.target(), "zh-Hans");
+        assert_eq!(english_chinese.source, "en");
+        assert_eq!(english_chinese.target, "zh-Hans");
         assert!(english_chinese.has("source-en"));
         assert!(english_chinese.has("target-zh"));
         assert!(english_chinese.has("script-cjk"));
         assert!(english_chinese.has("pair-en-zh"));
         assert_eq!(
             english_chinese.semantic_key(),
-            "language-rules-v1:en>zh-Hans:generic@1,source-en@1,target-zh@1,script-cjk@1,pair-en-zh@1"
+            "language-rules-v2:en>zh-Hans:generic@1,source-en@1,target-zh@1,script-cjk@1,pair-en-zh@1"
         );
 
         let auto_chinese = LanguageRuleRegistry::resolve("Auto", "Chinese");
         assert!(auto_chinese.has("source-en"));
         assert!(auto_chinese.has("source-ja"));
         assert!(!auto_chinese.has("pair-en-zh"));
+    }
+
+    #[test]
+    fn activates_japanese_to_chinese_rules_only_for_that_pair() {
+        let japanese_chinese = LanguageRuleRegistry::resolve("Japanese", "Chinese");
+        assert!(japanese_chinese.has("source-ja"));
+        assert!(japanese_chinese.has("pair-ja-zh"));
+        assert!(japanese_chinese.translation_guidance().is_some());
+        assert!(japanese_chinese.document_guide_guidance().is_some());
+        assert!(japanese_chinese.review_guidance().is_some());
+
+        let english_japanese = LanguageRuleRegistry::resolve("English", "Japanese");
+        assert!(!english_japanese.has("pair-ja-zh"));
+        assert!(english_japanese.translation_guidance().is_none());
     }
 
     #[test]

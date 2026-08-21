@@ -5,7 +5,9 @@ use crate::entities::{
     ReviewResult, ReviewStrategy, SubtitleSegment, TranslationLine,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::language_rules::{EnglishRules, LanguageRuleRegistry, ResolvedLanguageRules};
+#[cfg(test)]
+use crate::language_rules::LanguageRuleRegistry;
+use crate::language_rules::{EnglishRules, ResolvedLanguageRules};
 use crate::memory::ContextMemory;
 use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::ports::ChatMessage;
@@ -121,6 +123,7 @@ pub(crate) fn build_review_plan(
     plan
 }
 
+#[cfg(test)]
 pub(crate) fn build_full_review_plan(
     batches: &[Vec<SubtitleSegment>],
     translated_segments: &[SubtitleSegment],
@@ -129,6 +132,15 @@ pub(crate) fn build_full_review_plan(
     target_language: &str,
 ) -> Vec<ReviewBatchPlan> {
     let language_rules = LanguageRuleRegistry::resolve(source_language, target_language);
+    build_full_review_plan_with_rules(batches, translated_segments, memory, &language_rules)
+}
+
+pub(crate) fn build_full_review_plan_with_rules(
+    batches: &[Vec<SubtitleSegment>],
+    translated_segments: &[SubtitleSegment],
+    memory: &ContextMemory,
+    language_rules: &ResolvedLanguageRules,
+) -> Vec<ReviewBatchPlan> {
     let all_source = batches.iter().flatten().cloned().collect::<Vec<_>>();
     let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (source, translated) in all_source.iter().zip(translated_segments) {
@@ -150,11 +162,16 @@ pub(crate) fn build_full_review_plan(
                 translated,
                 memory,
                 &translations_by_source,
-                !source_language.eq_ignore_ascii_case(target_language),
+                language_rules.is_cross_language(),
             );
-            reasons.extend(document_guide_review_reasons(source, translated, memory));
+            reasons.extend(document_guide_review_reasons(
+                source,
+                translated,
+                memory,
+                language_rules,
+            ));
             let document_index = offset + local_index;
-            if has_contextual_pronoun_risk(&all_source, document_index, memory, &language_rules) {
+            if has_contextual_pronoun_risk(&all_source, document_index, memory, language_rules) {
                 reasons.push("pronoun/coreference continuity".to_owned());
             }
             reasons.sort();
@@ -313,8 +330,21 @@ fn review_context(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn build_review_messages(
     options: &PipelineOptions,
+    batch: &ReviewBatchPlan,
+    memory: &ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
+) -> Vec<ChatMessage> {
+    let language_rules =
+        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    build_review_messages_with_rules(options, &language_rules, batch, memory, required_glossary)
+}
+
+pub(crate) fn build_review_messages_with_rules(
+    options: &PipelineOptions,
+    language_rules: &ResolvedLanguageRules,
     batch: &ReviewBatchPlan,
     memory: &ContextMemory,
     required_glossary: &BTreeMap<String, String>,
@@ -424,6 +454,7 @@ pub(crate) fn build_review_messages(
         payload["document_guide"] = serde_json::to_value(guide).unwrap_or_default();
     }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
+    let language_guidance = language_rules.review_guidance().unwrap_or_default();
     let (system, response_shape, instructions) = match options.review_policy {
         ReviewPolicy::Full => (
             format!(
@@ -432,7 +463,7 @@ pub(crate) fn build_review_messages(
                  Review only the listed risk candidates in {} subtitles. The complete translation was scanned before this request; non-candidate context is read-only. Check meaning accuracy, omissions, terminology, cross-document consistency, pronouns, forms of address, speaker register, natural fluency, and subtitle readability.\n\
                  First resolve every deterministic_issues entry. Treat required_glossary values as mandatory exact targets; terminology_hints are advisory and never override them.\n\
                  Treat document_guide as frozen evidence, but do not force advisory character or terminology guidance when local meaning clearly differs. Preserve facts, numbers, formatting markers, required terminology, tone, humor, emotion, profanity, and intentionally incomplete phrasing across cue boundaries.\n\
-                 Do not replace a sound translation with a merely different synonym.{}",
+                 Do not replace a sound translation with a merely different synonym.{}\n{language_guidance}",
                 options.target_language,
                 if options.policy().review_strategy == ReviewStrategy::Adjudicated {
                     " Independently determine the intended translation for each editable line before comparing it with the supplied candidate, then keep whichever is materially better."
@@ -655,6 +686,7 @@ fn document_guide_review_reasons(
     source: &SubtitleSegment,
     translated: &SubtitleSegment,
     memory: &ContextMemory,
+    language_rules: &ResolvedLanguageRules,
 ) -> Vec<String> {
     let matcher = TermMatcher::case_insensitive();
     let mut reasons = Vec::new();
@@ -679,7 +711,7 @@ fn document_guide_review_reasons(
             if matcher.contains(&source.text, &form.source)
                 && !matcher.contains(&translated.text, &form.target)
             {
-                reasons.push("form-of-address consistency".to_owned());
+                reasons.push(language_rules.form_of_address_review_reason().to_owned());
             }
         }
     }
@@ -1064,6 +1096,72 @@ mod tests {
         );
         assert!(!plan[0].candidate_reasons.contains_key("1"));
         assert!(!plan[0].candidate_reasons.contains_key("3"));
+    }
+
+    #[test]
+    fn japanese_chinese_honorific_drift_is_advisory_full_review_only() {
+        let source = vec![segment(
+            "1",
+            "田中さんが来た。",
+            "00:00:00,000",
+            "00:00:01,000",
+        )];
+        let translated = vec![segment("1", "田中来了。", "00:00:00,000", "00:00:01,000")];
+        let mut memory = ContextMemory::default();
+        memory.document_guide.characters.push(DocumentCharacter {
+            canonical_source: "田中".to_owned(),
+            canonical_target: "田中".to_owned(),
+            aliases: vec![GlossaryEntry {
+                source: "田中".to_owned(),
+                target: "田中".to_owned(),
+            }],
+            forms_of_address: vec![GlossaryEntry {
+                source: "田中さん".to_owned(),
+                target: "田中先生".to_owned(),
+            }],
+            ..DocumentCharacter::default()
+        });
+
+        assert!(
+            final_validation_issues(
+                &source,
+                &translated,
+                &BTreeMap::new(),
+                "ja",
+                "zh-Hans",
+                FinalValidationPolicy::default(),
+            )
+            .expect("final validation")
+            .is_empty()
+        );
+
+        let full = build_full_review_plan(
+            std::slice::from_ref(&source),
+            &translated,
+            &memory,
+            "ja",
+            "zh-Hans",
+        );
+        assert_eq!(
+            full[0].candidate_reasons["1"],
+            vec!["Japanese honorific/form-of-address consistency"]
+        );
+        let targeted = build_review_plan(
+            std::slice::from_ref(&source),
+            &full[0].translated,
+            &memory,
+            "ja",
+            "zh-Hans",
+        );
+        assert!(targeted.is_empty());
+
+        let corrected = vec![segment(
+            "1",
+            "田中先生来了。",
+            "00:00:00,000",
+            "00:00:01,000",
+        )];
+        assert!(build_full_review_plan(&[source], &corrected, &memory, "ja", "zh-Hans").is_empty());
     }
 
     #[test]

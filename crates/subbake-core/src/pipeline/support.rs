@@ -6,6 +6,7 @@ use crate::entities::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::protect_formatting;
+use crate::language_rules::{LanguageRuleRegistry, ResolvedLanguageRules};
 use crate::memory::ContextMemory;
 use crate::ports::{CacheStage, ChatMessage};
 use crate::review::ReviewBatchPlan;
@@ -51,6 +52,7 @@ pub(super) fn estimated_request_tokens(
     prompt.saturating_add(anticipated_response)
 }
 
+#[cfg(test)]
 pub(super) fn build_translation_messages(
     options: &PipelineOptions,
     batch_index: usize,
@@ -60,6 +62,29 @@ pub(super) fn build_translation_messages(
     required_glossary: &BTreeMap<String, String>,
     compact_wire: bool,
 ) -> Vec<ChatMessage> {
+    let language_rules =
+        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    build_translation_messages_with_rules(
+        (options, &language_rules),
+        batch_index,
+        batch,
+        prompt_context,
+        memory,
+        required_glossary,
+        compact_wire,
+    )
+}
+
+pub(super) fn build_translation_messages_with_rules(
+    policy: (&PipelineOptions, &ResolvedLanguageRules),
+    batch_index: usize,
+    batch: &[SubtitleSegment],
+    prompt_context: &TranslationPromptContext,
+    memory: &ContextMemory,
+    required_glossary: &BTreeMap<String, String>,
+    compact_wire: bool,
+) -> Vec<ChatMessage> {
+    let (options, language_rules) = policy;
     let mut context = serde_json::json!({
         "src": options.source_language,
         "tgt": options.target_language,
@@ -210,6 +235,7 @@ pub(super) fn build_translation_messages(
     } else {
         "Tokens shaped like ⟦T<number>⟧ and ⟦/T<number>⟧ mark a terminology span. Translate the text inside normally while copying both markers exactly once and in order. Do not return separate terms, glossary_updates, or terminology_updates."
     };
+    let language_guidance = language_rules.translation_guidance().unwrap_or_default();
     let system = format!(
         "TASK_START\ntranslate_subtitles\nTASK_END\n\
 Return JSON only with this shape:\n\
@@ -224,7 +250,7 @@ CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
 only when they fit the meaning in the current context. CONTEXT_JSON.document_guide \
 is frozen document-level guidance; apply its global genre/tone/audience guidance and \
 only the character and terminology records selected for this scene. Do not invent \
-facts or force an advisory form where the local meaning differs.\n{}\n{terminology_rule}",
+facts or force an advisory form where the local meaning differs.\n{language_guidance}\n{}\n{terminology_rule}",
         if options.preserve_names {
             "Preserve personal names exactly in their source spelling unless CONTEXT_JSON.glossary explicitly requires another form."
         } else {
@@ -490,6 +516,8 @@ pub(super) fn contextual_translation_memory_keys(
 }
 
 pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
+    let language_rules =
+        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
     let project_scope = options
         .input_path
         .parent()
@@ -511,6 +539,10 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         (
             "final_validation_policy".to_owned(),
             JsonValue::Number(FINAL_VALIDATION_POLICY_VERSION.to_string()),
+        ),
+        (
+            "language_rules".to_owned(),
+            JsonValue::String(language_rules.semantic_key()),
         ),
         (
             "project".to_owned(),
@@ -770,7 +802,7 @@ mod tests {
         let other_semantic_keys =
             contextual_translation_memory_keys("/shows/one", &other_semantics);
 
-        assert!(first_keys["2"].starts_with("ctx-v4:"));
+        assert!(first_keys["2"].starts_with("ctx-v5:"));
         assert_ne!(first_keys["2"], second_keys["2"]);
         assert_ne!(first_keys["2"], other_project["2"]);
         assert_ne!(first_keys["2"], other_semantic_keys["2"]);
@@ -871,6 +903,40 @@ mod tests {
             false,
         );
         assert!(!comprehensive[0].content.contains("⟦N<number>⟧"));
+    }
+
+    #[test]
+    fn translation_prompt_applies_japanese_chinese_guidance_only_to_that_pair() {
+        let mut options = PipelineOptions::new("episode.ass".into());
+        options.source_language = "ja".to_owned();
+        options.target_language = "zh-Hans".to_owned();
+        let batch = [segment("1", "田中さん、行きましょう。")];
+        let japanese_chinese = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(
+            japanese_chinese[0].content.contains(
+                "Do not mechanically transliterate or uniformly drop Japanese honorifics"
+            )
+        );
+
+        options.source_language = "en".to_owned();
+        let english_chinese = build_translation_messages(
+            &options,
+            0,
+            &batch,
+            &TranslationPromptContext::default(),
+            &ContextMemory::default(),
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(!english_chinese[0].content.contains("Japanese honorifics"));
     }
 
     #[test]

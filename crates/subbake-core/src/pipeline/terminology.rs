@@ -7,7 +7,7 @@ use crate::entities::{
     TerminologyPreflightResult, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::language_rules::{EnglishRules, JapaneseRules};
+use crate::language_rules::{EnglishRules, JapaneseRules, ResolvedLanguageRules};
 use crate::memory::ContextMemory;
 use crate::ports::{
     BackendJsonResult, BackendPayload, CacheStage, DashboardSink, GenerationRequest, LlmBackend,
@@ -20,6 +20,7 @@ pub(super) struct TerminologyStage<'a, B, D> {
     pub backend: &'a mut B,
     pub dashboard: &'a mut D,
     pub options: &'a PipelineOptions,
+    pub language_rules: &'a ResolvedLanguageRules,
     pub memory: &'a mut ContextMemory,
     pub store: Option<&'a dyn RuntimeStore>,
     pub cancellation: &'a CancellationGuard,
@@ -69,7 +70,12 @@ where
 
         self.report(TaskState::Running, 0, candidates.len(), Usage::default());
         let existing = self.memory.glossary.clone();
-        let messages = build_messages(self.options, &candidates, &document.segments);
+        let messages = build_messages(
+            self.options,
+            self.language_rules,
+            &candidates,
+            &document.segments,
+        );
         let hash = super::support::request_hash(self.options, CacheStage::Terminology, &messages);
         let cached = if self.options.use_cache {
             self.store
@@ -559,6 +565,7 @@ fn is_redundant_possessive(value: &str, canonical: &str) -> bool {
 
 fn build_messages(
     options: &PipelineOptions,
+    language_rules: &ResolvedLanguageRules,
     candidates: &[TerminologyCandidate],
     segments: &[SubtitleSegment],
 ) -> Vec<crate::ports::ChatMessage> {
@@ -577,9 +584,10 @@ fn build_messages(
     } else {
         "Include every clearly identified personal name and translate or transliterate it into the target language's conventional script; do not omit a clear personal name merely because its canonical spelling is uncertain."
     };
+    let language_guidance = language_rules.document_guide_guidance().unwrap_or_default();
     vec![
         crate::ports::ChatMessage::system(format!(
-            "TASK_START\nextract_document_guide\nTASK_END\nReturn JSON only as {{\"guide\":{{\"synopsis\":\"short factual synopsis\",\"genre\":\"genre\",\"tone\":\"tone\",\"target_audience\":\"audience\",\"characters\":[{{\"canonical_source\":\"exact source name\",\"canonical_target\":\"canonical target name\",\"aliases\":[{{\"source\":\"exact source alias\",\"target\":\"target alias\"}}],\"gender\":\"optional only when explicit\",\"relationships\":[\"short factual relationship\"],\"speaking_style\":\"short observed register guidance\",\"forms_of_address\":[{{\"source\":\"exact source form\",\"target\":\"contextual target form\"}}]}}],\"terminology\":[{{\"canonical_source\":\"canonical term\",\"kind\":\"organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact source span\",\"target\":\"canonical translation\"}}]}}]}}}}. Build one frozen guide for the whole document. Include only recurring or meaning-critical information supported by supplied candidates or samples. Group aliases of one character or term while preserving the natural granularity of each source form. {name_policy} Copy every source name, alias, address form, and terminology variant exactly from a supplied candidate or document sample. Omit ordinary words, uncertain identities, inferred gender, speculative relationships, and invented plot facts. Keep synopsis, genre, tone, audience, relationships, and speaking-style fields concise."
+            "TASK_START\nextract_document_guide\nTASK_END\nReturn JSON only as {{\"guide\":{{\"synopsis\":\"short factual synopsis\",\"genre\":\"genre\",\"tone\":\"tone\",\"target_audience\":\"audience\",\"characters\":[{{\"canonical_source\":\"exact source name\",\"canonical_target\":\"canonical target name\",\"aliases\":[{{\"source\":\"exact source alias\",\"target\":\"target alias\"}}],\"gender\":\"optional only when explicit\",\"relationships\":[\"short factual relationship\"],\"speaking_style\":\"short observed register guidance\",\"forms_of_address\":[{{\"source\":\"exact source form\",\"target\":\"contextual target form\"}}]}}],\"terminology\":[{{\"canonical_source\":\"canonical term\",\"kind\":\"organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact source span\",\"target\":\"canonical translation\"}}]}}]}}}}. Build one frozen guide for the whole document. Include only recurring or meaning-critical information supported by supplied candidates or samples. Group aliases of one character or term while preserving the natural granularity of each source form. {name_policy} Copy every source name, alias, address form, and terminology variant exactly from a supplied candidate or document sample. Omit ordinary words, uncertain identities, inferred gender, speculative relationships, and invented plot facts. Keep synopsis, genre, tone, audience, relationships, and speaking-style fields concise. {language_guidance}"
         )),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
@@ -884,4 +892,47 @@ fn accept_entities(
         accepted.push(entity);
     }
     accepted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language_rules::LanguageRuleRegistry;
+
+    fn segment(text: &str) -> SubtitleSegment {
+        SubtitleSegment {
+            id: "1".to_owned(),
+            text: text.to_owned(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+            semantic: Default::default(),
+        }
+    }
+
+    #[test]
+    fn japanese_chinese_preflight_requests_exact_honorific_surfaces() {
+        let mut options = PipelineOptions::new("episode.ass".into());
+        options.source_language = "ja".to_owned();
+        options.target_language = "zh-Hans".to_owned();
+        let rules = LanguageRuleRegistry::resolve("ja", "zh-Hans");
+        let messages = build_messages(
+            &options,
+            &rules,
+            &[TerminologyCandidate {
+                source: "田中".to_owned(),
+                context: "田中さん、行きましょう。".to_owned(),
+                align_as_name: true,
+            }],
+            &[segment("田中さん、行きましょう。")],
+        );
+
+        assert!(
+            messages[0].content.contains(
+                "record each supported full Japanese honorific or address surface exactly"
+            )
+        );
+        assert!(messages[1].content.contains("田中さん"));
+    }
 }

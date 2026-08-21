@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::entities::TerminologyKind;
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+#[cfg(test)]
 use crate::language_rules::LanguageRuleRegistry;
+use crate::language_rules::ResolvedLanguageRules;
 use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
@@ -102,6 +104,7 @@ fn is_source_stable_acronym(candidate: &str) -> bool {
             .all(|character| character.is_ascii_uppercase())
 }
 
+#[cfg(test)]
 pub(super) fn reconcile_batch(
     source: &[SubtitleSegment],
     result: &mut BatchWithUsage,
@@ -109,6 +112,27 @@ pub(super) fn reconcile_batch(
     enforced: &mut BTreeMap<String, String>,
     candidates: &[String],
     target_language: &str,
+    preserve_names: bool,
+) -> CoreResult<()> {
+    let language_rules = LanguageRuleRegistry::resolve("Auto", target_language);
+    reconcile_batch_with_rules(
+        source,
+        result,
+        canonical,
+        enforced,
+        candidates,
+        &language_rules,
+        preserve_names,
+    )
+}
+
+pub(super) fn reconcile_batch_with_rules(
+    source: &[SubtitleSegment],
+    result: &mut BatchWithUsage,
+    canonical: &mut BTreeMap<String, String>,
+    enforced: &mut BTreeMap<String, String>,
+    candidates: &[String],
+    language_rules: &ResolvedLanguageRules,
     preserve_names: bool,
 ) -> CoreResult<()> {
     let mut replacements: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -146,8 +170,7 @@ pub(super) fn reconcile_batch(
             if existing.is_none()
                 && entity.kind == TerminologyKind::Person
                 && !preserve_names
-                && LanguageRuleRegistry::resolve("Auto", target_language)
-                    .target_requires_non_latin_name()
+                && language_rules.target_requires_non_latin_name()
                 && source_form.eq_ignore_ascii_case(proposed)
             {
                 return Err(CoreError::InvalidTranslation(format!(
