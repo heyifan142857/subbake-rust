@@ -72,6 +72,13 @@ pub(super) fn build_translation_messages(
         .map(|segment| segment.text.as_str())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
+    let guide_texts = batch
+        .iter()
+        .chain(&prompt_context.source.before)
+        .chain(&prompt_context.source.after)
+        .map(|segment| segment.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
     let term_markers = if options.online_terminology {
         select_term_markers(batch, &memory.terminology_candidates)
     } else {
@@ -115,6 +122,26 @@ pub(super) fn build_translation_messages(
                     })
                     .collect(),
             );
+        }
+        if !prompt_context.relevant_previous.is_empty() {
+            context["relevant_previous"] = serde_json::Value::Array(
+                prompt_context
+                    .relevant_previous
+                    .iter()
+                    .map(|line| {
+                        serde_json::json!({
+                            "id": line.id,
+                            "source": line.source,
+                            "translation": line.translation,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        let guide = memory.select_relevant_document_guide(&guide_texts);
+        if !guide.is_empty() {
+            context["document_guide"] = serde_json::to_value(guide).unwrap_or_default();
         }
 
         let glossary = memory.select_relevant_glossary(&batch_texts);
@@ -189,12 +216,15 @@ Return JSON only with this shape:\n\
 {response_shape}\n\
 Return exactly one line for every input line, in the same order. Copy each id exactly.\n\
 Every non-empty source line must have a non-empty translation. Do not include markdown or explanations.\n\
-CONTEXT_JSON.editable_ids is the complete set of ids you may return. CONTEXT_JSON.readonly_source and CONTEXT_JSON.confirmed_previous are read-only context; never return or modify their ids.\n\
+CONTEXT_JSON.editable_ids is the complete set of ids you may return. CONTEXT_JSON.readonly_source, CONTEXT_JSON.confirmed_previous, and CONTEXT_JSON.relevant_previous are read-only context; never return or modify their ids. relevant_previous contains a small set of earlier source/translation pairs retrieved for long-range consistency; use one only when it is semantically relevant to the current line.\n\
 Tokens shaped like ⟦SBK_FMT_<number>⟧ are protected subtitle formatting markers. Copy each marker exactly once and in the original order.\n\
 An optional third item in an input line is read-only semantic metadata such as speaker, style, layer, or cue settings. Use it to distinguish dialogue, signs, lyrics, and role-specific register; never translate or return the metadata.\n\
 Entries in CONTEXT_JSON.glossary are user-required translations. Entries in \
 CONTEXT_JSON.terminology_hints are automatically learned suggestions: use them \
-only when they fit the meaning in the current context.\n{}\n{terminology_rule}",
+only when they fit the meaning in the current context. CONTEXT_JSON.document_guide \
+is frozen document-level guidance; apply its global genre/tone/audience guidance and \
+only the character and terminology records selected for this scene. Do not invent \
+facts or force an advisory form where the local meaning differs.\n{}\n{terminology_rule}",
         if options.preserve_names {
             "Preserve personal names exactly in their source spelling unless CONTEXT_JSON.glossary explicitly requires another form."
         } else {
@@ -552,9 +582,9 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
             JsonValue::Bool(options.preserve_names),
         ),
         (
-            "glossary".to_owned(),
+            "document_guide".to_owned(),
             options
-                .glossary_fingerprint
+                .document_guide_fingerprint
                 .clone()
                 .map(JsonValue::String)
                 .unwrap_or(JsonValue::Null),
@@ -747,15 +777,15 @@ mod tests {
     }
 
     #[test]
-    fn translation_memory_scope_covers_behavior_and_frozen_glossary() {
+    fn translation_memory_scope_covers_behavior_and_frozen_document_guide() {
         let mut baseline = PipelineOptions::new("/shows/one/episode.srt".into());
         baseline.provider_fingerprint = Some("translator-route".to_owned());
-        baseline.glossary_fingerprint = Some("glossary-one".to_owned());
+        baseline.document_guide_fingerprint = Some("guide-one".to_owned());
         let scope = translation_memory_scope(&baseline);
 
-        let mut changed_glossary = baseline.clone();
-        changed_glossary.glossary_fingerprint = Some("glossary-two".to_owned());
-        assert_ne!(scope, translation_memory_scope(&changed_glossary));
+        let mut changed_guide = baseline.clone();
+        changed_guide.document_guide_fingerprint = Some("guide-two".to_owned());
+        assert_ne!(scope, translation_memory_scope(&changed_guide));
 
         let mut changed_concurrency = baseline.clone();
         changed_concurrency.translation_concurrency += 1;
@@ -880,6 +910,19 @@ mod tests {
         let options = PipelineOptions::new("episode.srt".into());
         let mut memory = ContextMemory::default();
         memory.update("legacy model summary", &[]);
+        memory.document_guide.synopsis = "A woman enters under an assumed name.".to_owned();
+        memory.document_guide.characters = vec![
+            crate::entities::DocumentCharacter {
+                canonical_source: "Mary".to_owned(),
+                canonical_target: "玛丽".to_owned(),
+                ..crate::entities::DocumentCharacter::default()
+            },
+            crate::entities::DocumentCharacter {
+                canonical_source: "Bob".to_owned(),
+                canonical_target: "鲍勃".to_owned(),
+                ..crate::entities::DocumentCharacter::default()
+            },
+        ];
         let batch = [segment("2", "Who is she?")];
         let prompt_context = TranslationPromptContext {
             source: SourceBatchContext {
@@ -890,6 +933,11 @@ mod tests {
                 id: "1".to_owned(),
                 source: "A woman enters.".to_owned(),
                 translation: "一位女士走了进来。".to_owned(),
+            }],
+            relevant_previous: vec![ConfirmedTranslationContext {
+                id: "old-9".to_owned(),
+                source: "Mary used this name before.".to_owned(),
+                translation: "玛丽以前用过这个名字。".to_owned(),
             }],
         };
 
@@ -922,6 +970,21 @@ mod tests {
         assert_eq!(
             context["confirmed_previous"][0]["translation"],
             "一位女士走了进来。"
+        );
+        assert_eq!(context["relevant_previous"][0]["id"], "old-9");
+        assert_eq!(
+            context["document_guide"]["synopsis"],
+            "A woman enters under an assumed name."
+        );
+        assert_eq!(
+            context["document_guide"]["characters"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            context["document_guide"]["characters"][0]["canonical_source"],
+            "Mary"
         );
         assert!(context.get("recent").is_none());
         assert_eq!(payload["lines"].as_array().map(Vec::len), Some(1));

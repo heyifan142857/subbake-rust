@@ -70,7 +70,13 @@ impl ReviewStage {
                     &options.source_language,
                     &options.target_language,
                 ),
-                ReviewPolicy::Full => build_full_review_plan(batches, translated),
+                ReviewPolicy::Full => build_full_review_plan(
+                    batches,
+                    translated,
+                    memory,
+                    &options.source_language,
+                    &options.target_language,
+                ),
             }
         };
         let resumed = if plan.is_empty() {
@@ -390,7 +396,9 @@ impl ReviewStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::{TranslationLine, TranslationMode};
+    use crate::entities::{
+        GlossaryEntry, TerminologyEntity, TerminologyKind, TranslationLine, TranslationMode,
+    };
 
     fn segment(id: &str, text: &str) -> SubtitleSegment {
         SubtitleSegment {
@@ -402,6 +410,19 @@ mod tests {
             settings: None,
             semantic: Default::default(),
         }
+    }
+
+    fn advisory_candidate_memory(source: &str, target: &str) -> ContextMemory {
+        let mut memory = ContextMemory::default();
+        memory.document_guide.terminology.push(TerminologyEntity {
+            canonical_source: source.to_owned(),
+            kind: TerminologyKind::DomainTerm,
+            variants: vec![GlossaryEntry {
+                source: source.to_owned(),
+                target: target.to_owned(),
+            }],
+        });
+        memory
     }
 
     #[test]
@@ -438,7 +459,7 @@ mod tests {
         )
         .expect("review stage");
 
-        assert_eq!(stage.scene_window_size(0, 3, &[0, 1, 2]), 2);
+        assert_eq!(stage.scene_window_size(0, 3, &[0, 1, 2]), 1);
         stage
             .apply(
                 1,
@@ -450,7 +471,7 @@ mod tests {
                 Usage::default(),
             )
             .expect("apply first review");
-        let window = stage.window(2, 1);
+        let window = stage.window(1, 1);
         let peer = window[0]
             .1
             .consistency_groups
@@ -519,11 +540,12 @@ mod tests {
         let mut options = PipelineOptions::new("review.txt".into());
         options.review_policy = ReviewPolicy::Full;
         let required_glossary = BTreeMap::from([("Rick".to_owned(), "Rick".to_owned())]);
+        let memory = advisory_candidate_memory("here", "在此");
         let mut stage = ReviewStage::new(
             &options,
             &batches,
             &translated,
-            &ContextMemory::default(),
+            &memory,
             &required_glossary,
             ReviewResumeInput {
                 completed_batches: 0,
@@ -562,11 +584,12 @@ mod tests {
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
         options.review_policy = ReviewPolicy::Full;
+        let memory = advisory_candidate_memory("Wait", "请稍候");
         let mut stage = ReviewStage::new(
             &options,
             &batches,
             &translated,
-            &ContextMemory::default(),
+            &memory,
             &BTreeMap::new(),
             ReviewResumeInput {
                 completed_batches: 0,
@@ -608,11 +631,12 @@ mod tests {
         let mut options = PipelineOptions::new("review.srt".into());
         options.review_policy = ReviewPolicy::Full;
         options.max_characters_per_second = Some(4.0);
+        let memory = advisory_candidate_memory("Come", "来吧");
         let mut stage = ReviewStage::new(
             &options,
             &batches,
             &translated,
-            &ContextMemory::default(),
+            &memory,
             &BTreeMap::new(),
             ReviewResumeInput {
                 completed_batches: 0,

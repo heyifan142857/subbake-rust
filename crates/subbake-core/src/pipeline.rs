@@ -22,7 +22,7 @@ use crate::recovery::{
     retry_correction_message, split_index,
 };
 use crate::review::{ReviewBatchPlan, build_review_messages, parse_review_payload};
-use crate::storage::{InputSignature, ResumeSnapshot, build_glossary_fingerprint};
+use crate::storage::{InputSignature, ResumeSnapshot, build_document_guide_fingerprint};
 use crate::validation::{
     FinalValidationIssue, FinalValidationPolicy, final_validation_error, final_validation_issues,
     validate_final_output, validate_full_alignment, validate_translation_batch,
@@ -416,10 +416,11 @@ where
 
         let terminology = self.run_terminology_preflight(document)?;
         self.sync_enforced_entities();
-        // Freeze the effective preflight glossary once for this run. Later
+        // Freeze the effective preflight guidance once for this run. Later
         // batches may learn advisory terms, but all Resume writes must retain
         // the same semantic-input fingerprint.
-        self.options.glossary_fingerprint = Some(build_glossary_fingerprint(&self.memory.glossary));
+        self.options.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&self.memory));
         let translation_memory_scope = translation_memory_scope(&self.options);
         let translation_memory_keys =
             contextual_translation_memory_keys(&translation_memory_scope, &document.segments);
@@ -584,12 +585,22 @@ where
     }
 
     fn sync_enforced_entities(&mut self) {
-        for entity in &self.memory.terminology_entities {
+        let characters = self
+            .memory
+            .document_guide
+            .characters
+            .iter()
+            .map(|character| crate::entities::TerminologyEntity {
+                canonical_source: character.canonical_source.clone(),
+                kind: crate::entities::TerminologyKind::Person,
+                variants: character.aliases.clone(),
+            });
+        for entity in characters.chain(self.memory.document_guide.terminology.iter().cloned()) {
             if entity.kind.is_enforced() {
-                for variant in &entity.variants {
+                for variant in entity.variants {
                     self.required_glossary
                         .entry(variant.source.to_lowercase())
-                        .or_insert_with(|| variant.target.clone());
+                        .or_insert(variant.target);
                 }
             }
         }
@@ -2600,17 +2611,21 @@ mod tests {
                 let candidates = parsed["candidates"].as_array().ok_or_else(|| {
                     CoreError::DataInvariant("missing terminology candidates".to_owned())
                 })?;
-                let entries = candidates
+                let terminology = candidates
                     .iter()
                     .map(|candidate| {
                         serde_json::json!({
-                            "source": candidate["source"],
-                            "target": "统一译名",
+                            "canonical_source": candidate["source"],
+                            "kind": "domain_term",
+                            "variants": [{
+                                "source": candidate["source"],
+                                "target": "统一译名",
+                            }],
                         })
                     })
                     .collect::<Vec<_>>();
                 return Ok(GenerationResponse::json(
-                    serde_json::json!({"entries": entries}),
+                    serde_json::json!({"guide": {"terminology": terminology}}),
                     Usage::default(),
                 ));
             }
@@ -3205,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_run_state_fingerprints_the_frozen_glossary() {
+    fn pipeline_run_state_fingerprints_the_frozen_document_guide() {
         let document = document("resume-glossary.txt", &["hello"]);
         let mut options = PipelineOptions::new("resume-glossary.txt".into());
         options.terminology_preflight = false;
@@ -3249,17 +3264,18 @@ mod tests {
             1
         );
         let mut expected_options = options;
-        expected_options.glossary_fingerprint = Some(build_glossary_fingerprint(
-            &loaded_glossary.into_iter().collect(),
-        ));
+        let mut expected_memory = ContextMemory::new();
+        expected_memory.glossary = loaded_glossary.into_iter().collect();
+        expected_options.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&expected_memory));
         let expected = crate::storage::build_translation_fingerprint(&expected_options, &signature);
         assert_eq!(state.translation_fingerprint, expected);
 
-        expected_options.glossary_fingerprint = Some(build_glossary_fingerprint(
-            &[("Lord".to_owned(), "领主".to_owned())]
-                .into_iter()
-                .collect(),
-        ));
+        expected_memory.glossary = [("Lord".to_owned(), "领主".to_owned())]
+            .into_iter()
+            .collect();
+        expected_options.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&expected_memory));
         let changed = crate::storage::build_translation_fingerprint(&expected_options, &signature);
         assert!(state.resume_snapshot(&changed).is_none());
     }
@@ -3269,8 +3285,8 @@ mod tests {
         let source = document("/shows/one/clip.txt", &["Fine."]);
         let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
         same_scope_options.resume = false;
-        same_scope_options.glossary_fingerprint =
-            Some(build_glossary_fingerprint(&BTreeMap::new()));
+        same_scope_options.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&ContextMemory::new()));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&same_scope_options),
             &source.segments,
@@ -3342,10 +3358,11 @@ mod tests {
         options.glossary_path = Some("glossary.json".into());
         options.resume = false;
         options.agent = false;
-        options.glossary_fingerprint = Some(build_glossary_fingerprint(&BTreeMap::from([(
-            "Lord".to_owned(),
-            "领主".to_owned(),
-        )])));
+        let mut key_memory = ContextMemory::new();
+        key_memory
+            .glossary
+            .insert("Lord".to_owned(), "领主".to_owned());
+        options.document_guide_fingerprint = Some(build_document_guide_fingerprint(&key_memory));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&options),
             &source.segments,
@@ -3951,7 +3968,7 @@ mod tests {
 
     #[test]
     fn agent_can_repair_review_validation_failure() {
-        let document = document("review-agent.txt", &["Meet Alice now."]);
+        let document = document("review-agent.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-agent.txt".into());
         options.batch_size = 1;
         options.retries = 0;
@@ -3973,7 +3990,10 @@ mod tests {
         assert_eq!(repair_calls.load(Ordering::SeqCst), 1);
         assert_eq!(run.result.agent_repairs.len(), 1);
         assert_eq!(run.result.agent_repairs[0].stage, "review");
-        assert_eq!(run.translated_segments[0].text, "[ECHO] Meet Alice now.");
+        assert_eq!(
+            run.translated_segments[0].text,
+            format!("[ECHO] {REVIEW_CANDIDATE_A}")
+        );
     }
 
     #[test]
@@ -4115,13 +4135,17 @@ mod tests {
         }];
         let parsed = parse_terminology_payload(
             &serde_json::json!({
-                "entries": [{"source": "Axe Gang", "target": "斧头帮"}]
+                "guide": {"terminology": [{
+                    "canonical_source": "Axe Gang",
+                    "kind": "organization",
+                    "variants": [{"source": "Axe Gang", "target": "斧头帮"}]
+                }]}
             }),
             &candidates,
             &[segment("1", "The Axe Gang is here.")],
         )
         .expect("valid terminology");
-        assert_eq!(parsed.entries[0].target, "斧头帮");
+        assert_eq!(parsed.guide.terminology[0].variants[0].target, "斧头帮");
 
         let alias_candidates = vec![
             TerminologyCandidate {
@@ -4142,15 +4166,24 @@ mod tests {
         ];
         let aliases = parse_terminology_payload(
             &serde_json::json!({
-                "entities": [{
-                    "canonical_source": "Joey Zasa",
-                    "kind": "person",
-                    "variants": [
-                        {"source": "Joey Zasa", "target": "乔伊·扎萨"},
-                        {"source": "Joey", "target": "乔伊"},
-                        {"source": "Zasa", "target": "扎萨"}
-                    ]
-                }]
+                "guide": {
+                    "synopsis": "Joey Zasa arrives to negotiate.",
+                    "genre": "crime drama",
+                    "tone": "tense",
+                    "target_audience": "adult",
+                    "characters": [{
+                        "canonical_source": "Joey Zasa",
+                        "canonical_target": "乔伊·扎萨",
+                        "aliases": [
+                            {"source": "Joey Zasa", "target": "乔伊·扎萨"},
+                            {"source": "Joey", "target": "乔伊"},
+                            {"source": "Zasa", "target": "扎萨"}
+                        ],
+                        "gender": "male",
+                        "relationships": ["rival negotiator"],
+                        "speaking_style": "controlled and formal"
+                    }]
+                }
             }),
             &alias_candidates,
             &[
@@ -4160,18 +4193,25 @@ mod tests {
             ],
         )
         .expect("entity aliases");
-        assert_eq!(aliases.entities[0].variants[1].target, "乔伊");
-        assert_eq!(aliases.entities[0].variants[2].target, "扎萨");
+        assert_eq!(aliases.guide.genre, "crime drama");
+        assert_eq!(aliases.guide.tone, "tense");
+        assert_eq!(aliases.guide.characters[0].gender.as_deref(), Some("male"));
+        assert_eq!(aliases.guide.characters[0].aliases[1].target, "乔伊");
+        assert_eq!(aliases.guide.characters[0].aliases[2].target, "扎萨");
 
         let error = parse_terminology_payload(
             &serde_json::json!({
-                "entries": [{"source": "Unknown", "target": "未知"}]
+                "guide": {"terminology": [{
+                    "canonical_source": "Unknown",
+                    "kind": "proper_name",
+                    "variants": [{"source": "Unknown", "target": "未知"}]
+                }]}
             }),
             &candidates,
             &[segment("1", "The Axe Gang is here.")],
         )
         .expect_err("unknown source rejected");
-        assert!(error.to_string().contains("unknown source"));
+        assert!(error.to_string().contains("unknown or empty variant"));
     }
 
     #[test]
@@ -4182,14 +4222,21 @@ mod tests {
         ];
         let parsed = parse_terminology_payload(
             &serde_json::json!({
-                "entries": [{"source": "量子航行系统", "target": "quantum navigation system"}]
+                "guide": {"terminology": [{
+                    "canonical_source": "量子航行系统",
+                    "kind": "domain_term",
+                    "variants": [{"source": "量子航行系统", "target": "quantum navigation system"}]
+                }]}
             }),
             &[],
             &segments,
         )
         .expect("document sample term");
 
-        assert_eq!(parsed.entries[0].source, "量子航行系统");
+        assert_eq!(
+            parsed.guide.terminology[0].variants[0].source,
+            "量子航行系统"
+        );
     }
 
     #[test]
@@ -4365,27 +4412,42 @@ mod tests {
         }];
         let parsed = parse_terminology_payload(
             &serde_json::json!({
-                "entries": [
-                    {"source": "All", "target": "全"},
-                    {"source": "Big", "target": "大"},
-                    {"source": "Summer", "target": "夏茉"}
-                ],
-                "entities": [
+                "guide": {
+                  "characters": [
                     {
-                        "canonical_source": "Morty",
-                        "kind": "person",
-                        "variants": [
-                            {"source": "Morty", "target": "莫蒂"},
-                            {"source": "M-Morty", "target": "莫-莫蒂"},
-                            {"source": "Morty's", "target": "莫蒂的"}
-                        ]
+                      "canonical_source": "Morty",
+                      "canonical_target": "莫蒂",
+                      "aliases": [
+                        {"source": "Morty", "target": "莫蒂"},
+                        {"source": "M-Morty", "target": "莫-莫蒂"},
+                        {"source": "Morty's", "target": "莫蒂的"}
+                      ]
                     },
                     {
-                        "canonical_source": "All",
-                        "kind": "person",
-                        "variants": [{"source": "All", "target": "全"}]
+                      "canonical_source": "All",
+                      "canonical_target": "全",
+                      "aliases": [{"source": "All", "target": "全"}]
                     }
-                ]
+                  ],
+                  "terminology": [
+                    {
+                      "canonical_source": "All",
+                      "kind": "domain_term",
+                      "variants": [{"source": "All", "target": "全"}]
+                    },
+                    {
+                      "canonical_source": "Big",
+                      "kind": "domain_term",
+                      "variants": [{"source": "Big", "target": "大"}]
+                    },
+                    {
+                      "canonical_source": "Summer",
+                      "kind": "proper_name",
+                      "variants": [{"source": "Summer", "target": "夏茉"}]
+                    }
+                  ],
+                  "tone": "informal"
+                }
             }),
             &candidates,
             &[
@@ -4397,12 +4459,12 @@ mod tests {
         )
         .expect("ordinary response entries should be safely omitted");
 
-        assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.entries[0].source, "Summer");
-        assert_eq!(parsed.entities.len(), 1);
-        assert_eq!(parsed.entities[0].canonical_source, "Morty");
-        assert_eq!(parsed.entities[0].variants.len(), 1);
-        assert_eq!(parsed.entities[0].variants[0].source, "Morty");
+        assert_eq!(parsed.guide.terminology.len(), 1);
+        assert_eq!(parsed.guide.terminology[0].canonical_source, "Summer");
+        assert_eq!(parsed.guide.characters.len(), 1);
+        assert_eq!(parsed.guide.characters[0].canonical_source, "Morty");
+        assert_eq!(parsed.guide.characters[0].aliases.len(), 1);
+        assert_eq!(parsed.guide.characters[0].aliases[0].source, "Morty");
     }
 
     #[test]
@@ -4769,7 +4831,7 @@ mod tests {
 
     #[test]
     fn pipeline_reviews_high_risk_batches_and_replaces_output() {
-        let document = document("review.txt", &["Meet Alice now.", "move now."]);
+        let document = document("review.txt", &[REVIEW_CANDIDATE_A, "move now."]);
         let mut options = PipelineOptions::new("review.txt".into());
         options.batch_size = 2;
         options.resume = false;
@@ -4808,15 +4870,13 @@ mod tests {
         assert_eq!(run.result.usage.total_tokens, 5);
         assert_eq!(
             run.translated_segments[0].text,
-            "[REVIEWED] [ECHO] Meet Alice now."
+            format!("[REVIEWED] [ECHO] {REVIEW_CANDIDATE_A}")
         );
         let data = captured.lock().expect("capture lock");
-        assert_eq!(
+        assert!(
             data.saved_translation_memory
                 .iter()
-                .find(|(key, _)| key.ends_with(":meet alice now."))
-                .map(|(_, text)| text.as_str()),
-            Some("[REVIEWED] [ECHO] Meet Alice now.")
+                .any(|(_, text)| text == &format!("[REVIEWED] [ECHO] {REVIEW_CANDIDATE_A}"))
         );
         let report = data.review_reports.last().expect("review report");
         assert_eq!(report.version, 2);
@@ -4832,7 +4892,7 @@ mod tests {
 
     #[test]
     fn cinema_full_review_uses_batches_independent_of_scene_splits() {
-        let mut document = document("review-scenes.txt", &["First scene.", "Second scene."]);
+        let mut document = document("review-scenes.txt", &[REVIEW_CANDIDATE_A, "Second scene."]);
         document.segments[0].start = Some("00:00:00,000".to_owned());
         document.segments[0].end = Some("00:00:01,000".to_owned());
         document.segments[1].start = Some("00:00:03,000".to_owned());
@@ -4867,7 +4927,10 @@ mod tests {
 
     #[test]
     fn parallel_review_uses_the_explicit_reviewer_backend() {
-        let document = document("parallel-review.txt", &["First.", "Second."]);
+        let document = document(
+            "parallel-review.txt",
+            &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
+        );
         let mut options = PipelineOptions::new("parallel-review.txt".into());
         options.batch_size = 1;
         options.translation_concurrency = 2;
@@ -4955,6 +5018,57 @@ mod tests {
                 .iter()
                 .all(|context| context.get("recent").is_none())
         );
+        assert!(
+            contexts
+                .iter()
+                .all(|context| context.get("relevant_previous").is_none())
+        );
+    }
+
+    #[test]
+    fn cinema_translation_retrieves_relevant_distant_confirmed_lines() {
+        let mut document = document(
+            "cinema-retrieval.srt",
+            &[
+                "The quantum beacon accepted the override.",
+                "Nothing else matters here.",
+                "Check the quantum beacon again.",
+            ],
+        );
+        for (index, segment) in document.segments.iter_mut().enumerate() {
+            let seconds = index * 3;
+            segment.start = Some(format!("00:00:{seconds:02},000"));
+            segment.end = Some(format!("00:00:{:02},000", seconds + 1));
+        }
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut options = PipelineOptions::new("cinema-retrieval.srt".into());
+        options.mode = crate::TranslationMode::Cinema;
+        options.batch_size = 1;
+        options.translation_concurrency = 1;
+        options.terminology_preflight = false;
+        options.review_policy = ReviewPolicy::Off;
+        options.resume = false;
+        options.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(
+            ContextCaptureBackend {
+                contexts: Arc::clone(&contexts),
+            },
+            NoopDashboard,
+            options,
+        );
+
+        pipeline
+            .run_document(&document)
+            .expect("cinema retrieval run");
+
+        let contexts = contexts.lock().expect("context lock");
+        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts[2]["confirmed_previous"][0]["id"], "2");
+        assert_eq!(contexts[2]["relevant_previous"][0]["id"], "1");
+        assert_eq!(
+            contexts[2]["relevant_previous"][0]["translation"],
+            "[ECHO] The quantum beacon accepted the override."
+        );
     }
 
     #[test]
@@ -4993,7 +5107,10 @@ mod tests {
 
     #[test]
     fn parallel_review_falls_back_to_the_translator_without_a_reviewer() {
-        let document = document("parallel-self-review.txt", &["First.", "Second."]);
+        let document = document(
+            "parallel-self-review.txt",
+            &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
+        );
         let mut options = PipelineOptions::new("parallel-self-review.txt".into());
         options.batch_size = 1;
         options.translation_concurrency = 2;
@@ -5027,7 +5144,7 @@ mod tests {
 
     #[test]
     fn full_review_records_zero_changes_for_an_empty_patch() {
-        let document = document("review-zero.txt", &["Meet Alice now."]);
+        let document = document("review-zero.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-zero.txt".into());
         options.review_policy = ReviewPolicy::Full;
         options.resume = false;
@@ -5039,12 +5156,18 @@ mod tests {
         assert_eq!(run.result.review.reviewed_lines, 1);
         assert_eq!(run.result.review.changed_lines, 0);
         assert_eq!(run.result.review.usage.total_tokens, 6);
-        assert_eq!(run.translated_segments[0].text, "[ECHO] Meet Alice now.");
+        assert_eq!(
+            run.translated_segments[0].text,
+            format!("[ECHO] {REVIEW_CANDIDATE_A}")
+        );
     }
 
     #[test]
     fn pipeline_resumes_review_batches_from_shards() {
-        let document = document("review-resume.txt", &["Meet Alice now.", "Meet Bob now."]);
+        let document = document(
+            "review-resume.txt",
+            &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
+        );
         let mut options = PipelineOptions::new("review-resume.txt".into());
         options.batch_size = 1;
         options.retries = 0;
@@ -5130,7 +5253,7 @@ mod tests {
 
     #[test]
     fn pipeline_reuses_review_request_cache() {
-        let document = document("review-cache.txt", &["Meet Alice now."]);
+        let document = document("review-cache.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-cache.txt".into());
         options.batch_size = 1;
         options.resume = false;
@@ -5180,7 +5303,7 @@ mod tests {
         assert_eq!(run.result.usage, Usage::default());
         assert_eq!(
             run.translated_segments[0].text,
-            "[REVIEWED] [ECHO] Meet Alice now."
+            format!("[REVIEWED] [ECHO] {REVIEW_CANDIDATE_A}")
         );
     }
 
@@ -5205,6 +5328,9 @@ mod tests {
             semantic: Default::default(),
         }
     }
+
+    const REVIEW_CANDIDATE_A: &str = "This intentionally overlong subtitle line is a deterministic readability candidate for document review routing tests.";
+    const REVIEW_CANDIDATE_B: &str = "Another intentionally overlong subtitle line is a deterministic readability candidate for parallel review tests.";
 
     fn document(path: &str, texts: &[&str]) -> SubtitleDocument {
         SubtitleDocument {

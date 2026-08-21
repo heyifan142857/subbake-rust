@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::entities::{ConfirmedTranslationContext, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
@@ -16,6 +16,7 @@ pub(super) struct SourceBatchContext {
 pub(super) struct TranslationPromptContext {
     pub source: SourceBatchContext,
     pub previous_confirmed: Vec<ConfirmedTranslationContext>,
+    pub relevant_previous: Vec<ConfirmedTranslationContext>,
 }
 
 impl TranslationPromptContext {
@@ -209,9 +210,153 @@ impl TranslationStage {
         bounded_confirmed_context(&context, max_lines, token_budget)
     }
 
+    pub fn relevant_previous_context(
+        &self,
+        query: &[SubtitleSegment],
+        excluded_ids: &HashSet<&str>,
+        max_lines: usize,
+        token_budget: usize,
+    ) -> Vec<ConfirmedTranslationContext> {
+        if query.is_empty() || max_lines == 0 || token_budget == 0 {
+            return Vec::new();
+        }
+        let query_terms = query
+            .iter()
+            .map(|segment| retrieval_terms(&segment.text))
+            .collect::<Vec<_>>();
+        let confirmed_source = self
+            .batches
+            .iter()
+            .take(self.next_batch)
+            .flatten()
+            .collect::<Vec<_>>();
+        let mut ranked = confirmed_source
+            .into_iter()
+            .zip(&self.output)
+            .enumerate()
+            .filter(|(_, (source, _))| !excluded_ids.contains(source.id.as_str()))
+            .filter_map(|(index, (source, translated))| {
+                let candidate_terms = retrieval_terms(&source.text);
+                let score = query
+                    .iter()
+                    .zip(&query_terms)
+                    .map(|(query, terms)| {
+                        retrieval_score(&query.text, terms, &source.text, &candidate_terms)
+                    })
+                    .max()
+                    .unwrap_or_default();
+                (score > 0).then(|| {
+                    (
+                        score,
+                        index,
+                        ConfirmedTranslationContext {
+                            id: source.id.clone(),
+                            source: source.text.clone(),
+                            translation: translated.text.clone(),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        let mut selected = Vec::new();
+        let mut tokens = 0usize;
+        for (_, index, line) in ranked.into_iter().take(max_lines.saturating_mul(3)) {
+            let estimate = super::planning::estimated_text_tokens(&line.source)
+                .saturating_add(super::planning::estimated_text_tokens(&line.translation))
+                .saturating_add(8);
+            if !selected.is_empty() && tokens.saturating_add(estimate) > token_budget {
+                continue;
+            }
+            selected.push((index, line));
+            tokens = tokens.saturating_add(estimate);
+            if selected.len() == max_lines {
+                break;
+            }
+        }
+        selected.sort_by_key(|(index, _)| *index);
+        selected.into_iter().map(|(_, line)| line).collect()
+    }
+
     pub fn finish(self) -> Vec<SubtitleSegment> {
         self.output
     }
+}
+
+fn retrieval_score(
+    query_text: &str,
+    query_terms: &BTreeSet<String>,
+    candidate_text: &str,
+    candidate_terms: &BTreeSet<String>,
+) -> usize {
+    let query_normalized = normalized_retrieval_text(query_text);
+    let candidate_normalized = normalized_retrieval_text(candidate_text);
+    if !query_normalized.is_empty() && query_normalized == candidate_normalized {
+        return 10_000;
+    }
+    let shared = query_terms
+        .intersection(candidate_terms)
+        .collect::<Vec<_>>();
+    if shared.len() < 2 && !shared.iter().any(|term| term.chars().count() >= 6) {
+        return 0;
+    }
+    let shared_weight = shared
+        .iter()
+        .map(|term| term.chars().count().min(12))
+        .sum::<usize>();
+    let denominator = candidate_terms.len().max(query_terms.len()).max(1);
+    shared_weight
+        .saturating_mul(100)
+        .saturating_add(shared.len().saturating_mul(100) / denominator)
+}
+
+fn retrieval_terms(text: &str) -> BTreeSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "and", "are", "but", "for", "from", "have", "just", "that", "the", "this", "was", "what",
+        "when", "with", "you", "your",
+    ];
+    let mut terms = BTreeSet::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, terms: &mut BTreeSet<String>| {
+        if current.is_empty() {
+            return;
+        }
+        let value = current.to_lowercase();
+        let length = value.chars().count();
+        if length >= 2 && !STOPWORDS.contains(&value.as_str()) {
+            terms.insert(value.clone());
+        }
+        let characters = value.chars().collect::<Vec<_>>();
+        if characters.iter().all(|character| is_cjk(*character)) && characters.len() > 2 {
+            for pair in characters.windows(2) {
+                terms.insert(pair.iter().collect());
+            }
+        }
+        current.clear();
+    };
+    for character in text.chars() {
+        if character.is_alphanumeric() || is_cjk(character) {
+            current.push(character);
+        } else {
+            flush(&mut current, &mut terms);
+        }
+    }
+    flush(&mut current, &mut terms);
+    terms
+}
+
+fn normalized_retrieval_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric() || is_cjk(*character))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+    )
 }
 
 pub(super) fn bounded_confirmed_context(
@@ -317,5 +462,48 @@ mod tests {
             token_bounded.last().map(|line| line.id.as_str()),
             Some("20")
         );
+    }
+
+    #[test]
+    fn relevant_previous_retrieves_a_distant_match_and_excludes_recent_context() {
+        let batches = vec![
+            vec![segment("1", "The quantum beacon accepted the override.")],
+            vec![segment("2", "Nothing else matters here.")],
+            vec![segment("3", "Check the quantum beacon again.")],
+        ];
+        let mut stage =
+            TranslationStage::new(batches, 0, Vec::new(), HashMap::new()).expect("stage");
+        for (id, translation) in [("1", "量子信标接受了覆盖指令。"), ("2", "别的都不重要。")]
+        {
+            let mut prepared = stage.prepare_window(1, false, &HashMap::new());
+            stage
+                .apply(
+                    prepared.remove(0),
+                    Some(BatchWithUsage {
+                        lines: vec![TranslationLine {
+                            id: id.to_owned(),
+                            translation: translation.to_owned(),
+                        }],
+                        summary: String::new(),
+                        glossary_updates: Vec::new(),
+                        terminology_updates: Vec::new(),
+                        usage: Default::default(),
+                        cache_key: None,
+                    }),
+                )
+                .expect("apply confirmed batch");
+        }
+
+        let excluded = HashSet::from(["2"]);
+        let relevant = stage.relevant_previous_context(
+            &[segment("3", "Check the quantum beacon again.")],
+            &excluded,
+            4,
+            600,
+        );
+
+        assert_eq!(relevant.len(), 1);
+        assert_eq!(relevant[0].id, "1");
+        assert_eq!(relevant[0].translation, "量子信标接受了覆盖指令。");
     }
 }

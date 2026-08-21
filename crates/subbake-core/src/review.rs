@@ -59,7 +59,7 @@ pub(crate) fn build_review_plan(
     let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (source, translated) in batches.iter().flatten().zip(translated_segments) {
         translations_by_source
-            .entry(normalize_text(&source.text))
+            .entry(consistency_key(&source.text))
             .or_default()
             .insert(normalize_text(&translated.text));
     }
@@ -123,38 +123,59 @@ pub(crate) fn build_review_plan(
 pub(crate) fn build_full_review_plan(
     batches: &[Vec<SubtitleSegment>],
     translated_segments: &[SubtitleSegment],
+    memory: &ContextMemory,
+    source_language: &str,
+    target_language: &str,
 ) -> Vec<ReviewBatchPlan> {
     let all_source = batches.iter().flatten().cloned().collect::<Vec<_>>();
-    let mut offset = 0;
-    batches
-        .iter()
-        .enumerate()
-        .map(|(batch_index, source)| {
-            let end = offset + source.len();
-            let consistency_groups =
-                build_consistency_groups(&all_source, translated_segments, source);
-            let consistency_ids = consistency_groups
-                .iter()
-                .flat_map(|group| &group.occurrences)
-                .filter(|occurrence| occurrence.editable)
-                .map(|occurrence| occurrence.source.id.as_str())
-                .collect::<BTreeSet<_>>();
-            let plan = ReviewBatchPlan {
+    let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (source, translated) in all_source.iter().zip(translated_segments) {
+        translations_by_source
+            .entry(consistency_key(&source.text))
+            .or_default()
+            .insert(normalize_text(&translated.text));
+    }
+    let mut plan = Vec::new();
+    let mut offset = 0usize;
+    for (batch_index, source) in batches.iter().enumerate() {
+        let end = offset + source.len();
+        let translated = &translated_segments[offset..end];
+        let consistency_groups = build_consistency_groups(&all_source, translated_segments, source);
+        let mut candidate_reasons = BTreeMap::new();
+        for (local_index, (source, translated)) in source.iter().zip(translated).enumerate() {
+            let mut reasons = line_review_reasons(
+                source,
+                translated,
+                memory,
+                &translations_by_source,
+                !source_language.eq_ignore_ascii_case(target_language),
+            );
+            reasons.extend(document_guide_review_reasons(source, translated, memory));
+            let document_index = offset + local_index;
+            if has_contextual_pronoun_risk(&all_source, document_index, memory, source_language) {
+                reasons.push("pronoun/coreference continuity".to_owned());
+            }
+            reasons.sort();
+            reasons.dedup();
+            if !reasons.is_empty() {
+                candidate_reasons.insert(source.id.clone(), reasons);
+            }
+        }
+        if !candidate_reasons.is_empty() {
+            let reasons = candidate_reasons
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            plan.push(ReviewBatchPlan {
                 batch_index: batch_index + 1,
                 start_offset: offset,
                 source: source.clone(),
-                translated: translated_segments[offset..end].to_vec(),
-                reasons: vec!["full review".to_owned()],
-                candidate_reasons: source
-                    .iter()
-                    .map(|segment| {
-                        let mut reasons = vec!["full review".to_owned()];
-                        if consistency_ids.contains(segment.id.as_str()) {
-                            reasons.push("repeated source consistency".to_owned());
-                        }
-                        (segment.id.clone(), reasons)
-                    })
-                    .collect(),
+                translated: translated.to_vec(),
+                reasons,
+                candidate_reasons,
                 before: review_context(
                     &all_source,
                     translated_segments,
@@ -169,11 +190,11 @@ pub(crate) fn build_full_review_plan(
                         .min(all_source.len()),
                 ),
                 consistency_groups,
-            };
-            offset = end;
-            plan
-        })
-        .collect()
+            });
+        }
+        offset = end;
+    }
+    plan
 }
 
 fn build_consistency_groups(
@@ -187,7 +208,7 @@ fn build_consistency_groups(
         .collect::<BTreeSet<_>>();
     let mut indices_by_source = BTreeMap::<String, Vec<usize>>::new();
     for (index, segment) in source.iter().enumerate() {
-        let key = normalize_text(&segment.text);
+        let key = consistency_key(&segment.text);
         if !key.is_empty() {
             indices_by_source.entry(key).or_default().push(index);
         }
@@ -396,19 +417,19 @@ pub(crate) fn build_review_messages(
                 .collect(),
         );
     }
-    if !memory.terminology_entities.is_empty() {
-        payload["terminology_entities"] =
-            serde_json::to_value(&memory.terminology_entities).unwrap_or_default();
+    let guide = memory.select_relevant_document_guide(&texts);
+    if !guide.is_empty() {
+        payload["document_guide"] = serde_json::to_value(guide).unwrap_or_default();
     }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
     let (system, response_shape, instructions) = match options.review_policy {
         ReviewPolicy::Full => (
             format!(
-                "You are SubBake's final subtitle revision adjudicator.\n\
+                "You are SubBake's document-level targeted subtitle revision adjudicator.\n\
                  Return valid JSON only.\n\
-                 Review {} subtitles for material improvements in meaning accuracy, omissions, terminology, cross-document consistency, speaker register, natural fluency, and subtitle readability.\n\
+                 Review only the listed risk candidates in {} subtitles. The complete translation was scanned before this request; non-candidate context is read-only. Check meaning accuracy, omissions, terminology, cross-document consistency, pronouns, forms of address, speaker register, natural fluency, and subtitle readability.\n\
                  First resolve every deterministic_issues entry. Treat required_glossary values as mandatory exact targets; terminology_hints are advisory and never override them.\n\
-                 Preserve facts, numbers, formatting markers, required terminology, tone, humor, emotion, profanity, and intentionally incomplete phrasing across cue boundaries.\n\
+                 Treat document_guide as frozen evidence, but do not force advisory character or terminology guidance when local meaning clearly differs. Preserve facts, numbers, formatting markers, required terminology, tone, humor, emotion, profanity, and intentionally incomplete phrasing across cue boundaries.\n\
                  Do not replace a sound translation with a merely different synonym.{}",
                 options.target_language,
                 if options.policy().review_strategy == ReviewStrategy::Adjudicated {
@@ -418,7 +439,7 @@ pub(crate) fn build_review_messages(
                 }
             ),
             "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\",\"category\":\"<category>\",\"rationale\":\"<short reason>\"}]}",
-            "Return a change for every listed deterministic issue. For all other lines, change one only when the replacement materially improves it. category must be one of accuracy, omission, terminology, consistency, register, fluency, or readability. rationale must be concise and specific. Omit unchanged lines only after checking them.",
+            "Return a change for every listed deterministic issue. For other candidate reasons, change a line only when the supplied document evidence confirms a material problem. category must be one of accuracy, omission, terminology, consistency, register, fluency, or readability. rationale must be concise and specific. Omit candidates that do not need a change.",
         ),
         ReviewPolicy::Targeted | ReviewPolicy::Off => (
             format!(
@@ -614,7 +635,7 @@ fn line_review_reasons(
         reasons.push("subtitle readability risk".to_owned());
     }
     if translations_by_source
-        .get(&normalize_text(&source.text))
+        .get(&consistency_key(&source.text))
         .is_some_and(|translations| translations.len() > 1)
     {
         reasons.push("inconsistent repeated translation".to_owned());
@@ -628,11 +649,116 @@ fn line_review_reasons(
     reasons
 }
 
+fn document_guide_review_reasons(
+    source: &SubtitleSegment,
+    translated: &SubtitleSegment,
+    memory: &ContextMemory,
+) -> Vec<String> {
+    let matcher = TermMatcher::case_insensitive();
+    let mut reasons = Vec::new();
+    for character in &memory.document_guide.characters {
+        let source_forms = std::iter::once(character.canonical_source.as_str())
+            .chain(character.aliases.iter().map(|alias| alias.source.as_str()))
+            .collect::<Vec<_>>();
+        if source_forms
+            .iter()
+            .any(|form| !form.is_empty() && matcher.contains(&source.text, form))
+        {
+            let target_forms = std::iter::once(character.canonical_target.as_str())
+                .chain(character.aliases.iter().map(|alias| alias.target.as_str()));
+            if !target_forms
+                .filter(|form| !form.is_empty())
+                .any(|form| matcher.contains(&translated.text, form))
+            {
+                reasons.push("character-name continuity".to_owned());
+            }
+        }
+        for form in &character.forms_of_address {
+            if matcher.contains(&source.text, &form.source)
+                && !matcher.contains(&translated.text, &form.target)
+            {
+                reasons.push("form-of-address consistency".to_owned());
+            }
+        }
+    }
+    for entity in &memory.document_guide.terminology {
+        for variant in &entity.variants {
+            if matcher.contains(&source.text, &variant.source)
+                && !matcher.contains(&translated.text, &variant.target)
+            {
+                reasons.push("document terminology consistency".to_owned());
+            }
+        }
+    }
+    reasons
+}
+
+fn has_contextual_pronoun_risk(
+    source: &[SubtitleSegment],
+    index: usize,
+    memory: &ContextMemory,
+    source_language: &str,
+) -> bool {
+    if !(source_language.eq_ignore_ascii_case("en")
+        || source_language.to_ascii_lowercase().starts_with("english"))
+        || memory.document_guide.characters.is_empty()
+    {
+        return false;
+    }
+    let Some(current) = source.get(index) else {
+        return false;
+    };
+    let words = current
+        .text
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>();
+    if ![
+        "he", "her", "hers", "him", "his", "she", "their", "them", "they",
+    ]
+    .iter()
+    .any(|pronoun| words.contains(*pronoun))
+    {
+        return false;
+    }
+    let start = index.saturating_sub(REVIEW_CONTEXT_LINES);
+    let end = index
+        .saturating_add(REVIEW_CONTEXT_LINES + 1)
+        .min(source.len());
+    let context = source[start..end]
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let matcher = TermMatcher::case_insensitive();
+    memory.document_guide.characters.iter().any(|character| {
+        std::iter::once(character.canonical_source.as_str())
+            .chain(character.aliases.iter().map(|alias| alias.source.as_str()))
+            .any(|name| !name.is_empty() && matcher.contains(&context, name))
+    })
+}
+
 fn normalize_text(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn consistency_key(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn formatting_tokens(text: &str) -> Vec<String> {
@@ -689,7 +815,7 @@ fn subtitle_timestamp_ms(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entities::TranslationMode;
+    use crate::entities::{DocumentCharacter, GlossaryEntry, TranslationMode};
 
     fn segment(id: &str, text: &str, start: &str, end: &str) -> SubtitleSegment {
         SubtitleSegment {
@@ -723,16 +849,13 @@ mod tests {
             .cloned()
             .map(|line| vec![line])
             .collect::<Vec<_>>();
-        let plan = build_full_review_plan(&batches, &translated);
+        let mut memory = ContextMemory::default();
+        memory.load_glossary(&[("two".to_owned(), "二".to_owned())]);
+        let plan = build_full_review_plan(&batches, &translated, &memory, "English", "Chinese");
         let mut options = PipelineOptions::new("review.srt".into());
         options.mode = crate::entities::TranslationMode::Cinema;
 
-        let messages = build_review_messages(
-            &options,
-            &plan[1],
-            &ContextMemory::default(),
-            &BTreeMap::new(),
-        );
+        let messages = build_review_messages(&options, &plan[0], &memory, &BTreeMap::new());
         let payload = messages[1]
             .content
             .split("REVIEW_JSON_START")
@@ -765,7 +888,13 @@ mod tests {
         translated[1].text = "稍后".to_owned();
         translated[2].text = "营业中".to_owned();
         let batches = vec![source[..2].to_vec(), source[2..].to_vec()];
-        let plan = build_full_review_plan(&batches, &translated);
+        let plan = build_full_review_plan(
+            &batches,
+            &translated,
+            &ContextMemory::default(),
+            "English",
+            "Chinese",
+        );
         let mut options = PipelineOptions::new("review.ass".into());
         options.mode = crate::entities::TranslationMode::Cinema;
 
@@ -807,19 +936,18 @@ mod tests {
         )];
         let mut translated = source.clone();
         translated[0].text = "再次离开学校。".to_owned();
-        let plan = build_full_review_plan(&[source], &translated);
-
         let mut full = PipelineOptions::new("review.srt".into());
         full.mode = TranslationMode::Cinema;
         full.review_policy = ReviewPolicy::Full;
         let required_glossary = BTreeMap::from([("school".to_owned(), "学校".to_owned())]);
         let mut memory = ContextMemory::default();
         memory.load_glossary(&[("leave school".to_owned(), "退学".to_owned())]);
+        let plan = build_full_review_plan(&[source], &translated, &memory, "English", "Chinese");
         let full_messages = build_review_messages(&full, &plan[0], &memory, &required_glossary);
         assert!(
             full_messages[0]
                 .content
-                .contains("final subtitle revision adjudicator")
+                .contains("document-level targeted subtitle revision adjudicator")
         );
         assert!(
             full_messages[0]
@@ -882,6 +1010,62 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert!(plan[0].candidate_reasons["1"][0].contains("ambiguous number expression"));
         assert_eq!(plan[0].candidate_reasons["2"], vec!["number mismatch"]);
+    }
+
+    #[test]
+    fn full_review_skips_a_clean_document() {
+        let source = vec![segment(
+            "1",
+            "Open the door.",
+            "00:00:00,000",
+            "00:00:01,000",
+        )];
+        let translated = vec![segment("1", "把门打开。", "00:00:00,000", "00:00:01,000")];
+
+        let plan = build_full_review_plan(
+            &[source],
+            &translated,
+            &ContextMemory::default(),
+            "English",
+            "Chinese",
+        );
+
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn full_review_targets_document_guide_and_pronoun_risks_only() {
+        let source = vec![
+            segment("1", "Alice arrived.", "00:00:00,000", "00:00:01,000"),
+            segment("2", "She sat down.", "00:00:01,000", "00:00:02,000"),
+            segment("3", "Hello there.", "00:00:02,000", "00:00:03,000"),
+        ];
+        let translated = vec![
+            segment("1", "爱丽丝到了。", "00:00:00,000", "00:00:01,000"),
+            segment("2", "他坐下了。", "00:00:01,000", "00:00:02,000"),
+            segment("3", "你好。", "00:00:02,000", "00:00:03,000"),
+        ];
+        let mut memory = ContextMemory::default();
+        memory.document_guide.characters.push(DocumentCharacter {
+            canonical_source: "Alice".to_owned(),
+            canonical_target: "爱丽丝".to_owned(),
+            aliases: vec![GlossaryEntry {
+                source: "Alice".to_owned(),
+                target: "爱丽丝".to_owned(),
+            }],
+            gender: Some("female".to_owned()),
+            ..DocumentCharacter::default()
+        });
+
+        let plan = build_full_review_plan(&[source], &translated, &memory, "English", "Chinese");
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].candidate_reasons["2"],
+            vec!["pronoun/coreference continuity"]
+        );
+        assert!(!plan[0].candidate_reasons.contains_key("1"));
+        assert!(!plan[0].candidate_reasons.contains_key("3"));
     }
 
     #[test]

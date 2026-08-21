@@ -7,14 +7,14 @@ use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
 use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
-pub const RUN_STATE_VERSION: u64 = 4;
+pub const RUN_STATE_VERSION: u64 = 5;
 pub const REVIEW_REPORT_VERSION: u64 = 2;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 16;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 17;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
-pub const CACHE_VERSION: u64 = 3;
+pub const CACHE_VERSION: u64 = 4;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 10;
+pub const PROMPT_CONTRACT_VERSION: u64 = 11;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 4;
 /// Bump when deterministic final-output validation semantics change.
@@ -268,6 +268,12 @@ pub fn build_glossary_fingerprint(glossary: &BTreeMap<String, String>) -> String
     ))
 }
 
+pub fn build_document_guide_fingerprint(memory: &ContextMemory) -> String {
+    let payload =
+        serde_json::to_vec(&(&memory.glossary, &memory.document_guide)).unwrap_or_default();
+    sha1_hex(&payload)
+}
+
 pub fn build_translation_fingerprint(
     options: &PipelineOptions,
     input_signature: &InputSignature,
@@ -322,8 +328,8 @@ pub fn build_translation_fingerprint(
             optional_string(&options.reviewer_fingerprint),
         ),
         (
-            "glossary_fingerprint".to_owned(),
-            optional_string(&options.glossary_fingerprint),
+            "document_guide_fingerprint".to_owned(),
+            optional_string(&options.document_guide_fingerprint),
         ),
         (
             "semantic_versions".to_owned(),
@@ -736,7 +742,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "692036dede89af8cea232c7866a530969a577980"
+            "8c958562b8093694dcfcae342253b41c9db1fbb5"
         );
     }
 
@@ -767,12 +773,15 @@ mod tests {
     #[test]
     fn translation_fingerprint_covers_resume_semantic_inputs() {
         let signature = input_signature_from_bytes(b"subtitle", Some(123));
-        let glossary = BTreeMap::from([("Lord".to_owned(), "勋爵".to_owned())]);
+        let mut guidance = ContextMemory::new();
+        guidance
+            .glossary
+            .insert("Lord".to_owned(), "勋爵".to_owned());
         let mut baseline = PipelineOptions::new("clip.srt".into());
         baseline.provider_fingerprint = Some("openai|responses|https://one.example|gpt".to_owned());
         baseline.reviewer_fingerprint =
             Some("anthropic|messages|https://review.example|opus".to_owned());
-        baseline.glossary_fingerprint = Some(build_glossary_fingerprint(&glossary));
+        baseline.document_guide_fingerprint = Some(build_document_guide_fingerprint(&guidance));
         let fingerprint = build_translation_fingerprint(&baseline, &signature);
 
         let mut changed_provider = baseline.clone();
@@ -790,13 +799,23 @@ mod tests {
             build_translation_fingerprint(&changed_reviewer, &signature)
         );
 
-        let mut changed_glossary = baseline.clone();
-        changed_glossary.glossary_fingerprint = Some(build_glossary_fingerprint(&BTreeMap::from(
-            [("Lord".to_owned(), "领主".to_owned())],
-        )));
+        let mut changed_guidance = baseline.clone();
+        guidance
+            .glossary
+            .insert("Lord".to_owned(), "领主".to_owned());
+        changed_guidance.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&guidance));
         assert_ne!(
             fingerprint,
-            build_translation_fingerprint(&changed_glossary, &signature)
+            build_translation_fingerprint(&changed_guidance, &signature)
+        );
+
+        guidance.document_guide.tone = "dry satire".to_owned();
+        let mut changed_tone = baseline.clone();
+        changed_tone.document_guide_fingerprint = Some(build_document_guide_fingerprint(&guidance));
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_tone, &signature)
         );
 
         let mut changed_review = baseline.clone();
@@ -898,7 +917,7 @@ mod tests {
 
         assert_eq!(
             build_request_hash("OpenAI", "gpt-test", "translate", messages),
-            "b8b52e99d044469a98851eadfdaef02aceb4cf9d"
+            "9b328039eed578ad29033181fbee531e0453049d"
         );
     }
 

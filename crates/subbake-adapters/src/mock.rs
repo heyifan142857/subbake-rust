@@ -74,7 +74,7 @@ impl LlmBackend for MockBackend {
         let payload = match task {
             "translate_subtitles" => serde_json::to_value(translate_subtitles(&prompt)?),
             "review_translations" => serde_json::to_value(review_translations(&prompt)?),
-            "extract_terminology" => serde_json::to_value(TerminologyPreflightResult::default()),
+            "extract_document_guide" => serde_json::to_value(TerminologyPreflightResult::default()),
             "agent_edit_subtitle" => serde_json::to_value(edit_subtitles(&prompt)?),
             other => {
                 return Err(LlmCallError::UnsupportedCapability(format!(

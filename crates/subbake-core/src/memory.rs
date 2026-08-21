@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entities::{GlossaryEntry, TerminologyEntity};
+use crate::entities::{DocumentGuide, GlossaryEntry, TerminologyEntity};
 use crate::term_matcher::TermMatcher;
 
 pub const DEFAULT_MAX_SUMMARIES: usize = 2;
@@ -54,8 +54,9 @@ pub struct ContextMemory {
     /// choose its own first translation while resume remains deterministic.
     #[serde(default)]
     pub name_translations: BTreeMap<String, String>,
+    /// Frozen structured guidance produced before translation.
     #[serde(default)]
-    pub terminology_entities: Vec<TerminologyEntity>,
+    pub document_guide: DocumentGuide,
     #[serde(default)]
     pub terminology_candidates: Vec<String>,
     /// Locally high-confidence personal-name candidates eligible for Turbo's
@@ -90,7 +91,7 @@ impl ContextMemory {
             recent_summaries: Vec::new(),
             glossary: BTreeMap::new(),
             name_translations: BTreeMap::new(),
-            terminology_entities: Vec::new(),
+            document_guide: DocumentGuide::default(),
             terminology_candidates: Vec::new(),
             name_candidates: Vec::new(),
             max_summaries: DEFAULT_MAX_SUMMARIES,
@@ -129,7 +130,7 @@ impl ContextMemory {
     }
 
     pub fn add_terminology_entity(&mut self, entity: TerminologyEntity) {
-        if let Some(current) = self.terminology_entities.iter_mut().find(|current| {
+        if let Some(current) = self.document_guide.terminology.iter_mut().find(|current| {
             current
                 .canonical_source
                 .eq_ignore_ascii_case(&entity.canonical_source)
@@ -145,7 +146,7 @@ impl ContextMemory {
                 }
             }
         } else {
-            self.terminology_entities.push(entity);
+            self.document_guide.terminology.push(entity);
         }
     }
 
@@ -182,6 +183,65 @@ impl ContextMemory {
             .collect()
     }
 
+    /// Select stable document-level guidance for the current scene. Global
+    /// prose stays available, while character and terminology records are
+    /// included only when one of their exact source/target forms is relevant.
+    pub fn select_relevant_document_guide(&self, texts: &[&str]) -> DocumentGuide {
+        let mut selected = DocumentGuide {
+            synopsis: self.document_guide.synopsis.clone(),
+            genre: self.document_guide.genre.clone(),
+            tone: self.document_guide.tone.clone(),
+            target_audience: self.document_guide.target_audience.clone(),
+            ..DocumentGuide::default()
+        };
+        if texts.is_empty() {
+            return selected;
+        }
+        let haystack = texts.join("\n");
+        let matcher = TermMatcher::case_insensitive();
+        selected.characters = self
+            .document_guide
+            .characters
+            .iter()
+            .filter(|character| {
+                std::iter::once(character.canonical_source.as_str())
+                    .chain(std::iter::once(character.canonical_target.as_str()))
+                    .chain(
+                        character
+                            .aliases
+                            .iter()
+                            .flat_map(|alias| [alias.source.as_str(), alias.target.as_str()]),
+                    )
+                    .chain(
+                        character
+                            .forms_of_address
+                            .iter()
+                            .flat_map(|form| [form.source.as_str(), form.target.as_str()]),
+                    )
+                    .any(|term| !term.is_empty() && matcher.contains(&haystack, term))
+            })
+            .take(8)
+            .cloned()
+            .collect();
+        selected.terminology =
+            self.document_guide
+                .terminology
+                .iter()
+                .filter(|entity| {
+                    std::iter::once(entity.canonical_source.as_str())
+                        .chain(
+                            entity.variants.iter().flat_map(|variant| {
+                                [variant.source.as_str(), variant.target.as_str()]
+                            }),
+                        )
+                        .any(|term| !term.is_empty() && matcher.contains(&haystack, term))
+                })
+                .take(16)
+                .cloned()
+                .collect();
+        selected
+    }
+
     /// Legacy persisted summaries, newest last, capped at `max_summaries`.
     /// Translation and review prompts no longer consume this field.
     pub fn recent_summaries_for_prompt(&self) -> &[String] {
@@ -196,6 +256,7 @@ impl ContextMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entities::{DocumentCharacter, TerminologyKind};
 
     #[test]
     fn recognizes_simple_english_possessive_forms() {
@@ -330,14 +391,64 @@ mod tests {
     }
 
     #[test]
-    fn older_memory_without_name_translations_remains_readable() {
+    fn document_guide_selection_keeps_global_style_and_only_relevant_records() {
+        let mut memory = ContextMemory::new();
+        memory.document_guide = DocumentGuide {
+            synopsis: "A portal experiment goes wrong.".to_owned(),
+            genre: "science fiction comedy".to_owned(),
+            tone: "dry and irreverent".to_owned(),
+            target_audience: "adult".to_owned(),
+            characters: vec![
+                DocumentCharacter {
+                    canonical_source: "Rick".to_owned(),
+                    canonical_target: "瑞克".to_owned(),
+                    ..DocumentCharacter::default()
+                },
+                DocumentCharacter {
+                    canonical_source: "Morty".to_owned(),
+                    canonical_target: "莫蒂".to_owned(),
+                    ..DocumentCharacter::default()
+                },
+            ],
+            terminology: vec![
+                TerminologyEntity {
+                    canonical_source: "portal gun".to_owned(),
+                    kind: TerminologyKind::DomainTerm,
+                    variants: vec![GlossaryEntry {
+                        source: "portal gun".to_owned(),
+                        target: "传送枪".to_owned(),
+                    }],
+                },
+                TerminologyEntity {
+                    canonical_source: "Council".to_owned(),
+                    kind: TerminologyKind::Organization,
+                    variants: vec![GlossaryEntry {
+                        source: "Council".to_owned(),
+                        target: "委员会".to_owned(),
+                    }],
+                },
+            ],
+        };
+
+        let selected = memory.select_relevant_document_guide(&["Rick fired the portal gun."]);
+
+        assert_eq!(selected.synopsis, memory.document_guide.synopsis);
+        assert_eq!(selected.characters.len(), 1);
+        assert_eq!(selected.characters[0].canonical_source, "Rick");
+        assert_eq!(selected.terminology.len(), 1);
+        assert_eq!(selected.terminology[0].canonical_source, "portal gun");
+    }
+
+    #[test]
+    fn memory_without_document_guide_uses_an_empty_guide() {
         let restored: ContextMemory = serde_json::from_str(
-            r#"{"style_rules":[],"recent_summaries":[],"glossary":{"Mary":"玛丽"},"terminology_entities":[],"terminology_candidates":[],"max_summaries":2}"#,
+            r#"{"style_rules":[],"recent_summaries":[],"glossary":{"Mary":"玛丽"},"terminology_candidates":[],"max_summaries":2}"#,
         )
-        .expect("deserialize legacy memory");
+        .expect("deserialize memory");
 
         assert!(restored.name_translations.is_empty());
         assert!(restored.name_candidates.is_empty());
+        assert!(restored.document_guide.is_empty());
         assert_eq!(restored.glossary["Mary"], "玛丽");
     }
 }

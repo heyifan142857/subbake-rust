@@ -1,5 +1,5 @@
 use crate::entities::{
-    ConcurrencyStrategy, ReviewPolicy, SubtitleSegment, TerminologyStats, Usage,
+    ConcurrencyStrategy, ContextStrategy, ReviewPolicy, SubtitleSegment, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
@@ -13,6 +13,9 @@ use super::support::validate_window_terminology;
 use super::translation_stage::{
     SourceBatchContext, TranslationPromptContext, TranslationStage, bounded_confirmed_context,
 };
+
+const CINEMA_RELEVANT_PREVIOUS_LINES: usize = 4;
+const CINEMA_RELEVANT_PREVIOUS_TOKEN_BUDGET: usize = 600;
 
 pub(super) struct TranslationRun {
     pub batches: Vec<Vec<SubtitleSegment>>,
@@ -107,12 +110,30 @@ where
             &pipeline.translation_memory,
         );
         for batch in &mut prepared {
+            let source_context = source_contexts
+                .get(batch.index)
+                .cloned()
+                .unwrap_or_default();
+            let excluded_ids = previous_confirmed
+                .iter()
+                .map(|line| line.id.as_str())
+                .chain(source_context.before.iter().map(|line| line.id.as_str()))
+                .collect::<HashSet<_>>();
+            let relevant_previous =
+                if pipeline.options.policy().context_strategy == ContextStrategy::SceneAware {
+                    stage.relevant_previous_context(
+                        &batch.pending,
+                        &excluded_ids,
+                        CINEMA_RELEVANT_PREVIOUS_LINES,
+                        CINEMA_RELEVANT_PREVIOUS_TOKEN_BUDGET,
+                    )
+                } else {
+                    Vec::new()
+                };
             batch.prompt_context = TranslationPromptContext {
-                source: source_contexts
-                    .get(batch.index)
-                    .cloned()
-                    .unwrap_or_default(),
+                source: source_context,
                 previous_confirmed: previous_confirmed.clone(),
+                relevant_previous,
             };
         }
         pipeline.report(

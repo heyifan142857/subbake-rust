@@ -456,9 +456,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use subbake_core::entities::{
-        AgentLog, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry, PipelineOptions,
-        ReviewChange, ReviewReport, ReviewStats, TerminologyPreflightResult, TerminologyStats,
-        TranslationLine, Usage,
+        AgentLog, AttemptLog, BatchTranslationResult, DocumentGuide, FailureLog, GlossaryEntry,
+        PipelineOptions, ReviewChange, ReviewReport, ReviewStats, TerminologyEntity,
+        TerminologyKind, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
     };
     use subbake_core::memory::ContextMemory;
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_python_compatible_run_state_shape() {
+    fn round_trips_versioned_run_state_shape() {
         let root = temp_root("run-state");
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
@@ -708,7 +708,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(loaded, state);
-        assert_eq!(value["version"], 4);
+        assert_eq!(value["version"], 5);
         assert_eq!(value["translation_batches_completed"], 1);
         assert!(value.get("translated_segments").is_none());
         assert!(value.get("pipeline_fingerprint").is_none());
@@ -832,12 +832,17 @@ mod tests {
         let store = FileRuntimeStore::new(paths);
         let response = BackendJsonResult {
             payload: BackendPayload::Terminology(TerminologyPreflightResult {
-                entries: vec![GlossaryEntry {
-                    source: "Axe Gang".to_owned(),
-                    target: "斧头帮".to_owned(),
-                }],
-                entities: Vec::new(),
-                document_brief: String::new(),
+                guide: DocumentGuide {
+                    terminology: vec![TerminologyEntity {
+                        canonical_source: "Axe Gang".to_owned(),
+                        kind: TerminologyKind::Organization,
+                        variants: vec![GlossaryEntry {
+                            source: "Axe Gang".to_owned(),
+                            target: "斧头帮".to_owned(),
+                        }],
+                    }],
+                    ..DocumentGuide::default()
+                },
             }),
             usage: Usage {
                 input_tokens: 10,

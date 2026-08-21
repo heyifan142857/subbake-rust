@@ -2,8 +2,9 @@ use std::time::Instant;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    GlossaryEntry, PipelineOptions, PreflightFailurePolicy, SubtitleDocument, SubtitleSegment,
-    TerminologyEntity, TerminologyPreflightResult, TerminologyStats, TerminologyStrategy, Usage,
+    DocumentCharacter, DocumentGuide, GlossaryEntry, PipelineOptions, PreflightFailurePolicy,
+    SubtitleDocument, SubtitleSegment, TerminologyEntity, TerminologyKind,
+    TerminologyPreflightResult, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::memory::{ContextMemory, english_possessive_base};
@@ -97,17 +98,7 @@ where
                 } else {
                     response.usage
                 };
-                let document_brief = payload.document_brief;
-                let accepted = accept_entries(self.memory, payload.entries, &mut stats);
-                let accepted_entities = accept_entities(self.memory, payload.entities, &mut stats);
-                if self.options.policy().terminology_strategy == TerminologyStrategy::Document
-                    && !document_brief.trim().is_empty()
-                {
-                    let brief = document_brief.trim().chars().take(800).collect::<String>();
-                    self.memory
-                        .style_rules
-                        .push(format!("Document brief: {brief}"));
-                }
+                let guide = accept_document_guide(self.memory, payload.guide, &mut stats);
                 stats.entries_added = self.memory.glossary.len().saturating_sub(existing.len());
                 if self.options.use_cache
                     && stats.cache_hits == 0
@@ -118,9 +109,7 @@ where
                         &hash,
                         &BackendJsonResult {
                             payload: BackendPayload::Terminology(TerminologyPreflightResult {
-                                entries: accepted,
-                                entities: accepted_entities,
-                                document_brief,
+                                guide,
                             }),
                             usage: response.usage,
                         },
@@ -625,7 +614,7 @@ fn build_messages(
     };
     vec![
         crate::ports::ChatMessage::system(format!(
-            "TASK_START\nextract_terminology\nTASK_END\nReturn JSON only as {{\"entries\":[{{\"source\":\"exact source span\",\"target\":\"canonical translation\"}}],\"entities\":[{{\"canonical_source\":\"canonical entity name\",\"kind\":\"person|organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact source span\",\"target\":\"natural translation of that source form\"}}]}}],\"document_brief\":\"short genre, tone, relationship, and register guidance\"}}. Include only names, titles, organizations, places, recurring objects, and domain terms whose translation should stay consistent. Group aliases of one entity while preserving the natural granularity of each source form. {name_policy} Copy every source form exactly from a supplied candidate or a document sample. For languages without case or whitespace cues, use recurring exact spans from the samples. Omit ordinary words and uncertain entries. The brief must be short and advisory; never invent plot facts."
+            "TASK_START\nextract_document_guide\nTASK_END\nReturn JSON only as {{\"guide\":{{\"synopsis\":\"short factual synopsis\",\"genre\":\"genre\",\"tone\":\"tone\",\"target_audience\":\"audience\",\"characters\":[{{\"canonical_source\":\"exact source name\",\"canonical_target\":\"canonical target name\",\"aliases\":[{{\"source\":\"exact source alias\",\"target\":\"target alias\"}}],\"gender\":\"optional only when explicit\",\"relationships\":[\"short factual relationship\"],\"speaking_style\":\"short observed register guidance\",\"forms_of_address\":[{{\"source\":\"exact source form\",\"target\":\"contextual target form\"}}]}}],\"terminology\":[{{\"canonical_source\":\"canonical term\",\"kind\":\"organization|place|proper_name|domain_term\",\"variants\":[{{\"source\":\"exact source span\",\"target\":\"canonical translation\"}}]}}]}}}}. Build one frozen guide for the whole document. Include only recurring or meaning-critical information supported by supplied candidates or samples. Group aliases of one character or term while preserving the natural granularity of each source form. {name_policy} Copy every source name, alias, address form, and terminology variant exactly from a supplied candidate or document sample. Omit ordinary words, uncertain identities, inferred gender, speculative relationships, and invented plot facts. Keep synopsis, genre, tone, audience, relationships, and speaking-style fields concise."
         )),
         crate::ports::ChatMessage::user(format!(
             "TERMINOLOGY_JSON_START{payload}TERMINOLOGY_JSON_END"
@@ -638,48 +627,42 @@ pub(super) fn parse_payload(
     candidates: &[TerminologyCandidate],
     segments: &[SubtitleSegment],
 ) -> CoreResult<TerminologyPreflightResult> {
-    let entries = payload
-        .get("entries")
-        .or_else(|| payload.get("glossary"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let mut parsed = Vec::new();
-    for entry in entries {
-        let source = entry["source"].as_str().unwrap_or_default().trim();
-        let target = entry["target"].as_str().unwrap_or_default().trim();
-        if source.is_empty() || target.is_empty() {
-            return Err(CoreError::InvalidTranslation(
-                "terminology entry contains an empty source or target".to_owned(),
-            ));
-        }
-        if is_ordinary_latin_document_span(source)
-            || candidates
-                .iter()
-                .any(|candidate| is_redundant_possessive(source, &candidate.source))
-        {
-            continue;
-        }
-        let canonical_source = candidates
-            .iter()
-            .find(|candidate| candidate.source.eq_ignore_ascii_case(source))
-            .map(|candidate| candidate.source.clone())
-            .or_else(|| source_span_in_document(source, segments));
-        let Some(canonical_source) = canonical_source else {
-            return Err(CoreError::InvalidTranslation(format!(
-                "terminology response contains unknown source `{source}`"
-            )));
-        };
-        parsed.push(GlossaryEntry {
-            source: canonical_source,
-            target: target.to_owned(),
-        });
+    let mut guide =
+        serde_json::from_value::<DocumentGuide>(payload["guide"].clone()).map_err(|error| {
+            CoreError::InvalidTranslation(format!(
+                "document guide has an invalid structure: {error}"
+            ))
+        })?;
+    guide.synopsis = bounded_text(&guide.synopsis, 800);
+    guide.genre = bounded_text(&guide.genre, 120);
+    guide.tone = bounded_text(&guide.tone, 240);
+    guide.target_audience = bounded_text(&guide.target_audience, 160);
+    guide.characters.truncate(64);
+    for character in &mut guide.characters {
+        validate_character(character, candidates, segments)?;
     }
-    let raw_entities =
-        serde_json::from_value::<Vec<TerminologyEntity>>(payload["entities"].clone())
-            .unwrap_or_default();
+    guide.characters.retain(|character| {
+        !character.canonical_source.is_empty() && !character.canonical_target.is_empty()
+    });
+    guide.terminology = validate_entities(guide.terminology, candidates, segments)?;
+    let character_sources = guide
+        .characters
+        .iter()
+        .map(|character| character.canonical_source.to_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    guide
+        .terminology
+        .retain(|entity| !character_sources.contains(&entity.canonical_source.to_lowercase()));
+    Ok(TerminologyPreflightResult { guide })
+}
+
+fn validate_entities(
+    raw_entities: Vec<TerminologyEntity>,
+    candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
+) -> CoreResult<Vec<TerminologyEntity>> {
     let mut entities = Vec::new();
-    for mut entity in raw_entities {
+    for mut entity in raw_entities.into_iter().take(128) {
         if entity.canonical_source.trim().is_empty() {
             return Err(CoreError::InvalidTranslation(
                 "terminology entity is missing a canonical source or variants".to_owned(),
@@ -709,14 +692,111 @@ pub(super) fn parse_payload(
         }
         entities.push(entity);
     }
-    Ok(TerminologyPreflightResult {
-        entries: parsed,
-        entities,
-        document_brief: payload["document_brief"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
-    })
+    Ok(entities)
+}
+
+fn validate_character(
+    character: &mut DocumentCharacter,
+    candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
+) -> CoreResult<()> {
+    character.canonical_source = character.canonical_source.trim().to_owned();
+    character.canonical_target = character.canonical_target.trim().to_owned();
+    if character.canonical_source.is_empty() || character.canonical_target.is_empty() {
+        return Err(CoreError::InvalidTranslation(
+            "document character is missing a canonical source or target".to_owned(),
+        ));
+    }
+    if !known_source_span(&character.canonical_source, candidates, segments) {
+        return Err(CoreError::InvalidTranslation(format!(
+            "document character contains unknown source `{}`",
+            character.canonical_source
+        )));
+    }
+    if is_ordinary_latin_document_span(&character.canonical_source)
+        && !candidates.iter().any(|candidate| {
+            candidate
+                .source
+                .eq_ignore_ascii_case(&character.canonical_source)
+        })
+    {
+        character.canonical_source.clear();
+        character.canonical_target.clear();
+        character.aliases.clear();
+        return Ok(());
+    }
+    validate_guide_entries(&mut character.aliases, candidates, segments)?;
+    character.aliases.retain(|alias| {
+        !is_ordinary_latin_document_span(&alias.source)
+            && !is_redundant_possessive(&alias.source, &character.canonical_source)
+    });
+    validate_guide_entries(&mut character.forms_of_address, candidates, segments)?;
+    if !character.aliases.iter().any(|alias| {
+        alias
+            .source
+            .eq_ignore_ascii_case(&character.canonical_source)
+    }) {
+        character.aliases.insert(
+            0,
+            GlossaryEntry {
+                source: character.canonical_source.clone(),
+                target: character.canonical_target.clone(),
+            },
+        );
+    }
+    character.aliases.truncate(16);
+    character.forms_of_address.truncate(16);
+    character.gender = character
+        .gender
+        .as_deref()
+        .map(|value| bounded_text(value, 40))
+        .filter(|value| !value.is_empty());
+    character.relationships = character
+        .relationships
+        .iter()
+        .map(|value| bounded_text(value, 160))
+        .filter(|value| !value.is_empty())
+        .take(16)
+        .collect();
+    character.speaking_style = bounded_text(&character.speaking_style, 240);
+    Ok(())
+}
+
+fn validate_guide_entries(
+    entries: &mut Vec<GlossaryEntry>,
+    candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
+) -> CoreResult<()> {
+    for entry in entries.iter_mut() {
+        entry.source = entry.source.trim().to_owned();
+        entry.target = entry.target.trim().to_owned();
+        if entry.source.is_empty()
+            || entry.target.is_empty()
+            || !known_source_span(&entry.source, candidates, segments)
+        {
+            return Err(CoreError::InvalidTranslation(format!(
+                "document guide contains unknown or empty source `{}`",
+                entry.source
+            )));
+        }
+    }
+    entries.dedup_by(|left, right| left.source.eq_ignore_ascii_case(&right.source));
+    Ok(())
+}
+
+fn known_source_span(
+    source: &str,
+    candidates: &[TerminologyCandidate],
+    segments: &[SubtitleSegment],
+) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| candidate.source.eq_ignore_ascii_case(source))
+        || source_span_in_document(source, segments).is_some()
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
 }
 
 fn document_samples(segments: &[SubtitleSegment]) -> Vec<serde_json::Value> {
@@ -774,6 +854,44 @@ fn reserve_provider_request(
     Ok(())
 }
 
+fn accept_document_guide(
+    memory: &mut ContextMemory,
+    mut guide: DocumentGuide,
+    stats: &mut TerminologyStats,
+) -> DocumentGuide {
+    let character_entities = guide
+        .characters
+        .iter()
+        .map(|character| TerminologyEntity {
+            canonical_source: character.canonical_source.clone(),
+            kind: TerminologyKind::Person,
+            variants: character.aliases.clone(),
+        })
+        .collect();
+    let accepted_characters = accept_entities(memory, character_entities, stats);
+    guide.characters.retain_mut(|character| {
+        let Some(accepted) = accepted_characters.iter().find(|entity| {
+            entity
+                .canonical_source
+                .eq_ignore_ascii_case(&character.canonical_source)
+        }) else {
+            return false;
+        };
+        character.aliases = accepted.variants.clone();
+        if let Some(canonical) = character.aliases.iter().find(|alias| {
+            alias
+                .source
+                .eq_ignore_ascii_case(&character.canonical_source)
+        }) {
+            character.canonical_target = canonical.target.clone();
+        }
+        true
+    });
+    guide.terminology = accept_entities(memory, guide.terminology, stats);
+    memory.document_guide = guide.clone();
+    guide
+}
+
 fn accept_entities(
     memory: &mut ContextMemory,
     entities: Vec<TerminologyEntity>,
@@ -798,34 +916,7 @@ fn accept_entities(
             continue;
         }
         entity.variants = variants;
-        memory.add_terminology_entity(entity.clone());
         accepted.push(entity);
     }
-    accepted
-}
-
-fn accept_entries(
-    memory: &mut ContextMemory,
-    entries: Vec<GlossaryEntry>,
-    stats: &mut TerminologyStats,
-) -> Vec<GlossaryEntry> {
-    let mut accepted = Vec::new();
-    for entry in entries {
-        if let Some(current) = memory.glossary.get(&entry.source) {
-            if !current.eq_ignore_ascii_case(&entry.target) {
-                stats.conflicts_omitted += 1;
-            }
-            continue;
-        }
-        if accepted.iter().any(|value: &GlossaryEntry| {
-            value.source.eq_ignore_ascii_case(&entry.source)
-                && !value.target.eq_ignore_ascii_case(&entry.target)
-        }) {
-            stats.conflicts_omitted += 1;
-            continue;
-        }
-        accepted.push(entry);
-    }
-    memory.update("", &accepted);
     accepted
 }

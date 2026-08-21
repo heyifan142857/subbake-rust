@@ -433,14 +433,43 @@ pub struct TerminologyEntity {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DocumentCharacter {
+    pub canonical_source: String,
+    pub canonical_target: String,
+    pub aliases: Vec<GlossaryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gender: Option<String>,
+    pub relationships: Vec<String>,
+    pub speaking_style: String,
+    pub forms_of_address: Vec<GlossaryEntry>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocumentGuide {
+    pub synopsis: String,
+    pub genre: String,
+    pub tone: String,
+    pub target_audience: String,
+    pub characters: Vec<DocumentCharacter>,
+    pub terminology: Vec<TerminologyEntity>,
+}
+
+impl DocumentGuide {
+    pub fn is_empty(&self) -> bool {
+        self.synopsis.trim().is_empty()
+            && self.genre.trim().is_empty()
+            && self.tone.trim().is_empty()
+            && self.target_audience.trim().is_empty()
+            && self.characters.is_empty()
+            && self.terminology.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TerminologyPreflightResult {
-    pub entries: Vec<GlossaryEntry>,
-    /// Entity-aware terminology. Older caches only contain flat `entries`.
-    #[serde(default)]
-    pub entities: Vec<TerminologyEntity>,
-    /// Advisory document-level context. Older cache entries omit it.
-    #[serde(default)]
-    pub document_brief: String,
+    pub guide: DocumentGuide,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,10 +728,10 @@ pub struct PipelineOptions {
     /// translation leaves this unset so its historical fingerprints remain
     /// stable.
     pub execution_fingerprint: Option<String>,
-    /// Hash of the glossary snapshot frozen after terminology preflight. This
-    /// is populated by the pipeline and keeps Resume state tied to the exact
-    /// terminology context without persisting glossary contents in run state.
-    pub glossary_fingerprint: Option<String>,
+    /// Hash of the document guide and glossary frozen after terminology
+    /// preflight. This keeps Resume and translation-memory entries tied to the
+    /// exact guidance without duplicating it in the semantic fingerprint.
+    pub document_guide_fingerprint: Option<String>,
     /// Confirmed translations immediately preceding a composed translation
     /// shard. Standalone document translation leaves this empty.
     pub initial_confirmed_context: Vec<ConfirmedTranslationContext>,
@@ -752,7 +781,7 @@ impl PipelineOptions {
             provider_fingerprint: None,
             reviewer_fingerprint: None,
             execution_fingerprint: None,
-            glossary_fingerprint: None,
+            document_guide_fingerprint: None,
             initial_confirmed_context: Vec::new(),
             dry_run: false,
             resume: true,
