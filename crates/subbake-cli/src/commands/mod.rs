@@ -20,6 +20,25 @@ mod transcribe;
 mod translate;
 mod whisper;
 
+pub(crate) const COMMAND_NAMES: &[&str] = &[
+    #[cfg(feature = "agent")]
+    "agent",
+    #[cfg(feature = "agent")]
+    "resume",
+    "translate",
+    "batch",
+    "evaluate",
+    "memory",
+    "qa",
+    "transcribe",
+    "pipeline",
+    "overnight",
+    "provider",
+    "runtime",
+    "whisper",
+    "help",
+];
+
 pub fn dispatch(args: Vec<String>) -> CliResult<()> {
     if args.is_empty() {
         #[cfg(feature = "agent")]
@@ -35,6 +54,11 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
 
     if let Some(help) = requested_help(&args) {
         print!("{help}");
+        return Ok(());
+    }
+
+    if args[0] == "help" {
+        print!("{}", help_text(&args[1..]));
         return Ok(());
     }
 

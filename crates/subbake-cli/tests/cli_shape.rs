@@ -20,6 +20,9 @@ fn cli_exposes_redesigned_commands() {
     assert!(names.contains(&"whisper"));
     assert!(names.contains(&"qa"));
     assert!(names.contains(&"memory"));
+    assert!(names.contains(&"evaluate"));
+    assert!(names.contains(&"overnight"));
+    assert!(names.contains(&"help"));
 }
 
 #[test]

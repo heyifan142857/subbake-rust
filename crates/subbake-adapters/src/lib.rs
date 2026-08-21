@@ -57,7 +57,7 @@ pub use pipeline::{
 };
 pub use providers::{
     ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
-    check_provider, default_api_key_env, resolve_env_var,
+    check_provider, check_provider_cancellable, default_api_key_env, resolve_env_var,
 };
 pub use runtime::{
     RuntimeAction, RuntimeCleanOutcome, RuntimeInspection, RuntimeOutcome, RuntimeRequest,

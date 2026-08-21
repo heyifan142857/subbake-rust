@@ -1,13 +1,12 @@
+use crate::CliResult;
+use crate::args::{OvernightAction, OvernightArgs};
 use subbake_adapters::{
     OvernightCollectRequest, OvernightStatusRequest, OvernightSubmitRequest, collect_overnight,
     overnight_status, submit_overnight,
 };
-use subbake_core::CancellationGuard;
-
-use crate::CliResult;
-use crate::args::{OvernightAction, OvernightArgs};
 
 pub fn run(args: OvernightArgs) -> CliResult<()> {
+    let cancellation = crate::cancellation::CliCancellation::new()?;
     match args.action {
         OvernightAction::Submit(args) => {
             let outcome = submit_overnight(
@@ -16,7 +15,7 @@ pub fn run(args: OvernightArgs) -> CliResult<()> {
                     output_path: args.output,
                     settings: args.settings,
                 },
-                &CancellationGuard::never(),
+                cancellation.guard(),
             )?;
             println!("Submitted overnight job: {}", outcome.job_id);
             println!("Requests: {}", outcome.requests);
@@ -28,7 +27,7 @@ pub fn run(args: OvernightArgs) -> CliResult<()> {
                     manifest_path: args.input_path,
                     settings: args.settings,
                 },
-                &CancellationGuard::never(),
+                cancellation.guard(),
             )?;
             println!("Job: {}", outcome.job_id);
             println!("Status: {}", outcome.status);
@@ -48,7 +47,7 @@ pub fn run(args: OvernightArgs) -> CliResult<()> {
                     settings: args.settings,
                     overwrite,
                 },
-                &CancellationGuard::never(),
+                cancellation.guard(),
             )?;
             println!("Output: {}", outcome.output_path.display());
             println!(

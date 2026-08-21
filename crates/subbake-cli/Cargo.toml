@@ -25,5 +25,8 @@ subbake-agent = { path = "../subbake-agent", optional = true }
 subbake-core = { path = "../subbake-core" }
 thiserror = "2"
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [lints]
 workspace = true

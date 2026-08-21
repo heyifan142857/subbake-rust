@@ -445,6 +445,119 @@ impl FileGuard {
         self.resolve(path)
     }
 
+    /// Resolve a persisted undo target through the same project boundary as
+    /// live tool calls. A leaf symlink is rejected so an event cannot be
+    /// redirected after the original mutation was recorded.
+    pub(crate) fn resolve_undo_target(&self, path: &Path) -> FileGuardResult<PathBuf> {
+        let anchored = normalize_path(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        });
+        if std::fs::symlink_metadata(&anchored)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(FileGuardError::Io {
+                operation: "resolve undo target",
+                path: Some(anchored),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "undo targets must not be symbolic links",
+                ),
+            });
+        }
+        self.resolve(path)
+    }
+
+    /// Validate a persisted backup path without applying the protected-path
+    /// rule: backups intentionally live under `.subbake`, but nowhere else is
+    /// accepted as an undo source.
+    pub(crate) fn resolve_undo_backup(&self, path: &Path) -> FileGuardResult<PathBuf> {
+        let anchored = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_root.join(path)
+        };
+        let metadata =
+            std::fs::symlink_metadata(&anchored).map_err(|source| FileGuardError::Io {
+                operation: "inspect undo backup",
+                path: Some(anchored.clone()),
+                source,
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(FileGuardError::Io {
+                operation: "inspect undo backup",
+                path: Some(anchored),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "undo backup must be a regular file",
+                ),
+            });
+        }
+        let safe = anchored
+            .canonicalize()
+            .map_err(|source| FileGuardError::Io {
+                operation: "resolve undo backup",
+                path: Some(anchored.clone()),
+                source,
+            })?;
+        let backup_root = self
+            .backup_root
+            .canonicalize()
+            .map_err(|source| FileGuardError::Io {
+                operation: "resolve undo backup directory",
+                path: Some(self.backup_root.clone()),
+                source,
+            })?;
+        if !safe.starts_with(&backup_root) {
+            return Err(FileGuardError::PathEscape {
+                root: backup_root,
+                path: safe,
+            });
+        }
+        Ok(safe)
+    }
+
+    pub(crate) fn remove_for_undo(&self, path: &Path) -> FileGuardResult<()> {
+        let safe = self.resolve_undo_target(path)?;
+        let metadata = match std::fs::symlink_metadata(&safe) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(FileGuardError::Io {
+                    operation: "inspect undo target",
+                    path: Some(safe),
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(FileGuardError::Io {
+                operation: "remove undo target",
+                path: Some(safe),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "undo can remove only a regular file created by SubBake",
+                ),
+            });
+        }
+        std::fs::remove_file(&safe).map_err(|source| FileGuardError::Io {
+            operation: "remove undo target",
+            path: Some(safe),
+            source,
+        })
+    }
+
+    pub(crate) fn restore_for_undo(
+        &self,
+        backup_path: &Path,
+        target: &Path,
+    ) -> FileGuardResult<()> {
+        let backup = self.resolve_undo_backup(backup_path)?;
+        let target = self.resolve_undo_target(target)?;
+        Self::restore_backup(&backup, &target)
+    }
+
     // ------------------------------------------------------------------
     // Path resolution + sandbox
     // ------------------------------------------------------------------
@@ -533,18 +646,26 @@ impl FileGuard {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry.file_type()?;
+            // Recursive discovery must not follow links after the initial
+            // directory has passed `resolve`. Following a directory symlink
+            // here could escape the project root or recurse through a cycle.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 self.search_recursive(&path, pattern, results)?;
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| {
-                    if pattern.contains(['*', '?']) {
-                        wildcard_matches(pattern, name)
-                    } else {
-                        name.contains(pattern)
-                    }
-                })
+            } else if file_type.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| {
+                        if pattern.contains(['*', '?']) {
+                            wildcard_matches(pattern, name)
+                        } else {
+                            name.contains(pattern)
+                        }
+                    })
             {
                 results.push(path);
             }
@@ -911,5 +1032,29 @@ mod tests {
         assert!(err.to_string().contains("escapes project root"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_search_skips_external_and_cyclic_symlink_directories() {
+        use std::os::unix::fs::symlink;
+
+        let (root, guard) = setup();
+        let outside =
+            std::env::temp_dir().join(format!("subbake-search-outside-{}", nanos_since_epoch()));
+        std::fs::create_dir_all(root.join("nested")).expect("create project tree");
+        std::fs::create_dir_all(&outside).expect("create outside tree");
+        std::fs::write(root.join("nested/inside.srt"), "inside").expect("write inside file");
+        std::fs::write(outside.join("outside.srt"), "outside").expect("write outside file");
+        symlink(&outside, root.join("outside-link")).expect("link outside directory");
+        symlink(&root, root.join("nested/cycle")).expect("link project cycle");
+
+        let files = guard
+            .search_files(Path::new("."), "*.srt")
+            .expect("bounded recursive search");
+
+        assert_eq!(files, vec![root.join("nested/inside.srt")]);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

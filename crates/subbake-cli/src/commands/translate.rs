@@ -1,16 +1,15 @@
 use std::path::PathBuf;
 
+use crate::CliResult;
+use crate::args::{BatchArgs, TranslateArgs};
+use crate::output::{print_batch_translation_outcome, print_translation_outcome};
 use subbake_adapters::{
     BatchTranslationRequest, TranslationRequest, translate_input_cancellable_with_progress,
     translate_subtitle_batch_with_progress,
 };
-use subbake_core::CancellationGuard;
-
-use crate::CliResult;
-use crate::args::{BatchArgs, TranslateArgs};
-use crate::output::{print_batch_translation_outcome, print_translation_outcome};
 
 pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
+    let cancellation = crate::cancellation::CliCancellation::new()?;
     let outcome = translate_input_cancellable_with_progress(
         TranslationRequest {
             input_path: args.input_path.clone(),
@@ -19,13 +18,14 @@ pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
             overwrite: true,
             settings: args.settings.clone(),
         },
-        &CancellationGuard::never(),
+        cancellation.guard(),
         std::sync::Arc::new(crate::progress::CliProgress::new()),
     )?;
     Ok(print_translation_outcome(&outcome, args.json)?)
 }
 
 pub fn translate_batch(args: BatchArgs) -> CliResult<()> {
+    let cancellation = crate::cancellation::CliCancellation::new()?;
     let outcome = translate_subtitle_batch_with_progress(
         BatchTranslationRequest {
             root: args.dir,
@@ -37,7 +37,7 @@ pub fn translate_batch(args: BatchArgs) -> CliResult<()> {
             output_language_tag: None,
             settings: args.translate.settings,
         },
-        &CancellationGuard::never(),
+        cancellation.guard(),
         std::sync::Arc::new(crate::progress::CliProgress::new()),
     )?;
     print_batch_translation_outcome(&outcome);

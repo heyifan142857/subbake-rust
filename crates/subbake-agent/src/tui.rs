@@ -51,19 +51,6 @@ use worker::{TuiWorker, WorkerRequest};
 
 const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "show commands"),
-    ("/plan", "toggle plan mode; accepts on/off"),
-    ("/profile", "list or switch profiles"),
-    ("/config", "edit configuration"),
-    ("/undo", "undo the last file operation"),
-    ("/sessions", "choose a saved session"),
-    ("/history", "show conversation history"),
-    ("/clear", "start a new session"),
-    ("/exit", "exit SubBake"),
-    ("/quit", "exit SubBake"),
-];
-
 // ---------------------------------------------------------------------------
 // TUI App
 // ---------------------------------------------------------------------------
@@ -504,6 +491,7 @@ impl SubBakeTui {
   /help /h  —  this menu
   /plan [on|off] — toggle or set plan mode
   /profile [NAME] — list or switch profiles
+  /model    — choose a model profile
   /config   —  edit configuration
   /undo     —  undo last file operation
   /sessions [ID] — choose or resume a saved session
@@ -513,7 +501,8 @@ impl SubBakeTui {
 
 Or just type what you want, e.g. "translate @clip.srt""#
                 .to_owned(),
-            "/plan" | "/profile" | "/config" | "/undo" | "/sessions" | "/history" | "/clear" => {
+            "/plan" | "/profile" | "/model" | "/config" | "/undo" | "/sessions" | "/history"
+            | "/clear" => {
                 format!(
                     "`{input}` is handled by the agent engine. When a real LLM backend is connected, these will route through the session."
                 )
@@ -830,10 +819,10 @@ fn slash_suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
         return Vec::new();
     }
     let query = input.to_ascii_lowercase();
-    SLASH_COMMANDS
+    crate::engine::SLASH_COMMAND_SPECS
         .iter()
-        .copied()
-        .filter(|(command, _)| command.starts_with(&query))
+        .filter(|spec| spec.suggest && spec.command.starts_with(&query))
+        .map(|spec| (spec.command, spec.description))
         .collect()
 }
 
@@ -927,12 +916,15 @@ mod tests {
 
     #[test]
     fn slash_displays_all_commands_and_filters_as_the_user_types() {
-        assert_eq!(slash_suggestions("/").len(), 10);
+        assert_eq!(slash_suggestions("/").len(), 11);
         assert_eq!(
             slash_suggestions("/con"),
             vec![("/config", "edit configuration")]
         );
-        assert!(slash_suggestions("/mod").is_empty());
+        assert_eq!(
+            slash_suggestions("/mod"),
+            vec![("/model", "choose a model profile")]
+        );
         assert!(slash_suggestions("hello /").is_empty());
     }
 
@@ -947,7 +939,7 @@ mod tests {
     fn visible_slash_and_approval_options_take_vertical_navigation_priority() {
         assert_eq!(
             vertical_navigation(&InputMode::Editing, slash_suggestions("/").len()),
-            VerticalNavigation::Selection(10)
+            VerticalNavigation::Selection(11)
         );
         assert_eq!(
             vertical_navigation(&InputMode::AwaitingPlanDecision, 3),

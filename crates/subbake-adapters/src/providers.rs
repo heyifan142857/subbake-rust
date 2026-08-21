@@ -152,6 +152,14 @@ pub fn build_backend_with_timeout(
 }
 
 pub fn check_provider(request: ProviderCheckRequest) -> AdapterResult<ProviderCheckOutcome> {
+    check_provider_cancellable(request, &CancellationGuard::never())
+}
+
+pub fn check_provider_cancellable(
+    request: ProviderCheckRequest,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<ProviderCheckOutcome> {
+    cancellation.check().map_err(AdapterError::from)?;
     let mut backend = build_backend(&request.config)?;
     if request.config.id.eq_ignore_ascii_case("mock") {
         let (_, message) = backend.check_credentials().map_err(AdapterError::from)?;
@@ -168,7 +176,7 @@ pub fn check_provider(request: ProviderCheckRequest) -> AdapterResult<ProviderCh
             GenerationRequest::json(vec![ChatMessage::user(
                 "Return exactly this JSON object: {\"ok\":true}",
             )]),
-            &CancellationGuard::never(),
+            cancellation,
         )
         .map_err(AdapterError::from)?;
     let (json, _) = response.into_json().map_err(AdapterError::from)?;

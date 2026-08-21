@@ -1,5 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use subbake_core::entities::{SubtitleDocument, SubtitleSegment};
 use subbake_core::formats::{
@@ -46,37 +48,7 @@ pub fn render_and_write_document(
     options: &RenderOptions,
 ) -> AdapterResult<String> {
     let rendered = render_document(document, translations, options).map_err(AdapterError::from)?;
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| {
-            AdapterError::external_io(
-                "create subtitle output directory",
-                Some(parent.to_path_buf()),
-                source,
-            )
-        })?;
-    }
-    fs::write(output_path, rendered.as_bytes()).map_err(|source| {
-        AdapterError::external_io(
-            "write rendered subtitle",
-            Some(output_path.to_path_buf()),
-            source,
-        )
-    })?;
-    let written = fs::read_to_string(output_path).map_err(|source| {
-        AdapterError::external_io(
-            "verify rendered subtitle",
-            Some(output_path.to_path_buf()),
-            source,
-        )
-    })?;
-    if written != rendered {
-        return Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
-            format!("write verification failed for {}", output_path.display()),
-        )));
-    }
+    write_verified_atomically(output_path, rendered.as_bytes())?;
     Ok(rendered)
 }
 
@@ -86,7 +58,10 @@ pub(crate) fn render_and_write_document_atomic(
     output_path: &Path,
     options: &RenderOptions,
 ) -> AdapterResult<String> {
-    let rendered = render_document(document, translations, options).map_err(AdapterError::from)?;
+    render_and_write_document(document, translations, output_path, options)
+}
+
+fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<()> {
     let parent = output_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -102,19 +77,109 @@ pub(crate) fn render_and_write_document_atomic(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("subtitle");
-    let temporary = parent.join(format!(".{file_name}.subbake-tmp-{}", std::process::id()));
-    fs::write(&temporary, rendered.as_bytes()).map_err(|source| {
-        AdapterError::external_io("stage rendered subtitle", Some(temporary.clone()), source)
-    })?;
-    fs::rename(&temporary, output_path).map_err(|source| {
+    static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.subbake-tmp-{}-{nonce}",
+        std::process::id()
+    ));
+    let staged = (|| -> AdapterResult<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|source| {
+                AdapterError::external_io("create staged subtitle", Some(temporary.clone()), source)
+            })?;
+        file.write_all(bytes).map_err(|source| {
+            AdapterError::external_io("write staged subtitle", Some(temporary.clone()), source)
+        })?;
+        file.sync_all().map_err(|source| {
+            AdapterError::external_io("sync staged subtitle", Some(temporary.clone()), source)
+        })?;
+        if let Ok(metadata) = fs::metadata(output_path) {
+            fs::set_permissions(&temporary, metadata.permissions()).map_err(|source| {
+                AdapterError::external_io(
+                    "preserve subtitle permissions",
+                    Some(temporary.clone()),
+                    source,
+                )
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = staged {
         let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    publish_staged_file(&temporary, output_path)?;
+    let written = fs::read(output_path).map_err(|source| {
+        AdapterError::external_io(
+            "verify rendered subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
+    })?;
+    if written != bytes {
+        return Err(AdapterError::Core(subbake_core::CoreError::DataInvariant(
+            format!("write verification failed for {}", output_path.display()),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()> {
+    fs::rename(temporary, output_path).map_err(|source| {
+        let _ = fs::remove_file(temporary);
         AdapterError::external_io(
             "publish rendered subtitle",
             Some(output_path.to_path_buf()),
             source,
         )
+    })
+}
+
+#[cfg(windows)]
+fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()> {
+    if !output_path.exists() {
+        return fs::rename(temporary, output_path).map_err(|source| {
+            let _ = fs::remove_file(temporary);
+            AdapterError::external_io(
+                "publish rendered subtitle",
+                Some(output_path.to_path_buf()),
+                source,
+            )
+        });
+    }
+    let prior = output_path.with_file_name(format!(
+        ".{}.subbake-prior-{}",
+        output_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("subtitle"),
+        std::process::id()
+    ));
+    fs::rename(output_path, &prior).map_err(|source| {
+        let _ = fs::remove_file(temporary);
+        AdapterError::external_io(
+            "stage previous subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
     })?;
-    Ok(rendered)
+    if let Err(source) = fs::rename(temporary, output_path) {
+        let _ = fs::rename(&prior, output_path);
+        let _ = fs::remove_file(temporary);
+        return Err(AdapterError::external_io(
+            "publish rendered subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        ));
+    }
+    let _ = fs::remove_file(prior);
+    Ok(())
 }
 
 pub fn default_output_path(
@@ -227,5 +292,68 @@ mod tests {
             default_output_path(Path::new("movie.ass"), None, false).expect("ASS output path"),
             PathBuf::from("movie.translated.ass")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_replaces_contents_and_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-atomic-output-{nonce}"));
+        fs::create_dir_all(&root).expect("create root");
+        let output = root.join("translated.srt");
+        fs::write(&output, b"old").expect("write old output");
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o640))
+            .expect("set output permissions");
+
+        write_verified_atomically(&output, b"new subtitle").expect("publish replacement");
+
+        assert_eq!(
+            fs::read(&output).expect("read replacement"),
+            b"new subtitle"
+        );
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("list root")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_atomic_publish_removes_its_staged_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-atomic-failure-{nonce}"));
+        let output = root.join("directory-target.srt");
+        fs::create_dir_all(&output).expect("create conflicting directory");
+
+        write_verified_atomically(&output, b"subtitle")
+            .expect_err("a directory cannot be replaced as a subtitle file");
+
+        let staged = fs::read_dir(&root)
+            .expect("list root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("subbake-tmp"))
+            .count();
+        assert_eq!(staged, 0);
+        assert!(output.is_dir());
+        let _ = fs::remove_dir_all(root);
     }
 }

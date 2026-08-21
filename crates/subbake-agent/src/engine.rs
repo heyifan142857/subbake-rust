@@ -96,6 +96,83 @@ pub enum CommandDecision {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashCommandSpec {
+    pub command: &'static str,
+    pub description: &'static str,
+    pub suggest: bool,
+}
+
+pub(crate) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        command: "/help",
+        description: "show commands",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/plan",
+        description: "toggle plan mode; accepts on/off",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/profile",
+        description: "list or switch profiles",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/model",
+        description: "choose a model profile",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/config",
+        description: "edit configuration",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/undo",
+        description: "undo the last file operation",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/sessions",
+        description: "choose a saved session",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/history",
+        description: "show conversation history",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/clear",
+        description: "start a new session",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/exit",
+        description: "exit SubBake",
+        suggest: true,
+    },
+    SlashCommandSpec {
+        command: "/quit",
+        description: "exit SubBake",
+        suggest: true,
+    },
+    // Approval is presented as a typed picker. These legacy spellings remain
+    // recognized for persisted/headless compatibility but are not suggested.
+    SlashCommandSpec {
+        command: "/approve",
+        description: "approve pending plan",
+        suggest: false,
+    },
+    SlashCommandSpec {
+        command: "/reject",
+        description: "reject pending plan",
+        suggest: false,
+    },
+];
+
 /// Returns whether `input` is a complete built-in slash command.
 ///
 /// Inputs that merely start with `/` are ordinary chat text. This keeps
@@ -103,26 +180,14 @@ pub enum CommandDecision {
 /// unknown commands.
 pub fn is_known_slash_command(input: &str) -> bool {
     let command = input.trim();
-    matches!(
-        command,
-        "/help"
-            | "/h"
-            | "/plan"
-            | "/plan on"
-            | "/plan off"
-            | "/approve"
-            | "/reject"
-            | "/undo"
-            | "/sessions"
-            | "/clear"
-            | "/config"
-            | "/profile"
-            | "/history"
-            | "/exit"
-            | "/quit"
-    ) || command
-        .strip_prefix("/profile ")
-        .is_some_and(|name| !name.trim().is_empty())
+    command == "/h"
+        || SLASH_COMMAND_SPECS
+            .iter()
+            .any(|spec| spec.command == command)
+        || matches!(command, "/plan on" | "/plan off")
+        || command
+            .strip_prefix("/profile ")
+            .is_some_and(|name| !name.trim().is_empty())
         || command
             .strip_prefix("/sessions ")
             .is_some_and(|id| !id.trim().is_empty())
@@ -660,7 +725,7 @@ impl AgentEngine {
             "/sessions" => self.sessions_summary(20),
             "/clear" => self.clear_session(),
             "/config" => Ok("Opening configuration.".to_owned()),
-            "/profile" => self
+            "/profile" | "/model" => self
                 .run_tool("list_profiles", &serde_json::json!({}))
                 .map(|outcome| render_tool_outcome(&outcome)),
             command if command.starts_with("/profile ") => {
@@ -705,6 +770,7 @@ impl AgentEngine {
             self.session
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("no active session"))?,
+            &self.operation_guard,
         )?;
         self.record(EventKind::Undo)?;
 
@@ -746,7 +812,7 @@ mod error_persistence_tests {
         assert!(is_known_slash_command("/plan on"));
         assert!(is_known_slash_command("/profile subtitles"));
         assert!(is_known_slash_command("/config"));
-        assert!(!is_known_slash_command("/model"));
+        assert!(is_known_slash_command("/model"));
         assert!(is_known_slash_command("/history 50"));
         assert!(!is_known_slash_command(
             "/home/azote/Downloads/Braveheart.fixed.translated.srt改为中英双语"
