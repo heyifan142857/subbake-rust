@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+use crate::language_rules::LanguageRuleRegistry;
 use crate::memory::ContextMemory;
 use crate::term_matcher::TermMatcher;
 
@@ -107,7 +108,8 @@ pub(super) fn reconcile_batch(
         for marker in translated {
             clean.push_str(&line.translation[cursor..marker.start]);
             if marker.source == marker.target
-                && requires_target_script_change(&marker.source, target_language)
+                && LanguageRuleRegistry::resolve("Auto", target_language)
+                    .target_requires_script_change(&marker.source)
             {
                 return Err(CoreError::InvalidTranslation(format!(
                     "personal name `{}` was left in source spelling",
@@ -248,31 +250,6 @@ fn is_source_stable_acronym(candidate: &str) -> bool {
         && letters
             .iter()
             .all(|character| character.is_ascii_uppercase())
-}
-
-fn requires_target_script_change(source: &str, target_language: &str) -> bool {
-    let target = target_language
-        .split('-')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match target.as_str() {
-        "zh" => source.chars().any(|character| {
-            character.is_ascii_alphabetic()
-                || matches!(character, '\u{3040}'..='\u{30ff}' | '\u{ff66}'..='\u{ff9f}')
-        }),
-        "ja" => source
-            .chars()
-            .any(|character| character.is_ascii_alphabetic()),
-        "ko" => source.chars().any(|character| {
-            character.is_ascii_alphabetic()
-                || matches!(character, '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{9fff}')
-        }),
-        "ru" | "uk" | "ar" | "hi" | "th" => source
-            .chars()
-            .any(|character| character.is_ascii_alphabetic()),
-        _ => false,
-    }
 }
 
 fn invalid_marker(reason: &str) -> CoreError {

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::entities::{DocumentGuide, GlossaryEntry, TerminologyEntity};
+use crate::language_rules::EnglishRules;
 use crate::term_matcher::TermMatcher;
 
 pub const DEFAULT_MAX_SUMMARIES: usize = 2;
@@ -18,28 +19,6 @@ pub const DEFAULT_STYLE_RULES: &[&str] = &[
     "Keep subtitles concise and easy to read on screen.",
     "Do not merge or drop subtitle entries.",
 ];
-
-/// Return the lemma-like base of a simple English possessive form. Glossary
-/// consistency is enforced on the base term because target languages may
-/// express possession with particles, word order, or compounds.
-pub(crate) fn english_possessive_base(value: &str) -> Option<&str> {
-    let value = value.trim();
-    for suffix in ["'s", "'S", "’s", "’S"] {
-        if let Some(base) = value.strip_suffix(suffix)
-            && !base.is_empty()
-        {
-            return Some(base);
-        }
-    }
-    for suffix in ['\'', '’'] {
-        if let Some(base) = value.strip_suffix(suffix)
-            && base.ends_with(['s', 'S'])
-        {
-            return Some(base);
-        }
-    }
-    None
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextMemory {
@@ -120,7 +99,7 @@ impl ContextMemory {
         }
         for entry in glossary_updates {
             if (entry.source.is_empty() && entry.target.is_empty())
-                || english_possessive_base(&entry.source).is_some()
+                || EnglishRules::possessive_base(&entry.source).is_some()
             {
                 continue;
             }
@@ -160,7 +139,7 @@ impl ContextMemory {
         let entries = self
             .glossary
             .iter()
-            .filter(|(source, _)| english_possessive_base(source).is_none())
+            .filter(|(source, _)| EnglishRules::possessive_base(source).is_none())
             .collect::<Vec<_>>();
         let terms = entries
             .iter()
@@ -260,14 +239,17 @@ mod tests {
 
     #[test]
     fn recognizes_simple_english_possessive_forms() {
-        assert_eq!(english_possessive_base("MacAndrews'"), Some("MacAndrews"));
         assert_eq!(
-            english_possessive_base("MacClannough's"),
+            EnglishRules::possessive_base("MacAndrews'"),
+            Some("MacAndrews")
+        );
+        assert_eq!(
+            EnglishRules::possessive_base("MacClannough's"),
             Some("MacClannough")
         );
-        assert_eq!(english_possessive_base("James’"), Some("James"));
-        assert_eq!(english_possessive_base("Mornay’s"), Some("Mornay"));
-        assert_eq!(english_possessive_base("MacAndrews"), None);
+        assert_eq!(EnglishRules::possessive_base("James’"), Some("James"));
+        assert_eq!(EnglishRules::possessive_base("Mornay’s"), Some("Mornay"));
+        assert_eq!(EnglishRules::possessive_base("MacAndrews"), None);
     }
 
     #[test]

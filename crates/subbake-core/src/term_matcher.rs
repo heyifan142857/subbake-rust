@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
+use crate::language_rules::CjkRules;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TermMatcher {
     case_sensitive: bool,
@@ -129,7 +131,7 @@ impl TermMatcher {
         if term.is_empty() {
             return Vec::new();
         }
-        if term.chars().any(is_cjk) {
+        if term.chars().any(CjkRules::is_character) {
             return self.literal_candidates(text, term_index, term, false);
         }
         if term.chars().all(is_latin_term_character) {
@@ -323,7 +325,8 @@ fn normalize_case(value: &str, case_sensitive: bool) -> String {
 }
 
 fn is_latin_word_character(character: char) -> bool {
-    (character.is_alphanumeric() && !is_cjk(character)) || matches!(character, '_' | '\'' | '’')
+    (character.is_alphanumeric() && !CjkRules::is_character(character))
+        || matches!(character, '_' | '\'' | '’')
 }
 
 fn is_latin_term_character(character: char) -> bool {
@@ -343,21 +346,6 @@ fn has_literal_boundaries(text: &str, start: usize, end: usize) -> bool {
 
 fn ranges_overlap(left: &MatchCandidate, right: &MatchCandidate) -> bool {
     left.start < right.end && right.start < left.end
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x1100..=0x11ff
-            | 0x2e80..=0x2fdf
-            | 0x3040..=0x30ff
-            | 0x31f0..=0x31ff
-            | 0x3400..=0x4dbf
-            | 0x4e00..=0x9fff
-            | 0xac00..=0xd7af
-            | 0xf900..=0xfaff
-            | 0xff66..=0xff9d
-    )
 }
 
 #[cfg(test)]

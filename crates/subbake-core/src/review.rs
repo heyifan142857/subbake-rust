@@ -5,6 +5,7 @@ use crate::entities::{
     ReviewResult, ReviewStrategy, SubtitleSegment, TranslationLine,
 };
 use crate::error::{CoreError, CoreResult};
+use crate::language_rules::{EnglishRules, LanguageRuleRegistry, ResolvedLanguageRules};
 use crate::memory::ContextMemory;
 use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::ports::ChatMessage;
@@ -127,6 +128,7 @@ pub(crate) fn build_full_review_plan(
     source_language: &str,
     target_language: &str,
 ) -> Vec<ReviewBatchPlan> {
+    let language_rules = LanguageRuleRegistry::resolve(source_language, target_language);
     let all_source = batches.iter().flatten().cloned().collect::<Vec<_>>();
     let mut translations_by_source: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (source, translated) in all_source.iter().zip(translated_segments) {
@@ -152,7 +154,7 @@ pub(crate) fn build_full_review_plan(
             );
             reasons.extend(document_guide_review_reasons(source, translated, memory));
             let document_index = offset + local_index;
-            if has_contextual_pronoun_risk(&all_source, document_index, memory, source_language) {
+            if has_contextual_pronoun_risk(&all_source, document_index, memory, &language_rules) {
                 reasons.push("pronoun/coreference continuity".to_owned());
             }
             reasons.sort();
@@ -697,11 +699,9 @@ fn has_contextual_pronoun_risk(
     source: &[SubtitleSegment],
     index: usize,
     memory: &ContextMemory,
-    source_language: &str,
+    language_rules: &ResolvedLanguageRules,
 ) -> bool {
-    if !(source_language.eq_ignore_ascii_case("en")
-        || source_language.to_ascii_lowercase().starts_with("english"))
-        || memory.document_guide.characters.is_empty()
+    if !language_rules.supports_english_coreference() || memory.document_guide.characters.is_empty()
     {
         return false;
     }
@@ -713,11 +713,9 @@ fn has_contextual_pronoun_risk(
         .split(|character: char| !character.is_alphanumeric())
         .map(str::to_ascii_lowercase)
         .collect::<BTreeSet<_>>();
-    if ![
-        "he", "her", "hers", "him", "his", "she", "their", "them", "they",
-    ]
-    .iter()
-    .any(|pronoun| words.contains(*pronoun))
+    if !words
+        .iter()
+        .any(|word| EnglishRules::is_coreference_pronoun(word))
     {
         return false;
     }

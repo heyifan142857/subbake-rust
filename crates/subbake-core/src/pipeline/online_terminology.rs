@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::entities::TerminologyKind;
 use crate::entities::{GlossaryEntry, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+use crate::language_rules::LanguageRuleRegistry;
 use crate::term_matcher::TermMatcher;
 
 use super::BatchWithUsage;
@@ -145,7 +146,8 @@ pub(super) fn reconcile_batch(
             if existing.is_none()
                 && entity.kind == TerminologyKind::Person
                 && !preserve_names
-                && requires_non_latin_name(target_language)
+                && LanguageRuleRegistry::resolve("Auto", target_language)
+                    .target_requires_non_latin_name()
                 && source_form.eq_ignore_ascii_case(proposed)
             {
                 return Err(CoreError::InvalidTranslation(format!(
@@ -240,13 +242,6 @@ pub(super) fn reconcile_batch(
         }
     }
     Ok(())
-}
-
-fn requires_non_latin_name(target_language: &str) -> bool {
-    matches!(
-        target_language.split('-').next().unwrap_or_default(),
-        "zh" | "ja" | "ko" | "ru" | "uk" | "ar" | "hi" | "th"
-    )
 }
 
 fn contains_case_insensitive(text: &str, needle: &str) -> bool {

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::language_rules::{CjkRules, EnglishRules};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NumberFactComparison {
     Match,
@@ -184,9 +186,9 @@ fn number_facts(text: &str) -> NumberFacts {
             push_scaled_digits(&mut facts.definite, &digits, multiplier);
             continue;
         }
-        if is_cjk_numeral(character) {
+        if CjkRules::is_numeral(character) {
             let start = index;
-            while index < characters.len() && is_cjk_numeral(characters[index]) {
+            while index < characters.len() && CjkRules::is_numeral(characters[index]) {
                 index += 1;
             }
             if start > 0 && characters[start - 1] == '第' {
@@ -229,11 +231,13 @@ fn classify_cjk_span(characters: &[char], start: usize, end: usize, facts: &mut 
     } else {
         (full_span, following_context)
     };
-    let pure_digits = span.iter().all(|character| cjk_digit(*character).is_some());
+    let pure_digits = span
+        .iter()
+        .all(|character| CjkRules::digit(*character).is_some());
 
     if pure_digits && span.len() > 1 {
         let value = parse_cjk_digit_sequence(span).map(|value| value.to_string());
-        if context.is_some_and(|suffix| DIGIT_SEQUENCE_CONTEXTS.contains(&suffix)) {
+        if context.is_some_and(|suffix| CjkRules::DIGIT_SEQUENCE_CONTEXTS.contains(&suffix)) {
             if let Some(value) = value {
                 facts.definite.push(value);
             } else {
@@ -266,125 +270,8 @@ fn classify_cjk_span(characters: &[char], start: usize, end: usize, facts: &mut 
     }
 }
 
-const DIGIT_SEQUENCE_CONTEXTS: &[&str] = &["年", "编号", "代码", "号码", "号"];
-
-// Ordered only for readability; longest_quantity_context still selects by
-// character count so additions cannot accidentally shadow a longer suffix.
-const QUANTITY_CONTEXTS: &[&str] = &[
-    "摄氏度",
-    "华氏度",
-    "个百分点",
-    "个小时",
-    "个星期",
-    "个季度",
-    "个世纪",
-    "人民币",
-    "分钟",
-    "秒钟",
-    "小时",
-    "钟头",
-    "星期",
-    "季度",
-    "世纪",
-    "年代",
-    "个月",
-    "公里",
-    "千米",
-    "厘米",
-    "毫米",
-    "英里",
-    "英尺",
-    "英寸",
-    "公斤",
-    "千克",
-    "毫升",
-    "加仑",
-    "美元",
-    "美金",
-    "欧元",
-    "英镑",
-    "日元",
-    "韩元",
-    "块钱",
-    "等级",
-    "编号",
-    "代码",
-    "号码",
-    "个人",
-    "点钟",
-    "年",
-    "岁",
-    "月",
-    "周",
-    "天",
-    "日",
-    "时",
-    "点",
-    "刻",
-    "分",
-    "秒",
-    "人",
-    "个",
-    "位",
-    "名",
-    "只",
-    "条",
-    "本",
-    "件",
-    "张",
-    "辆",
-    "艘",
-    "架",
-    "台",
-    "部",
-    "枚",
-    "颗",
-    "块",
-    "份",
-    "家",
-    "间",
-    "所",
-    "场",
-    "次",
-    "遍",
-    "回",
-    "趟",
-    "轮",
-    "集",
-    "季",
-    "章",
-    "页",
-    "行",
-    "句",
-    "字",
-    "层",
-    "级",
-    "号",
-    "届",
-    "期",
-    "队",
-    "组",
-    "对",
-    "双",
-    "套",
-    "种",
-    "米",
-    "码",
-    "吨",
-    "磅",
-    "斤",
-    "升",
-    "克",
-    "元",
-    "档",
-    "阶",
-    "星",
-    "倍",
-    "度",
-];
-
 fn longest_quantity_context(characters: &[char], start: usize) -> Option<&'static str> {
-    QUANTITY_CONTEXTS
+    CjkRules::QUANTITY_CONTEXTS
         .iter()
         .copied()
         .filter(|suffix| {
@@ -423,7 +310,7 @@ fn cjk_percentage(characters: &[char], start: usize) -> Option<(String, usize)> 
     }
     while characters
         .get(end)
-        .is_some_and(|character| is_cjk_numeral(*character))
+        .is_some_and(|character| CjkRules::is_numeral(*character))
     {
         end += 1;
     }
@@ -461,13 +348,7 @@ fn normalize_digits(digits: &str) -> &str {
 
 fn numeric_scale(characters: &[char], start: usize) -> Option<(u128, usize)> {
     let cjk = characters.get(start).copied().and_then(|character| {
-        let scale = match character {
-            '百' => 100,
-            '千' => 1_000,
-            '万' => 10_000,
-            '亿' => 100_000_000,
-            _ => return None,
-        };
+        let scale = CjkRules::unit_value(character)?;
         Some((scale, start + 1))
     });
     if cjk.is_some() {
@@ -481,42 +362,15 @@ fn numeric_scale(characters: &[char], start: usize) -> Option<(u128, usize)> {
         .iter()
         .collect::<String>()
         .to_ascii_lowercase();
-    let scale = match word.as_str() {
-        "hundred" => 100,
-        "thousand" => 1_000,
-        "million" => 1_000_000,
-        "billion" => 1_000_000_000,
-        "trillion" => 1_000_000_000_000,
-        _ => return None,
-    };
+    let scale = EnglishRules::scale(&word)?;
     Some((scale, end))
-}
-
-fn is_cjk_numeral(character: char) -> bool {
-    matches!(
-        character,
-        '零' | '〇'
-            | '一'
-            | '二'
-            | '两'
-            | '三'
-            | '四'
-            | '五'
-            | '六'
-            | '七'
-            | '八'
-            | '九'
-            | '十'
-            | '百'
-            | '千'
-            | '万'
-            | '亿'
-    )
 }
 
 fn parse_cjk_digit_sequence(characters: &[char]) -> Option<u128> {
     characters.iter().try_fold(0_u128, |value, character| {
-        value.checked_mul(10)?.checked_add(cjk_digit(*character)?)
+        value
+            .checked_mul(10)?
+            .checked_add(CjkRules::digit(*character)?)
     })
 }
 
@@ -526,10 +380,10 @@ fn parse_cjk_cardinal(characters: &[char]) -> Option<u128> {
     }
     if characters
         .iter()
-        .all(|character| cjk_digit(*character).is_some())
+        .all(|character| CjkRules::digit(*character).is_some())
     {
         return (characters.len() == 1)
-            .then(|| cjk_digit(characters[0]))
+            .then(|| CjkRules::digit(characters[0]))
             .flatten();
     }
 
@@ -542,7 +396,7 @@ fn parse_cjk_cardinal(characters: &[char]) -> Option<u128> {
     let mut zero_pending = false;
 
     for (index, character) in characters.iter().copied().enumerate() {
-        if let Some(digit) = cjk_digit(character) {
+        if let Some(digit) = CjkRules::digit(character) {
             if digit == 0 {
                 if index == 0
                     || index + 1 == characters.len()
@@ -562,7 +416,7 @@ fn parse_cjk_cardinal(characters: &[char]) -> Option<u128> {
             continue;
         }
 
-        let unit = cjk_unit_value(character)?;
+        let unit = CjkRules::unit_value(character)?;
         if unit < 10_000 {
             if zero_pending || unit >= last_small_unit {
                 return None;
@@ -599,33 +453,6 @@ fn parse_cjk_cardinal(characters: &[char]) -> Option<u128> {
     total.checked_add(section)
 }
 
-fn cjk_digit(character: char) -> Option<u128> {
-    match character {
-        '零' | '〇' => Some(0),
-        '一' => Some(1),
-        '二' | '两' => Some(2),
-        '三' => Some(3),
-        '四' => Some(4),
-        '五' => Some(5),
-        '六' => Some(6),
-        '七' => Some(7),
-        '八' => Some(8),
-        '九' => Some(9),
-        _ => None,
-    }
-}
-
-fn cjk_unit_value(character: char) -> Option<u128> {
-    match character {
-        '十' => Some(10),
-        '百' => Some(100),
-        '千' => Some(1_000),
-        '万' => Some(10_000),
-        '亿' => Some(100_000_000),
-        _ => None,
-    }
-}
-
 fn english_number_facts(text: &str) -> NumberFacts {
     let words = text
         // Keep digit-only tokens as boundaries so `a 12 million` does not
@@ -647,7 +474,7 @@ fn english_number_facts(text: &str) -> NumberFacts {
         }
         let phrase = &words[start..index];
         if phrase.len() == 1 {
-            if let Some(scale) = english_scale(&phrase[0]) {
+            if let Some(scale) = EnglishRules::scale(&phrase[0]) {
                 if start > 0 && matches!(words[start - 1].as_str(), "a" | "an") {
                     facts.definite.push(scale.to_string());
                 }
@@ -670,20 +497,22 @@ fn english_number_facts(text: &str) -> NumberFacts {
 }
 
 fn parse_english_number(words: &[String]) -> Option<u128> {
-    if words.len() > 1 && words.iter().all(|word| english_digit(word).is_some()) {
+    if words.len() > 1 && words.iter().all(|word| EnglishRules::digit(word).is_some()) {
         return words.iter().try_fold(0_u128, |value, word| {
-            value.checked_mul(10)?.checked_add(english_digit(word)?)
+            value
+                .checked_mul(10)?
+                .checked_add(EnglishRules::digit(word)?)
         });
     }
     let mut total = 0_u128;
     let mut current = 0_u128;
     for word in words {
-        if let Some(digit) = english_digit(word) {
+        if let Some(digit) = EnglishRules::digit(word) {
             current = current.checked_add(digit)?;
-        } else if let Some(value) = english_small_number(word) {
+        } else if let Some(value) = EnglishRules::small_number(word) {
             current = current.checked_add(value)?;
         } else {
-            let scale = english_scale(word)?;
+            let scale = EnglishRules::scale(word)?;
             if scale == 100 {
                 current = current.max(1).checked_mul(scale)?;
             } else {
@@ -696,60 +525,9 @@ fn parse_english_number(words: &[String]) -> Option<u128> {
 }
 
 fn english_number_value(word: &str) -> Option<u128> {
-    english_digit(word)
-        .or_else(|| english_small_number(word))
-        .or_else(|| english_scale(word))
-}
-
-fn english_digit(word: &str) -> Option<u128> {
-    match word {
-        "zero" | "oh" => Some(0),
-        "one" => Some(1),
-        "two" => Some(2),
-        "three" => Some(3),
-        "four" => Some(4),
-        "five" => Some(5),
-        "six" => Some(6),
-        "seven" => Some(7),
-        "eight" => Some(8),
-        "nine" => Some(9),
-        _ => None,
-    }
-}
-
-fn english_small_number(word: &str) -> Option<u128> {
-    match word {
-        "ten" => Some(10),
-        "eleven" => Some(11),
-        "twelve" => Some(12),
-        "thirteen" => Some(13),
-        "fourteen" => Some(14),
-        "fifteen" => Some(15),
-        "sixteen" => Some(16),
-        "seventeen" => Some(17),
-        "eighteen" => Some(18),
-        "nineteen" => Some(19),
-        "twenty" => Some(20),
-        "thirty" => Some(30),
-        "forty" => Some(40),
-        "fifty" => Some(50),
-        "sixty" => Some(60),
-        "seventy" => Some(70),
-        "eighty" => Some(80),
-        "ninety" => Some(90),
-        _ => None,
-    }
-}
-
-fn english_scale(word: &str) -> Option<u128> {
-    match word {
-        "hundred" => Some(100),
-        "thousand" => Some(1_000),
-        "million" => Some(1_000_000),
-        "billion" => Some(1_000_000_000),
-        "trillion" => Some(1_000_000_000_000),
-        _ => None,
-    }
+    EnglishRules::digit(word)
+        .or_else(|| EnglishRules::small_number(word))
+        .or_else(|| EnglishRules::scale(word))
 }
 
 #[cfg(test)]

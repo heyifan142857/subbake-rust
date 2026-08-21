@@ -7,7 +7,8 @@ use crate::entities::{
     TerminologyPreflightResult, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::memory::{ContextMemory, english_possessive_base};
+use crate::language_rules::{EnglishRules, JapaneseRules};
+use crate::memory::ContextMemory;
 use crate::ports::{
     BackendJsonResult, BackendPayload, CacheStage, DashboardSink, GenerationRequest, LlmBackend,
     RuntimeStore,
@@ -236,7 +237,7 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                 let word = word.trim_matches(|ch: char| {
                     !ch.is_alphanumeric() && ch != '-' && ch != '\'' && ch != '’'
                 });
-                let word = english_possessive_base(word).unwrap_or(word);
+                let word = EnglishRules::possessive_base(word).unwrap_or(word);
                 english_stutter_base(word).unwrap_or(word)
             })
             .filter(|word| word.len() >= 2)
@@ -287,7 +288,7 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
                 });
             index = end;
         }
-        for source in japanese_honorific_names(&segment.text) {
+        for source in JapaneseRules::honorific_names(&segment.text) {
             candidates
                 .entry(source.to_lowercase())
                 .and_modify(|candidate| candidate.count += 1)
@@ -347,42 +348,6 @@ pub(super) fn extract_candidates(segments: &[SubtitleSegment]) -> Vec<Terminolog
         })
         .take(256)
         .collect()
-}
-
-fn japanese_honorific_names(text: &str) -> Vec<String> {
-    const HONORIFICS: [&str; 8] = ["ちゃん", "さん", "さま", "先生", "博士", "君", "様", "氏"];
-    let mut names = Vec::new();
-    for honorific in HONORIFICS {
-        for (honorific_at, _) in text.match_indices(honorific) {
-            let mut start = honorific_at;
-            let mut length = 0;
-            for (index, character) in text[..honorific_at].char_indices().rev() {
-                if length == 8 || !is_japanese_name_character(character) {
-                    break;
-                }
-                start = index;
-                length += 1;
-            }
-            if length < 2 {
-                continue;
-            }
-            let candidate = &text[start..honorific_at];
-            if !names.iter().any(|name| name == candidate) {
-                names.push(candidate.to_owned());
-            }
-        }
-    }
-    names
-}
-
-fn is_japanese_name_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3400}'..='\u{9fff}'
-            | '\u{30a0}'..='\u{30ff}'
-            | '\u{ff66}'..='\u{ff9f}'
-            | '·'
-    )
 }
 
 fn is_common_sentence_initial(value: &str) -> bool {
@@ -588,7 +553,7 @@ fn is_ordinary_latin_document_span(value: &str) -> bool {
 }
 
 fn is_redundant_possessive(value: &str, canonical: &str) -> bool {
-    english_possessive_base(value)
+    EnglishRules::possessive_base(value)
         .is_some_and(|base| base.trim().eq_ignore_ascii_case(canonical.trim()))
 }
 

@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::entities::{ConfirmedTranslationContext, SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
+use crate::language_rules::CjkRules;
 
 use super::BatchWithUsage;
 use super::support::{apply_lines, merge_translation_lines};
@@ -327,7 +328,11 @@ fn retrieval_terms(text: &str) -> BTreeSet<String> {
             terms.insert(value.clone());
         }
         let characters = value.chars().collect::<Vec<_>>();
-        if characters.iter().all(|character| is_cjk(*character)) && characters.len() > 2 {
+        if characters
+            .iter()
+            .all(|character| CjkRules::is_han_character(*character))
+            && characters.len() > 2
+        {
             for pair in characters.windows(2) {
                 terms.insert(pair.iter().collect());
             }
@@ -335,7 +340,7 @@ fn retrieval_terms(text: &str) -> BTreeSet<String> {
         current.clear();
     };
     for character in text.chars() {
-        if character.is_alphanumeric() || is_cjk(character) {
+        if character.is_alphanumeric() || CjkRules::is_han_character(character) {
             current.push(character);
         } else {
             flush(&mut current, &mut terms);
@@ -347,16 +352,9 @@ fn retrieval_terms(text: &str) -> BTreeSet<String> {
 
 fn normalized_retrieval_text(text: &str) -> String {
     text.chars()
-        .filter(|character| character.is_alphanumeric() || is_cjk(*character))
+        .filter(|character| character.is_alphanumeric() || CjkRules::is_han_character(*character))
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
-    )
 }
 
 pub(super) fn bounded_confirmed_context(

@@ -5,6 +5,7 @@ pub mod error;
 pub mod evaluation;
 pub mod formats;
 mod formatting;
+mod language_rules;
 pub mod languages;
 pub mod memory;
 mod number_facts;

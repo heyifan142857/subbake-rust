@@ -219,28 +219,8 @@ pub fn translation_readability_defaults(
     mode: TranslationMode,
     target_language: &str,
 ) -> TranslationReadabilityDefaults {
-    if mode != TranslationMode::Cinema {
-        return TranslationReadabilityDefaults {
-            max_characters_per_second: None,
-            max_characters_per_line: None,
-            max_lines: None,
-        };
-    }
-    let language = target_language
-        .split(['-', '_'])
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let cjk = matches!(language.as_str(), "zh" | "ja" | "ko");
-    TranslationReadabilityDefaults {
-        // CJK subtitle references are much denser than prose, especially on
-        // sub-second cues. These hard safety rails sit just above the observed
-        // maxima of the local five-episode reference corpus; stricter editorial
-        // targets belong in QA because translation cannot retime source cues.
-        max_characters_per_second: Some(if cjk { 23.0 } else { 17.0 }),
-        max_characters_per_line: Some(if cjk { 32 } else { 42 }),
-        max_lines: Some(2),
-    }
+    crate::language_rules::LanguageRuleRegistry::resolve("Auto", target_language)
+        .readability_defaults(mode)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
