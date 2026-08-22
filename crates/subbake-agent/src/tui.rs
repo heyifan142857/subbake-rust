@@ -21,7 +21,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use unicode_width::UnicodeWidthStr;
 
 use crate::engine::SessionChoice;
 use crate::error::AgentResult;
@@ -36,17 +35,23 @@ use subbake_core::{ProgressEvent, TaskState};
 
 mod history;
 mod input_router;
+mod layout;
+mod main_view;
+mod overlay_view;
 mod progress;
 mod protocol;
 mod render;
 mod terminal;
+mod text;
 mod worker;
 
 use history::ActiveTool;
 pub use history::{Msg, MsgStyle, MsgView, TuiObserver};
+use layout::ActiveLayout;
 use progress::format_progress;
 pub use protocol::{ConfigApplyAfter, StartupInfo, TuiAction, TuiInteraction};
 use terminal::TerminalSessionGuard;
+use text::{display_width, truncate_with_ellipsis};
 use worker::{TuiWorker, WorkerRequest};
 
 const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -74,6 +79,7 @@ pub struct SubBakeTui {
     history_cursor: usize,
     startup_pending: bool,
     config_editor: Option<ConfigEditorState>,
+    active_layout: Option<ActiveLayout>,
 }
 
 impl SubBakeTui {
@@ -108,6 +114,7 @@ impl SubBakeTui {
             history_cursor: 0,
             startup_pending: true,
             config_editor: None,
+            active_layout: None,
         })
     }
 
@@ -309,6 +316,7 @@ impl SubBakeTui {
     }
 
     fn open_fullscreen_overlay(&mut self) -> io::Result<()> {
+        self.invalidate_layout();
         if self.overlay_terminal.is_none() {
             self.terminal_session.enter_alternate_screen()?;
             let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
@@ -318,11 +326,16 @@ impl SubBakeTui {
     }
 
     fn close_fullscreen_overlay(&mut self) -> io::Result<()> {
+        self.invalidate_layout();
         if let Some(mut terminal) = self.overlay_terminal.take() {
             terminal.clear()?;
             terminal.show_cursor()?;
         }
         self.terminal_session.leave_alternate_screen()
+    }
+
+    fn invalidate_layout(&mut self) {
+        self.active_layout = None;
     }
 
     /// Run the event loop. `process_fn` is called with the user's input each
@@ -608,10 +621,6 @@ const INPUT_HINTS: &[&str] = &[
     "Use /history to revisit earlier requests",
 ];
 
-fn terminal_width(value: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(value)).unwrap_or(u16::MAX)
-}
-
 fn message_lines(message: &Msg) -> Vec<Line<'static>> {
     match message.style {
         MsgStyle::ToolCall => return tool_message_lines(&message.text, "✓", Color::Green),
@@ -695,9 +704,9 @@ fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
     let border_style = Style::default().fg(Color::DarkGray);
     let row = |label: &'static str, value: &str| {
         let prefix = format!("  {label:<10}");
-        let available = inner_width.saturating_sub(prefix.chars().count());
+        let available = inner_width.saturating_sub(display_width(&prefix));
         let value = truncate_with_ellipsis(value, available);
-        let padding = " ".repeat(available.saturating_sub(value.chars().count()));
+        let padding = " ".repeat(available.saturating_sub(display_width(&value)));
         Line::from(vec![
             Span::styled("│", border_style),
             Span::styled(prefix, Style::default().fg(Color::DarkGray)),
@@ -714,7 +723,7 @@ fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
         ])
     };
     let title = truncate_with_ellipsis(&format!("  SubBake v{}", info.version), inner_width);
-    let title_padding = " ".repeat(inner_width.saturating_sub(title.chars().count()));
+    let title_padding = " ".repeat(inner_width.saturating_sub(display_width(&title)));
     vec![
         Line::from(Span::styled(
             format!("╭{}╮", "─".repeat(inner_width)),
@@ -743,19 +752,6 @@ fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
             border_style,
         )),
     ]
-}
-
-fn truncate_with_ellipsis(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    value.chars().take(width - 1).chain(['…']).collect()
 }
 
 fn session_input_hint() -> &'static str {
@@ -853,7 +849,7 @@ mod tests {
         VerticalNavigation, empty_mode_choice, history_down, history_lines_height, history_up,
         is_insert_newline_key, is_profile_name_character, message_lines, picker_viewport,
         previous_suggestion, push_immediate_response, slash_suggestions, startup_panel_lines,
-        suggestions_for, terminal_width, vertical_navigation,
+        suggestions_for, vertical_navigation,
     };
 
     #[test]
@@ -862,13 +858,6 @@ mod tests {
         assert_eq!(super::inline_viewport_height(12), 11);
         assert_eq!(super::inline_viewport_height(2), 1);
         assert_eq!(super::inline_viewport_height(1), 1);
-    }
-
-    #[test]
-    fn terminal_width_uses_display_columns_for_unicode_input() {
-        assert_eq!(terminal_width("hello"), 5);
-        assert_eq!(terminal_width("中文"), 4);
-        assert_eq!(terminal_width("a中"), 3);
     }
 
     #[test]

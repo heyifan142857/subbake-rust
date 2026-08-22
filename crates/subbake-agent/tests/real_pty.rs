@@ -85,6 +85,28 @@ exit "$status"
     let reader_thread = spawn_terminal_emulator(reader, writer.clone(), transcript.clone());
 
     wait_for_output(&transcript, b"\x1b[>1u", STEP_TIMEOUT);
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize PTY to narrow composer");
+    send_text(&writer, "after ");
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize PTY to wide composer");
+    send_text(&writer, "resize");
+    send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "SubmitText:after resize", &transcript);
+    wait_for_output(&transcript, b"resize accepted", STEP_TIMEOUT);
+
     send(&writer, SHIFT_TAB_KEY);
     wait_for_action(&action_log, "TogglePlan", &transcript);
     wait_for_output(&transcript, b"plan toggled", STEP_TIMEOUT);
@@ -94,7 +116,23 @@ exit "$status"
     wait_for_action(&action_log, "SubmitText:/profile", &transcript);
     wait_for_output(&transcript, b"\x1b[?1049h", STEP_TIMEOUT);
 
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize PTY profile picker");
     send(&writer, b"\x1b[B");
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("widen PTY profile picker");
     send(&writer, ENTER_KEY);
     send_text(&writer, "pty_profile");
     send(&writer, ENTER_KEY);
@@ -106,6 +144,23 @@ exit "$status"
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:/config", &transcript);
     wait_for_output_count(&transcript, b"\x1b[?1049h", 2, STEP_TIMEOUT);
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize PTY configuration editor");
+    send(&writer, b"\t\x1b[B");
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("widen PTY configuration editor");
     send(&writer, b"q");
     wait_for_output_count(&transcript, b"\x1b[?1049l", 2, STEP_TIMEOUT);
 
@@ -246,6 +301,9 @@ fn scripted_interaction(
     match action {
         TuiAction::TogglePlan => Ok(TuiInteraction::Message {
             message: "plan toggled".to_owned(),
+        }),
+        TuiAction::SubmitText(input) if input == "after resize" => Ok(TuiInteraction::Message {
+            message: "resize accepted".to_owned(),
         }),
         TuiAction::SubmitText(input) if input == "/profile" => Ok(TuiInteraction::ProfilePicker {
             message: String::new(),

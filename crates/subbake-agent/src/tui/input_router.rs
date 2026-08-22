@@ -18,10 +18,28 @@ pub(super) fn handle_event(
     app: &mut SubBakeTui,
     request_tx: &mpsc::Sender<WorkerRequest>,
 ) -> io::Result<()> {
-    if !event::poll(super::EVENT_POLL_INTERVAL)? {
+    let Some(event) = read_event()? else {
+        return Ok(());
+    };
+    dispatch_event(app, request_tx, event)
+}
+
+fn read_event() -> io::Result<Option<Event>> {
+    event::poll(super::EVENT_POLL_INTERVAL)?
+        .then(event::read)
+        .transpose()
+}
+
+fn dispatch_event(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+    event: Event,
+) -> io::Result<()> {
+    if event_invalidates_layout(&event) {
+        app.invalidate_layout();
         return Ok(());
     }
-    match event::read()? {
+    match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.interaction_state.is_processing() {
                 return handle_processing_key(app, key.code, key.modifiers);
@@ -86,10 +104,13 @@ pub(super) fn handle_event(
                 _ => {}
             }
         }
-        Event::Resize(_, _) => {}
         _ => {}
     }
     Ok(())
+}
+
+fn event_invalidates_layout(event: &Event) -> bool {
+    matches!(event, Event::Resize(_, _))
 }
 
 fn handle_config_event(
@@ -653,7 +674,10 @@ fn navigate_vertical(app: &mut SubBakeTui, up: bool) -> io::Result<()> {
             };
         }
         VerticalNavigation::History => {
-            let width = app.terminal.size()?.width.saturating_sub(4).max(1);
+            let width = app
+                .active_layout
+                .and_then(|layout| layout.composer)
+                .map_or(1, |layout| layout.input_content_width);
             let moved = if up {
                 app.input.move_up(width)
             } else {
@@ -780,5 +804,11 @@ mod tests {
             processing_key_action(KeyCode::Char('q'), KeyModifiers::NONE, false),
             ProcessingKeyAction::Ignore
         );
+    }
+
+    #[test]
+    fn resize_events_are_classified_without_using_reported_dimensions() {
+        assert!(event_invalidates_layout(&Event::Resize(40, 12)));
+        assert!(!event_invalidates_layout(&Event::FocusGained));
     }
 }
