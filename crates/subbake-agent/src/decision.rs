@@ -22,6 +22,7 @@ use crate::event::{
     EventKind, PendingAgentTurn, PendingAggregateFailureCount, PendingFailureCount,
     PendingToolCall, PendingToolExchange, ToolCallDraft,
 };
+use crate::guard::ExternalPathGuard;
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::tools::{
     ToolValidationError, find_tool_spec, model_visible_tool_names, model_visible_tool_specs,
@@ -361,29 +362,34 @@ impl AgentEngine {
             ));
         }
 
-        let planned = calls
-            .iter()
-            .filter_map(|call| {
-                find_tool_spec(&call.name)
-                    .filter(|spec| spec.model_visible)
-                    .filter(|spec| {
-                        spec.mutates_with(&call.arguments)
-                            && !(call.name == "run_command" && !self.is_in_plan_mode())
-                            && (self.is_in_plan_mode()
-                                || (spec.requires_approval_with(&call.arguments)
-                                    && !(call.name == "run_command"
-                                        && self.runtime_policy.auto_approve_commands())))
-                    })
-                    .and_then(|_| {
-                        validate_tool_call(&call.name, &call.arguments)
-                            .is_ok()
-                            .then(|| ToolCallDraft {
-                                tool_name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            })
-                    })
-            })
-            .collect::<Vec<_>>();
+        let contains_external_delete = calls.iter().any(|call| call.name == "delete_external_path");
+        let planned = if contains_external_delete {
+            Vec::new()
+        } else {
+            calls
+                .iter()
+                .filter_map(|call| {
+                    find_tool_spec(&call.name)
+                        .filter(|spec| spec.model_visible)
+                        .filter(|spec| {
+                            spec.mutates_with(&call.arguments)
+                                && !(call.name == "run_command" && !self.is_in_plan_mode())
+                                && (self.is_in_plan_mode()
+                                    || (spec.requires_approval_with(&call.arguments)
+                                        && !(call.name == "run_command"
+                                            && self.runtime_policy.auto_approve_commands())))
+                        })
+                        .and_then(|_| {
+                            validate_tool_call(&call.name, &call.arguments)
+                                .is_ok()
+                                .then(|| ToolCallDraft {
+                                    tool_name: call.name.clone(),
+                                    arguments: call.arguments.clone(),
+                                })
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
         if !planned.is_empty() {
             self.store_plan("", planned)?;
             return Ok(ProcessedCalls::Planned);
@@ -395,8 +401,32 @@ impl AgentEngine {
             .collect::<Vec<_>>();
         let mut native_results = Vec::new();
         let mut calls = VecDeque::from(calls);
-        while let Some(call) = calls.pop_front() {
+        while let Some(mut call) = calls.pop_front() {
             self.check_cancelled()?;
+            if call.name == "delete_external_path"
+                && validate_tool_call(&call.name, &call.arguments).is_ok()
+                && let Ok(reason) = prepare_external_delete_call(&mut call, &self.project_root)
+            {
+                return Ok(ProcessedCalls::AwaitingCommandApproval {
+                    call,
+                    reason,
+                    completed_results: native_results,
+                    remaining_calls: calls.into(),
+                });
+            }
+            if contains_external_delete
+                && call.name != "delete_external_path"
+                && self.is_in_plan_mode()
+                && find_tool_spec(&call.name).is_some_and(|spec| spec.mutates_with(&call.arguments))
+                && validate_tool_call(&call.name, &call.arguments).is_ok()
+            {
+                return Ok(ProcessedCalls::AwaitingCommandApproval {
+                    reason: "plan mode requires approval before this mutation; an external deletion in the same tool batch will receive its own separate approval".to_owned(),
+                    call,
+                    completed_results: native_results,
+                    remaining_calls: calls.into(),
+                });
+            }
             if call.name == "run_command"
                 && validate_tool_call(&call.name, &call.arguments).is_ok()
                 && !self.runtime_policy.auto_approve_commands()
@@ -672,7 +702,7 @@ impl AgentEngine {
             }
             crate::engine::CommandDecision::Reject => ToolFeedback::failure(
                 &pending.tool_call.tool_name,
-                "the user declined this command".to_owned(),
+                "the user declined this operation".to_owned(),
                 "user_denied",
                 available_tools,
             ),
@@ -1003,6 +1033,40 @@ impl AgentEngine {
         }
         result
     }
+}
+
+fn prepare_external_delete_call(
+    call: &mut ModelToolCall,
+    project_root: &std::path::Path,
+) -> AgentResult<String> {
+    let requested = call
+        .arguments
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| AgentError::ToolArguments {
+            message: "missing required argument `path`".to_owned(),
+        })?;
+    let recursive = call
+        .arguments
+        .get("recursive")
+        .and_then(JsonValue::as_bool)
+        .ok_or_else(|| AgentError::ToolArguments {
+            message: "missing required argument `recursive`".to_owned(),
+        })?;
+    let prepared = ExternalPathGuard::new(project_root.to_path_buf())
+        .prepare(std::path::Path::new(requested))?;
+    call.arguments["path"] = JsonValue::String(prepared.path.to_string_lossy().into_owned());
+    let target_kind = if prepared.is_symlink {
+        "symbolic link (the link itself, not its target)"
+    } else if prepared.is_directory {
+        "directory"
+    } else {
+        "file"
+    };
+    Ok(format!(
+        "permanent external {target_kind} deletion: {}; recursive={recursive}; this operation is not recoverable through /undo",
+        prepared.path.display()
+    ))
 }
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -1526,6 +1590,53 @@ mod tests {
                 .is_none()
         );
         assert!(backend.prompts[1][1].content.contains("approved-output"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_delete_is_canonicalized_and_requires_per_use_approval() {
+        let root = temp_root("external-delete-project");
+        let outside = temp_root("external-delete-target");
+        std::fs::create_dir_all(&root).expect("project root");
+        std::fs::write(&outside, "delete me").expect("external target");
+        let canonical_outside = outside.canonicalize().expect("canonical external target");
+        let mut engine = active_engine(root.clone());
+        engine.set_runtime_policy(
+            crate::engine::AgentRuntimePolicy::new(24, true).expect("runtime policy"),
+        );
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "tool_name":"delete_external_path",
+                    "arguments":{"path":outside,"recursive":false}
+                }),
+                json!({"action":"respond","text":"external path deleted permanently"}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let pending = engine
+            .run_line("delete that external file", &mut backend)
+            .expect("request external deletion approval");
+
+        assert!(pending.contains("High-risk external deletion awaiting approval"));
+        assert!(pending.contains(&canonical_outside.to_string_lossy().to_string()));
+        assert!(pending.contains("not recoverable through /undo"));
+        assert!(canonical_outside.exists());
+        assert!(engine.has_pending_command_approval());
+
+        let response = engine
+            .handle_command_decision(crate::engine::CommandDecision::Approve, &mut backend)
+            .expect("approve external deletion");
+
+        assert_eq!(response, "external path deleted permanently");
+        assert!(!canonical_outside.exists());
+        assert!(
+            backend.prompts[1][1]
+                .content
+                .contains("permanently_deleted_external_path_not_recoverable_by_undo")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

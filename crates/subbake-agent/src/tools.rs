@@ -50,6 +50,7 @@ pub(crate) enum ToolExecutor {
     ApplyPatch,
     RenamePath,
     DeleteFile,
+    DeleteExternalPath,
     SwitchProfile,
     ListProfiles,
     RunCommand,
@@ -453,6 +454,20 @@ const RENAME_PATH_ARGS: &[ToolArgSpec] = &[
     arg("from", StringArg, true, "existing path"),
     arg("to", StringArg, true, "new path"),
 ];
+const DELETE_EXTERNAL_PATH_ARGS: &[ToolArgSpec] = &[
+    arg(
+        "path",
+        StringArg,
+        true,
+        "absolute path outside the active project; the runtime resolves it before approval",
+    ),
+    arg(
+        "recursive",
+        BooleanArg,
+        true,
+        "explicitly declare whether a non-empty directory may be deleted recursively",
+    ),
+];
 const DIAGNOSE_TEXT_ARGS: &[ToolArgSpec] = &[arg("text", StringArg, true, "diagnostic text")];
 const SWITCH_PROFILE_ARGS: &[ToolArgSpec] = &[arg("name", StringArg, true, "profile name")];
 const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
@@ -720,6 +735,17 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         DeleteFile
     ),
     tool!(
+        "delete_external_path",
+        FileOp,
+        true,
+        true,
+        false,
+        true,
+        "Permanently delete one path outside the active project. Every call requires explicit user approval, never follows a leaf symlink, rejects filesystem/HOME/project roots, and cannot be undone by /undo.",
+        DELETE_EXTERNAL_PATH_ARGS,
+        DeleteExternalPath
+    ),
+    tool!(
         "switch_profile",
         Profile,
         false,
@@ -942,6 +968,7 @@ mod tests {
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"delete_external_path"));
     }
 
     proptest! {
@@ -1023,6 +1050,32 @@ mod tests {
                 &serde_json::json!({"command":"true","timeout_seconds":1801})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn external_delete_requires_a_path_and_explicit_recursive_choice() {
+        assert!(
+            validate_tool_call(
+                "delete_external_path",
+                &serde_json::json!({"path":"/tmp/file"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_call(
+                "delete_external_path",
+                &serde_json::json!({"path":"/tmp/file","recursive":false})
+            )
+            .is_ok()
+        );
+        assert!(
+            find_tool_spec("delete_external_path")
+                .expect("external delete spec")
+                .requires_approval_with(&serde_json::json!({
+                    "path":"/tmp/file",
+                    "recursive":false
+                }))
         );
     }
 

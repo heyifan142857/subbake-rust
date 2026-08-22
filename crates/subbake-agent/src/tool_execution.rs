@@ -23,7 +23,7 @@ use subbake_core::{
 
 use crate::discovery::rank_subtitle_candidates;
 use crate::error::{AgentError, AgentResult};
-use crate::guard::{FileGuard, FileOpAction, FileOpResult, SemanticUndo};
+use crate::guard::{ExternalPathGuard, FileGuard, FileOpAction, FileOpResult, SemanticUndo};
 use crate::session::AgentEvent;
 use crate::session::EventTag;
 use crate::tools::ToolExecutor;
@@ -228,6 +228,25 @@ pub(crate) fn execute_local_tool(
         ToolExecutor::DeleteFile => {
             let operation = guard.delete_file(&required_path(args, "path")?)?;
             mutation("delete", operation)
+        }
+        ToolExecutor::DeleteExternalPath => {
+            let recursive = args
+                .get("recursive")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(|| AgentError::ToolArguments {
+                    message: "missing required argument `recursive`".to_owned(),
+                })?;
+            let deleted = ExternalPathGuard::new(project_root.to_path_buf())
+                .delete(&required_path(args, "path")?, recursive)?;
+            LocalToolOutcome {
+                outcome: AgentToolOutcome::File(FileToolOutcome {
+                    status: ToolExecutionStatus::Written,
+                    action: "permanently_deleted_external_path_not_recoverable_by_undo".to_owned(),
+                    paths: vec![deleted.path],
+                    destination_paths: Vec::new(),
+                }),
+                file_operation: None,
+            }
         }
         _ => return Ok(None),
     };

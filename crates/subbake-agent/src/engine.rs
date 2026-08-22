@@ -498,8 +498,13 @@ impl AgentEngine {
         else {
             return "No command awaiting approval.".to_owned();
         };
+        let label = if pending.tool_call.tool_name == "delete_external_path" {
+            "High-risk external deletion awaiting approval"
+        } else {
+            "Command awaiting approval"
+        };
         format!(
-            "Command awaiting approval ({})\n{}",
+            "{label} ({})\n{}",
             pending.reason, pending.tool_call.arguments
         )
     }
@@ -515,6 +520,11 @@ impl AgentEngine {
             let Some(call) = call else {
                 break;
             };
+            if call.tool_name == "delete_external_path" {
+                return Err(AgentError::invalid_state(
+                    "external deletion cannot run inside a batch plan; submit it as a separate tool call for per-use high-risk approval",
+                ));
+            }
 
             let result = self.run_observed_tool(&call.tool_name, &call.arguments)?;
             outputs.push(format!(

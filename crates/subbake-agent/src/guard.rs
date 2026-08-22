@@ -24,6 +24,21 @@ pub enum FileGuardError {
     AlreadyExists { path: PathBuf },
     #[error("cannot back up non-existent file: {path}")]
     MissingBackupSource { path: PathBuf },
+    #[error("external deletion requires an absolute path: {path}")]
+    ExternalPathMustBeAbsolute { path: PathBuf },
+    #[error("use project-local file tools for paths inside `{root}`: {path}")]
+    ExternalPathInsideProject { root: PathBuf, path: PathBuf },
+    #[error("refusing to delete protected filesystem root `{path}`")]
+    CriticalExternalPath { path: PathBuf },
+    #[error(
+        "external deletion target changed after approval: approved `{approved}`, resolved `{resolved}`"
+    )]
+    ExternalPathChanged {
+        approved: PathBuf,
+        resolved: PathBuf,
+    },
+    #[error("external directory is not empty; set `recursive` to true to delete it: {path}")]
+    ExternalDirectoryRequiresRecursive { path: PathBuf },
     #[error("{operation}{path_suffix}: {source}", path_suffix = path.as_ref().map(|value| format!(" `{}`", value.display())).unwrap_or_default())]
     Io {
         operation: &'static str,
@@ -105,6 +120,144 @@ pub enum FileOpAction {
 pub struct FileGuard {
     project_root: PathBuf,
     backup_root: PathBuf,
+}
+
+/// Guard for the deliberately exceptional operation that deletes paths outside
+/// the active project. It does not create backups or participate in `/undo`;
+/// callers must put every invocation behind explicit user approval.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalPathGuard {
+    project_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedExternalDelete {
+    pub path: PathBuf,
+    pub is_directory: bool,
+    pub is_symlink: bool,
+}
+
+impl ExternalPathGuard {
+    pub(crate) fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+
+    /// Resolve the exact path shown at the approval boundary. A leaf symlink
+    /// is kept as the target so deletion removes the link rather than what it
+    /// points to; existing parent components are canonicalized.
+    pub(crate) fn prepare(&self, requested_path: &Path) -> FileGuardResult<PreparedExternalDelete> {
+        if !requested_path.is_absolute() {
+            return Err(FileGuardError::ExternalPathMustBeAbsolute {
+                path: requested_path.to_path_buf(),
+            });
+        }
+        let normalized = normalize_path(requested_path.to_path_buf());
+        let metadata =
+            std::fs::symlink_metadata(&normalized).map_err(|source| FileGuardError::Io {
+                operation: "inspect external deletion target",
+                path: Some(normalized.clone()),
+                source,
+            })?;
+        let is_symlink = metadata.file_type().is_symlink();
+        let resolved = if is_symlink {
+            let parent =
+                normalized
+                    .parent()
+                    .ok_or_else(|| FileGuardError::CriticalExternalPath {
+                        path: normalized.clone(),
+                    })?;
+            let canonical_parent = parent.canonicalize().map_err(|source| FileGuardError::Io {
+                operation: "resolve external deletion parent",
+                path: Some(parent.to_path_buf()),
+                source,
+            })?;
+            canonical_parent.join(normalized.file_name().ok_or_else(|| {
+                FileGuardError::CriticalExternalPath {
+                    path: normalized.clone(),
+                }
+            })?)
+        } else {
+            normalized
+                .canonicalize()
+                .map_err(|source| FileGuardError::Io {
+                    operation: "resolve external deletion target",
+                    path: Some(normalized.clone()),
+                    source,
+                })?
+        };
+
+        self.reject_critical_path(&resolved)?;
+        Ok(PreparedExternalDelete {
+            path: resolved,
+            is_directory: metadata.is_dir(),
+            is_symlink,
+        })
+    }
+
+    pub(crate) fn delete(
+        &self,
+        approved_path: &Path,
+        recursive: bool,
+    ) -> FileGuardResult<PreparedExternalDelete> {
+        let approved = normalize_path(approved_path.to_path_buf());
+        let prepared = self.prepare(&approved)?;
+        if prepared.path != approved {
+            return Err(FileGuardError::ExternalPathChanged {
+                approved,
+                resolved: prepared.path,
+            });
+        }
+
+        if prepared.is_symlink || !prepared.is_directory {
+            std::fs::remove_file(&prepared.path).map_err(|source| FileGuardError::Io {
+                operation: "delete external path",
+                path: Some(prepared.path.clone()),
+                source,
+            })?;
+        } else if recursive {
+            std::fs::remove_dir_all(&prepared.path).map_err(|source| FileGuardError::Io {
+                operation: "recursively delete external directory",
+                path: Some(prepared.path.clone()),
+                source,
+            })?;
+        } else if let Err(source) = std::fs::remove_dir(&prepared.path) {
+            if source.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                return Err(FileGuardError::ExternalDirectoryRequiresRecursive {
+                    path: prepared.path,
+                });
+            }
+            return Err(FileGuardError::Io {
+                operation: "delete external directory",
+                path: Some(prepared.path),
+                source,
+            });
+        }
+        Ok(prepared)
+    }
+
+    fn reject_critical_path(&self, path: &Path) -> FileGuardResult<()> {
+        let project_root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(self.project_root.clone()));
+        if path.starts_with(&project_root) {
+            return Err(FileGuardError::ExternalPathInsideProject {
+                root: project_root,
+                path: path.to_path_buf(),
+            });
+        }
+        if path.parent().is_none() || canonical_home().as_deref() == Some(path) {
+            return Err(FileGuardError::CriticalExternalPath {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn canonical_home() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.canonicalize().unwrap_or_else(|_| normalize_path(home)))
 }
 
 impl FileGuard {
@@ -794,6 +947,92 @@ mod tests {
         let root = std::env::temp_dir().join(format!("subbake-guard-{ts}"));
         let guard = FileGuard::new(root.clone());
         (root, guard)
+    }
+
+    #[test]
+    fn external_delete_rejects_project_paths_and_filesystem_root() {
+        let (root, _) = setup();
+        std::fs::create_dir_all(&root).expect("create project root");
+        std::fs::write(root.join("inside.txt"), "keep").expect("write project file");
+        let guard = ExternalPathGuard::new(root.clone());
+
+        let project_error = guard
+            .prepare(&root.join("inside.txt"))
+            .expect_err("project path must use FileGuard");
+        let root_error = guard
+            .prepare(Path::new("/"))
+            .expect_err("filesystem root must be protected");
+
+        assert!(matches!(
+            project_error,
+            FileGuardError::ExternalPathInsideProject { .. }
+        ));
+        assert!(matches!(
+            root_error,
+            FileGuardError::CriticalExternalPath { .. }
+        ));
+        assert!(root.join("inside.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn external_directory_requires_an_explicit_recursive_delete() {
+        let (project_root, _) = setup();
+        let outside = std::env::temp_dir().join(format!(
+            "subbake-external-delete-directory-{}",
+            nanos_since_epoch()
+        ));
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&outside).expect("create external directory");
+        std::fs::write(outside.join("data.txt"), "data").expect("write external file");
+        let guard = ExternalPathGuard::new(project_root.clone());
+        let approved = guard.prepare(&outside).expect("prepare external directory");
+
+        let error = guard
+            .delete(&approved.path, false)
+            .expect_err("non-empty directory should require recursive=true");
+        assert!(matches!(
+            error,
+            FileGuardError::ExternalDirectoryRequiresRecursive { .. }
+        ));
+        assert!(outside.exists());
+
+        let deleted = guard
+            .delete(&approved.path, true)
+            .expect("recursive external deletion");
+        assert_eq!(deleted.path, outside);
+        assert!(!outside.exists());
+        let _ = std::fs::remove_dir_all(project_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_delete_removes_a_leaf_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let (project_root, _) = setup();
+        let outside = std::env::temp_dir().join(format!(
+            "subbake-external-delete-symlink-{}",
+            nanos_since_epoch()
+        ));
+        let target = outside.join("target");
+        let link = outside.join("link");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&target).expect("create symlink target");
+        std::fs::write(target.join("keep.txt"), "keep").expect("write target file");
+        symlink(&target, &link).expect("create symlink");
+        let guard = ExternalPathGuard::new(project_root.clone());
+        let approved = guard.prepare(&link).expect("prepare symlink deletion");
+
+        assert!(approved.is_symlink);
+        guard
+            .delete(&approved.path, true)
+            .expect("delete leaf symlink");
+        assert!(!link.exists());
+        assert!(target.join("keep.txt").exists());
+
+        let _ = std::fs::remove_dir_all(project_root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

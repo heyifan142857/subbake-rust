@@ -141,7 +141,10 @@ exit "$status"
     send_text(&writer, "inspect file");
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:inspect file", &transcript);
-    wait_for_output(&transcript, b"Reading sample.srt", STEP_TIMEOUT);
+    // Ratatui may emit the transient "Reading" label as multiple cursor-diff
+    // writes, so the raw PTY byte stream is not guaranteed to contain that
+    // visual text contiguously. The stable completed activity remains a
+    // reliable end-to-end assertion; running labels are covered by unit tests.
     wait_for_output(&transcript, b"Read sample.srt", STEP_TIMEOUT);
     wait_for_output(&transcript, b"inspection complete", STEP_TIMEOUT);
 

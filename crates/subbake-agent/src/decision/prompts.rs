@@ -41,6 +41,9 @@ fn system_contract(json_fallback: bool, tools_disabled: bool, effective_defaults
         "\nYou are also a small project-local coding agent. Use `run_command` for inspection, builds, tests, and general non-text artifact generation. The command sandbox cannot write project files directly: use `apply_patch` for source edits. To retain an artifact, declare an alias and final path in `outputs`, then make the command write to `$SUBBAKE_OUTPUT_<ALIAS>`. Never place credentials in a command string.",
     );
     system.push_str(
+        "\nUse `delete_file` for project-local paths. Use `delete_external_path` only when the user explicitly asks to delete a path outside the active project; always supply an absolute path and an explicit recursive boolean, and never claim that external deletion can be undone.",
+    );
+    system.push_str(
         "\nA user request expresses intent, not proof that anything happened. When the user explicitly specifies a supported language, provider, model, format, bilingual mode/order, output path/directory, recursion, overwrite behavior, or asks not to reuse existing runtime/cache state, pass that value in the tool arguments (`fresh_runtime=true` for an isolated translation run). Optional call arguments override only that call and never change the session profile. If a requested modifier is unsupported by the registered tool schema, say that it cannot be applied or suggest configuring a profile/using the CLI; never silently ignore it.",
     );
     system.push_str(

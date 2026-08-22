@@ -148,7 +148,7 @@ fn action_label(
                 "Renaming"
             }
         }
-        Some(ToolExecutor::DeleteFile) => {
+        Some(ToolExecutor::DeleteFile | ToolExecutor::DeleteExternalPath) => {
             if completed {
                 "Deleted"
             } else {
@@ -194,9 +194,12 @@ fn failure_label(executor: Option<ToolExecutor>) -> &'static str {
         ) => "Listing failed",
         Some(ToolExecutor::SearchFiles) => "Search failed",
         Some(ToolExecutor::ReadFilePreview | ToolExecutor::ReadFile) => "Read failed",
-        Some(ToolExecutor::ApplyPatch | ToolExecutor::RenamePath | ToolExecutor::DeleteFile) => {
-            "File operation failed"
-        }
+        Some(
+            ToolExecutor::ApplyPatch
+            | ToolExecutor::RenamePath
+            | ToolExecutor::DeleteFile
+            | ToolExecutor::DeleteExternalPath,
+        ) => "File operation failed",
         Some(ToolExecutor::SwitchProfile) => "Profile switch failed",
         Some(ToolExecutor::RunCommand) => "Command failed",
         None => "Tool failed",
@@ -346,6 +349,12 @@ fn argument_detail(executor: Option<ToolExecutor>, arguments: &JsonValue) -> Opt
             if let Some(patch) = string_argument(arguments, "patch") {
                 let (_, additions, deletions) = patch_stats(patch);
                 parts.push(format!("+{additions} −{deletions}"));
+            }
+        }
+        Some(ToolExecutor::DeleteExternalPath) => {
+            parts.push("permanent · unavailable to /undo".to_owned());
+            if arguments.get("recursive").and_then(JsonValue::as_bool) == Some(true) {
+                parts.push("recursive".to_owned());
             }
         }
         _ => {}

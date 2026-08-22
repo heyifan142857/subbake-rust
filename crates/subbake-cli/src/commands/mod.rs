@@ -390,10 +390,13 @@ Options:
       --runs          Remove run state
       --cache         Remove request and review caches
       --glossary      Remove glossary data
-      --all           Remove all runtime artifacts
+      --all           Remove all managed translation artifacts; preserve the runtime root and unrelated files
       --runtime-dir <DIR>  Override the runtime directory
       --yes           Confirm deletion
   -h, --help          Print help
+
+At least one of --runs, --cache, --glossary, or --all is required.
+Custom runtime directories must have been created by SubBake.
 "#;
 const WHISPER_HELP: &str = r#"Install and manage whisper.cpp and its models
 

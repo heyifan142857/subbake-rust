@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,9 @@ use subbake_core::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeStore,
 };
 use subbake_core::storage::{RunState, RuntimePaths};
+
+pub(crate) const RUNTIME_MARKER_NAME: &str = ".subbake-runtime-v1";
+pub(crate) const RUNTIME_MARKER_CONTENT: &str = "subbake-runtime-v1\n";
 
 #[derive(Debug, Clone)]
 pub struct FileRuntimeStore {
@@ -78,6 +81,26 @@ impl RuntimeStore for FileRuntimeStore {
             &self.paths.agent_logs_dir,
         ] {
             fs::create_dir_all(directory).map_err(storage_error)?;
+        }
+        let marker = self.paths.root_dir.join(RUNTIME_MARKER_NAME);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(storage_error(io::Error::other(format!(
+                    "runtime marker is not a regular file: {}",
+                    marker.display()
+                ))));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker)
+                    .map_err(storage_error)?;
+                file.write_all(RUNTIME_MARKER_CONTENT.as_bytes())
+                    .map_err(storage_error)?;
+            }
+            Err(error) => return Err(storage_error(error)),
         }
         Ok(())
     }
