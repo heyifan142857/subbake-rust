@@ -188,15 +188,28 @@ fn read_lines(reader: impl Read, sender: mpsc::Sender<String>) -> io::Result<Vec
     Ok(output)
 }
 
-fn terminate_child(child: &mut std::process::Child) {
+pub(crate) fn terminate_child(child: &mut std::process::Child) {
     #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", child.id())])
-            .status();
-    }
+    terminate_child_process_group(child);
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn terminate_child_process_group(child: &std::process::Child) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::{Pid, getpgid};
+
+    let Ok(raw_pid) = i32::try_from(child.id()) else {
+        return;
+    };
+    let child_pid = Pid::from_raw(raw_pid);
+    // Never signal a group inherited from the parent (for example a CI runner
+    // job group). Commands configured with `process_group(0)` are safe group
+    // targets only after the child is confirmed as that group's leader.
+    if getpgid(Some(child_pid)) == Ok(child_pid) {
+        let _ = killpg(child_pid, Signal::SIGTERM);
+    }
 }
 
 fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
@@ -243,5 +256,17 @@ mod tests {
         canceller.join().expect("join canceller");
 
         assert!(error.is_cancelled());
+    }
+
+    #[test]
+    fn termination_never_signals_an_inherited_process_group() {
+        let mut child = Command::new("sh")
+            .args(["-c", "while true; do sleep 1; done"])
+            .spawn()
+            .expect("spawn child in inherited process group");
+
+        terminate_child(&mut child);
+
+        assert!(child.try_wait().expect("poll terminated child").is_some());
     }
 }

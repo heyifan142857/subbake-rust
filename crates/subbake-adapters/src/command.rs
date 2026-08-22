@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use subbake_core::CancellationGuard;
 
 use crate::error::{AdapterError, AdapterResult};
+use crate::process::terminate_child;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -290,17 +291,6 @@ fn truncate_output(bytes: &[u8]) -> (String, bool) {
     value.push_str("\n… output truncated …\n");
     value.push_str(&String::from_utf8_lossy(&bytes[bytes.len() - half..]));
     (value, true)
-}
-
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{}", child.id())])
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]

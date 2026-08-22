@@ -2310,6 +2310,7 @@ dependencies = [
 name = "subbake-adapters"
 version = "0.2.0-alpha.1"
 dependencies = [
+ "nix 0.29.0",
  "reqwest",
  "serde",
  "serde_json",
