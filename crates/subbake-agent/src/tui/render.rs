@@ -310,4 +310,31 @@ mod tests {
             assert_eq!(layout.frame.width, width);
         }
     }
+
+    #[test]
+    fn config_confirmation_uses_native_block_shadow() {
+        use std::path::PathBuf;
+
+        use super::OverlaySnapshot;
+        use crate::ConfigEditorSnapshot;
+        use crate::tui_state::{ConfigConfirm, ConfigEditorState};
+
+        let mut editor = ConfigEditorState::new(ConfigEditorSnapshot {
+            path: PathBuf::from("subbake.toml"),
+            target: subbake_adapters::ConfigEditTarget::Defaults,
+            active_profile: None,
+            profiles: Vec::new(),
+            fields: Vec::new(),
+        });
+        editor.confirm = Some(ConfigConfirm::Close);
+        let mut snapshot = composer_snapshot("");
+        snapshot.overlay = Some(OverlaySnapshot::Config(editor));
+
+        let (layout, buffer, _) = render_snapshot(80, 20, &snapshot);
+        let popup = layout.overlay.expect("overlay").popup;
+        let shadow = &buffer[(popup.right(), popup.y.saturating_add(1))];
+
+        assert_eq!(shadow.symbol(), "▓");
+        assert_eq!(shadow.fg, ratatui::style::Color::DarkGray);
+    }
 }

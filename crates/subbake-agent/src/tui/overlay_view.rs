@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Shadow};
 
 use super::layout::OverlayLayout;
 use super::render::{OverlaySnapshot, ViewSnapshot};
@@ -261,7 +261,8 @@ fn render_config_editor(
                         usize::from(layout.popup.width),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .shadow(Shadow::dark_shade().style(Color::DarkGray)),
             ),
             layout.popup,
         );

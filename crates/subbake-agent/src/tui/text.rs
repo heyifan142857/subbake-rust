@@ -1,8 +1,8 @@
+use ratatui::buffer::CellWidth;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 pub(super) fn display_width(value: &str) -> usize {
-    UnicodeWidthStr::width(value)
+    usize::from(value.cell_width())
 }
 
 pub(super) fn truncate_with_ellipsis(value: &str, width: usize) -> String {
@@ -61,6 +61,9 @@ mod tests {
     #[test]
     fn helpers_use_unicode_display_columns() {
         assert_eq!(display_width("a中文"), 5);
+        // Ratatui accounts for the way terminals render halfwidth katakana
+        // sound marks, unlike unicode-width's generic Unicode calculation.
+        assert_eq!(display_width("ｶﾞ"), 2);
         assert_eq!(truncate_with_ellipsis("a中文", 4), "a中…");
         assert_eq!(tail_by_width("ab中文", 4), "中文");
         assert_eq!(display_width(&pad_to_width("中", 4)), 4);

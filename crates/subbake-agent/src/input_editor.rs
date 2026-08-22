@@ -1,7 +1,7 @@
 use std::ops::Range;
 
+use ratatui::buffer::CellWidth;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InputEditor {
@@ -92,7 +92,7 @@ impl InputEditor {
             return false;
         }
         let column = self.preferred_column.unwrap_or_else(|| {
-            UnicodeWidthStr::width(&self.text[lines[current].range.start..self.cursor])
+            usize::from(self.text[lines[current].range.start..self.cursor].cell_width())
         });
         self.cursor = cursor_at_column(&self.text, &lines[target as usize].range, column);
         self.preferred_column = Some(column);
@@ -113,7 +113,7 @@ impl InputEditor {
                 columns = 0;
                 continue;
             }
-            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            let grapheme_width = usize::from(grapheme.cell_width().max(1));
             if columns > 0 && columns + grapheme_width > width {
                 lines.push(VisualLine {
                     range: start..index,
@@ -155,7 +155,7 @@ impl InputEditor {
     pub(crate) fn cursor_position(&self, width: u16) -> (u16, u16) {
         let lines = self.visual_lines(width);
         let index = line_index(&lines, self.cursor);
-        let column = UnicodeWidthStr::width(&self.text[lines[index].range.start..self.cursor]);
+        let column = usize::from(self.text[lines[index].range.start..self.cursor].cell_width());
         (
             u16::try_from(column).unwrap_or(u16::MAX),
             u16::try_from(index.saturating_sub(self.scroll)).unwrap_or(u16::MAX),
@@ -179,7 +179,7 @@ fn line_index(lines: &[VisualLine], cursor: usize) -> usize {
 fn cursor_at_column(text: &str, range: &Range<usize>, target: usize) -> usize {
     let mut columns = 0;
     for (offset, grapheme) in text[range.clone()].grapheme_indices(true) {
-        let next = columns + UnicodeWidthStr::width(grapheme).max(1);
+        let next = columns + usize::from(grapheme.cell_width().max(1));
         if next > target {
             return range.start + offset;
         }
@@ -223,5 +223,13 @@ mod tests {
         editor.set_text("e\u{301}".to_owned());
         editor.backspace();
         assert!(editor.is_empty());
+    }
+
+    #[test]
+    fn cursor_uses_terminal_width_for_halfwidth_katakana_marks() {
+        let mut editor = InputEditor::default();
+        editor.set_text("ｶﾞ".to_owned());
+
+        assert_eq!(editor.cursor_position(10), (2, 0));
     }
 }

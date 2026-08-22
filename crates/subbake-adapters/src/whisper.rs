@@ -534,7 +534,7 @@ async fn download_file(
     file.flush().map_err(|source| {
         AdapterError::external_io("flush temporary download", Some(tmp.clone()), source)
     })?;
-    let actual_sha256 = format!("{:x}", hasher.finalize());
+    let actual_sha256 = hex_lower(hasher.finalize().as_ref());
     if let Some(expected) = expected_sha256
         && !actual_sha256.eq_ignore_ascii_case(&expected)
     {
@@ -1382,7 +1382,18 @@ fn hash_file(path: &Path, cancellation: &CancellationGuard) -> AdapterResult<Str
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_lower(hasher.finalize().as_ref()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> AdapterResult<()> {
@@ -1692,6 +1703,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn sha256_output_remains_lowercase_and_zero_padded() {
+        let digest = Sha256::digest(b"abc");
+
+        assert_eq!(
+            hex_lower(digest.as_ref()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn status_uses_configured_paths() {
