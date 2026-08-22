@@ -85,14 +85,16 @@ pub struct SubBakeTui {
 impl SubBakeTui {
     pub fn new() -> io::Result<Self> {
         let terminal_session = TerminalSessionGuard::enter()?;
-        let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
         let terminal_rows = crossterm::terminal::size()?.1;
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
-            },
-        )?;
+        let terminal = retry_terminal_initialization(|| {
+            let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+            Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
+                },
+            )
+        })?;
         Ok(Self {
             terminal_session,
             terminal,
@@ -609,6 +611,16 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 }
 
+/// Inline terminal initialization asks the terminal for its cursor position.
+/// A response can be lost while keyboard-protocol detection is handing the
+/// input stream back to the normal event reader, so retry that handshake once.
+/// Persistent terminal errors are still returned to the caller.
+fn retry_terminal_initialization<T>(
+    mut initialize: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    initialize().or_else(|_| initialize())
+}
+
 fn inline_viewport_height(terminal_rows: u16) -> u16 {
     terminal_rows.saturating_sub(1).clamp(1, 12)
 }
@@ -858,6 +870,36 @@ mod tests {
         assert_eq!(super::inline_viewport_height(12), 11);
         assert_eq!(super::inline_viewport_height(2), 1);
         assert_eq!(super::inline_viewport_height(1), 1);
+    }
+
+    #[test]
+    fn terminal_initialization_retries_one_lost_query_response() {
+        let mut attempts = 0;
+        let value = super::retry_terminal_initialization(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::other("lost terminal response"))
+            } else {
+                Ok("ready")
+            }
+        })
+        .expect("second terminal initialization should succeed");
+
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn terminal_initialization_returns_a_persistent_error_after_retry() {
+        let mut attempts = 0;
+        let error = super::retry_terminal_initialization::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::other("terminal unavailable"))
+        })
+        .expect_err("persistent terminal failure should be returned");
+
+        assert_eq!(error.to_string(), "terminal unavailable");
+        assert_eq!(attempts, 2);
     }
 
     #[test]
