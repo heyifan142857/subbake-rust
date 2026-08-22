@@ -21,10 +21,13 @@ use crate::process::{
     run_command_cancellable, run_command_cancellable_with_stderr_lines,
     run_command_cancellable_with_stdout_lines,
 };
-use crate::settings::{ResolvedSettings, StorageSettings};
+use crate::settings::{
+    DEFAULT_VAD_MIN_SILENCE_DURATION_MS, DEFAULT_VAD_MIN_SPEECH_DURATION_MS,
+    DEFAULT_VAD_SPEECH_PAD_MS, DEFAULT_VAD_THRESHOLD, ResolvedSettings, StorageSettings,
+};
 use crate::whisper::{
-    default_whisper_binary_path_for, default_whisper_models_dir_for, installed_models_in,
-    verify_whisper_cli,
+    DEFAULT_WHISPER_VAD_MODEL, default_whisper_binary_path_for, default_whisper_models_dir_for,
+    installed_models_in, vad_model_path, verify_whisper_cli,
 };
 
 const LONG_AUDIO_THRESHOLD_MS: u64 = 12 * 60 * 1_000;
@@ -36,7 +39,7 @@ const MAX_UNCOVERED_TRAILING_MS: u64 = 30 * 60 * 1_000;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionRequest {
     pub media_path: PathBuf,
     pub output_path: Option<PathBuf>,
@@ -44,7 +47,7 @@ pub struct TranscriptionRequest {
     pub settings: TranscriptionSettings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionSettings {
     pub language: Option<String>,
     pub model: Option<String>,
@@ -55,6 +58,12 @@ pub struct TranscriptionSettings {
     pub runtime_dir: Option<PathBuf>,
     pub multiple_model_policy: MultipleModelPolicy,
     pub filter_hallucinations: bool,
+    pub vad_enabled: Option<bool>,
+    pub vad_model: Option<String>,
+    pub vad_threshold: Option<f32>,
+    pub vad_min_speech_duration_ms: Option<u64>,
+    pub vad_min_silence_duration_ms: Option<u64>,
+    pub vad_speech_pad_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +141,43 @@ impl Default for TranscriptionSettings {
             runtime_dir: None,
             multiple_model_policy: MultipleModelPolicy::RequireExplicit,
             filter_hallucinations: true,
+            vad_enabled: None,
+            vad_model: None,
+            vad_threshold: None,
+            vad_min_speech_duration_ms: None,
+            vad_min_silence_duration_ms: None,
+            vad_speech_pad_ms: None,
         }
+    }
+}
+
+impl TranscriptionSettings {
+    pub(crate) fn effective_vad_enabled(&self) -> bool {
+        self.vad_enabled.unwrap_or(true)
+    }
+
+    pub(crate) fn effective_vad_model(&self) -> &str {
+        self.vad_model
+            .as_deref()
+            .unwrap_or(DEFAULT_WHISPER_VAD_MODEL)
+    }
+
+    pub(crate) fn effective_vad_threshold(&self) -> f32 {
+        self.vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD)
+    }
+
+    pub(crate) fn effective_vad_min_speech_duration_ms(&self) -> u64 {
+        self.vad_min_speech_duration_ms
+            .unwrap_or(DEFAULT_VAD_MIN_SPEECH_DURATION_MS)
+    }
+
+    pub(crate) fn effective_vad_min_silence_duration_ms(&self) -> u64 {
+        self.vad_min_silence_duration_ms
+            .unwrap_or(DEFAULT_VAD_MIN_SILENCE_DURATION_MS)
+    }
+
+    pub(crate) fn effective_vad_speech_pad_ms(&self) -> u64 {
+        self.vad_speech_pad_ms.unwrap_or(DEFAULT_VAD_SPEECH_PAD_MS)
     }
 }
 
@@ -333,6 +378,65 @@ fn parse_whisper_progress(line: &str) -> Option<u64> {
         .map(|value| value.min(100))
 }
 
+fn whisper_vad_args(settings: &TranscriptionSettings) -> AdapterResult<Vec<String>> {
+    if !settings.effective_vad_enabled() {
+        return Ok(Vec::new());
+    }
+    let model = settings.effective_vad_model().trim();
+    if model.is_empty() {
+        return Err(AdapterError::invalid_input(
+            "VAD model must not be empty when VAD is enabled",
+        ));
+    }
+    let configured_path = PathBuf::from(model);
+    let model_path = if configured_path.is_file()
+        || configured_path.is_absolute()
+        || configured_path.components().count() > 1
+    {
+        configured_path
+    } else {
+        let models_dir = settings
+            .whisper_models_dir
+            .clone()
+            .unwrap_or_else(|| default_whisper_models_dir_for(None));
+        vad_model_path(&models_dir, model)
+    };
+    if !model_path.is_file() {
+        return Err(AdapterError::invalid_input(format!(
+            "whisper.cpp VAD model `{model}` was not found at `{}`; run `sbake whisper vad-model {model}` or disable VAD explicitly with `--no-vad`",
+            model_path.display()
+        )));
+    }
+
+    let threshold = settings.effective_vad_threshold();
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(AdapterError::invalid_input(
+            "VAD threshold must be from 0 through 1",
+        ));
+    }
+    let min_speech = settings.effective_vad_min_speech_duration_ms();
+    let min_silence = settings.effective_vad_min_silence_duration_ms();
+    let speech_pad = settings.effective_vad_speech_pad_ms();
+    if min_speech == 0 || min_silence == 0 {
+        return Err(AdapterError::invalid_input(
+            "VAD minimum speech and silence durations must be greater than zero",
+        ));
+    }
+    Ok(vec![
+        "--vad".to_owned(),
+        "--vad-model".to_owned(),
+        model_path.to_string_lossy().into_owned(),
+        "--vad-threshold".to_owned(),
+        threshold.to_string(),
+        "--vad-min-speech-duration-ms".to_owned(),
+        min_speech.to_string(),
+        "--vad-min-silence-duration-ms".to_owned(),
+        min_silence.to_string(),
+        "--vad-speech-pad-ms".to_owned(),
+        speech_pad.to_string(),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
@@ -452,7 +556,9 @@ pub fn transcribe_media_cancellable_with_progress(
         raw_last_timestamp,
         prepared_audio.duration_ms(),
         cleanup,
+        0,
     )?;
+    shift_document_timestamps(&mut doc, prepared_audio.timeline_offset_ms());
 
     check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
@@ -562,6 +668,7 @@ pub(crate) fn transcribe_media_incremental_with_progress(
         cancellation,
         &progress,
         observer,
+        prepared_audio.timeline_offset_ms(),
     )?;
 
     Ok(IncrementalTranscriptionOutcome {
@@ -647,11 +754,12 @@ fn transcribe_prepared_audio(
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
 ) -> AdapterResult<SubtitleDocument> {
+    let vad_args = whisper_vad_args(settings)?;
     let Some(duration_ms) = prepared_audio.duration_ms() else {
         return WhisperCppTranscriber::new(
             binary.to_path_buf(),
             model_path.to_path_buf(),
-            Vec::new(),
+            vad_args,
         )
         .with_progress(progress.clone())
         .transcribe_cancellable(
@@ -666,7 +774,7 @@ fn transcribe_prepared_audio(
         return WhisperCppTranscriber::new(
             binary.to_path_buf(),
             model_path.to_path_buf(),
-            Vec::new(),
+            vad_args,
         )
         .with_progress(progress.clone())
         .transcribe_cancellable(
@@ -687,6 +795,7 @@ fn transcribe_prepared_audio(
         cancellation,
         progress,
         &chunks,
+        &vad_args,
     )
 }
 
@@ -701,7 +810,9 @@ fn transcribe_prepared_audio_incremental(
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
     observer: &mut dyn TranscriptionChunkObserver,
+    timeline_offset_ms: i64,
 ) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
+    let vad_args = whisper_vad_args(settings)?;
     let duration_ms = prepared_audio.duration_ms();
     let chunks = duration_ms.map(transcription_chunks).unwrap_or_else(|| {
         vec![TranscriptionChunk {
@@ -730,20 +841,24 @@ fn transcribe_prepared_audio_incremental(
                 passthrough_blocks: Vec::new(),
                 metadata: subbake_core::SubtitleDocumentMetadata::None,
             },
-            None => WhisperCppTranscriber::new(
-                binary.to_path_buf(),
-                model_path.to_path_buf(),
-                Vec::new(),
-            )
-            .with_progress(progress.clone())
-            .transcribe_cancellable(
-                prepared_audio.path(),
-                language,
-                whisper_format,
-                cancellation,
-            )?,
+            None => {
+                let mut document = WhisperCppTranscriber::new(
+                    binary.to_path_buf(),
+                    model_path.to_path_buf(),
+                    vad_args.clone(),
+                )
+                .with_progress(progress.clone())
+                .transcribe_cancellable(
+                    prepared_audio.path(),
+                    language,
+                    whisper_format,
+                    cancellation,
+                )?;
+                shift_document_timestamps(&mut document, timeline_offset_ms);
+                document
+            }
         };
-        let raw_last_timestamp = last_timed_end_ms(&document);
+        let raw_last_timestamp = last_timed_end_ms_on_audio(&document, timeline_offset_ms);
         let cleanup = if settings.filter_hallucinations && !resumed {
             clean_transcription_document(&mut document)
         } else {
@@ -756,7 +871,13 @@ fn transcribe_prepared_audio_incremental(
             segments: document.segments.clone(),
             resumed,
         })?;
-        validate_transcription_coverage(&document, raw_last_timestamp, duration_ms, cleanup)?;
+        validate_transcription_coverage(
+            &document,
+            raw_last_timestamp,
+            duration_ms,
+            cleanup,
+            timeline_offset_ms,
+        )?;
         if output_format == TranscriptionFormat::Txt {
             clear_timing_for_text(&mut document);
         }
@@ -775,6 +896,8 @@ fn transcribe_prepared_audio_incremental(
         &chunks,
         duration_ms,
         observer,
+        &vad_args,
+        timeline_offset_ms,
     )
 }
 
@@ -791,6 +914,8 @@ fn transcribe_long_audio_incremental(
     chunks: &[TranscriptionChunk],
     duration_ms: Option<u64>,
     observer: &mut dyn TranscriptionChunkObserver,
+    vad_args: &[String],
+    timeline_offset_ms: i64,
 ) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
     let runtime_dir = settings
         .runtime_dir
@@ -833,10 +958,12 @@ fn transcribe_long_audio_incremental(
                 extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
                 let progress_start = (index as u64 * 100) / chunks.len() as u64;
                 let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
+                let mut extra_args = vad_args.to_vec();
+                extra_args.extend(["--max-context".to_owned(), "0".to_owned()]);
                 let transcriber = WhisperCppTranscriber::new(
                     binary.to_path_buf(),
                     model_path.to_path_buf(),
-                    vec!["--max-context".to_owned(), "0".to_owned()],
+                    extra_args,
                 )
                 .with_progress(progress.clone())
                 .with_progress_window(progress_start, progress_end);
@@ -853,10 +980,12 @@ fn transcribe_long_audio_incremental(
                     index + 1 == chunks.len(),
                     whisper_format,
                 );
+                shift_document_timestamps(&mut document, timeline_offset_ms);
                 document
             }
         };
-        raw_last_timestamp = last_timed_end_ms(&document).or(raw_last_timestamp);
+        raw_last_timestamp =
+            last_timed_end_ms_on_audio(&document, timeline_offset_ms).or(raw_last_timestamp);
         if settings.filter_hallucinations && !resumed {
             let chunk_cleanup = clean_transcription_document(&mut document);
             cleanup.removed_empty_or_silence += chunk_cleanup.removed_empty_or_silence;
@@ -879,7 +1008,13 @@ fn transcribe_long_audio_incremental(
     let mut document = merged.ok_or_else(|| {
         AdapterError::invalid_input("long-audio transcription produced no chunks")
     })?;
-    validate_transcription_coverage(&document, raw_last_timestamp, duration_ms, cleanup)?;
+    validate_transcription_coverage(
+        &document,
+        raw_last_timestamp,
+        duration_ms,
+        cleanup,
+        timeline_offset_ms,
+    )?;
     if output_format == TranscriptionFormat::Txt {
         clear_timing_for_text(&mut document);
     }
@@ -929,6 +1064,7 @@ fn transcribe_long_audio(
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
     chunks: &[TranscriptionChunk],
+    vad_args: &[String],
 ) -> AdapterResult<SubtitleDocument> {
     let runtime_dir = settings
         .runtime_dir
@@ -956,13 +1092,12 @@ fn transcribe_long_audio(
         extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
         let progress_start = (index as u64 * 100) / chunks.len() as u64;
         let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
-        let transcriber = WhisperCppTranscriber::new(
-            binary.to_path_buf(),
-            model_path.to_path_buf(),
-            vec!["--max-context".to_owned(), "0".to_owned()],
-        )
-        .with_progress(progress.clone())
-        .with_progress_window(progress_start, progress_end);
+        let mut extra_args = vad_args.to_vec();
+        extra_args.extend(["--max-context".to_owned(), "0".to_owned()]);
+        let transcriber =
+            WhisperCppTranscriber::new(binary.to_path_buf(), model_path.to_path_buf(), extra_args)
+                .with_progress(progress.clone())
+                .with_progress_window(progress_start, progress_end);
         let mut document = transcriber.transcribe_cancellable(
             &chunk_path,
             language,
@@ -1113,17 +1248,63 @@ fn last_timed_end_ms(document: &SubtitleDocument) -> Option<u64> {
         .max()
 }
 
+fn last_timed_end_ms_on_audio(document: &SubtitleDocument, timeline_offset_ms: i64) -> Option<u64> {
+    last_timed_end_ms(document)
+        .map(|timestamp| unapply_timeline_offset(timestamp, timeline_offset_ms))
+}
+
+fn unapply_timeline_offset(timestamp_ms: u64, timeline_offset_ms: i64) -> u64 {
+    if timeline_offset_ms >= 0 {
+        timestamp_ms.saturating_sub(timeline_offset_ms as u64)
+    } else {
+        timestamp_ms.saturating_add(timeline_offset_ms.unsigned_abs())
+    }
+}
+
+fn shift_document_timestamps(document: &mut SubtitleDocument, timeline_offset_ms: i64) {
+    if timeline_offset_ms == 0 {
+        return;
+    }
+    document.segments.retain_mut(|segment| {
+        let (Some(start), Some(end)) = (
+            segment.start.as_deref().and_then(parse_timestamp_ms),
+            segment.end.as_deref().and_then(parse_timestamp_ms),
+        ) else {
+            return true;
+        };
+        let shifted_end = i128::from(end) + i128::from(timeline_offset_ms);
+        if shifted_end <= 0 {
+            return false;
+        }
+        let shifted_start = (i128::from(start) + i128::from(timeline_offset_ms)).max(0) as u64;
+        let shifted_end = shifted_end as u64;
+        let separator = if segment
+            .start
+            .as_deref()
+            .is_some_and(|value| value.contains('.'))
+        {
+            '.'
+        } else {
+            ','
+        };
+        segment.start = Some(format_timestamp_ms(shifted_start, separator));
+        segment.end = Some(format_timestamp_ms(shifted_end, separator));
+        true
+    });
+}
+
 fn validate_transcription_coverage(
     document: &SubtitleDocument,
     raw_last_timestamp: Option<u64>,
     duration_ms: Option<u64>,
     cleanup: TranscriptionCleanupStats,
+    timeline_offset_ms: i64,
 ) -> AdapterResult<()> {
     let Some(duration_ms) = duration_ms.filter(|duration| *duration > LONG_AUDIO_THRESHOLD_MS)
     else {
         return Ok(());
     };
-    let last_timestamp = last_timed_end_ms(document).unwrap_or(0);
+    let last_timestamp = last_timed_end_ms_on_audio(document, timeline_offset_ms).unwrap_or(0);
     let trailing_gap = duration_ms.saturating_sub(last_timestamp);
     if trailing_gap <= MAX_UNCOVERED_TRAILING_MS {
         return Ok(());
@@ -1154,6 +1335,7 @@ fn display_duration(milliseconds: u64) -> String {
 struct PreparedAudio {
     path: PathBuf,
     duration_ms: Option<u64>,
+    timeline_offset_ms: i64,
     _temporary_dir: Option<AudioTempDirectory>,
 }
 
@@ -1162,14 +1344,21 @@ impl PreparedAudio {
         Self {
             path: path.to_path_buf(),
             duration_ms,
+            timeline_offset_ms: 0,
             _temporary_dir: None,
         }
     }
 
-    fn temporary(path: PathBuf, duration_ms: Option<u64>, directory: AudioTempDirectory) -> Self {
+    fn temporary(
+        path: PathBuf,
+        duration_ms: Option<u64>,
+        timeline_offset_ms: i64,
+        directory: AudioTempDirectory,
+    ) -> Self {
         Self {
             path,
             duration_ms,
+            timeline_offset_ms,
             _temporary_dir: Some(directory),
         }
     }
@@ -1180,6 +1369,10 @@ impl PreparedAudio {
 
     fn duration_ms(&self) -> Option<u64> {
         self.duration_ms
+    }
+
+    fn timeline_offset_ms(&self) -> i64 {
+        self.timeline_offset_ms
     }
 }
 
@@ -1253,12 +1446,12 @@ fn prepare_audio_with_programs(
     })?;
     let temp_dir = unique_audio_temp_dir(&temp_root)?;
     let output = temp_dir.path().join("audio.wav");
-    let duration_ms = audio_info.duration_ms;
+    let progress_duration_ms = audio_info.duration_ms;
     progress.emit(ProgressEvent::running(
         TaskKind::Transcription,
         "PREPARE_AUDIO",
         0,
-        duration_ms,
+        progress_duration_ms,
         ProgressUnit::Duration,
     ));
 
@@ -1298,8 +1491,8 @@ fn prepare_audio_with_programs(
                 progress.emit(ProgressEvent::running(
                     TaskKind::Transcription,
                     "PREPARE_AUDIO",
-                    duration_ms.map_or(current, |total| current.min(total)),
-                    duration_ms,
+                    progress_duration_ms.map_or(current, |total| current.min(total)),
+                    progress_duration_ms,
                     ProgressUnit::Duration,
                 ));
             }
@@ -1323,19 +1516,26 @@ fn prepare_audio_with_programs(
     let mut done = ProgressEvent::running(
         TaskKind::Transcription,
         "PREPARE_AUDIO",
-        duration_ms.unwrap_or(processed_ms),
-        duration_ms,
+        progress_duration_ms.unwrap_or(processed_ms),
+        progress_duration_ms,
         ProgressUnit::Duration,
     );
     done.state = TaskState::Completed;
     progress.emit(done);
-    Ok(PreparedAudio::temporary(output, duration_ms, temp_dir))
+    let duration_ms = wav_duration_ms(&output).or(progress_duration_ms);
+    Ok(PreparedAudio::temporary(
+        output,
+        duration_ms,
+        audio_info.start_time_ms,
+        temp_dir,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MediaAudioInfo {
     codec: String,
     duration_ms: Option<u64>,
+    start_time_ms: i64,
 }
 
 fn probe_audio_info(
@@ -1350,7 +1550,7 @@ fn probe_audio_info(
             "-select_streams",
             "a:0",
             "-show_entries",
-            "stream=codec_name:format=duration",
+            "stream=codec_name,start_time:format=duration",
             "-of",
             "json",
             &media_path.to_string_lossy(),
@@ -1389,7 +1589,18 @@ fn probe_audio_info(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
         .map(|seconds| (seconds * 1_000.0).round() as u64);
-    Ok(MediaAudioInfo { codec, duration_ms })
+    let start_time_ms = value
+        .pointer("/streams/0/start_time")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite())
+        .map(|seconds| (seconds * 1_000.0).round() as i64)
+        .unwrap_or(0);
+    Ok(MediaAudioInfo {
+        codec,
+        duration_ms,
+        start_time_ms,
+    })
 }
 
 fn validate_audio_decodable(
@@ -1681,6 +1892,26 @@ pub fn apply_whisper_configuration(
     if transcription.model.is_none() {
         transcription.model = settings.transcription.model.clone();
     }
+    if transcription.vad_enabled.is_none() {
+        transcription.vad_enabled = Some(settings.transcription.vad_enabled);
+    }
+    if transcription.vad_model.is_none() {
+        transcription.vad_model = Some(settings.transcription.vad_model.clone());
+    }
+    if transcription.vad_threshold.is_none() {
+        transcription.vad_threshold = Some(settings.transcription.vad_threshold);
+    }
+    if transcription.vad_min_speech_duration_ms.is_none() {
+        transcription.vad_min_speech_duration_ms =
+            Some(settings.transcription.vad_min_speech_duration_ms);
+    }
+    if transcription.vad_min_silence_duration_ms.is_none() {
+        transcription.vad_min_silence_duration_ms =
+            Some(settings.transcription.vad_min_silence_duration_ms);
+    }
+    if transcription.vad_speech_pad_ms.is_none() {
+        transcription.vad_speech_pad_ms = Some(settings.transcription.vad_speech_pad_ms);
+    }
 }
 
 fn default_output_path(media_path: &Path, fmt: TranscriptionFormat) -> PathBuf {
@@ -1870,6 +2101,7 @@ mod tests {
                 removed_empty_or_silence: 0,
                 removed_repeated: 250,
             },
+            0,
         )
         .expect_err("truncated long transcription must fail");
         let message = error.to_string();
@@ -2090,7 +2322,7 @@ mod tests {
         let ffmpeg = root.join("ffmpeg");
         fs::write(
             &ffprobe,
-            "#!/bin/sh\nprintf '{\"streams\":[{\"codec_name\":\"mp3\"}],\"format\":{\"duration\":\"10.0\"}}\\n'\n",
+            "#!/bin/sh\nprintf '{\"streams\":[{\"codec_name\":\"mp3\",\"start_time\":\"10.0\"}],\"format\":{\"duration\":\"10.0\"}}\\n'\n",
         )
         .expect("write ffprobe");
         fs::write(
@@ -2123,6 +2355,7 @@ mod tests {
             .expect("temporary parent")
             .to_path_buf();
         assert!(prepared.path().is_file());
+        assert_eq!(prepared.timeline_offset_ms(), 10_000);
         assert!(temporary_dir.starts_with(runtime_dir.join("tmp/transcription")));
         let events = recorder.0.lock().expect("progress lock");
         assert!(events.iter().any(|event| {
@@ -2135,6 +2368,24 @@ mod tests {
         drop(prepared);
         assert!(!temporary_dir.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn media_timeline_offset_shifts_cues_without_changing_duration() {
+        let mut document = SubtitleDocument {
+            path: PathBuf::from("audio.srt"),
+            format: "srt".to_owned(),
+            segments: vec![timed_segment("1", "hello", "00:00:01,000", "00:00:02,500")],
+            header: None,
+            passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
+        };
+
+        shift_document_timestamps(&mut document, 10_000);
+
+        assert_eq!(document.segments[0].start.as_deref(), Some("00:00:11,000"));
+        assert_eq!(document.segments[0].end.as_deref(), Some("00:00:12,500"));
+        assert_eq!(last_timed_end_ms_on_audio(&document, 10_000), Some(2_500));
     }
 
     #[cfg(unix)]
@@ -2299,13 +2550,15 @@ mod tests {
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp version: fake-1"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
+  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context --vad --vad-model" >&2
   exit 0
 fi
 output=""
 format=""
 threads=""
 print_progress=0
+vad=0
+vad_model=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -os) echo "unexpected legacy -os" >&2; exit 17 ;;
@@ -2314,11 +2567,15 @@ while [ "$#" -gt 0 ]; do
     --output-vtt) format="vtt" ;;
     --threads) shift; threads="$1" ;;
     --print-progress) print_progress=1 ;;
+    --vad) vad=1 ;;
+    --vad-model) shift; vad_model="$1" ;;
   esac
   shift
 done
 if [ -z "$threads" ]; then echo "missing --threads" >&2; exit 18; fi
 if [ "$print_progress" -ne 1 ]; then echo "missing --print-progress" >&2; exit 19; fi
+if [ "$vad" -ne 1 ]; then echo "missing --vad" >&2; exit 20; fi
+if [ ! -f "$vad_model" ]; then echo "missing --vad-model" >&2; exit 21; fi
 i=0
 while [ "$i" -lt 20000 ]; do echo "diagnostic-$i" >&2; i=$((i + 1)); done
 echo "whisper_print_progress_callback: progress =  25%" >&2
@@ -2333,8 +2590,10 @@ fi
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod fake CLI");
         let audio = root.join("audio.wav");
         let model = root.join("ggml-fake.bin");
+        let vad_model = root.join("ggml-silero-v6.2.0.bin");
         fs::write(&audio, b"fake audio").expect("write audio");
         fs::write(&model, b"fake model").expect("write model");
+        fs::write(&vad_model, b"fake VAD model").expect("write VAD model");
 
         let output = root.join("result.srt");
         let recorder = Arc::new(Recorder::default());

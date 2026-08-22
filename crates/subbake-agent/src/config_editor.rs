@@ -160,6 +160,12 @@ config_fields! {
     MaxRequests => (Translation, "Maximum requests", ConfigFieldKind::Integer, ["translation", "max_requests"]),
     MaxTokens => (Translation, "Maximum tokens", ConfigFieldKind::Integer, ["translation", "max_tokens"]),
     TranscriptionModel => (Transcription, "Whisper model", ConfigFieldKind::Text, ["transcription", "model"]),
+    VadEnabled => (Transcription, "Silero VAD", ConfigFieldKind::Boolean, ["transcription", "vad_enabled"]),
+    VadModel => (Transcription, "VAD model", ConfigFieldKind::Text, ["transcription", "vad_model"]),
+    VadThreshold => (Transcription, "VAD threshold", ConfigFieldKind::Float, ["transcription", "vad_threshold"]),
+    VadMinSpeechDuration => (Transcription, "VAD minimum speech (ms)", ConfigFieldKind::Integer, ["transcription", "vad_min_speech_duration_ms"]),
+    VadMinSilenceDuration => (Transcription, "VAD minimum silence (ms)", ConfigFieldKind::Integer, ["transcription", "vad_min_silence_duration_ms"]),
+    VadSpeechPad => (Transcription, "VAD speech padding (ms)", ConfigFieldKind::Integer, ["transcription", "vad_speech_pad_ms"]),
     OutputFormat => (Output, "Output format", ConfigFieldKind::Text, ["output", "format"]),
     Bilingual => (Output, "Bilingual output", ConfigFieldKind::Boolean, ["output", "bilingual"]),
     BilingualOrder => (Output, "Bilingual order", ConfigFieldKind::Choice(BILINGUAL_ORDERS), ["output", "bilingual_order"]),
@@ -418,6 +424,18 @@ fn effective_value(
         ConfigFieldId::MaxRequests => some_string!(resolved.translation.max_requests),
         ConfigFieldId::MaxTokens => some_string!(resolved.translation.max_tokens),
         ConfigFieldId::TranscriptionModel => some_string!(resolved.transcription.model),
+        ConfigFieldId::VadEnabled => resolved.transcription.vad_enabled.to_string(),
+        ConfigFieldId::VadModel => resolved.transcription.vad_model.clone(),
+        ConfigFieldId::VadThreshold => resolved.transcription.vad_threshold.to_string(),
+        ConfigFieldId::VadMinSpeechDuration => resolved
+            .transcription
+            .vad_min_speech_duration_ms
+            .to_string(),
+        ConfigFieldId::VadMinSilenceDuration => resolved
+            .transcription
+            .vad_min_silence_duration_ms
+            .to_string(),
+        ConfigFieldId::VadSpeechPad => resolved.transcription.vad_speech_pad_ms.to_string(),
         ConfigFieldId::OutputFormat => some_string!(resolved.output.format),
         ConfigFieldId::Bilingual => resolved.output.bilingual.to_string(),
         ConfigFieldId::BilingualOrder => resolved.output.bilingual_order.as_str().to_owned(),
@@ -529,6 +547,16 @@ fn has_override(id: ConfigFieldId, settings: &SettingsOverrides) -> bool {
         ConfigFieldId::MaxRequests => settings.translation.max_requests.is_some(),
         ConfigFieldId::MaxTokens => settings.translation.max_tokens.is_some(),
         ConfigFieldId::TranscriptionModel => settings.transcription.model.is_some(),
+        ConfigFieldId::VadEnabled => settings.transcription.vad_enabled.is_some(),
+        ConfigFieldId::VadModel => settings.transcription.vad_model.is_some(),
+        ConfigFieldId::VadThreshold => settings.transcription.vad_threshold.is_some(),
+        ConfigFieldId::VadMinSpeechDuration => {
+            settings.transcription.vad_min_speech_duration_ms.is_some()
+        }
+        ConfigFieldId::VadMinSilenceDuration => {
+            settings.transcription.vad_min_silence_duration_ms.is_some()
+        }
+        ConfigFieldId::VadSpeechPad => settings.transcription.vad_speech_pad_ms.is_some(),
         ConfigFieldId::OutputFormat => settings.output.format.is_some(),
         ConfigFieldId::Bilingual => settings.output.bilingual.is_some(),
         ConfigFieldId::BilingualOrder => settings.output.bilingual_order.is_some(),

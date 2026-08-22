@@ -79,6 +79,8 @@ target_language = "Simplified Chinese"
 
 [profiles.default.transcription]
 model = "large-v3-turbo"
+vad_enabled = true
+vad_model = "silero-v6.2.0"
 
 [profiles.default.storage]
 whisper_binary_path = "/opt/whisper.cpp/build/bin/whisper-cli"
@@ -93,7 +95,8 @@ sbake provider check --profile default
 使用 `--config` 指定其他配置文件，使用 `--profile` 切换 profile。翻译模式可选
 `economy`、`turbo` 或 `cinema`。翻译模型由 `[backends.<名称>].model` 指定；如需只为
 某个 profile 覆盖模型，可写入 `[profiles.<名称>.backend].model`。交互式界面中输入
-`/config` 也可以编辑翻译模型、Whisper 模型、`whisper-cli` 路径和模型目录。
+`/config` 也可以编辑翻译模型、Whisper 模型、Silero VAD 参数、`whisper-cli`
+路径和模型目录。首次转写前可运行 `sbake whisper vad-model` 下载默认 VAD 模型。
 
 ## 翻译模式
 

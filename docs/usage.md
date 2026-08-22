@@ -111,6 +111,12 @@ target_language = "English"
 
 [profiles.local-transcription.transcription]
 model = "base"
+vad_enabled = true
+vad_model = "silero-v6.2.0"
+vad_threshold = 0.5
+vad_min_speech_duration_ms = 250
+vad_min_silence_duration_ms = 100
+vad_speech_pad_ms = 30
 
 [profiles.local-transcription.storage]
 whisper_binary_path = "/path/to/whisper-cli"
@@ -353,11 +359,16 @@ sbake whisper versions
 sbake whisper install --variant cpu
 sbake whisper model list
 sbake whisper model base
+sbake whisper vad-model list
+sbake whisper vad-model
 sbake whisper update
 ```
 
 Supported build variants are `cpu`, `cuda`, `metal`, `vulkan`, and `openblas`.
 Use `--bin`, `--models-dir`, and `--runtime-dir` to override managed locations.
+Silero VAD is enabled by default. `sbake whisper vad-model` downloads the
+default `silero-v6.2.0` model into the same managed model directory. VAD files
+are tracked separately and are never considered transcription models.
 
 Remove the managed installation with `uninstall`; use `--keep-models` when
 model files should remain available:
@@ -378,6 +389,10 @@ sbake transcribe interview.mp4 \
   --output interview.srt
 ```
 
+Disable VAD for a comparison run with `--no-vad`, or tune it with
+`--vad-threshold`, `--vad-min-speech-duration-ms`,
+`--vad-min-silence-duration-ms`, and `--vad-speech-pad-ms`.
+
 Use an existing timed sidecar instead of running whisper.cpp:
 
 ```bash
@@ -389,6 +404,10 @@ sbake transcribe interview.mp4 \
 
 Long media is processed in overlapping chunks. SubBake merges boundary text,
 checks coverage, and does not publish an obviously incomplete final subtitle.
+The same VAD contract is applied to short audio, every long-audio chunk, and
+resumed streaming pipelines. For container media, the selected audio stream's
+`start_time` is added back after FFmpeg normalization so a delayed audio track
+does not produce a globally early subtitle.
 
 ## Transcription and translation pipeline
 

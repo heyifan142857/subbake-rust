@@ -212,11 +212,13 @@ fn batch_text(outcome: &BatchTranslationOutcome) -> String {
 fn whisper_text(outcome: &WhisperOutcome) -> String {
     match outcome {
         WhisperOutcome::Status(status) => format!(
-            "Whisper binary: {} ({})\nModel directory: {} ({})\n{}{}",
+            "Whisper binary: {} ({})\nModel directory: {} ({})\nDefault VAD model: {} ({})\n{}{}",
             status.binary_path.display(),
             exists_label(status.binary_exists),
             status.models_dir.display(),
             exists_label(status.models_dir_exists),
+            status.default_vad_model_path.display(),
+            exists_label(status.default_vad_model_exists),
             status
                 .version
                 .as_ref()
@@ -228,9 +230,14 @@ fn whisper_text(outcome: &WhisperOutcome) -> String {
                 .map(|error| format!("Compatibility: {error}\n"))
                 .unwrap_or_default()
         ),
-        WhisperOutcome::ModelList(list) => {
+        WhisperOutcome::ModelList(list) | WhisperOutcome::VadModelList(list) => {
+            let kind = if matches!(outcome, WhisperOutcome::VadModelList(_)) {
+                "VAD models"
+            } else {
+                "models"
+            };
             let mut output = format!(
-                "Model directory: {} ({})\nInstalled models: {}\n",
+                "Model directory: {} ({})\nInstalled {kind}: {}\n",
                 list.models_dir.display(),
                 exists_label(list.models_dir_exists),
                 list.models.len()
@@ -239,7 +246,7 @@ fn whisper_text(outcome: &WhisperOutcome) -> String {
                 output.push_str(&format!("  {}: {}\n", model.name, model.path.display()));
             }
             output.push_str(&format!(
-                "Available models: {}\n",
+                "Available {kind}: {}\n",
                 list.available_models.len()
             ));
             for model in &list.available_models {
@@ -461,6 +468,8 @@ mod tests {
             models_dir_exists: true,
             version: None,
             capability_error: None,
+            default_vad_model_path: "models/ggml-silero-v6.2.0.bin".into(),
+            default_vad_model_exists: false,
         }));
 
         assert!(output.contains("whisper-cli (missing)"));

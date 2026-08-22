@@ -525,6 +525,36 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
             }
             "--filter-hallucinations" => parsed.settings.filter_hallucinations = true,
             "--no-filter-hallucinations" => parsed.settings.filter_hallucinations = false,
+            "--vad" => parsed.settings.vad_enabled = Some(true),
+            "--no-vad" => parsed.settings.vad_enabled = Some(false),
+            "--vad-model" => {
+                parsed.settings.vad_model = Some(required_value(args, &mut index, "--vad-model")?)
+            }
+            "--vad-threshold" => {
+                parsed.settings.vad_threshold =
+                    Some(parse_unit_f32(args, &mut index, "--vad-threshold")?)
+            }
+            "--vad-min-speech-duration-ms" => {
+                parsed.settings.vad_min_speech_duration_ms = Some(parse_positive_u64(
+                    args,
+                    &mut index,
+                    "--vad-min-speech-duration-ms",
+                )?)
+            }
+            "--vad-min-silence-duration-ms" => {
+                parsed.settings.vad_min_silence_duration_ms = Some(parse_positive_u64(
+                    args,
+                    &mut index,
+                    "--vad-min-silence-duration-ms",
+                )?)
+            }
+            "--vad-speech-pad-ms" => {
+                parsed.settings.vad_speech_pad_ms = Some(parse_nonnegative_u64(
+                    args,
+                    &mut index,
+                    "--vad-speech-pad-ms",
+                )?)
+            }
             other => {
                 return Err(CliError::usage(format!(
                     "unknown transcribe option `{other}`"
@@ -561,6 +591,23 @@ fn parse_pipeline_transcription_option(
         }
         "--filter-hallucinations" => settings.filter_hallucinations = true,
         "--no-filter-hallucinations" => settings.filter_hallucinations = false,
+        "--vad" | "--transcribe-vad" => settings.vad_enabled = Some(true),
+        "--no-vad" | "--no-transcribe-vad" => settings.vad_enabled = Some(false),
+        "--vad-model" | "--transcribe-vad-model" => {
+            settings.vad_model = Some(required_value(args, index, option)?)
+        }
+        "--vad-threshold" | "--transcribe-vad-threshold" => {
+            settings.vad_threshold = Some(parse_unit_f32(args, index, option)?)
+        }
+        "--vad-min-speech-duration-ms" => {
+            settings.vad_min_speech_duration_ms = Some(parse_positive_u64(args, index, option)?)
+        }
+        "--vad-min-silence-duration-ms" => {
+            settings.vad_min_silence_duration_ms = Some(parse_positive_u64(args, index, option)?)
+        }
+        "--vad-speech-pad-ms" => {
+            settings.vad_speech_pad_ms = Some(parse_nonnegative_u64(args, index, option)?)
+        }
         _ => return Ok(false),
     }
 
@@ -703,6 +750,19 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
                 .cloned()
                 .ok_or_else(|| CliError::usage("whisper model requires a model name"))?;
             (WhisperAction::DownloadModel { name }, 2usize)
+        }
+        "vad-model" if args.get(1).is_some_and(|value| value == "list") => {
+            (WhisperAction::ListVadModels, 2usize)
+        }
+        "vad-model" | "download-vad-model" => {
+            let name = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned());
+            (
+                WhisperAction::DownloadVadModel { name },
+                usize::from(args.get(1).is_some()) + 1,
+            )
         }
         other => {
             return Err(CliError::usage(format!(
@@ -939,6 +999,33 @@ fn parse_batch_size(args: &[String], index: &mut usize, flag: &str) -> CliResult
         return Err(CliError::usage(format!("{flag} must be greater than zero")));
     }
     Ok(value)
+}
+
+fn parse_unit_f32(args: &[String], index: &mut usize, flag: &str) -> CliResult<f32> {
+    let raw = required_value(args, index, flag)?;
+    let value = raw
+        .parse::<f32>()
+        .map_err(|_| CliError::usage(format!("{flag} must be a number from 0 through 1")))?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(CliError::usage(format!(
+            "{flag} must be a number from 0 through 1"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_positive_u64(args: &[String], index: &mut usize, flag: &str) -> CliResult<u64> {
+    let value = parse_nonnegative_u64(args, index, flag)?;
+    if value == 0 {
+        return Err(CliError::usage(format!("{flag} must be greater than zero")));
+    }
+    Ok(value)
+}
+
+fn parse_nonnegative_u64(args: &[String], index: &mut usize, flag: &str) -> CliResult<u64> {
+    required_value(args, index, flag)?
+        .parse::<u64>()
+        .map_err(|_| CliError::usage(format!("{flag} must be a non-negative integer")))
 }
 
 fn parse_bilingual_font_scale(args: &[String], index: &mut usize, flag: &str) -> CliResult<f64> {
@@ -1473,6 +1560,21 @@ mod tests {
     }
 
     #[test]
+    fn transcription_vad_defaults_to_silero_and_cli_can_disable_it() {
+        let configured =
+            parse_transcribe_args(&["movie.mp4".to_owned()]).expect("parse default VAD settings");
+        let disabled = parse_transcribe_args(&["movie.mp4".to_owned(), "--no-vad".to_owned()])
+            .expect("parse disabled VAD settings");
+
+        assert_eq!(configured.settings.vad_enabled, Some(true));
+        assert_eq!(
+            configured.settings.vad_model.as_deref(),
+            Some(subbake_adapters::DEFAULT_WHISPER_VAD_MODEL)
+        );
+        assert_eq!(disabled.settings.vad_enabled, Some(false));
+    }
+
+    #[test]
     fn parse_provider_check_defaults_to_mock() {
         let config = empty_config("provider-default");
         let args = vec![
@@ -1649,6 +1751,19 @@ mod tests {
 
         assert_eq!(parsed.action, WhisperAction::ListModels);
         assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
+    }
+
+    #[test]
+    fn parse_whisper_vad_model_defaults_to_silero() {
+        let parsed = parse_whisper_args(&["vad-model".to_owned()])
+            .expect("whisper VAD model args should parse");
+
+        assert_eq!(
+            parsed.action,
+            WhisperAction::DownloadVadModel {
+                name: subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned(),
+            }
+        );
     }
 
     #[test]

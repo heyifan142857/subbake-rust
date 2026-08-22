@@ -352,7 +352,8 @@ pub(crate) fn execute_adapter_tool(
                 .unwrap_or_default();
             let action_name = whisper_action_name(&action).to_owned();
             let requested_model = match &action {
-                WhisperAction::DownloadModel { name } => Some(name.clone()),
+                WhisperAction::DownloadModel { name }
+                | WhisperAction::DownloadVadModel { name } => Some(name.clone()),
                 _ => None,
             };
             let request = WhisperRequest {
@@ -403,7 +404,7 @@ pub(crate) fn execute_adapter_tool(
                             Vec::new(),
                             None,
                         ),
-                        WhisperOutcome::ModelList(list) => (
+                        WhisperOutcome::ModelList(list) | WhisperOutcome::VadModelList(list) => (
                             None,
                             None,
                             Some(list.models_dir),
@@ -1060,6 +1061,7 @@ fn whisper_action(args: &JsonValue) -> AgentResult<WhisperAction> {
         "status" => Ok(WhisperAction::Status),
         "list-versions" | "versions" => Ok(WhisperAction::ListVersions),
         "list-models" | "models" => Ok(WhisperAction::ListModels),
+        "list-vad-models" | "vad-models" => Ok(WhisperAction::ListVadModels),
         "download" | "download_model" => Ok(WhisperAction::DownloadModel {
             name: optional_argument(args, "model")
                 .map(|model| nonempty_value("model", model))
@@ -1067,6 +1069,12 @@ fn whisper_action(args: &JsonValue) -> AgentResult<WhisperAction> {
                 .ok_or_else(|| AgentError::ToolArguments {
                     message: "download requires an explicitly selected `model`".to_owned(),
                 })?,
+        }),
+        "download-vad" | "download_vad_model" => Ok(WhisperAction::DownloadVadModel {
+            name: optional_argument(args, "model")
+                .map(|model| nonempty_value("model", model))
+                .transpose()?
+                .unwrap_or_else(|| subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned()),
         }),
         other => Err(AgentError::InvalidInput {
             message: format!("unknown whisper action `{other}`"),
@@ -1083,6 +1091,8 @@ fn whisper_action_name(action: &WhisperAction) -> &'static str {
         WhisperAction::Uninstall { .. } => "uninstall",
         WhisperAction::ListModels => "list_models",
         WhisperAction::DownloadModel { .. } => "download_model",
+        WhisperAction::ListVadModels => "list_vad_models",
+        WhisperAction::DownloadVadModel { .. } => "download_vad_model",
     }
 }
 

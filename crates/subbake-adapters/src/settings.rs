@@ -9,6 +9,12 @@ use subbake_core::entities::{
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::providers::{ApiFormat, BackendConfig};
+use crate::whisper::DEFAULT_WHISPER_VAD_MODEL;
+
+pub const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
+pub const DEFAULT_VAD_MIN_SPEECH_DURATION_MS: u64 = 250;
+pub const DEFAULT_VAD_MIN_SILENCE_DURATION_MS: u64 = 100;
+pub const DEFAULT_VAD_SPEECH_PAD_MS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedSettings {
@@ -30,6 +36,12 @@ pub struct AgentDomainSettings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionDomainSettings {
     pub model: Option<String>,
+    pub vad_enabled: bool,
+    pub vad_model: String,
+    pub vad_threshold: f32,
+    pub vad_min_speech_duration_ms: u64,
+    pub vad_min_silence_duration_ms: u64,
+    pub vad_speech_pad_ms: u64,
 }
 
 /// Compatibility alias for service request types. New configuration code
@@ -174,6 +186,12 @@ pub struct TranslationOverrides {
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionOverrides {
     pub model: Option<String>,
+    pub vad_enabled: Option<bool>,
+    pub vad_model: Option<String>,
+    pub vad_threshold: Option<f32>,
+    pub vad_min_speech_duration_ms: Option<u64>,
+    pub vad_min_silence_duration_ms: Option<u64>,
+    pub vad_speech_pad_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,6 +291,14 @@ impl SettingsOverrides {
             },
             transcription: TranscriptionOverrides {
                 model: settings.transcription.model.clone(),
+                vad_enabled: Some(settings.transcription.vad_enabled),
+                vad_model: Some(settings.transcription.vad_model.clone()),
+                vad_threshold: Some(settings.transcription.vad_threshold),
+                vad_min_speech_duration_ms: Some(settings.transcription.vad_min_speech_duration_ms),
+                vad_min_silence_duration_ms: Some(
+                    settings.transcription.vad_min_silence_duration_ms,
+                ),
+                vad_speech_pad_ms: Some(settings.transcription.vad_speech_pad_ms),
             },
             output: OutputOverrides {
                 format: settings.output.format.clone(),
@@ -365,7 +391,17 @@ impl AgentOverrides {
 
 impl TranscriptionOverrides {
     fn merge(&mut self, other: Self) {
-        merge_optional_fields!(self, other, model);
+        merge_optional_fields!(
+            self,
+            other,
+            model,
+            vad_enabled,
+            vad_model,
+            vad_threshold,
+            vad_min_speech_duration_ms,
+            vad_min_silence_duration_ms,
+            vad_speech_pad_ms
+        );
     }
 }
 
@@ -468,7 +504,15 @@ impl Default for ResolvedSettings {
                 max_requests: None,
                 max_tokens: None,
             },
-            transcription: TranscriptionDomainSettings { model: None },
+            transcription: TranscriptionDomainSettings {
+                model: None,
+                vad_enabled: true,
+                vad_model: DEFAULT_WHISPER_VAD_MODEL.to_owned(),
+                vad_threshold: DEFAULT_VAD_THRESHOLD,
+                vad_min_speech_duration_ms: DEFAULT_VAD_MIN_SPEECH_DURATION_MS,
+                vad_min_silence_duration_ms: DEFAULT_VAD_MIN_SILENCE_DURATION_MS,
+                vad_speech_pad_ms: DEFAULT_VAD_SPEECH_PAD_MS,
+            },
             storage: StorageSettings {
                 runtime_dir: None,
                 glossary_path: None,
@@ -570,6 +614,24 @@ impl ResolvedSettings {
         } = overrides.translation;
         if let Some(model) = overrides.transcription.model {
             self.transcription.model = Some(model);
+        }
+        if let Some(value) = overrides.transcription.vad_enabled {
+            self.transcription.vad_enabled = value;
+        }
+        if let Some(value) = overrides.transcription.vad_model {
+            self.transcription.vad_model = value;
+        }
+        if let Some(value) = overrides.transcription.vad_threshold {
+            self.transcription.vad_threshold = value;
+        }
+        if let Some(value) = overrides.transcription.vad_min_speech_duration_ms {
+            self.transcription.vad_min_speech_duration_ms = value;
+        }
+        if let Some(value) = overrides.transcription.vad_min_silence_duration_ms {
+            self.transcription.vad_min_silence_duration_ms = value;
+        }
+        if let Some(value) = overrides.transcription.vad_speech_pad_ms {
+            self.transcription.vad_speech_pad_ms = value;
         }
         let AgentOverrides {
             max_steps,
@@ -777,6 +839,34 @@ impl ResolvedSettings {
             return Err(AdapterError::invalid_input(
                 "configuration field `transcription.model` must not be empty",
             ));
+        }
+        if self.transcription.vad_enabled && self.transcription.vad_model.trim().is_empty() {
+            return Err(AdapterError::invalid_input(
+                "configuration field `transcription.vad_model` must not be empty when VAD is enabled",
+            ));
+        }
+        if !self.transcription.vad_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.transcription.vad_threshold)
+        {
+            return Err(AdapterError::invalid_input(
+                "configuration field `transcription.vad_threshold` must be from 0 through 1",
+            ));
+        }
+        for (name, value) in [
+            (
+                "transcription.vad_min_speech_duration_ms",
+                self.transcription.vad_min_speech_duration_ms,
+            ),
+            (
+                "transcription.vad_min_silence_duration_ms",
+                self.transcription.vad_min_silence_duration_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(AdapterError::invalid_input(format!(
+                    "configuration field `{name}` must be greater than zero"
+                )));
+            }
         }
         for (name, value) in [
             ("translation.batch_size", self.translation.batch_size),

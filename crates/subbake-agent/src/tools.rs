@@ -114,7 +114,13 @@ impl ToolSpec {
                 .get("action")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("status"),
-            "status" | "list-models" | "models" | "list-versions" | "versions"
+            "status"
+                | "list-models"
+                | "models"
+                | "list-vad-models"
+                | "vad-models"
+                | "list-versions"
+                | "versions"
         )
     }
 
@@ -475,7 +481,7 @@ const MANAGE_WHISPER_ARGS: &[ToolArgSpec] = &[
         "action",
         StringArg,
         false,
-        "status, list-versions, install, update, uninstall, list-models, or download",
+        "status, list-versions, install, update, uninstall, list-models, list-vad-models, download, or download-vad",
     ),
     arg(
         "keep_models",
@@ -609,7 +615,7 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         false,
         true,
-        "Manage local whisper.cpp. status, list-models, and list-versions are read-only checks and should be followed immediately by the next task action. For an install request: install the CLI first, then call list-models and present the available models to the user; do not choose or download a model until the user selects one. Use list-versions to fetch upstream releases.",
+        "Manage local whisper.cpp. status, list-models, list-vad-models, and list-versions are read-only checks and should be followed immediately by the next task action. VAD defaults to Silero; use download-vad without a model to install the default. For an install request: install the CLI first, install the default VAD model, then call list-models and present the transcription models to the user; do not choose or download a transcription model until the user selects one. Use list-versions to fetch upstream releases.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
     ),
@@ -1082,12 +1088,12 @@ mod tests {
     #[test]
     fn whisper_observations_are_read_only_but_asset_changes_require_approval() {
         let spec = find_tool_spec("manage_whisper").expect("manage_whisper");
-        for action in ["status", "list-models", "list-versions"] {
+        for action in ["status", "list-models", "list-vad-models", "list-versions"] {
             let arguments = serde_json::json!({"action": action});
             assert!(!spec.mutates_with(&arguments));
             assert!(!spec.requires_approval_with(&arguments));
         }
-        for action in ["install", "update", "uninstall", "download"] {
+        for action in ["install", "update", "uninstall", "download", "download-vad"] {
             let arguments = serde_json::json!({"action": action});
             assert!(spec.mutates_with(&arguments));
             assert!(spec.requires_approval_with(&arguments));

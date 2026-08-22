@@ -128,6 +128,7 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
         ["runtime", "clean"] => RUNTIME_CLEAN_HELP,
         ["whisper"] => WHISPER_HELP,
         ["whisper", "model"] => WHISPER_MODEL_HELP,
+        ["whisper", "vad-model"] => WHISPER_VAD_MODEL_HELP,
         _ => TOP_LEVEL_HELP,
     }
 }
@@ -311,6 +312,12 @@ Options:
       --model <NAME>           Transcription model
       --format <FORMAT>        Output format: srt, vtt, or txt
       --sidecar <PATH>         Use a sidecar transcript
+      --vad / --no-vad        Enable or disable Silero voice activity detection
+      --vad-model <NAME|PATH>  VAD model name or explicit model path
+      --vad-threshold <0..1>   Speech detection probability threshold
+      --vad-min-speech-duration-ms <MS> Minimum retained speech duration
+      --vad-min-silence-duration-ms <MS> Minimum silence used to split speech
+      --vad-speech-pad-ms <MS> Padding around detected speech
       --no-filter-hallucinations Keep repeated/silence marker segments
       --config <PATH>          Configuration file
       --profile <NAME>         Named profile
@@ -331,6 +338,8 @@ Accepts all `translate` options plus:
       --transcribe-model <NAME>        Transcription model
       --transcribe-format <FORMAT>     srt, vtt, or txt
       --sidecar <PATH>                 Use a sidecar transcript
+      --transcribe-vad / --no-transcribe-vad Enable or disable Silero VAD
+      --transcribe-vad-model <NAME|PATH> VAD model name or path
       --whisper-bin <PATH>             Override whisper-cli path
       --whisper-models-dir <DIR>       Override whisper model directory
   -h, --help                           Print help
@@ -412,6 +421,8 @@ Commands:
   uninstall           Uninstall whisper.cpp
   model list          List supported models
   model <NAME>        Download a model
+  vad-model list      List supported VAD models
+  vad-model [NAME]    Download a VAD model (default: silero-v6.2.0)
 
 Options:
       --bin <PATH>         Override the whisper binary path
@@ -428,4 +439,12 @@ const WHISPER_MODEL_HELP: &str = r#"List or download whisper.cpp models
 Usage:
   sbake whisper model list
   sbake whisper model <NAME> [--models-dir <DIR>]
+"#;
+const WHISPER_VAD_MODEL_HELP: &str = r#"List or download whisper.cpp VAD models
+
+Usage:
+  sbake whisper vad-model list
+  sbake whisper vad-model [NAME] [--models-dir <DIR>]
+
+When NAME is omitted, SubBake downloads silero-v6.2.0.
 "#;

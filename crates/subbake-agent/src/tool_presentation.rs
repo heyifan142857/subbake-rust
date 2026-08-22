@@ -229,7 +229,7 @@ fn whisper_action(arguments: &JsonValue, completed: bool) -> &'static str {
                 "Removing Whisper"
             }
         }
-        "download" => {
+        "download" | "download-vad" | "download_vad_model" => {
             if completed {
                 "Downloaded model"
             } else {
@@ -241,6 +241,13 @@ fn whisper_action(arguments: &JsonValue, completed: bool) -> &'static str {
                 "Listed Whisper models"
             } else {
                 "Listing Whisper models"
+            }
+        }
+        "list-vad-models" | "vad-models" => {
+            if completed {
+                "Listed Whisper VAD models"
+            } else {
+                "Listing Whisper VAD models"
             }
         }
         "list-versions" | "versions" => {

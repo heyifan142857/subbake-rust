@@ -56,6 +56,8 @@ pub enum WhisperAction {
     Uninstall { keep_models: bool },
     ListModels,
     DownloadModel { name: String },
+    ListVadModels,
+    DownloadVadModel { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +65,7 @@ pub enum WhisperOutcome {
     Status(WhisperStatus),
     VersionList(WhisperVersionList),
     ModelList(WhisperModelList),
+    VadModelList(WhisperModelList),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +91,8 @@ pub struct WhisperStatus {
     pub models_dir_exists: bool,
     pub version: Option<String>,
     pub capability_error: Option<String>,
+    pub default_vad_model_path: PathBuf,
+    pub default_vad_model_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +129,7 @@ pub fn run_whisper_cancellable_with_progress(
     cancellation.check().map_err(AdapterError::from)?;
     let stage = match request.action {
         WhisperAction::Install | WhisperAction::Update => "INSTALL",
-        WhisperAction::DownloadModel { .. } => "DOWNLOAD",
+        WhisperAction::DownloadModel { .. } | WhisperAction::DownloadVadModel { .. } => "DOWNLOAD",
         WhisperAction::Uninstall { .. } => "UNINSTALL",
         _ => "INSPECT",
     };
@@ -179,6 +184,20 @@ pub fn run_whisper_cancellable_with_progress(
                 &request, None, None,
             )?))
         }
+        WhisperAction::ListVadModels => {
+            let (models, warning) = fetch_available_vad_models(cancellation)?;
+            Ok(WhisperOutcome::VadModelList(list_vad_models(
+                &request,
+                Some(models),
+                warning,
+            )?))
+        }
+        WhisperAction::DownloadVadModel { ref name } => {
+            download_vad_model(&request, name, cancellation, &progress)?;
+            Ok(WhisperOutcome::VadModelList(list_vad_models(
+                &request, None, None,
+            )?))
+        }
     };
     let outcome = outcome?;
     let mut done = ProgressEvent::running(
@@ -214,6 +233,7 @@ fn runtime() -> AdapterResult<&'static Runtime> {
 const GITHUB_REPO_OWNER: &str = "ggml-org";
 const GITHUB_REPO_NAME: &str = "whisper.cpp";
 const HF_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const HF_VAD_MODEL_BASE: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main";
 const INSTALL_MANIFEST_NAME: &str = "install-manifest.json";
 const WHISPER_VERSION_TAG: &str = "v1.9.1";
 const WHISPER_SOURCE_SHA256: &str =
@@ -221,6 +241,9 @@ const WHISPER_SOURCE_SHA256: &str =
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=100";
 const HF_MODEL_TREE_URL: &str = "https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main?recursive=false&expand=false&limit=1000";
+const HF_VAD_MODEL_TREE_URL: &str = "https://huggingface.co/api/models/ggml-org/whisper-vad/tree/main?recursive=false&expand=false&limit=1000";
+pub const DEFAULT_WHISPER_VAD_MODEL: &str = "silero-v6.2.0";
+const FALLBACK_VAD_MODELS: &[&str] = &[DEFAULT_WHISPER_VAD_MODEL];
 const FALLBACK_MODELS: &[&str] = &[
     "tiny",
     "tiny.en",
@@ -625,6 +648,27 @@ fn fetch_available_models(
     }
 }
 
+fn fetch_available_vad_models(
+    cancellation: &CancellationGuard,
+) -> AdapterResult<(Vec<String>, Option<String>)> {
+    let fetched: AdapterResult<Vec<HuggingFaceEntry>> = runtime()?.block_on(fetch_json(
+        HF_VAD_MODEL_TREE_URL,
+        cancellation,
+        "fetch whisper.cpp VAD model catalog",
+    ));
+    match fetched {
+        Ok(entries) => Ok((parse_available_vad_models(entries), None)),
+        Err(AdapterError::Cancelled) => Err(AdapterError::Cancelled),
+        Err(error) => Ok((
+            FALLBACK_VAD_MODELS
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+            Some(format!("could not refresh upstream VAD models: {error}")),
+        )),
+    }
+}
+
 fn parse_available_models(entries: Vec<HuggingFaceEntry>) -> Vec<String> {
     let mut models = entries
         .into_iter()
@@ -637,6 +681,25 @@ fn parse_available_models(entries: Vec<HuggingFaceEntry>) -> Vec<String> {
                 .map(str::to_owned)
         })
         .filter(|name| !name.starts_with("for-tests-"))
+        .filter(|name| !is_vad_model_name(name))
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn parse_available_vad_models(entries: Vec<HuggingFaceEntry>) -> Vec<String> {
+    let mut models = entries
+        .into_iter()
+        .filter(|entry| entry.entry_type == "file")
+        .filter_map(|entry| {
+            entry
+                .path
+                .strip_prefix("ggml-")
+                .and_then(|name| name.strip_suffix(".bin"))
+                .map(str::to_owned)
+        })
+        .filter(|name| is_vad_model_name(name))
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
@@ -1349,6 +1412,63 @@ fn download_model(
     Ok(())
 }
 
+fn download_vad_model(
+    request: &WhisperRequest,
+    name: &str,
+    cancellation: &CancellationGuard,
+    progress: &SharedProgress,
+) -> AdapterResult<()> {
+    if !is_safe_model_name(name) || !is_vad_model_name(name) {
+        return Err(AdapterError::invalid_input(format!(
+            "invalid whisper.cpp VAD model name `{name}`"
+        )));
+    }
+
+    let models_dir = request
+        .models_dir
+        .clone()
+        .unwrap_or_else(default_whisper_models_dir);
+    let dest = vad_model_path(&models_dir, name);
+    let checksum_path = dest.with_extension("bin.sha256");
+    if dest.is_file() && checksum_path.is_file() {
+        let expected = fs::read_to_string(&checksum_path).map_err(|source| {
+            AdapterError::external_io(
+                "read VAD model checksum",
+                Some(checksum_path.clone()),
+                source,
+            )
+        })?;
+        if hash_file(&dest, cancellation)?.eq_ignore_ascii_case(expected.trim()) {
+            return Ok(());
+        }
+    }
+
+    let (available_models, _) = fetch_available_vad_models(cancellation)?;
+    validate_available_vad_model(name, &available_models)?;
+    fs::create_dir_all(&models_dir).map_err(|source| {
+        AdapterError::external_io(
+            "create whisper models directory",
+            Some(models_dir.clone()),
+            source,
+        )
+    })?;
+
+    let url = format!("{HF_VAD_MODEL_BASE}/ggml-{name}.bin");
+    let checksum = runtime()?.block_on(async {
+        download_file(
+            &url,
+            &dest,
+            None,
+            cancellation,
+            progress,
+            "DOWNLOAD_VAD_MODEL",
+        )
+        .await
+    })?;
+    write_atomic(&checksum_path, format!("{checksum}\n").as_bytes())?;
+    Ok(())
+}
+
 fn is_safe_model_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
@@ -1363,6 +1483,15 @@ fn validate_available_model(name: &str, available_models: &[String]) -> AdapterR
     }
     Err(AdapterError::invalid_input(format!(
         "unknown model `{name}`; run `sbake whisper model list` to see available models"
+    )))
+}
+
+fn validate_available_vad_model(name: &str, available_models: &[String]) -> AdapterResult<()> {
+    if available_models.iter().any(|model| model == name) {
+        return Ok(());
+    }
+    Err(AdapterError::invalid_input(format!(
+        "unknown VAD model `{name}`; run `sbake whisper vad-model list` to see available models"
     )))
 }
 
@@ -1460,11 +1589,58 @@ fn list_models(
     })
 }
 
+fn list_vad_models(
+    request: &WhisperRequest,
+    available_models: Option<Vec<String>>,
+    refresh_warning: Option<String>,
+) -> io::Result<WhisperModelList> {
+    let models_dir = request
+        .models_dir
+        .clone()
+        .unwrap_or_else(default_whisper_models_dir);
+    if !models_dir.is_dir() {
+        return Ok(WhisperModelList {
+            models_dir,
+            models_dir_exists: false,
+            models: Vec::new(),
+            available_models: available_models.unwrap_or_default(),
+            refresh_warning,
+        });
+    }
+    Ok(WhisperModelList {
+        models: installed_vad_models_in(&models_dir)?,
+        models_dir,
+        models_dir_exists: true,
+        available_models: available_models.unwrap_or_default(),
+        refresh_warning,
+    })
+}
+
 pub(crate) fn installed_models_in(models_dir: &Path) -> io::Result<Vec<WhisperModel>> {
     let mut models = Vec::new();
     for entry in fs::read_dir(models_dir)? {
         let path = entry?.path();
         if !path.is_file() || !is_whisper_model_file(&path) {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("model")
+            .strip_prefix("ggml-")
+            .unwrap_or("model")
+            .to_owned();
+        models.push(WhisperModel { name, path });
+    }
+    models.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(models)
+}
+
+fn installed_vad_models_in(models_dir: &Path) -> io::Result<Vec<WhisperModel>> {
+    let mut models = Vec::new();
+    for entry in fs::read_dir(models_dir)? {
+        let path = entry?.path();
+        if !path.is_file() || !is_vad_model_file(&path) {
             continue;
         }
         let name = path
@@ -1502,6 +1678,8 @@ fn inspect_status(
     } else {
         (None, None)
     };
+    let default_vad_model_path = vad_model_path(&models_dir, DEFAULT_WHISPER_VAD_MODEL);
+    let default_vad_model_exists = default_vad_model_path.is_file();
     Ok(WhisperStatus {
         binary_exists: binary_path.is_file(),
         models_dir_exists: models_dir.is_dir(),
@@ -1509,6 +1687,8 @@ fn inspect_status(
         models_dir,
         version,
         capability_error,
+        default_vad_model_path,
+        default_vad_model_exists,
     })
 }
 
@@ -1548,6 +1728,8 @@ pub(crate) fn verify_whisper_cli(
         "--threads",
         "--print-progress",
         "--no-prints",
+        "--vad",
+        "--vad-model",
     ]
     .into_iter()
     .filter(|flag| !help.contains(flag))
@@ -1654,7 +1836,24 @@ fn is_whisper_model_file(path: &std::path::Path) -> bool {
     matches!(
         path.extension().and_then(|value| value.to_str()),
         Some("bin" | "gguf")
-    )
+    ) && !is_vad_model_file(path)
+}
+
+fn is_vad_model_file(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("bin")
+        && path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|name| name.strip_prefix("ggml-"))
+            .is_some_and(is_vad_model_name)
+}
+
+fn is_vad_model_name(name: &str) -> bool {
+    name.starts_with("silero-")
+}
+
+pub(crate) fn vad_model_path(models_dir: &Path, name: &str) -> PathBuf {
+    models_dir.join(format!("ggml-{name}.bin"))
 }
 
 pub fn default_whisper_binary_path() -> PathBuf {
@@ -1954,6 +2153,8 @@ mod tests {
         fs::create_dir_all(&models_dir).expect("create models dir");
         fs::write(models_dir.join("ggml-small.bin"), b"model").expect("write model");
         fs::write(models_dir.join("ggml-base.gguf"), b"model").expect("write model");
+        fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"VAD model")
+            .expect("write VAD model");
         fs::write(models_dir.join("notes.txt"), b"ignore").expect("write note");
 
         let request = WhisperRequest {
@@ -1973,6 +2174,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["base", "small"]
         );
+    }
+
+    #[test]
+    fn list_vad_models_does_not_include_transcription_models() {
+        let root = temp_root("vad-models");
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        fs::write(models_dir.join("ggml-small.bin"), b"model").expect("write model");
+        fs::write(models_dir.join("ggml-silero-v6.2.0.bin"), b"VAD model")
+            .expect("write VAD model");
+        let request = WhisperRequest {
+            action: WhisperAction::ListVadModels,
+            binary_path: None,
+            models_dir: Some(models_dir),
+            build_variant: WhisperBuildVariant::Cpu,
+        };
+
+        let list = list_vad_models(&request, None, None).expect("list VAD models");
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(list.models.len(), 1);
+        assert_eq!(list.models[0].name, DEFAULT_WHISPER_VAD_MODEL);
     }
 
     #[test]
@@ -2064,12 +2287,56 @@ mod tests {
                 entry_type: "file".to_owned(),
             },
             HuggingFaceEntry {
+                path: "ggml-silero-v6.2.0.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+            HuggingFaceEntry {
                 path: "README.md".to_owned(),
                 entry_type: "file".to_owned(),
             },
         ]);
 
         assert_eq!(models, vec!["base.en", "small"]);
+    }
+
+    #[test]
+    fn available_vad_catalog_keeps_only_silero_models() {
+        let models = parse_available_vad_models(vec![
+            HuggingFaceEntry {
+                path: "ggml-silero-v6.2.0.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+            HuggingFaceEntry {
+                path: "ggml-base.bin".to_owned(),
+                entry_type: "file".to_owned(),
+            },
+        ]);
+
+        assert_eq!(models, vec![DEFAULT_WHISPER_VAD_MODEL]);
+    }
+
+    #[test]
+    fn vad_model_download_succeeds_when_checked_file_exists() {
+        let root = temp_root("vad-exists");
+        let models_dir = root.join("models");
+        fs::create_dir_all(&models_dir).expect("create models dir");
+        let model_path = vad_model_path(&models_dir, DEFAULT_WHISPER_VAD_MODEL);
+        fs::write(&model_path, b"fake VAD").expect("write VAD model");
+        let checksum = hash_file(&model_path, &CancellationGuard::never()).expect("hash VAD model");
+        fs::write(model_path.with_extension("bin.sha256"), checksum).expect("write checksum");
+
+        let outcome = run_whisper(WhisperRequest {
+            action: WhisperAction::DownloadVadModel {
+                name: DEFAULT_WHISPER_VAD_MODEL.to_owned(),
+            },
+            binary_path: None,
+            models_dir: Some(models_dir),
+            build_variant: WhisperBuildVariant::Cpu,
+        })
+        .expect("existing VAD file should succeed");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(matches!(outcome, WhisperOutcome::VadModelList(_)));
     }
 
     #[test]
