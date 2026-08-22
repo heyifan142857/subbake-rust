@@ -13,6 +13,9 @@ use subbake_core::ports::{
 };
 use subbake_core::storage::{RunState, RuntimePaths};
 
+use crate::error::AdapterError;
+use crate::fs::write_file_atomically;
+
 pub(crate) const RUNTIME_MARKER_NAME: &str = ".subbake-runtime-v1";
 pub(crate) const RUNTIME_MARKER_CONTENT: &str = "subbake-runtime-v1\n";
 
@@ -152,15 +155,7 @@ impl RuntimeStore for FileRuntimeStore {
             return Ok(Vec::new());
         }
         let text = fs::read_to_string(&self.paths.glossary_path).map_err(storage_error)?;
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&text).map_err(|error| {
-                CoreError::DataInvariant(format!("glossary parse failed: {error}",))
-            })?;
-        let entries: Vec<(String, String)> = map
-            .into_iter()
-            .filter_map(|(source, value)| value.as_str().map(|target| (source, target.to_owned())))
-            .collect();
-        Ok(entries)
+        parse_string_map(&text, "glossary")
     }
 
     fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>> {
@@ -173,19 +168,7 @@ impl RuntimeStore for FileRuntimeStore {
             return Ok(Vec::new());
         };
         let text = fs::read_to_string(&path).map_err(storage_error)?;
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&text).map_err(|error| {
-                CoreError::DataInvariant(format!("translation memory parse failed: {error}",))
-            })?;
-        let entries: Vec<(String, String)> = map
-            .into_iter()
-            .filter_map(|(key, value)| {
-                value
-                    .as_str()
-                    .map(|translation| (key, translation.to_owned()))
-            })
-            .collect();
-        Ok(entries)
+        parse_string_map(&text, "translation memory")
     }
 
     fn load_batch_segments(
@@ -433,30 +416,41 @@ fn option_string_json(value: &Option<String>) -> serde_json::Value {
 }
 
 fn write_json_verified(path: &Path, payload: &serde_json::Value) -> CoreResult<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(storage_error)?;
-    }
     let serialized = serde_json::to_string(payload)
         .map_err(|error| CoreError::DataInvariant(format!("serialize json failed: {error}")))?;
-    let temp_path = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("runtime")
-    ));
-    fs::write(&temp_path, serialized.as_bytes()).map_err(storage_error)?;
-    fs::rename(&temp_path, path).map_err(storage_error)?;
-    let written = fs::read_to_string(path).map_err(storage_error)?;
-    if written != serialized {
-        return Err(CoreError::DataInvariant(format!(
-            "write verification failed for {}",
-            path.display()
-        )));
+    write_file_atomically(path, serialized.as_bytes()).map_err(atomic_storage_error)
+}
+
+fn parse_string_map(text: &str, label: &str) -> CoreResult<Vec<(String, String)>> {
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+        .map_err(|error| CoreError::DataInvariant(format!("{label} parse failed: {error}")))?;
+    map.into_iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::String(value) => Ok((key, value)),
+            value => Err(CoreError::DataInvariant(format!(
+                "{label} entry `{key}` must be a string, got {}",
+                json_type_name(&value)
+            ))),
+        })
+        .collect()
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
-    Ok(())
+}
+
+fn atomic_storage_error(error: AdapterError) -> CoreError {
+    match error {
+        AdapterError::ExternalIo { source, .. } => storage_error(source),
+        other => CoreError::DataInvariant(format!("atomic runtime write failed: {other}")),
+    }
 }
 
 fn storage_error(error: io::Error) -> CoreError {
@@ -534,6 +528,67 @@ mod tests {
         assert!(loaded.contains(&("Alice".to_owned(), "爱丽丝".to_owned())));
         assert!(loaded.contains(&("Bob".to_owned(), "鲍勃".to_owned())));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_glossary_value_reports_the_key() {
+        let root = temp_root("glossary-invalid");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        fs::create_dir_all(
+            paths
+                .glossary_path
+                .parent()
+                .expect("glossary parent directory"),
+        )
+        .expect("create glossary directory");
+        fs::write(&paths.glossary_path, r#"{"Alice":42}"#).expect("write invalid glossary");
+        let store = FileRuntimeStore::new(paths);
+
+        let error = store
+            .load_glossary()
+            .expect_err("non-string glossary entry must fail");
+        assert!(error.to_string().contains("glossary entry `Alice`"));
+        assert!(error.to_string().contains("got number"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_translation_memory_value_reports_the_key() {
+        let root = temp_root("translation-memory-invalid");
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        fs::create_dir_all(
+            paths
+                .translation_memory_path
+                .parent()
+                .expect("memory parent directory"),
+        )
+        .expect("create memory directory");
+        fs::write(&paths.translation_memory_path, r#"{"ctx":false}"#)
+            .expect("write invalid memory");
+        let store = FileRuntimeStore::new(paths);
+
+        let error = store
+            .load_translation_memory()
+            .expect_err("non-string translation memory entry must fail");
+        assert!(error.to_string().contains("translation memory entry `ctx`"));
+        assert!(error.to_string().contains("got boolean"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

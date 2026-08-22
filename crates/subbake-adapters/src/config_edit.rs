@@ -1,11 +1,12 @@
 use std::fmt::{Debug, Formatter};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::config::{CONFIG_VERSION, ConfigFile};
 use crate::error::{AdapterError, AdapterResult, ConfigError};
+use crate::fs::write_file_atomically_with_permissions;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ConfigEditTarget {
@@ -161,69 +162,24 @@ fn scalar_item(value: &ConfigScalar) -> Item {
 }
 
 fn atomic_replace(path: &Path, content: &str) -> AdapterResult<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    fs::write(&temporary, content).map_err(|source| {
-        AdapterError::external_io(
-            "write temporary configuration",
-            Some(temporary.clone()),
-            source,
-        )
-    })?;
-
-    if path.exists() {
-        let permissions = fs::metadata(path)
-            .map_err(|source| {
-                AdapterError::external_io(
-                    "read configuration metadata",
-                    Some(path.to_path_buf()),
-                    source,
-                )
-            })?
-            .permissions();
-        fs::set_permissions(&temporary, permissions).map_err(|source| {
-            AdapterError::external_io(
-                "preserve configuration permissions",
-                Some(temporary.clone()),
-                source,
-            )
-        })?;
-    } else {
-        set_private_permissions(&temporary)?;
-    }
-
-    let result = fs::rename(&temporary, path);
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map_err(|source| {
-        AdapterError::external_io("replace configuration", Some(PathBuf::from(path)), source)
-    })
+    write_file_atomically_with_permissions(path, content.as_bytes(), private_permissions())
 }
 
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> AdapterResult<()> {
+fn private_permissions() -> Option<fs::Permissions> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        AdapterError::external_io(
-            "set private configuration permissions",
-            Some(path.to_path_buf()),
-            source,
-        )
-    })
+    Some(fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> AdapterResult<()> {
-    Ok(())
+fn private_permissions() -> Option<fs::Permissions> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn temporary_path(label: &str) -> PathBuf {

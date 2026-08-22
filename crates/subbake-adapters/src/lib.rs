@@ -43,7 +43,7 @@ pub use embedded_subtitles::{
 pub use error::{AdapterError, AdapterResult, ConfigError};
 pub use fs::{
     default_output_path, default_output_path_with_language, is_supported_subtitle_path,
-    read_document, render_and_write_document, stable_runtime_input_path,
+    read_document, render_and_write_document, stable_runtime_input_path, write_file_atomically,
 };
 pub use memory_management::{MemoryAction, MemoryOutcome, MemoryRequest, manage_memory};
 pub use mock::MockBackend;

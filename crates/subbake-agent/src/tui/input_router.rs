@@ -23,6 +23,9 @@ pub(super) fn handle_event(
     }
     match event::read()? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if app.interaction_state.is_processing() {
+                return handle_processing_key(app, key.code, key.modifiers);
+            }
             if app.config_editor.is_some() {
                 return handle_config_event(app, request_tx, key.code, key.modifiers);
             }
@@ -98,13 +101,6 @@ fn handle_config_event(
     if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')) {
         app.running = false;
         return Ok(());
-    }
-    if app.interaction_state.is_processing() {
-        return if code == KeyCode::Esc {
-            handle_escape(app, request_tx)
-        } else {
-            Ok(())
-        };
     }
     match app.interaction_state.input_mode() {
         InputMode::ChoosingConfigProfile(_) => match code {
@@ -417,20 +413,7 @@ fn submit_config_apply(
 
 fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) -> io::Result<()> {
     if app.interaction_state.is_processing() {
-        if app.interaction_state.request_cancellation() {
-            if let Ok(mut progress) = app.progress.lock()
-                && let Some((event, _)) = progress.as_mut()
-            {
-                event.state = TaskState::Cancelling;
-                event.stage = "CANCELLING".to_owned();
-            }
-            if let Some(token) = &app.cancellation {
-                token.cancel();
-            }
-            if let Ok(mut view) = app.msg_view.lock() {
-                view.push(MsgStyle::System, "Cancellation requested…".to_owned());
-            }
-        }
+        request_active_cancellation(app);
         return Ok(());
     }
     if matches!(
@@ -460,6 +443,63 @@ fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>)
         app.running = false;
     }
     Ok(())
+}
+
+fn handle_processing_key(
+    app: &mut SubBakeTui,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> io::Result<()> {
+    match processing_key_action(code, modifiers, app.input.is_empty()) {
+        ProcessingKeyAction::Exit => {
+            request_active_cancellation(app);
+            app.running = false;
+        }
+        ProcessingKeyAction::Cancel => request_active_cancellation(app),
+        ProcessingKeyAction::Ignore => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessingKeyAction {
+    Cancel,
+    Exit,
+    Ignore,
+}
+
+fn processing_key_action(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    input_empty: bool,
+) -> ProcessingKeyAction {
+    if (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')))
+        || (code == KeyCode::Char('q') && input_empty)
+    {
+        ProcessingKeyAction::Exit
+    } else if code == KeyCode::Esc {
+        ProcessingKeyAction::Cancel
+    } else {
+        ProcessingKeyAction::Ignore
+    }
+}
+
+fn request_active_cancellation(app: &mut SubBakeTui) {
+    if !app.interaction_state.request_cancellation() {
+        return;
+    }
+    if let Ok(mut progress) = app.progress.lock()
+        && let Some((event, _)) = progress.as_mut()
+    {
+        event.state = TaskState::Cancelling;
+        event.stage = "CANCELLING".to_owned();
+    }
+    if let Some(token) = &app.cancellation {
+        token.cancel();
+    }
+    if let Ok(mut view) = app.msg_view.lock() {
+        view.push(MsgStyle::System, "Cancellation requested…".to_owned());
+    }
 }
 
 fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) -> io::Result<()> {
@@ -704,4 +744,41 @@ fn send(
     request_tx
         .send((action, guard))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processing_keys_ignore_edits_and_cancel_before_exit() {
+        assert_eq!(
+            processing_key_action(KeyCode::Char('x'), KeyModifiers::NONE, true),
+            ProcessingKeyAction::Ignore
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Backspace, KeyModifiers::NONE, true),
+            ProcessingKeyAction::Ignore
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Esc, KeyModifiers::NONE, true),
+            ProcessingKeyAction::Cancel
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Char('c'), KeyModifiers::CONTROL, true),
+            ProcessingKeyAction::Exit
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Char('d'), KeyModifiers::CONTROL, true),
+            ProcessingKeyAction::Exit
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Char('q'), KeyModifiers::NONE, true),
+            ProcessingKeyAction::Exit
+        );
+        assert_eq!(
+            processing_key_action(KeyCode::Char('q'), KeyModifiers::NONE, false),
+            ProcessingKeyAction::Ignore
+        );
+    }
 }

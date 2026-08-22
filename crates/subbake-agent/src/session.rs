@@ -3,7 +3,7 @@
 // Version 2 of the persisted agent-session JSON contract. The session JSON
 // lives at `<project_root>/.subbake/agent/sessions/<id>.json`.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -373,27 +373,31 @@ impl AgentSession {
 
 #[derive(Debug, Clone)]
 pub struct AgentSessionStore {
+    project_root: PathBuf,
     root: PathBuf,
 }
 
 impl AgentSessionStore {
     pub fn new(project_root: PathBuf) -> Self {
+        let project_root = project_root.canonicalize().unwrap_or(project_root);
         Self {
             root: project_root.join(".subbake/agent/sessions"),
+            project_root,
         }
     }
 
-    pub fn path_for(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.json"))
+    pub fn path_for(&self, id: &str) -> AgentResult<PathBuf> {
+        validate_session_id(id)?;
+        Ok(self.root.join(format!("{id}.json")))
     }
 
     pub fn create(&self) -> AgentResult<AgentSession> {
-        let id = format!("{}-{}", iso_now(), hex_id());
+        let id = format!("{}-{}", iso_now().replace(':', "-"), hex_id());
         Ok(AgentSession::new(id))
     }
 
     pub fn save(&self, session: &AgentSession) -> AgentResult<()> {
-        let path = self.path_for(&session.id);
+        let path = self.path_for(&session.id)?;
         if session.version != SESSION_VERSION {
             return Err(AgentError::invalid_state(format!(
                 "cannot save session version {}; expected version {SESSION_VERSION}",
@@ -401,6 +405,8 @@ impl AgentSessionStore {
             )));
         }
         if session.events.is_empty() {
+            self.ensure_storage_root(false)?;
+            reject_symlink_or_non_file(&path)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -414,35 +420,22 @@ impl AgentSessionStore {
             }
             return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| AgentError::SessionStorage {
-                operation: "create session directory",
-                path: Some(parent.to_path_buf()),
-                source,
-            })?;
-        }
+        self.ensure_storage_root(true)?;
+        reject_symlink_or_non_file(&path)?;
         let json =
             serde_json::to_string_pretty(session).map_err(|source| AgentError::SessionData {
                 operation: "serialize session",
                 path: path.clone(),
                 source,
             })?;
-        let tmp = path.with_file_name(format!("{}.tmp", session.id));
-        std::fs::write(&tmp, &json).map_err(|source| AgentError::SessionStorage {
-            operation: "write temporary session",
-            path: Some(tmp.clone()),
-            source,
-        })?;
-        std::fs::rename(&tmp, &path).map_err(|source| AgentError::SessionStorage {
-            operation: "replace session",
-            path: Some(path),
-            source,
-        })?;
+        subbake_adapters::write_file_atomically(&path, json.as_bytes())?;
         Ok(())
     }
 
     pub fn load(&self, id: &str) -> AgentResult<AgentSession> {
-        let path = self.path_for(id);
+        let path = self.path_for(id)?;
+        self.ensure_storage_root(false)?;
+        reject_symlink_or_non_file(&path)?;
         let json = std::fs::read_to_string(&path).map_err(|source| AgentError::SessionStorage {
             operation: "read session",
             path: Some(path.clone()),
@@ -460,6 +453,13 @@ impl AgentSessionStore {
                 session.version
             )));
         }
+        if session.id != id {
+            return Err(AgentError::invalid_state(format!(
+                "session file `{}` contains mismatched id `{}`",
+                path.display(),
+                session.id
+            )));
+        }
         Ok(session)
     }
 
@@ -468,7 +468,7 @@ impl AgentSessionStore {
     }
 
     pub fn list(&self, limit: usize) -> AgentResult<Vec<AgentSession>> {
-        if !self.root.is_dir() {
+        if !self.ensure_storage_root(false)? {
             return Ok(Vec::new());
         }
         let mut sessions = Vec::new();
@@ -482,6 +482,22 @@ impl AgentSessionStore {
                 path: Some(self.root.clone()),
                 source,
             })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|source| AgentError::SessionStorage {
+                    operation: "inspect session directory entry",
+                    path: Some(entry.path()),
+                    source,
+                })?;
+            if file_type.is_symlink() {
+                return Err(AgentError::invalid_state(format!(
+                    "refusing symlinked session file `{}`",
+                    entry.path().display()
+                )));
+            }
+            if !file_type.is_file() {
+                continue;
+            }
             if !entry.path().extension().is_some_and(|ext| ext == "json") {
                 continue;
             }
@@ -501,6 +517,102 @@ impl AgentSessionStore {
         });
         sessions.truncate(limit);
         Ok(sessions)
+    }
+
+    fn ensure_storage_root(&self, create: bool) -> AgentResult<bool> {
+        if create && !self.project_root.exists() {
+            std::fs::create_dir_all(&self.project_root).map_err(|source| {
+                AgentError::SessionStorage {
+                    operation: "create project directory",
+                    path: Some(self.project_root.clone()),
+                    source,
+                }
+            })?;
+        }
+        if !self.project_root.is_dir() {
+            return if create {
+                Err(AgentError::invalid_state(format!(
+                    "session project root is not a directory: {}",
+                    self.project_root.display()
+                )))
+            } else {
+                Ok(false)
+            };
+        }
+
+        let mut current = self.project_root.clone();
+        for component in [".subbake", "agent", "sessions"] {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(AgentError::invalid_state(format!(
+                        "refusing symlinked session directory `{}`",
+                        current.display()
+                    )));
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(AgentError::invalid_state(format!(
+                        "session storage component is not a directory: {}",
+                        current.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound && create => {
+                    std::fs::create_dir(&current).map_err(|source| AgentError::SessionStorage {
+                        operation: "create session directory",
+                        path: Some(current.clone()),
+                        source,
+                    })?;
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(source) => {
+                    return Err(AgentError::SessionStorage {
+                        operation: "inspect session directory",
+                        path: Some(current),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn validate_session_id(id: &str) -> AgentResult<()> {
+    let is_single_component = matches!(
+        Path::new(id).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(component)] if *component == id
+    );
+    if id.is_empty()
+        || id.len() > 160
+        || !is_single_component
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+    {
+        return Err(AgentError::invalid_input(
+            "session id must contain only ASCII letters, digits, ':', '_', or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_non_file(path: &Path) -> AgentResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(AgentError::invalid_state(
+            format!("refusing symlinked session file `{}`", path.display()),
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(AgentError::invalid_state(format!(
+            "session path is not a regular file: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AgentError::SessionStorage {
+            operation: "inspect session file",
+            path: Some(path.to_path_buf()),
+            source,
+        }),
     }
 }
 
@@ -563,7 +675,7 @@ mod tests {
         assert_eq!(session.mode, SessionMode::Chat);
         assert!(session.events.is_empty());
 
-        assert!(!store.path_for(&session.id).exists());
+        assert!(!store.path_for(&session.id).expect("valid id").exists());
         assert!(store.list(20).expect("list sessions").is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -602,13 +714,106 @@ mod tests {
     }
 
     #[test]
+    fn rejects_session_ids_that_are_not_plain_safe_components() {
+        let dir = std::env::temp_dir().join(format!("subbake-agent-id-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+
+        for id in ["../escape", "/tmp/escape", "nested/session", "session.json"] {
+            assert!(store.path_for(id).is_err(), "unexpectedly accepted {id}");
+            assert!(store.load(id).is_err(), "unexpectedly loaded {id}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_session_whose_embedded_id_does_not_match_its_filename() {
+        let dir = std::env::temp_dir().join(format!("subbake-agent-id-mismatch-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+        let mut session = AgentSession::new("different-id".to_owned());
+        session.record_event("user", "hello", serde_json::json!({}));
+        let path = store.path_for("requested-id").expect("valid id");
+        std::fs::create_dir_all(path.parent().expect("session directory"))
+            .expect("create session directory");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&session).expect("serialize session"),
+        )
+        .expect("write mismatched session");
+
+        let error = store
+            .load("requested-id")
+            .expect_err("mismatched embedded id must fail");
+        assert!(error.to_string().contains("mismatched id `different-id`"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_session_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("subbake-agent-symlink-{}", hex_id()));
+        let store = AgentSessionStore::new(dir.clone());
+        let path = store.path_for("linked").expect("valid id");
+        std::fs::create_dir_all(path.parent().expect("session directory"))
+            .expect("create session directory");
+        let target = dir.join("outside.json");
+        std::fs::write(&target, "{}").expect("write target");
+        symlink(&target, &path).expect("create symlink");
+
+        let error = store.load("linked").expect_err("session symlink must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing symlinked session file")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_session_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("subbake-agent-dir-symlink-{}", hex_id()));
+        let outside = std::env::temp_dir().join(format!("subbake-agent-outside-{}", hex_id()));
+        std::fs::create_dir_all(&dir).expect("create project root");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        symlink(&outside, dir.join(".subbake")).expect("create storage symlink");
+        let store = AgentSessionStore::new(dir.clone());
+        let mut session = store.create().expect("create session");
+        session.record_event("user", "hello", serde_json::json!({}));
+
+        let error = store
+            .save(&session)
+            .expect_err("session directory symlink must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing symlinked session directory")
+        );
+        assert!(
+            std::fs::read_dir(&outside)
+                .expect("read outside")
+                .next()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn rejects_an_older_session_version() {
         let dir = std::env::temp_dir().join(format!("subbake-agent-old-version-{}", hex_id()));
         let store = AgentSessionStore::new(dir.clone());
         let mut session = store.create().expect("create session");
         session.record_event("user", "old", serde_json::json!({}));
         session.version = 1;
-        let path = store.path_for(&session.id);
+        let path = store.path_for(&session.id).expect("valid id");
         std::fs::create_dir_all(path.parent().expect("session directory"))
             .expect("create session directory");
         std::fs::write(

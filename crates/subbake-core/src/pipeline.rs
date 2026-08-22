@@ -27,6 +27,7 @@ use crate::storage::{InputSignature, ResumeSnapshot, build_document_guide_finger
 use crate::validation::{
     FinalValidationIssue, FinalValidationPolicy, final_validation_error, final_validation_issues,
     validate_final_output, validate_full_alignment, validate_translation_batch,
+    validate_unique_segment_ids,
 };
 
 mod name_alignment;
@@ -334,6 +335,7 @@ where
 
     pub fn run_document(&mut self, document: &SubtitleDocument) -> CoreResult<PipelineRun> {
         self.cancellation.check()?;
+        validate_unique_segment_ids(&document.segments, "source")?;
         if self.options.batch_size == 0 {
             return Err(CoreError::InvalidTranslation(
                 "batch size must be greater than zero".to_owned(),

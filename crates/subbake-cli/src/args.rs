@@ -342,6 +342,11 @@ fn parse_file_translation_args(
                 skip_two(args, &mut index)?;
             }
             "--json" => parsed.json = true,
+            value if command_name != "pipeline" && is_container_translation_option(value) => {
+                return Err(CliError::usage(format!(
+                    "{value} is only valid with `sbake pipeline`"
+                )));
+            }
             value
                 if command_name == "pipeline"
                     && parse_pipeline_transcription_option(
@@ -368,6 +373,13 @@ fn parse_file_translation_args(
     parsed.config_path = resolved.config_path;
     parsed.profile = resolved.profile;
     Ok(parsed)
+}
+
+fn is_container_translation_option(option: &str) -> bool {
+    matches!(
+        option,
+        "--subtitle-stream" | "--preserve-source-container" | "--in-place-container"
+    )
 }
 
 /// Scan only for `--config` and `--profile`, returning their values.
@@ -435,6 +447,11 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
             }
             "--config" | "--profile" => {
                 skip_two(args, &mut index)?;
+            }
+            value if is_container_translation_option(value) => {
+                return Err(CliError::usage(format!(
+                    "{value} is only valid with `sbake pipeline`"
+                )));
             }
             value if parse_translation_setting_option(value, args, &mut index, &mut overrides)? => {
             }
@@ -1150,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_translate_overrides_name_and_container_policies() {
+    fn parse_pipeline_overrides_name_and_container_policies() {
         let config = empty_config("translation-retention-policies");
         let args = vec![
             "movie.mkv".to_owned(),
@@ -1159,11 +1176,31 @@ mod tests {
             "--preserve-names".to_owned(),
             "--preserve-source-container".to_owned(),
         ];
-        let parsed = parse_translate_args(&args).expect("retention policy options");
+        let parsed = parse_pipeline_args(&args).expect("retention policy options");
         let _ = std::fs::remove_file(config);
 
         assert!(parsed.settings.translation.preserve_names);
         assert!(parsed.settings.output.preserve_source_container);
+    }
+
+    #[test]
+    fn parse_translate_rejects_pipeline_only_container_options() {
+        let config = empty_config("translation-container-option");
+        let args = vec![
+            "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--subtitle-stream".to_owned(),
+            "2".to_owned(),
+        ];
+        let error = parse_translate_args(&args).expect_err("container option must be explicit");
+        let _ = std::fs::remove_file(config);
+
+        assert!(
+            error
+                .to_string()
+                .contains("only valid with `sbake pipeline`")
+        );
     }
 
     #[test]

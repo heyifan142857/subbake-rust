@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use subbake_core::entities::{SubtitleDocument, SubtitleSegment};
 use subbake_core::formats::{
@@ -10,6 +11,8 @@ use subbake_core::formats::{
 };
 
 use crate::error::{AdapterError, AdapterResult};
+
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn is_supported_subtitle_path(path: &Path) -> bool {
     supported_format_from_path(path).is_some()
@@ -48,7 +51,7 @@ pub fn render_and_write_document(
     options: &RenderOptions,
 ) -> AdapterResult<String> {
     let rendered = render_document(document, translations, options).map_err(AdapterError::from)?;
-    write_verified_atomically(output_path, rendered.as_bytes())?;
+    write_file_atomically(output_path, rendered.as_bytes())?;
     Ok(rendered)
 }
 
@@ -61,7 +64,15 @@ pub(crate) fn render_and_write_document_atomic(
     render_and_write_document(document, translations, output_path, options)
 }
 
-fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<()> {
+pub fn write_file_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<()> {
+    write_file_atomically_with_permissions(output_path, bytes, None)
+}
+
+pub(crate) fn write_file_atomically_with_permissions(
+    output_path: &Path,
+    bytes: &[u8],
+    new_file_permissions: Option<fs::Permissions>,
+) -> AdapterResult<()> {
     let parent = output_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -73,11 +84,11 @@ fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<
             source,
         )
     })?;
+    let write_lock = AtomicWriteLock::acquire(output_path)?;
     let file_name = output_path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("subtitle");
-    static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
         ".{file_name}.subbake-tmp-{}-{nonce}",
@@ -89,18 +100,26 @@ fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<
             .create_new(true)
             .open(&temporary)
             .map_err(|source| {
-                AdapterError::external_io("create staged subtitle", Some(temporary.clone()), source)
+                AdapterError::external_io("create staged file", Some(temporary.clone()), source)
             })?;
         file.write_all(bytes).map_err(|source| {
-            AdapterError::external_io("write staged subtitle", Some(temporary.clone()), source)
+            AdapterError::external_io("write staged file", Some(temporary.clone()), source)
         })?;
         file.sync_all().map_err(|source| {
-            AdapterError::external_io("sync staged subtitle", Some(temporary.clone()), source)
+            AdapterError::external_io("sync staged file", Some(temporary.clone()), source)
         })?;
         if let Ok(metadata) = fs::metadata(output_path) {
             fs::set_permissions(&temporary, metadata.permissions()).map_err(|source| {
                 AdapterError::external_io(
-                    "preserve subtitle permissions",
+                    "preserve file permissions",
+                    Some(temporary.clone()),
+                    source,
+                )
+            })?;
+        } else if let Some(permissions) = new_file_permissions {
+            fs::set_permissions(&temporary, permissions).map_err(|source| {
+                AdapterError::external_io(
+                    "set staged file permissions",
                     Some(temporary.clone()),
                     source,
                 )
@@ -116,7 +135,7 @@ fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<
     publish_staged_file(&temporary, output_path)?;
     let written = fs::read(output_path).map_err(|source| {
         AdapterError::external_io(
-            "verify rendered subtitle",
+            "verify atomic write",
             Some(output_path.to_path_buf()),
             source,
         )
@@ -126,7 +145,83 @@ fn write_verified_atomically(output_path: &Path, bytes: &[u8]) -> AdapterResult<
             format!("write verification failed for {}", output_path.display()),
         )));
     }
+    drop(write_lock);
+    sync_parent_directory(parent)?;
     Ok(())
+}
+
+struct AtomicWriteLock {
+    path: PathBuf,
+}
+
+impl AtomicWriteLock {
+    fn acquire(target: &Path) -> AdapterResult<Self> {
+        let file_name = target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file");
+        let path = target.with_file_name(format!(".{file_name}.subbake-write-lock"));
+        for attempt in 0..100 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(std::process::id().to_string().as_bytes())
+                        .and_then(|()| file.sync_all())
+                        .map_err(|source| {
+                            let _ = fs::remove_file(&path);
+                            AdapterError::external_io(
+                                "initialize atomic write lock",
+                                Some(path.clone()),
+                                source,
+                            )
+                        })?;
+                    return Ok(Self { path });
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if attempt < 99 {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    return Err(AdapterError::external_io(
+                        "acquire atomic write lock",
+                        Some(path),
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "another process is writing the same file",
+                        ),
+                    ));
+                }
+                Err(source) => {
+                    return Err(AdapterError::external_io(
+                        "create atomic write lock",
+                        Some(path),
+                        source,
+                    ));
+                }
+            }
+        }
+        unreachable!("atomic write lock loop always returns")
+    }
+}
+
+impl Drop for AtomicWriteLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|elapsed| elapsed > Duration::from_secs(300))
 }
 
 #[cfg(not(windows))]
@@ -134,7 +229,7 @@ fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()
     fs::rename(temporary, output_path).map_err(|source| {
         let _ = fs::remove_file(temporary);
         AdapterError::external_io(
-            "publish rendered subtitle",
+            "publish staged file",
             Some(output_path.to_path_buf()),
             source,
         )
@@ -147,14 +242,15 @@ fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()
         return fs::rename(temporary, output_path).map_err(|source| {
             let _ = fs::remove_file(temporary);
             AdapterError::external_io(
-                "publish rendered subtitle",
+                "publish staged file",
                 Some(output_path.to_path_buf()),
                 source,
             )
         });
     }
+    let prior_nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let prior = output_path.with_file_name(format!(
-        ".{}.subbake-prior-{}",
+        ".{}.subbake-prior-{}-{prior_nonce}",
         output_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -164,7 +260,7 @@ fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()
     fs::rename(output_path, &prior).map_err(|source| {
         let _ = fs::remove_file(temporary);
         AdapterError::external_io(
-            "stage previous subtitle",
+            "stage previous file",
             Some(output_path.to_path_buf()),
             source,
         )
@@ -173,12 +269,30 @@ fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()
         let _ = fs::rename(&prior, output_path);
         let _ = fs::remove_file(temporary);
         return Err(AdapterError::external_io(
-            "publish rendered subtitle",
+            "publish staged file",
             Some(output_path.to_path_buf()),
             source,
         ));
     }
     let _ = fs::remove_file(prior);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> AdapterResult<()> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| {
+            AdapterError::external_io(
+                "sync atomic write directory",
+                Some(parent.to_path_buf()),
+                source,
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> AdapterResult<()> {
     Ok(())
 }
 
@@ -218,6 +332,7 @@ pub fn default_output_path_with_language(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -310,7 +425,7 @@ mod tests {
         fs::set_permissions(&output, fs::Permissions::from_mode(0o640))
             .expect("set output permissions");
 
-        write_verified_atomically(&output, b"new subtitle").expect("publish replacement");
+        write_file_atomically(&output, b"new subtitle").expect("publish replacement");
 
         assert_eq!(
             fs::read(&output).expect("read replacement"),
@@ -335,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writer_serializes_concurrent_replacements() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-atomic-concurrent-{nonce}"));
+        fs::create_dir_all(&root).expect("create root");
+        let output = Arc::new(root.join("state.json"));
+        fs::write(output.as_ref(), b"initial").expect("write initial file");
+        let barrier = Arc::new(Barrier::new(8));
+        let writers = (0..8)
+            .map(|index| {
+                let output = Arc::clone(&output);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let bytes = format!("writer-{index}").into_bytes();
+                    barrier.wait();
+                    write_file_atomically(&output, &bytes)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for writer in writers {
+            writer.join().expect("writer thread").expect("atomic write");
+        }
+
+        let content = fs::read_to_string(output.as_ref()).expect("read final file");
+        assert!(content.starts_with("writer-"));
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("list root")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn failed_atomic_publish_removes_its_staged_file() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -344,7 +498,7 @@ mod tests {
         let output = root.join("directory-target.srt");
         fs::create_dir_all(&output).expect("create conflicting directory");
 
-        write_verified_atomically(&output, b"subtitle")
+        write_file_atomically(&output, b"subtitle")
             .expect_err("a directory cannot be replaced as a subtitle file");
 
         let staged = fs::read_dir(&root)

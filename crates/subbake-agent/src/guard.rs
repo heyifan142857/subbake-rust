@@ -851,16 +851,13 @@ impl FileGuard {
 
     /// Write content to a file atomically via temp + rename.
     fn write_atomically(&self, path: &Path, content: &str) -> FileGuardResult<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_file_name(format!(
-            ".{}.tmp",
-            path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
-        ));
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        subbake_adapters::write_file_atomically(path, content.as_bytes()).map_err(|source| {
+            FileGuardError::Io {
+                operation: "atomically write project file",
+                path: Some(path.to_path_buf()),
+                source: std::io::Error::other(source),
+            }
+        })
     }
 
     /// Restore a file from a backup. Used by undo.

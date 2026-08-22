@@ -14,10 +14,14 @@ use subbake_core::{
     SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment, TranslationMode, Usage,
 };
 
+use crate::embedded_subtitles::{
+    has_translatable_text_subtitle, is_supported_subtitle_container_path,
+    translate_embedded_subtitle_cancellable_with_progress,
+};
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
-    render_and_write_document_atomic, stable_runtime_input_path,
+    render_and_write_document_atomic, stable_runtime_input_path, write_file_atomically,
 };
 use crate::settings::TranslationSettings;
 use crate::transcription::{
@@ -280,21 +284,7 @@ impl StreamingPipelineStore {
                 context: "serialize pipeline Resume shard",
                 source,
             })?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        fs::write(&temporary, bytes).map_err(|source| {
-            AdapterError::external_io(
-                "write pipeline Resume shard",
-                Some(temporary.clone()),
-                source,
-            )
-        })?;
-        fs::rename(&temporary, path).map_err(|source| {
-            AdapterError::external_io(
-                "commit pipeline Resume shard",
-                Some(path.to_path_buf()),
-                source,
-            )
-        })
+        write_file_atomically(path, &bytes)
     }
 
     fn read_json_if_exists<T: for<'de> Deserialize<'de>>(
@@ -373,12 +363,39 @@ pub fn run_pipeline_cancellable_with_progress(
         return Ok(PipelineOutcome::Subtitle(outcome));
     }
 
+    if is_supported_subtitle_container_path(&request.input_path)
+        && should_translate_embedded_subtitle(
+            &request.settings,
+            has_translatable_text_subtitle(&request.input_path, cancellation)?,
+        )
+    {
+        let outcome = translate_embedded_subtitle_cancellable_with_progress(
+            TranslationRequest {
+                input_path: request.input_path,
+                output_path: request.output_path,
+                output_language_tag: None,
+                overwrite: true,
+                settings: request.settings,
+            },
+            cancellation,
+            progress,
+        )?;
+        return Ok(PipelineOutcome::Subtitle(outcome));
+    }
+
     match media_pipeline_strategy(&request.settings) {
         MediaPipelineStrategy::Sequential => {
             run_sequential_media_pipeline(request, cancellation, progress)
         }
         strategy => run_streaming_media_pipeline(request, strategy, cancellation, progress),
     }
+}
+
+fn should_translate_embedded_subtitle(
+    settings: &TranslationSettings,
+    has_translatable_stream: bool,
+) -> bool {
+    settings.translation.subtitle_stream_index.is_some() || has_translatable_stream
 }
 
 fn media_pipeline_strategy(settings: &TranslationSettings) -> MediaPipelineStrategy {
@@ -1022,6 +1039,16 @@ mod tests {
             media_pipeline_strategy(&TranslationSettings::default()),
             MediaPipelineStrategy::TurboImmediate
         );
+    }
+
+    #[test]
+    fn container_pipeline_prefers_text_subtitles_and_falls_back_without_them() {
+        let mut settings = TranslationSettings::default();
+        assert!(should_translate_embedded_subtitle(&settings, true));
+        assert!(!should_translate_embedded_subtitle(&settings, false));
+
+        settings.translation.subtitle_stream_index = Some(3);
+        assert!(should_translate_embedded_subtitle(&settings, false));
     }
 
     #[test]

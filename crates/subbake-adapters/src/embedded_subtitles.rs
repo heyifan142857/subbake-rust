@@ -168,6 +168,20 @@ pub fn is_supported_subtitle_container_path(path: &Path) -> bool {
     SubtitleContainerKind::from_path(path).is_some()
 }
 
+pub(crate) fn has_translatable_text_subtitle(
+    input_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<bool> {
+    let streams = probe_subtitle_streams(Path::new(FFPROBE), input_path, cancellation)?;
+    Ok(streams.iter().any(|stream| {
+        is_text_subtitle_codec(&stream.codec)
+            && !stream
+                .title
+                .as_deref()
+                .is_some_and(is_subbake_translation_title)
+    }))
+}
+
 pub fn default_embedded_translation_output_path(
     input_path: &Path,
     bilingual: bool,

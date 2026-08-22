@@ -58,6 +58,6 @@ impl<'a> SessionController<'a> {
             .active
             .as_ref()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        Ok(self.store.path_for(&session.id))
+        self.store.path_for(&session.id)
     }
 }

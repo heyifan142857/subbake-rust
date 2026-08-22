@@ -18,7 +18,7 @@ use subbake_core::{CancellationGuard, FinalValidationPolicy};
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
-    render_and_write_document_atomic, stable_runtime_input_path,
+    render_and_write_document_atomic, stable_runtime_input_path, write_file_atomically,
 };
 use crate::llm_backends::{OpenAiBatchClient, OpenAiBatchStatus, build_openai_batch_client};
 use crate::runtime_store::FileRuntimeStore;
@@ -466,18 +466,7 @@ fn write_manifest(path: &Path, manifest: &OvernightManifest) -> AdapterResult<()
             context: "encode overnight manifest",
             source,
         })?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, data).map_err(|source| {
-        AdapterError::external_io("write overnight manifest", Some(temporary.clone()), source)
-    })?;
-    fs::rename(&temporary, path).map_err(|source| {
-        AdapterError::external_io(
-            "commit overnight manifest",
-            Some(path.to_path_buf()),
-            source,
-        )
-    })?;
-    Ok(())
+    write_file_atomically(path, &data)
 }
 
 #[cfg(test)]

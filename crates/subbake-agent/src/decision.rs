@@ -1993,8 +1993,13 @@ mod tests {
         ));
 
         let session = engine.session.as_ref().expect("session");
-        let saved = std::fs::read_to_string(engine.session_store.path_for(&session.id))
-            .expect("read saved session");
+        let saved = std::fs::read_to_string(
+            engine
+                .session_store
+                .path_for(&session.id)
+                .expect("valid session id"),
+        )
+        .expect("read saved session");
         assert!(saved.contains("Read sample.srt"));
         assert!(!saved.contains("private subtitle body"));
         assert!(!saved.contains("\"outcome\""));

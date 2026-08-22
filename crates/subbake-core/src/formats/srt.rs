@@ -226,7 +226,9 @@ fn parse_block(block: &str, cue_index: usize) -> CoreResult<SubtitleSegment> {
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
         .map(ToOwned::to_owned);
-    let id = identifier.clone().unwrap_or_else(|| cue_index.to_string());
+    // Display identifiers are not guaranteed to be unique. Internal IDs are
+    // positional so every cue remains independently addressable.
+    let id = cue_index.to_string();
     let text = lines[timing_index + 1..].join("\n");
 
     Ok(SubtitleSegment {
@@ -286,5 +288,29 @@ mod tests {
             sanitize_ass_derived_font_tags(source),
             "<font color=\"#ff0000\">Hello</font>"
         );
+    }
+
+    #[test]
+    fn duplicate_display_identifiers_keep_unique_internal_ids() {
+        let document = parse(
+            Path::new("duplicate.srt"),
+            "7\n00:00:01,000 --> 00:00:02,000\nFirst\n\n7\n00:00:03,000 --> 00:00:04,000\nSecond\n",
+        )
+        .expect("parse duplicate identifiers");
+
+        assert_eq!(document.segments[0].id, "1");
+        assert_eq!(document.segments[1].id, "2");
+        assert_eq!(document.segments[0].identifier.as_deref(), Some("7"));
+        assert_eq!(document.segments[1].identifier.as_deref(), Some("7"));
+
+        let rendered = render(
+            &document.segments,
+            &document.segments,
+            false,
+            BilingualOrder::TargetFirst,
+        )
+        .expect("render duplicate identifiers");
+        assert_eq!(rendered.matches("\n7\n").count(), 1);
+        assert!(rendered.starts_with("7\n"));
     }
 }

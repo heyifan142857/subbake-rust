@@ -140,7 +140,7 @@ Usage: sbake [OPTIONS] [COMMAND]
 Commands:
   agent       Start the interactive agent (also the default with no command)
   resume      Resume the latest or a specified agent session
-  translate   Translate a subtitle file or an embedded container subtitle
+  translate   Translate a subtitle file
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
   memory      Inspect, export, import, or prune glossary and translation memory
@@ -172,7 +172,7 @@ const TOP_LEVEL_HELP: &str = r#"Subtitle translation and transcription CLI
 Usage: sbake [OPTIONS] [COMMAND]
 
 Commands:
-  translate   Translate a subtitle file or an embedded container subtitle
+  translate   Translate a subtitle file
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
   memory      Inspect, export, import, or prune glossary and translation memory
@@ -210,9 +210,9 @@ Usage: sbake resume [SESSION_ID]
 
 Omit SESSION_ID to resume the latest session.
 "#;
-const TRANSLATE_HELP: &str = r#"Translate a subtitle file or an embedded container subtitle
+const TRANSLATE_HELP: &str = r#"Translate a subtitle file
 
-Usage: sbake translate <SUBTITLE_OR_MEDIA> [OPTIONS]
+Usage: sbake translate <SUBTITLE> [OPTIONS]
 
 Options:
   -o, --output <PATH>              Output file path
@@ -220,7 +220,6 @@ Options:
       --profile <NAME>             Named provider profile
       --source-lang <LANGUAGE>     Source language
       --target-lang <LANGUAGE>     Target language
-      --subtitle-stream <INDEX>    Explicit embedded subtitle stream index
       --provider <NAME>            Provider name
       --model <NAME>               Model name
       --output-format <FORMAT>     Output subtitle format: srt, vtt, txt, or ass
@@ -232,8 +231,6 @@ Options:
       --strict-preflight           Fail when requested terminology preflight is unavailable or fails
       --preserve-names             Keep names in source spelling; disable Turbo name alignment
       --transliterate-names        Transliterate personal names (default)
-      --preserve-source-container  Write a separate translated media file
-      --in-place-container         Atomically replace the source media (default)
       --mode <MODE>               Translation mode: economy, turbo, or cinema
       --request-token-budget <N>  Limit estimated prompt plus response tokens per request
       --confirmed-context-lines <N>
@@ -255,11 +252,8 @@ Options:
   -h, --help                       Print help
 
 Additional provider, batching, concurrency, cache, retry, glossary, and runtime
-options are accepted. MKV, MP4/M4V/MOV, and WebM inputs select a matching text
-subtitle stream and add the translation while copying existing streams. Embedded
-subtitle codecs are selected automatically for container compatibility. By
-default the source container is atomically replaced after verification. Media
-input is never transcribed; use `sbake pipeline` when transcription is needed.
+options are accepted. Media input is rejected; use `sbake transcribe` or
+`sbake pipeline` for media workflows.
 "#;
 const BATCH_HELP: &str = r#"Translate subtitle files in a directory
 
@@ -330,6 +324,9 @@ const PIPELINE_HELP: &str = r#"Transcribe media when needed, then translate it
 Usage: sbake pipeline <MEDIA_OR_SUBTITLE> [OPTIONS]
 
 Accepts all `translate` options plus:
+      --subtitle-stream <INDEX>       Explicit embedded text subtitle stream index
+      --preserve-source-container     Write a separate translated media file
+      --in-place-container            Atomically replace the source media (default)
       --transcribe-language <LANGUAGE> Spoken language
       --transcribe-model <NAME>        Transcription model
       --transcribe-format <FORMAT>     srt, vtt, or txt
@@ -337,6 +334,11 @@ Accepts all `translate` options plus:
       --whisper-bin <PATH>             Override whisper-cli path
       --whisper-models-dir <DIR>       Override whisper model directory
   -h, --help                           Print help
+
+For MKV, MP4/M4V/MOV, and WebM inputs, an existing text subtitle stream is
+translated and added while the other streams are copied. If no translatable
+text subtitle exists, the media is transcribed first. Use --subtitle-stream to
+select a specific embedded stream.
 "#;
 const OVERNIGHT_HELP: &str = r#"Submit, check, and collect a provider-managed asynchronous translation batch
 

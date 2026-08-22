@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AdapterError, AdapterResult, ConfigError};
+use crate::fs::write_file_atomically;
 use crate::settings::{BackendOverrides, ResolvedSettings, SettingsOverrides};
 
 pub const CONFIG_VERSION: u64 = 2;
@@ -249,41 +250,7 @@ pub fn append_profile_snapshot(
     content.push('\n');
     content.push_str(&rendered);
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config");
-    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let permissions = fs::metadata(path)
-        .map_err(|source| {
-            AdapterError::external_io(
-                "read configuration metadata",
-                Some(path.to_path_buf()),
-                source,
-            )
-        })?
-        .permissions();
-    fs::write(&temporary, content).map_err(|source| {
-        AdapterError::external_io(
-            "write temporary configuration",
-            Some(temporary.clone()),
-            source,
-        )
-    })?;
-    fs::set_permissions(&temporary, permissions).map_err(|source| {
-        AdapterError::external_io(
-            "preserve configuration permissions",
-            Some(temporary.clone()),
-            source,
-        )
-    })?;
-    let rename_result = fs::rename(&temporary, path);
-    if rename_result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    rename_result.map_err(|source| {
-        AdapterError::external_io("replace configuration", Some(path.to_path_buf()), source)
-    })
+    write_file_atomically(path, content.as_bytes())
 }
 
 fn validate_profile_name(name: &str) -> Result<(), ConfigError> {

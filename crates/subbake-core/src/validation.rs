@@ -23,6 +23,7 @@ pub fn validate_translation_batch(
     source: &[SubtitleSegment],
     lines: &[TranslationLine],
 ) -> CoreResult<()> {
+    validate_unique_segment_ids(source, "source")?;
     if source.len() != lines.len() {
         return Err(CoreError::InvalidTranslation(format!(
             "expected {} translated line(s), got {}",
@@ -35,7 +36,14 @@ pub fn validate_translation_batch(
         .iter()
         .map(|segment| segment.id.as_str())
         .collect::<HashSet<_>>();
+    let mut translated_ids = HashSet::with_capacity(lines.len());
     for line in lines {
+        if !translated_ids.insert(line.id.as_str()) {
+            return Err(CoreError::InvalidTranslation(format!(
+                "duplicate translated id `{}`",
+                line.id
+            )));
+        }
         if !source_ids.contains(line.id.as_str()) {
             return Err(CoreError::InvalidTranslation(format!(
                 "unexpected translated id `{}`",
@@ -73,6 +81,8 @@ pub fn validate_full_alignment(
     source: &[SubtitleSegment],
     translated: &[SubtitleSegment],
 ) -> CoreResult<()> {
+    validate_unique_segment_ids(source, "source")?;
+    validate_unique_segment_ids(translated, "translated")?;
     if source.len() != translated.len() {
         return Err(CoreError::InvalidTranslation(format!(
             "source has {} segment(s), translated has {}",
@@ -90,6 +100,22 @@ pub fn validate_full_alignment(
         }
     }
 
+    Ok(())
+}
+
+pub fn validate_unique_segment_ids(
+    segments: &[SubtitleSegment],
+    collection: &str,
+) -> CoreResult<()> {
+    let mut seen = HashSet::with_capacity(segments.len());
+    for segment in segments {
+        if !seen.insert(segment.id.as_str()) {
+            return Err(CoreError::InvalidTranslation(format!(
+                "duplicate {collection} segment id `{}`",
+                segment.id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -323,6 +349,20 @@ fn parse_timestamp(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_alignment_rejects_duplicate_internal_ids() {
+        let source = vec![segment("1", "first", None), segment("1", "second", None)];
+        let translated = source.clone();
+
+        let error = validate_full_alignment(&source, &translated)
+            .expect_err("duplicate internal ids must fail before alignment");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate source segment id `1`")
+        );
+    }
 
     #[test]
     fn final_validation_accepts_required_terms_facts_and_formatting() {

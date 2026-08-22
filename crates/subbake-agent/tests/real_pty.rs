@@ -148,8 +148,11 @@ exit "$status"
     wait_for_output(&transcript, b"Read sample.srt", STEP_TIMEOUT);
     wait_for_output(&transcript, b"inspection complete", STEP_TIMEOUT);
 
-    send_text(&writer, "/exit");
+    send_text(&writer, "cancel and exit");
     send(&writer, ENTER_KEY);
+    wait_for_action(&action_log, "SubmitText:cancel and exit", &transcript);
+    send(&writer, b"\x03");
+    wait_for_action(&action_log, "CancellationObservedOnExit", &transcript);
     let status = wait_for_child(&mut child, &transcript);
     assert!(
         status.success(),
@@ -302,6 +305,13 @@ fn scripted_interaction(
                 thread::sleep(Duration::from_millis(10));
             }
             append_action(action_log, "CancellationObserved")?;
+            Err(AgentError::Cancelled)
+        }
+        TuiAction::SubmitText(input) if input == "cancel and exit" => {
+            while !guard.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            append_action(action_log, "CancellationObservedOnExit")?;
             Err(AgentError::Cancelled)
         }
         TuiAction::SubmitText(input) if input == "after cancel" => Ok(TuiInteraction::Message {

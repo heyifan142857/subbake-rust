@@ -23,7 +23,7 @@ use crate::embedded_subtitles::{
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
-    render_and_write_document, stable_runtime_input_path,
+    render_and_write_document, stable_runtime_input_path, write_file_atomically,
 };
 use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
@@ -622,18 +622,12 @@ fn persist_batch_manifest(path: &Path, manifest: &BatchTranslationManifest) -> A
             source,
         )
     })?;
-    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
     let bytes =
         serde_json::to_vec_pretty(manifest).map_err(|source| AdapterError::Serialization {
             context: "serialize batch manifest",
             source,
         })?;
-    fs::write(&temporary, bytes).map_err(|source| {
-        AdapterError::external_io("write batch manifest", Some(temporary.clone()), source)
-    })?;
-    fs::rename(&temporary, path).map_err(|source| {
-        AdapterError::external_io("commit batch manifest", Some(path.to_path_buf()), source)
-    })
+    write_file_atomically(path, &bytes)
 }
 
 pub fn batch_translation_output_path(
@@ -859,6 +853,21 @@ mod tests {
         .expect_err("unsupported media translation must require the explicit pipeline");
 
         assert!(error.to_string().contains("when transcription is required"));
+    }
+
+    #[test]
+    fn subtitle_translation_rejects_supported_media_containers() {
+        let error = translate_subtitle(TranslationRequest {
+            input_path: PathBuf::from("movie.mkv"),
+            output_path: None,
+            output_language_tag: None,
+            overwrite: true,
+            settings: TranslationSettings::default(),
+        })
+        .expect_err("subtitle-only service must reject a container");
+
+        assert!(error.to_string().contains("accepts subtitle files only"));
+        assert!(error.to_string().contains("use `pipeline`"));
     }
 
     #[test]
