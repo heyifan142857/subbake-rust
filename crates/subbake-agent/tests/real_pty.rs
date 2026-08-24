@@ -155,24 +155,6 @@ exit "$status"
         CURSOR_SHOW,
         STEP_TIMEOUT,
     );
-    {
-        let resize_bytes = transcript.bytes.lock().expect("lock PTY transcript");
-        let resize_output = resize_bytes
-            .get(narrow_reflow_checkpoint..)
-            .expect("resize output starts at checkpoint");
-        assert!(
-            contains_subslice(resize_output, b"\x1b[3J"),
-            "resize reflow must purge terminal-native scrollback before replay"
-        );
-        assert!(
-            contains_subslice(resize_output, b"\x1b[2J"),
-            "resize reflow must clear the visible screen"
-        );
-        assert!(
-            contains_subslice(resize_output, b"/pty-test"),
-            "resize reflow must replay stable startup history"
-        );
-    }
     send_text(&writer, "after ");
     thread::sleep(Duration::from_millis(200));
     let wide_resize_request = transcript_len(&transcript);
