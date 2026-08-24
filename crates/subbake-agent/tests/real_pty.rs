@@ -129,6 +129,7 @@ exit "$status"
     } else {
         LEGACY_SHIFT_TAB_KEY
     };
+    let resize_checkpoint = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -137,6 +138,21 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY to narrow composer");
+    wait_for_output_growth_and_quiet(
+        &transcript,
+        resize_checkpoint,
+        Duration::from_millis(100),
+        STEP_TIMEOUT,
+    );
+    assert!(
+        !transcript
+            .bytes
+            .lock()
+            .expect("lock PTY transcript")
+            .get(resize_checkpoint..)
+            .is_some_and(|tail| contains_subslice(tail, b"\x1b[2J")),
+        "inline width shrink must not clear committed terminal history"
+    );
     send_text(&writer, "after ");
     pair.master
         .resize(PtySize {

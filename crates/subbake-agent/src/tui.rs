@@ -63,6 +63,7 @@ const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 pub struct SubBakeTui {
     terminal_session: TerminalSessionGuard,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    inline_terminal_size: (u16, u16),
     overlay_terminal: Option<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
@@ -85,19 +86,12 @@ pub struct SubBakeTui {
 impl SubBakeTui {
     pub fn new() -> io::Result<Self> {
         let terminal_session = TerminalSessionGuard::enter()?;
-        let terminal_rows = crossterm::terminal::size()?.1;
-        let terminal = retry_terminal_initialization(|| {
-            let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
-            Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
-                },
-            )
-        })?;
+        let inline_terminal_size = crossterm::terminal::size()?;
+        let terminal = create_inline_terminal(inline_terminal_size.1)?;
         Ok(Self {
             terminal_session,
             terminal,
+            inline_terminal_size,
             overlay_terminal: None,
             // The terminal emulator owns scrollback retention. Keep the source
             // items for this process lifetime so the commit cursor stays stable.
@@ -479,6 +473,7 @@ impl SubBakeTui {
                         }
                     }
                 }
+                self.sync_inline_terminal_size()?;
                 self.flush_history()?;
                 self.draw()?;
                 self.handle_event(worker.sender()?)?;
@@ -567,6 +562,7 @@ Or just type what you want, e.g. "translate @clip.srt""#
         if self.overlay_terminal.is_some() {
             return Ok(());
         }
+        self.sync_inline_terminal_size()?;
         let width = self.terminal.size()?.width.max(1);
         if self.startup_pending {
             self.startup_pending = false;
@@ -603,7 +599,31 @@ Or just type what you want, e.g. "translate @clip.srt""#
     }
 
     fn draw(&mut self) -> io::Result<()> {
+        self.sync_inline_terminal_size()?;
         render::draw(self)
+    }
+
+    /// Keep Ratatui's inline terminal synchronized without using its resize
+    /// path. Ratatui 0.30 clears the entire visible screen when an inline
+    /// viewport becomes narrower, which also erases committed history above
+    /// the viewport. A fresh inline terminal clears only its active viewport;
+    /// the terminal emulator remains responsible for reflowing native
+    /// scrollback at the new width.
+    fn sync_inline_terminal_size(&mut self) -> io::Result<()> {
+        if self.overlay_terminal.is_some() {
+            return Ok(());
+        }
+        let size = crossterm::terminal::size()?;
+        if size == self.inline_terminal_size {
+            return Ok(());
+        }
+
+        let mut terminal = create_inline_terminal(size.1)?;
+        terminal.clear()?;
+        self.terminal = terminal;
+        self.inline_terminal_size = size;
+        self.invalidate_layout();
+        Ok(())
     }
 
     fn handle_event(&mut self, request_tx: &mpsc::Sender<WorkerRequest>) -> io::Result<()> {
@@ -619,6 +639,20 @@ fn retry_terminal_initialization<T>(
     mut initialize: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     initialize().or_else(|_| initialize())
+}
+
+fn create_inline_terminal(
+    terminal_rows: u16,
+) -> io::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
+    retry_terminal_initialization(|| {
+        let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
+            },
+        )
+    })
 }
 
 fn inline_viewport_height(terminal_rows: u16) -> u16 {
