@@ -718,51 +718,24 @@ impl FileGuard {
     /// Resolve a user-supplied path to an absolute path under the project root,
     /// rejecting paths that escape the project root or contain protected components.
     fn resolve(&self, user_path: &Path) -> FileGuardResult<PathBuf> {
+        let project_root = self.anchored_project_root()?;
+
         // Normalise `..` components so `root/../etc/passwd` is caught below.
         let anchored = normalize_path(if user_path.is_absolute() {
             user_path.to_path_buf()
         } else {
-            self.project_root.join(user_path)
+            project_root.join(user_path)
         });
 
-        // ── Escape guard: anchor must be under project_root ──
-        let root_canon = self
-            .project_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.project_root.clone());
-        if !anchored.starts_with(&root_canon) {
-            return Err(FileGuardError::PathEscape {
-                root: root_canon,
-                path: anchored,
-            });
-        }
         self.reject_protected_components(&anchored)?;
 
-        // Canonicalize existing paths. For new nested paths, canonicalize the
-        // nearest existing ancestor so a symlink in any parent component
-        // cannot redirect a later create_dir_all outside the project.
-        let safe = if anchored.exists() {
-            anchored
-                .canonicalize()
-                .map_err(|e| std::io::Error::other(format!("resolve existing path: {e}")))?
-        } else {
-            let mut ancestor = anchored.as_path();
-            while !ancestor.exists() {
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| FileGuardError::PathEscape {
-                        root: root_canon.clone(),
-                        path: anchored.clone(),
-                    })?;
-            }
-            let canonical_ancestor = ancestor
-                .canonicalize()
-                .map_err(|e| std::io::Error::other(format!("resolve ancestor: {e}")))?;
-            let suffix = anchored
-                .strip_prefix(ancestor)
-                .unwrap_or_else(|_| Path::new(""));
-            canonical_ancestor.join(suffix)
-        };
+        // Resolve both sides through their nearest existing ancestors before
+        // comparing them. macOS can canonicalize `/var` as `/private/var`,
+        // while Windows can expand an 8.3 path and add a verbatim prefix. A
+        // lexical comparison between those equivalent spellings would reject
+        // every missing child path as an escape.
+        let root_canon = canonicalize_with_missing_tail(&project_root, "resolve project root")?;
+        let safe = canonicalize_with_missing_tail(&anchored, "resolve project path")?;
 
         if !safe.starts_with(&root_canon) {
             return Err(FileGuardError::PathEscape {
@@ -774,6 +747,21 @@ impl FileGuard {
         self.reject_protected_components(&safe)?;
 
         Ok(safe)
+    }
+
+    fn anchored_project_root(&self) -> FileGuardResult<PathBuf> {
+        let root = if self.project_root.is_absolute() {
+            self.project_root.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| FileGuardError::Io {
+                    operation: "resolve project root",
+                    path: Some(self.project_root.clone()),
+                    source,
+                })?
+                .join(&self.project_root)
+        };
+        Ok(normalize_path(root))
     }
 
     fn reject_protected_components(&self, path: &Path) -> FileGuardResult<()> {
@@ -838,7 +826,16 @@ impl FileGuard {
             });
         }
 
-        let rel = path.strip_prefix(&self.project_root).unwrap_or(path);
+        let project_root = canonicalize_with_missing_tail(
+            &self.anchored_project_root()?,
+            "resolve project root for backup",
+        )?;
+        let rel = path
+            .strip_prefix(&project_root)
+            .map_err(|_| FileGuardError::PathEscape {
+                root: project_root,
+                path: path.to_path_buf(),
+            })?;
         let ts = nanos_since_epoch();
         let backup_path = self.backup_root.join(format!("{ts}")).join(rel);
 
@@ -933,6 +930,56 @@ fn normalize_path(path: PathBuf) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+/// Canonicalize the deepest existing path prefix and append any missing tail.
+///
+/// `symlink_metadata` deliberately identifies dangling symlinks as existing;
+/// canonicalizing such an ancestor then fails safely instead of allowing a
+/// later directory creation to follow an unchecked link.
+fn canonicalize_with_missing_tail(
+    path: &Path,
+    operation: &'static str,
+) -> FileGuardResult<PathBuf> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or_else(|| FileGuardError::Io {
+                    operation,
+                    path: Some(path.to_path_buf()),
+                    source,
+                })?;
+            }
+            Err(source) => {
+                return Err(FileGuardError::Io {
+                    operation,
+                    path: Some(ancestor.to_path_buf()),
+                    source,
+                });
+            }
+        }
+    }
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map_err(|source| FileGuardError::Io {
+            operation,
+            path: Some(ancestor.to_path_buf()),
+            source,
+        })?;
+    let suffix = path
+        .strip_prefix(ancestor)
+        .map_err(|source| FileGuardError::Io {
+            operation,
+            path: Some(path.to_path_buf()),
+            source: std::io::Error::other(source),
+        })?;
+    if suffix.as_os_str().is_empty() {
+        Ok(canonical_ancestor)
+    } else {
+        Ok(canonical_ancestor.join(suffix))
+    }
 }
 
 #[cfg(test)]
@@ -1075,6 +1122,37 @@ mod tests {
         assert_eq!(result.action, FileOpAction::Create);
         assert_eq!(guard.read_file(path).expect("read"), "hello");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_missing_children_beneath_an_aliased_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let container =
+            std::env::temp_dir().join(format!("subbake-guard-root-alias-{}", nanos_since_epoch()));
+        let actual_parent = container.join("actual");
+        let alias_parent = container.join("alias");
+        let actual_root = actual_parent.join("project");
+        let alias_root = alias_parent.join("project");
+        std::fs::create_dir_all(&actual_root).expect("create actual project root");
+        symlink(&actual_parent, &alias_parent).expect("create project-root alias");
+        let guard = FileGuard::new(alias_root.clone());
+
+        let result = guard
+            .create_file(&alias_root.join("nested/new.txt"), "safe")
+            .expect("create through aliased project root");
+
+        assert_eq!(
+            std::fs::read_to_string(actual_root.join("nested/new.txt")).expect("read created file"),
+            "safe"
+        );
+        assert!(
+            result
+                .path
+                .starts_with(actual_root.canonicalize().expect("canonical root"))
+        );
+        let _ = std::fs::remove_dir_all(container);
     }
 
     #[test]
@@ -1281,6 +1359,27 @@ mod tests {
         assert!(err.to_string().contains("escapes project root"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_dangling_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let (root, guard) = setup();
+        std::fs::create_dir_all(&root).expect("create root");
+        let outside = std::env::temp_dir().join(format!(
+            "subbake-dangling-symlink-target-{}",
+            nanos_since_epoch()
+        ));
+        symlink(&outside, root.join("dangling-link")).expect("create dangling symlink");
+
+        guard
+            .create_file(Path::new("dangling-link/escape.txt"), "data")
+            .expect_err("a dangling parent symlink must not be followed");
+
+        assert!(!outside.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
