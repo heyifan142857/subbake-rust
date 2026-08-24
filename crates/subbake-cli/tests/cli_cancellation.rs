@@ -1,6 +1,8 @@
 #![cfg(any(unix, windows))]
 
 #[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 #[cfg(unix)]
@@ -44,9 +46,15 @@ sleep 30
     // libtest itself ignores SIGINT, so exercise the same cancellation bridge
     // through SIGTERM in this isolated process. Normal CLI launches register
     // both SIGINT (Ctrl+C) and SIGTERM.
-    let mut command = Command::new("env");
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("env");
+        command.args(["--default-signal=INT,TERM", env!("CARGO_BIN_EXE_sbake")]);
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sbake"));
     let mut sbake = command
-        .args(["--default-signal=INT,TERM", env!("CARGO_BIN_EXE_sbake")])
         .args([
             "transcribe",
             audio.to_str().expect("audio path"),
@@ -60,14 +68,18 @@ sleep 30
             root.join("result.srt").to_str().expect("output path"),
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("start sbake");
 
     let ready_deadline = Instant::now() + Duration::from_secs(5);
     while !child_pid_path.exists() {
         if let Some(status) = sbake.try_wait().expect("poll sbake") {
-            panic!("sbake exited before whisper started: {status}");
+            let mut stderr = String::new();
+            if let Some(mut stream) = sbake.stderr.take() {
+                let _ = stream.read_to_string(&mut stderr);
+            }
+            panic!("sbake exited before whisper started: {status}; stderr: {stderr}");
         }
         assert!(
             Instant::now() < ready_deadline,

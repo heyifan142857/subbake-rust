@@ -26,9 +26,12 @@ const KEYBOARD_QUERY: &[u8] = b"\x1b[?u\x1b[c";
 const KEYBOARD_RESPONSE: &[u8] = b"\x1b[?1u\x1b[?1;2c";
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
-const ENTER_KEY: &[u8] = b"\x1b[13u";
-const ESCAPE_KEY: &[u8] = b"\x1b[27u";
-const SHIFT_TAB_KEY: &[u8] = b"\x1b[9;2u";
+const ENHANCED_ENTER_KEY: &[u8] = b"\x1b[13u";
+const ENHANCED_ESCAPE_KEY: &[u8] = b"\x1b[27u";
+const ENHANCED_SHIFT_TAB_KEY: &[u8] = b"\x1b[9;2u";
+const LEGACY_ENTER_KEY: &[u8] = b"\r";
+const LEGACY_ESCAPE_KEY: &[u8] = b"\x1b";
+const LEGACY_SHIFT_TAB_KEY: &[u8] = b"\x1b[Z";
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -103,7 +106,29 @@ exit "$status"
     ));
     let reader_thread = spawn_terminal_emulator(reader, writer.clone(), transcript.clone());
 
-    wait_for_output(&transcript, b"\x1b[>1u", STEP_TIMEOUT);
+    // The injected cwd is stable across prompt tips and rendering modes, so
+    // observing it proves that the first complete main view was rendered.
+    wait_for_output(&transcript, b"/pty-test", STEP_TIMEOUT);
+    // Keyboard enhancement is optional. Kitty-compatible terminals use CSI-u
+    // key encodings after negotiation, while ConPTY and other terminals may
+    // retain the traditional encodings. Exercise whichever mode the child
+    // actually selected instead of making one terminal protocol mandatory.
+    let enhanced_keyboard = transcript_contains(&transcript, b"\x1b[>1u");
+    let enter_key = if enhanced_keyboard {
+        ENHANCED_ENTER_KEY
+    } else {
+        LEGACY_ENTER_KEY
+    };
+    let escape_key = if enhanced_keyboard {
+        ENHANCED_ESCAPE_KEY
+    } else {
+        LEGACY_ESCAPE_KEY
+    };
+    let shift_tab_key = if enhanced_keyboard {
+        ENHANCED_SHIFT_TAB_KEY
+    } else {
+        LEGACY_SHIFT_TAB_KEY
+    };
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -122,16 +147,16 @@ exit "$status"
         })
         .expect("resize PTY to wide composer");
     send_text(&writer, "resize");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:after resize", &transcript);
     wait_for_output(&transcript, b"resize accepted", STEP_TIMEOUT);
 
-    send(&writer, SHIFT_TAB_KEY);
+    send(&writer, shift_tab_key);
     wait_for_action(&action_log, "TogglePlan", &transcript);
     wait_for_output(&transcript, b"plan toggled", STEP_TIMEOUT);
 
     send_text(&writer, "/profile");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:/profile", &transcript);
     wait_for_output(&transcript, b"\x1b[?1049h", STEP_TIMEOUT);
     wait_for_output(&transcript, b"Choose a model profile", STEP_TIMEOUT);
@@ -153,7 +178,7 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("widen PTY profile picker");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     // Ratatui updates the picker header by terminal diff, so the full title is
     // not guaranteed to occur contiguously in the raw PTY stream. This form-
     // specific line is newly rendered and is therefore a stable readiness
@@ -164,14 +189,14 @@ exit "$status"
         STEP_TIMEOUT,
     );
     send_text(&writer, "pty_profile");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "CreateProfile:pty_profile", &transcript);
     wait_for_output(&transcript, b"\x1b[?1049l", STEP_TIMEOUT);
     wait_for_output(&transcript, b"profile created", STEP_TIMEOUT);
 
     let config_checkpoint = transcript_len(&transcript);
     send_text(&writer, "/config");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:/config", &transcript);
     wait_for_output_after(
         &transcript,
@@ -206,36 +231,36 @@ exit "$status"
     );
 
     send_text(&writer, "make a plan");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:make a plan", &transcript);
     wait_for_output(&transcript, b"pending PTY plan", STEP_TIMEOUT);
     send(&writer, b"\x1b[B");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "RejectPlan", &transcript);
     wait_for_output(&transcript, b"plan rejected", STEP_TIMEOUT);
 
     send_text(&writer, "run command");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:run command", &transcript);
     wait_for_output(&transcript, b"pending PTY command", STEP_TIMEOUT);
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "ApproveCommand", &transcript);
     wait_for_output(&transcript, b"command continued", STEP_TIMEOUT);
 
     send_text(&writer, "cancel me");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:cancel me", &transcript);
-    send(&writer, ESCAPE_KEY);
+    send(&writer, escape_key);
     wait_for_action(&action_log, "CancellationObserved", &transcript);
     wait_for_output(&transcript, b"Cancelled.", STEP_TIMEOUT);
 
     send_text(&writer, "after cancel");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:after cancel", &transcript);
     wait_for_output(&transcript, b"worker recovered", STEP_TIMEOUT);
 
     send_text(&writer, "inspect file");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:inspect file", &transcript);
     // Ratatui may emit the transient "Reading" label as multiple cursor-diff
     // writes, so the raw PTY byte stream is not guaranteed to contain that
@@ -245,7 +270,7 @@ exit "$status"
     wait_for_output(&transcript, b"inspection complete", STEP_TIMEOUT);
 
     send_text(&writer, "cancel and exit");
-    send(&writer, ENTER_KEY);
+    send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:cancel and exit", &transcript);
     send(&writer, b"\x03");
     wait_for_action(&action_log, "CancellationObservedOnExit", &transcript);
@@ -280,7 +305,7 @@ exit "$status"
     assert_eq!(
         count_subslice(&output, b"\x1b[>1u"),
         count_subslice(&output, b"\x1b[<1u"),
-        "keyboard enhancement push/pop must be paired"
+        "negotiated keyboard enhancement push/pop must be paired"
     );
     assert!(
         count_subslice(&output, DSR_QUERY) > 0,
@@ -575,6 +600,13 @@ fn wait_for_output(transcript: &Transcript, needle: &[u8], timeout: Duration) {
 
 fn transcript_len(transcript: &Transcript) -> usize {
     transcript.bytes.lock().expect("lock PTY transcript").len()
+}
+
+fn transcript_contains(transcript: &Transcript, needle: &[u8]) -> bool {
+    contains_subslice(
+        &transcript.bytes.lock().expect("lock PTY transcript"),
+        needle,
+    )
 }
 
 fn wait_for_output_after(
