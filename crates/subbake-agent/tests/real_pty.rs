@@ -225,9 +225,15 @@ exit "$status"
         b"resize accepted",
         STEP_TIMEOUT,
     );
-    wait_for_output_after(
+    let height_footer_checkpoint = wait_for_output_after(
         &transcript,
         height_history_checkpoint + b"resize accepted".len(),
+        b"/pty-test",
+        STEP_TIMEOUT,
+    );
+    wait_for_output_after(
+        &transcript,
+        height_footer_checkpoint + b"/pty-test".len(),
         CURSOR_SHOW,
         STEP_TIMEOUT,
     );
