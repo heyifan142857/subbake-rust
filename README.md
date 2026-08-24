@@ -22,7 +22,7 @@ FFmpeg codec 都可用。
 
 ## 功能
 
-- 翻译 SRT、ASS、VTT 等字幕与文本文件
+- 翻译 SRT、VTT、ASS/SSA、TTML/DFXP 与 TXT 字幕/文本文件
 - 直接翻译 MKV、MP4/M4V/MOV 和 WebM 中的文本字幕轨
 - 并发分批翻译、审校、缓存、失败重试与断点续跑
 - 批量处理目录中的字幕文件
@@ -32,6 +32,7 @@ FFmpeg codec 都可用。
 - 提供带计划确认、会话恢复、历史记录和撤销功能的终端 Agent
 - 支持术语表与翻译记忆，并兼容部分旧版运行数据
 - 提供无参考译文的字幕 QA、可恢复批处理清单和资源预算
+- 安全润色已翻译字幕，支持 dry-run 差异预览和确定性发布前校验
 
 ## 安装
 
@@ -153,6 +154,9 @@ sbake translate movie.mkv --subtitle-stream 7 --target-lang Chinese
 
 # 批量翻译
 sbake batch ./subtitles
+
+# 预览并校验字幕润色，不写入文件
+sbake edit episode.translated.srt --instruction "让对白更口语化" --dry-run
 
 # 转写，或转写后翻译
 sbake transcribe episode.mp4

@@ -607,7 +607,7 @@ pub struct BatchPlanEntry {
     pub last_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentRepairRecord {
     pub stage: String,
     pub batch_index: usize,
@@ -666,11 +666,14 @@ pub struct AgentLog {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineOptions {
-    pub input_path: PathBuf,
-    pub output_path: Option<PathBuf>,
-    pub output_format: Option<String>,
-    pub provider: String,
-    pub model: String,
+    pub execution: PipelineExecutionOptions,
+    pub validation: PipelineValidationOptions,
+    pub rendering: PipelineRenderingOptions,
+    pub identity: PipelineRuntimeIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineExecutionOptions {
     pub batch_size: usize,
     pub batch_token_budget: usize,
     pub request_token_budget: usize,
@@ -679,41 +682,12 @@ pub struct PipelineOptions {
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub mode: TranslationMode,
-    pub bilingual: bool,
-    pub bilingual_order: BilingualOrder,
-    pub bilingual_font_scale: f64,
-    pub target_language: String,
-    pub source_language: String,
     pub retries: usize,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
-    /// Ask translation batches to emit and consume incremental terminology.
     pub online_terminology: bool,
     pub allow_degraded_preflight: bool,
-    /// Keep personal names in their source spelling instead of translating or
-    /// transliterating them into the target language.
-    pub preserve_names: bool,
-    /// Optional hard subtitle readability limits. `None` disables the
-    /// corresponding final-output check.
-    pub max_characters_per_second: Option<f64>,
-    pub max_characters_per_line: Option<usize>,
-    pub max_lines: Option<usize>,
     pub timeout_seconds: f64,
-    /// Non-secret identity of the configured API route, used to isolate v2
-    /// cache entries across protocols and relay endpoints.
-    pub provider_fingerprint: Option<String>,
-    pub reviewer_fingerprint: Option<String>,
-    /// Optional execution contract that isolates Resume state for composed
-    /// workflows such as incremental media pipelines. Standalone subtitle
-    /// translation leaves this unset so its historical fingerprints remain
-    /// stable.
-    pub execution_fingerprint: Option<String>,
-    /// Hash of the document guide and glossary frozen after terminology
-    /// preflight. This keeps Resume and translation-memory entries tied to the
-    /// exact guidance without duplicating it in the semantic fingerprint.
-    pub document_guide_fingerprint: Option<String>,
-    /// Confirmed translations immediately preceding a composed translation
-    /// shard. Standalone document translation leaves this empty.
     pub initial_confirmed_context: Vec<ConfirmedTranslationContext>,
     pub dry_run: bool,
     pub resume: bool,
@@ -722,6 +696,36 @@ pub struct PipelineOptions {
     pub agent_repair_attempts: usize,
     pub max_requests: Option<usize>,
     pub max_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineValidationOptions {
+    pub target_language: String,
+    pub source_language: String,
+    pub preserve_names: bool,
+    pub max_characters_per_second: Option<f64>,
+    pub max_characters_per_line: Option<usize>,
+    pub max_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineRenderingOptions {
+    pub output_path: Option<PathBuf>,
+    pub output_format: Option<String>,
+    pub bilingual: bool,
+    pub bilingual_order: BilingualOrder,
+    pub bilingual_font_scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipelineRuntimeIdentity {
+    pub input_path: PathBuf,
+    pub provider: String,
+    pub model: String,
+    pub provider_fingerprint: Option<String>,
+    pub reviewer_fingerprint: Option<String>,
+    pub execution_fingerprint: Option<String>,
+    pub document_guide_fingerprint: Option<String>,
     pub runtime_dir: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
 }
@@ -730,57 +734,65 @@ impl PipelineOptions {
     pub fn new(input_path: PathBuf) -> Self {
         let policy = TranslationPolicy::for_mode(TranslationMode::Turbo);
         Self {
-            input_path,
-            output_path: None,
-            output_format: None,
-            provider: default_provider(),
-            model: default_model(),
-            batch_size: policy.batch_size,
-            batch_token_budget: policy.batch_token_budget,
-            request_token_budget: policy.request_token_budget,
-            confirmed_context_lines: policy.confirmed_context_lines,
-            confirmed_context_token_budget: policy.confirmed_context_token_budget,
-            translation_concurrency: policy.translation_concurrency,
-            review_concurrency: policy.review_concurrency,
-            mode: TranslationMode::Turbo,
-            bilingual: false,
-            bilingual_order: BilingualOrder::default(),
-            bilingual_font_scale: 1.0,
-            target_language: default_target_language(),
-            source_language: default_source_language(),
-            retries: DEFAULT_RETRIES,
-            review_policy: policy.review_policy,
-            terminology_preflight: policy.terminology_strategy.preflight_default(),
-            online_terminology: policy.terminology_strategy.online_default(),
-            allow_degraded_preflight: policy.preflight_failure_policy.allows_degraded(),
-            preserve_names: false,
-            max_characters_per_second: None,
-            max_characters_per_line: None,
-            max_lines: None,
-            timeout_seconds: default_timeout_seconds(),
-            provider_fingerprint: None,
-            reviewer_fingerprint: None,
-            execution_fingerprint: None,
-            document_guide_fingerprint: None,
-            initial_confirmed_context: Vec::new(),
-            dry_run: false,
-            resume: true,
-            use_cache: true,
-            agent: true,
-            agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
-            max_requests: None,
-            max_tokens: None,
-            runtime_dir: None,
-            glossary_path: None,
+            execution: PipelineExecutionOptions {
+                batch_size: policy.batch_size,
+                batch_token_budget: policy.batch_token_budget,
+                request_token_budget: policy.request_token_budget,
+                confirmed_context_lines: policy.confirmed_context_lines,
+                confirmed_context_token_budget: policy.confirmed_context_token_budget,
+                translation_concurrency: policy.translation_concurrency,
+                review_concurrency: policy.review_concurrency,
+                mode: TranslationMode::Turbo,
+                retries: DEFAULT_RETRIES,
+                review_policy: policy.review_policy,
+                terminology_preflight: policy.terminology_strategy.preflight_default(),
+                online_terminology: policy.terminology_strategy.online_default(),
+                allow_degraded_preflight: policy.preflight_failure_policy.allows_degraded(),
+                timeout_seconds: default_timeout_seconds(),
+                initial_confirmed_context: Vec::new(),
+                dry_run: false,
+                resume: true,
+                use_cache: true,
+                agent: true,
+                agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
+                max_requests: None,
+                max_tokens: None,
+            },
+            validation: PipelineValidationOptions {
+                target_language: default_target_language(),
+                source_language: default_source_language(),
+                preserve_names: false,
+                max_characters_per_second: None,
+                max_characters_per_line: None,
+                max_lines: None,
+            },
+            rendering: PipelineRenderingOptions {
+                output_path: None,
+                output_format: None,
+                bilingual: false,
+                bilingual_order: BilingualOrder::default(),
+                bilingual_font_scale: 1.0,
+            },
+            identity: PipelineRuntimeIdentity {
+                input_path,
+                provider: default_provider(),
+                model: default_model(),
+                provider_fingerprint: None,
+                reviewer_fingerprint: None,
+                execution_fingerprint: None,
+                document_guide_fingerprint: None,
+                runtime_dir: None,
+                glossary_path: None,
+            },
         }
     }
 
     pub const fn policy(&self) -> TranslationPolicy {
-        TranslationPolicy::for_mode(self.mode)
+        TranslationPolicy::for_mode(self.execution.mode)
     }
 
     pub const fn preflight_failure_policy(&self) -> PreflightFailurePolicy {
-        if self.allow_degraded_preflight {
+        if self.execution.allow_degraded_preflight {
             PreflightFailurePolicy::ContinueDegraded
         } else {
             PreflightFailurePolicy::Fail
@@ -903,7 +915,7 @@ mod tests {
     fn explicit_preflight_override_becomes_the_effective_typed_policy() {
         let mut options = PipelineOptions::new("sample.srt".into());
 
-        options.allow_degraded_preflight = false;
+        options.execution.allow_degraded_preflight = false;
         assert_eq!(
             options.preflight_failure_policy(),
             PreflightFailurePolicy::Fail
@@ -924,34 +936,43 @@ mod tests {
         let options = PipelineOptions::new("sample.srt".into());
         let policy = TranslationPolicy::for_mode(TranslationMode::Turbo);
 
-        assert_eq!(options.mode, TranslationMode::Turbo);
-        assert_eq!(options.batch_size, policy.batch_size);
-        assert_eq!(options.batch_token_budget, policy.batch_token_budget);
-        assert_eq!(options.request_token_budget, policy.request_token_budget);
+        assert_eq!(options.execution.mode, TranslationMode::Turbo);
+        assert_eq!(options.execution.batch_size, policy.batch_size);
         assert_eq!(
-            options.confirmed_context_lines,
+            options.execution.batch_token_budget,
+            policy.batch_token_budget
+        );
+        assert_eq!(
+            options.execution.request_token_budget,
+            policy.request_token_budget
+        );
+        assert_eq!(
+            options.execution.confirmed_context_lines,
             policy.confirmed_context_lines
         );
         assert_eq!(
-            options.confirmed_context_token_budget,
+            options.execution.confirmed_context_token_budget,
             policy.confirmed_context_token_budget
         );
         assert_eq!(
-            options.translation_concurrency,
+            options.execution.translation_concurrency,
             policy.translation_concurrency
         );
-        assert_eq!(options.review_concurrency, policy.review_concurrency);
-        assert_eq!(options.review_policy, policy.review_policy);
         assert_eq!(
-            options.terminology_preflight,
+            options.execution.review_concurrency,
+            policy.review_concurrency
+        );
+        assert_eq!(options.execution.review_policy, policy.review_policy);
+        assert_eq!(
+            options.execution.terminology_preflight,
             policy.terminology_strategy.preflight_default()
         );
         assert_eq!(
-            options.online_terminology,
+            options.execution.online_terminology,
             policy.terminology_strategy.online_default()
         );
         assert_eq!(
-            options.allow_degraded_preflight,
+            options.execution.allow_degraded_preflight,
             policy.preflight_failure_policy.allows_degraded()
         );
     }

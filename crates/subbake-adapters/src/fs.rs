@@ -447,6 +447,21 @@ mod tests {
     }
 
     #[test]
+    fn ssa_ttml_and_dfxp_are_discovered_with_canonical_outputs() {
+        assert!(is_supported_subtitle_path(Path::new("movie.ssa")));
+        assert!(is_supported_subtitle_path(Path::new("movie.ttml")));
+        assert!(is_supported_subtitle_path(Path::new("movie.dfxp")));
+        assert_eq!(
+            default_output_path(Path::new("movie.ssa"), None, false).expect("SSA output"),
+            PathBuf::from("movie.translated.ssa")
+        );
+        assert_eq!(
+            default_output_path(Path::new("movie.dfxp"), None, false).expect("DFXP output"),
+            PathBuf::from("movie.translated.dfxp")
+        );
+    }
+
+    #[test]
     fn atomic_writer_replaces_existing_file_without_leaving_staging_files() {
         let temporary = tempfile::Builder::new()
             .prefix("subbake-atomic-replace-")

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
     BatchTranslationOutcome, PipelineOutcome, ProviderCheckOutcome, RuntimeOutcome,
-    TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
+    SubtitleEditOutcome, TranscriptionOutcome, TranslationOutcome, WhisperOutcome,
 };
 use subbake_core::entities::PipelineResult;
 
@@ -16,8 +16,40 @@ pub fn print_translation_outcome(
     Ok(output_path)
 }
 
-pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome) {
-    print!("{}", batch_text(outcome));
+pub fn print_batch_translation_outcome(outcome: &BatchTranslationOutcome, json: bool) {
+    if json {
+        print_json_value("batch_translation_result", batch_json(outcome));
+    } else {
+        print!("{}", batch_text(outcome));
+    }
+}
+
+pub fn print_subtitle_edit_outcome(outcome: &SubtitleEditOutcome, json: bool) -> io::Result<()> {
+    if json {
+        let result = serde_json::to_value(outcome)
+            .map_err(|error| io::Error::other(format!("serialize edit result: {error}")))?;
+        print_json_value("subtitle_edit_result", result);
+        return Ok(());
+    }
+    println!(
+        "{}: {} proposed change(s) for {}",
+        if outcome.dry_run { "Dry run" } else { "Edited" },
+        outcome.modified_entries,
+        outcome.target_path.display()
+    );
+    for change in &outcome.changes {
+        println!("@@ {} @@", change.id);
+        for line in change.before.lines() {
+            println!("- {line}");
+        }
+        for line in change.after.lines() {
+            println!("+ {line}");
+        }
+    }
+    if !outcome.edit_notes.trim().is_empty() {
+        println!("Notes: {}", outcome.edit_notes.trim());
+    }
+    Ok(())
 }
 
 pub fn print_pipeline_outcome(
@@ -29,7 +61,29 @@ pub fn print_pipeline_outcome(
     }
 }
 
-pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
+pub fn print_transcription_outcome(outcome: &TranscriptionOutcome, json: bool) {
+    if json {
+        print_json_value(
+            "transcription_result",
+            serde_json::json!({
+                "output_path": outcome.output_path,
+                "language": outcome.language,
+                "provider": outcome.provider,
+                "model": outcome.model,
+                "model_auto_selected": outcome.model_auto_selected,
+                "output_format": outcome.output_format.extension(),
+                "subtitle_entries": outcome.subtitle_entries,
+                "quality": outcome.quality,
+                "cleanup": {
+                    "removed_empty_or_silence": outcome.cleanup.removed_empty_or_silence,
+                    "removed_repeated": outcome.cleanup.removed_repeated,
+                    "normalized_segments": outcome.cleanup.normalized_segments,
+                    "speaker_labels_detected": outcome.cleanup.speaker_labels_detected,
+                }
+            }),
+        );
+        return;
+    }
     if outcome.model_auto_selected {
         println!("Model: {} (automatically selected)", outcome.model);
     }
@@ -41,19 +95,66 @@ pub fn print_transcription_outcome(outcome: &TranscriptionOutcome) {
             outcome.cleanup.removed_empty_or_silence, outcome.cleanup.removed_repeated
         );
     }
+    if outcome.cleanup.normalized_segments > 0 || outcome.cleanup.speaker_labels_detected > 0 {
+        println!(
+            "Post-processing: {} normalized segment(s), {} speaker label(s) detected",
+            outcome.cleanup.normalized_segments, outcome.cleanup.speaker_labels_detected
+        );
+    }
+    println!(
+        "QA: {} error(s), {} warning(s)",
+        outcome.quality.errors, outcome.quality.warnings
+    );
 }
 
-pub fn print_provider_check_outcome(outcome: &ProviderCheckOutcome) {
+pub fn print_provider_check_outcome(outcome: &ProviderCheckOutcome, json: bool) {
+    if json {
+        print_json_value(
+            "provider_check_result",
+            serde_json::json!({
+                "provider": outcome.provider,
+                "model": outcome.model,
+                "message": outcome.message,
+                "passed": true,
+            }),
+        );
+        return;
+    }
     println!("Provider check passed.");
     println!("{}", outcome.message);
 }
 
-pub fn print_runtime_outcome(outcome: &RuntimeOutcome) {
-    print!("{}", runtime_text(outcome));
+pub fn print_runtime_outcome(outcome: &RuntimeOutcome, json: bool) {
+    if json {
+        print_json_value("runtime_result", runtime_json(outcome));
+    } else {
+        print!("{}", runtime_text(outcome));
+    }
 }
 
-pub fn print_whisper_outcome(outcome: &WhisperOutcome) {
-    print!("{}", whisper_text(outcome));
+pub fn print_whisper_outcome(outcome: &WhisperOutcome, json: bool) {
+    if json {
+        print_json_value("whisper_result", whisper_json(outcome));
+    } else {
+        print!("{}", whisper_text(outcome));
+    }
+}
+
+pub fn print_json_value(kind: &str, result: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_envelope(kind, result))
+            .unwrap_or_else(|_| "{}".to_owned())
+    );
+}
+
+pub fn json_envelope(kind: &str, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "kind": kind,
+        "build": crate::version::build_identity(),
+        "result": result,
+    })
 }
 
 fn render_translation_outcome(
@@ -69,9 +170,16 @@ fn render_translation_outcome(
         .clone()
         .ok_or_else(|| io::Error::other("translation completed without an output path"))?;
     let output = if json {
-        format!("{}\n", result_json(&outcome.result))
+        format!("{}\n", translation_outcome_json(outcome))
     } else {
-        translation_text(&outcome.result, &output_path)
+        let mut rendered = translation_text(&outcome.result, &output_path);
+        if let Some(quality) = &outcome.quality {
+            rendered.push_str(&format!(
+                "QA: {} error(s), {} warning(s)\n",
+                quality.errors, quality.warnings
+            ));
+        }
+        rendered
     };
 
     Ok((output, Some(output_path)))
@@ -209,6 +317,27 @@ fn batch_text(outcome: &BatchTranslationOutcome) -> String {
     output
 }
 
+fn batch_json(outcome: &BatchTranslationOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "processed": outcome.processed,
+        "inputs": outcome.inputs,
+        "skipped": outcome.skipped,
+        "outputs": outcome.outputs,
+        "failures": outcome.failures.iter().map(|failure| serde_json::json!({
+            "input": failure.input,
+            "error": failure.error,
+        })).collect::<Vec<_>>(),
+        "manifest_path": outcome.manifest_path,
+        "subtitle_entries": outcome.subtitle_entries,
+        "dry_run": outcome.dry_run,
+        "cache_hits": outcome.cache_hits,
+        "resumed_translation_batches": outcome.resumed_translation_batches,
+        "resumed_review_batches": outcome.resumed_review_batches,
+        "translation_memory_hits": outcome.translation_memory_hits,
+        "runtime_dir": outcome.runtime_dir,
+    })
+}
+
 fn whisper_text(outcome: &WhisperOutcome) -> String {
     match outcome {
         WhisperOutcome::Status(status) => format!(
@@ -313,11 +442,97 @@ fn runtime_text(outcome: &RuntimeOutcome) -> String {
     }
 }
 
+fn runtime_json(outcome: &RuntimeOutcome) -> serde_json::Value {
+    match outcome {
+        RuntimeOutcome::Inspection(inspection) => {
+            let paths = &inspection.paths;
+            serde_json::json!({
+                "action": "inspect",
+                "paths": {
+                    "root_dir": paths.root_dir,
+                    "run_dir": paths.run_dir,
+                    "cache_dir": paths.cache_dir,
+                    "state_path": paths.state_path,
+                    "glossary_path": paths.glossary_path,
+                    "translation_memory_path": paths.translation_memory_path,
+                    "review_report_path": paths.review_report_path,
+                }
+            })
+        }
+        RuntimeOutcome::Clean(clean) => serde_json::json!({
+            "action": "clean",
+            "root_dir": clean.root_dir,
+            "removed": clean.removed,
+        }),
+    }
+}
+
+fn whisper_json(outcome: &WhisperOutcome) -> serde_json::Value {
+    match outcome {
+        WhisperOutcome::Status(status) => serde_json::json!({
+            "action": "status",
+            "binary_path": status.binary_path,
+            "binary_exists": status.binary_exists,
+            "models_dir": status.models_dir,
+            "models_dir_exists": status.models_dir_exists,
+            "version": status.version,
+            "capability_error": status.capability_error,
+            "default_vad_model_path": status.default_vad_model_path,
+            "default_vad_model_exists": status.default_vad_model_exists,
+        }),
+        WhisperOutcome::VersionList(list) => serde_json::json!({
+            "action": "list_versions",
+            "pinned_version": list.pinned_version,
+            "versions": list.versions.iter().map(|version| serde_json::json!({
+                "tag": version.tag,
+                "prerelease": version.prerelease,
+                "published_at": version.published_at,
+                "installable": version.installable,
+            })).collect::<Vec<_>>(),
+            "refresh_warning": list.refresh_warning,
+        }),
+        WhisperOutcome::ModelList(list) | WhisperOutcome::VadModelList(list) => serde_json::json!({
+            "action": if matches!(outcome, WhisperOutcome::VadModelList(_)) {
+                "list_vad_models"
+            } else {
+                "list_models"
+            },
+            "models_dir": list.models_dir,
+            "models_dir_exists": list.models_dir_exists,
+            "models": list.models.iter().map(|model| serde_json::json!({
+                "name": model.name,
+                "path": model.path,
+            })).collect::<Vec<_>>(),
+            "available_models": list.available_models,
+            "refresh_warning": list.refresh_warning,
+        }),
+    }
+}
+
 fn exists_label(value: bool) -> &'static str {
     if value { "found" } else { "missing" }
 }
 
 pub fn result_json(result: &PipelineResult) -> String {
+    serde_json::to_string(&json_envelope(
+        "translation_result",
+        translation_result_value(result, None),
+    ))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn translation_outcome_json(outcome: &TranslationOutcome) -> String {
+    serde_json::to_string(&json_envelope(
+        "translation_result",
+        translation_result_value(&outcome.result, outcome.quality.as_ref()),
+    ))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn translation_result_value(
+    result: &PipelineResult,
+    quality: Option<&subbake_core::QualityReport>,
+) -> serde_json::Value {
     let output_path = result
         .output_path
         .as_ref()
@@ -343,7 +558,7 @@ pub fn result_json(result: &PipelineResult) -> String {
         })
         .collect();
 
-    serde_json::to_string(&serde_json::json!({
+    let result = serde_json::json!({
         "output_path": output_path,
         "batches_translated": result.batches_translated,
         "review_batches": result.review_batches,
@@ -369,8 +584,10 @@ pub fn result_json(result: &PipelineResult) -> String {
         "review": result.review,
         "state_path": state_path,
         "glossary_path": glossary_path,
-    }))
-    .unwrap_or_else(|_| "{}".to_owned())
+        "agent_repairs": result.agent_repairs,
+        "quality": quality,
+    });
+    result
 }
 
 #[cfg(test)]
@@ -402,7 +619,17 @@ mod tests {
             review: Default::default(),
         };
 
-        assert!(result_json(&result).contains("quote\\\"path.txt"));
+        let encoded = result_json(&result);
+        assert!(encoded.contains("quote\\\"path.txt"));
+        let value: serde_json::Value = serde_json::from_str(&encoded).expect("result JSON");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["kind"], "translation_result");
+        assert_eq!(value["result"]["output_path"], "quote\"path.txt");
+        assert!(
+            value["build"]
+                .as_str()
+                .is_some_and(|build| !build.is_empty())
+        );
     }
 
     #[test]

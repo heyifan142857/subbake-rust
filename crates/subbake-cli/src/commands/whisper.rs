@@ -15,6 +15,6 @@ pub fn run(args: WhisperArgs) -> CliResult<()> {
         cancellation.guard(),
         std::sync::Arc::new(crate::progress::CliProgress::new()),
     )?;
-    print_whisper_outcome(&outcome);
+    print_whisper_outcome(&outcome, args.json);
     Ok(())
 }

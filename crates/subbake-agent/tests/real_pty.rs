@@ -160,23 +160,7 @@ exit "$status"
     wait_for_action(&action_log, "SubmitText:/profile", &transcript);
     wait_for_output(&transcript, b"Choose a model profile", STEP_TIMEOUT);
 
-    pair.master
-        .resize(PtySize {
-            rows: 30,
-            cols: 40,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("resize PTY profile picker");
     send(&writer, b"\x1b[B");
-    pair.master
-        .resize(PtySize {
-            rows: 30,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("widen PTY profile picker");
     send(&writer, enter_key);
     // Ratatui updates the picker header by terminal diff, so the full title is
     // not guaranteed to occur contiguously in the raw PTY stream. This form-

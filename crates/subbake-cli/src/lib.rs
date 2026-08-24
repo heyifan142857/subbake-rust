@@ -8,8 +8,11 @@ mod version;
 
 pub use error::{CliError, CliResult};
 
-pub fn command_names() -> &'static [&'static str] {
-    commands::COMMAND_NAMES
+pub fn command_names() -> Vec<&'static str> {
+    commands::command_specs()
+        .iter()
+        .map(|spec| spec.name)
+        .collect()
 }
 
 pub fn run(args: Vec<String>) -> CliResult<()> {

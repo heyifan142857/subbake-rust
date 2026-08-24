@@ -6,6 +6,7 @@ use crate::error::{CoreError, CoreResult};
 
 mod ass;
 mod srt;
+mod ttml;
 mod txt;
 mod vtt;
 
@@ -46,6 +47,9 @@ pub fn supported_format_from_path(path: &Path) -> Option<&'static str> {
         Some(ext) if ext.eq_ignore_ascii_case("vtt") => Some("vtt"),
         Some(ext) if ext.eq_ignore_ascii_case("txt") => Some("txt"),
         Some(ext) if ext.eq_ignore_ascii_case("ass") => Some("ass"),
+        Some(ext) if ext.eq_ignore_ascii_case("ssa") => Some("ssa"),
+        Some(ext) if ext.eq_ignore_ascii_case("ttml") => Some("ttml"),
+        Some(ext) if ext.eq_ignore_ascii_case("dfxp") => Some("dfxp"),
         _ => None,
     }
 }
@@ -67,6 +71,15 @@ pub fn parse_document_text(
         "vtt" => vtt::parse(path, text),
         "txt" => Ok(txt::parse(path, text)),
         "ass" => ass::parse(path, text),
+        "ssa" => ass::parse(path, text).map(|mut document| {
+            document.format = "ssa".to_owned();
+            document
+        }),
+        "ttml" => ttml::parse(path, text),
+        "dfxp" => ttml::parse(path, text).map(|mut document| {
+            document.format = "dfxp".to_owned();
+            document
+        }),
         _ => Err(CoreError::UnsupportedFormat(format)),
     }
 }
@@ -83,13 +96,25 @@ pub fn render_document(
 
     let portable_document;
     let portable_segments;
-    let (document, translations) = if document.format == "ass" && target_format != "ass" {
+    let (document, translations) = if matches!(document.format.as_str(), "ass" | "ssa")
+        && !matches!(target_format.as_str(), "ass" | "ssa")
+    {
         portable_document = SubtitleDocument {
             segments: ass::portable_segments(&document.segments, &target_format)?,
             metadata: Default::default(),
             ..document.clone()
         };
         portable_segments = ass::portable_segments(translations, &target_format)?;
+        (&portable_document, portable_segments.as_slice())
+    } else if matches!(document.format.as_str(), "ttml" | "dfxp")
+        && !matches!(target_format.as_str(), "ttml" | "dfxp")
+    {
+        portable_document = SubtitleDocument {
+            segments: ttml::portable_segments(&document.segments, &target_format)?,
+            metadata: Default::default(),
+            ..document.clone()
+        };
+        portable_segments = ttml::portable_segments(translations, &target_format)?;
         (&portable_document, portable_segments.as_slice())
     } else {
         (document, translations)
@@ -121,6 +146,25 @@ pub fn render_document(
             options.bilingual_order,
             options.bilingual_font_scale,
         ),
+        "ssa" => ass::render(
+            document,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+            options.bilingual_font_scale,
+        ),
+        "ttml" => ttml::render(
+            document,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+        ),
+        "dfxp" => ttml::render(
+            document,
+            translations,
+            options.bilingual,
+            options.bilingual_order,
+        ),
         _ => Err(CoreError::UnsupportedFormat(target_format)),
     }
 }
@@ -147,7 +191,7 @@ pub(crate) fn normalize_line_endings(text: &str) -> Cow<'_, str> {
 pub fn normalize_format(value: &str) -> CoreResult<String> {
     let normalized = value.trim().trim_start_matches('.').to_lowercase();
     match normalized.as_str() {
-        "srt" | "vtt" | "txt" | "ass" => Ok(normalized),
+        "srt" | "vtt" | "txt" | "ass" | "ssa" | "ttml" | "dfxp" => Ok(normalized),
         _ => Err(CoreError::UnsupportedFormat(value.to_owned())),
     }
 }

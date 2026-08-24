@@ -11,7 +11,7 @@ use subbake_core::overnight::{
     OVERNIGHT_TRANSLATION_CONTRACT_VERSION, OvernightBatch, OvernightPlanOptions,
     finalize_translation_output, parse_translation_output, plan_translation,
 };
-use subbake_core::ports::RuntimeStore;
+use subbake_core::ports::{RuntimeLayoutStore, RuntimeMemoryStore};
 use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
 use subbake_core::{CancellationGuard, FinalValidationPolicy};
 

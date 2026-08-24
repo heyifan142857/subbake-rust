@@ -36,6 +36,8 @@ pub struct AgentDomainSettings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionDomainSettings {
     pub model: Option<String>,
+    pub normalize_text: bool,
+    pub speaker_labels: bool,
     pub vad_enabled: bool,
     pub vad_model: String,
     pub vad_threshold: f32,
@@ -186,6 +188,8 @@ pub struct TranslationOverrides {
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionOverrides {
     pub model: Option<String>,
+    pub normalize_text: Option<bool>,
+    pub speaker_labels: Option<bool>,
     pub vad_enabled: Option<bool>,
     pub vad_model: Option<String>,
     pub vad_threshold: Option<f32>,
@@ -291,6 +295,8 @@ impl SettingsOverrides {
             },
             transcription: TranscriptionOverrides {
                 model: settings.transcription.model.clone(),
+                normalize_text: Some(settings.transcription.normalize_text),
+                speaker_labels: Some(settings.transcription.speaker_labels),
                 vad_enabled: Some(settings.transcription.vad_enabled),
                 vad_model: Some(settings.transcription.vad_model.clone()),
                 vad_threshold: Some(settings.transcription.vad_threshold),
@@ -395,6 +401,8 @@ impl TranscriptionOverrides {
             self,
             other,
             model,
+            normalize_text,
+            speaker_labels,
             vad_enabled,
             vad_model,
             vad_threshold,
@@ -506,6 +514,8 @@ impl Default for ResolvedSettings {
             },
             transcription: TranscriptionDomainSettings {
                 model: None,
+                normalize_text: true,
+                speaker_labels: true,
                 vad_enabled: true,
                 vad_model: DEFAULT_WHISPER_VAD_MODEL.to_owned(),
                 vad_threshold: DEFAULT_VAD_THRESHOLD,
@@ -614,6 +624,12 @@ impl ResolvedSettings {
         } = overrides.translation;
         if let Some(model) = overrides.transcription.model {
             self.transcription.model = Some(model);
+        }
+        if let Some(value) = overrides.transcription.normalize_text {
+            self.transcription.normalize_text = value;
+        }
+        if let Some(value) = overrides.transcription.speaker_labels {
+            self.transcription.speaker_labels = value;
         }
         if let Some(value) = overrides.transcription.vad_enabled {
             self.transcription.vad_enabled = value;
@@ -926,43 +942,45 @@ impl ResolvedSettings {
         output_path: Option<PathBuf>,
     ) -> PipelineOptions {
         let mut options = PipelineOptions::new(input_path.into());
-        options.output_path = output_path;
-        options.output_format = self.output.format.clone();
-        options.provider = self.backend.id.clone();
-        options.model = self.backend.model.clone();
-        options.provider_fingerprint = self.provider_fingerprint();
-        options.reviewer_fingerprint = self.reviewer_backend.as_ref().and_then(backend_fingerprint);
-        options.source_language = self.translation.source_language.clone();
-        options.target_language = self.translation.target_language.clone();
-        options.batch_size = self.translation.batch_size;
-        options.batch_token_budget = self.translation.batch_token_budget;
-        options.request_token_budget = self.translation.request_token_budget;
-        options.confirmed_context_lines = self.translation.confirmed_context_lines;
-        options.confirmed_context_token_budget = self.translation.confirmed_context_token_budget;
-        options.translation_concurrency = self.translation.translation_concurrency;
-        options.review_concurrency = self.translation.review_concurrency;
-        options.bilingual = self.output.bilingual;
-        options.bilingual_order = self.output.bilingual_order;
-        options.bilingual_font_scale = self.output.bilingual_font_scale;
-        options.mode = self.translation.mode;
-        options.review_policy = self.translation.review_policy;
-        options.terminology_preflight = self.translation.terminology_preflight;
-        options.online_terminology = self.translation.online_terminology;
-        options.allow_degraded_preflight = self.translation.allow_degraded_preflight;
-        options.preserve_names = self.translation.preserve_names;
-        options.max_characters_per_second = self.translation.max_characters_per_second;
-        options.max_characters_per_line = self.translation.max_characters_per_line;
-        options.max_lines = self.translation.max_lines;
-        options.dry_run = self.translation.dry_run;
-        options.resume = self.translation.resume;
-        options.use_cache = self.translation.use_cache;
-        options.retries = self.translation.retries;
-        options.agent = self.translation.agent;
-        options.agent_repair_attempts = self.translation.agent_repair_attempts;
-        options.max_requests = self.translation.max_requests;
-        options.max_tokens = self.translation.max_tokens;
-        options.runtime_dir = self.storage.runtime_dir.clone();
-        options.glossary_path = self.storage.glossary_path.clone();
+        options.rendering.output_path = output_path;
+        options.rendering.output_format = self.output.format.clone();
+        options.identity.provider = self.backend.id.clone();
+        options.identity.model = self.backend.model.clone();
+        options.identity.provider_fingerprint = self.provider_fingerprint();
+        options.identity.reviewer_fingerprint =
+            self.reviewer_backend.as_ref().and_then(backend_fingerprint);
+        options.validation.source_language = self.translation.source_language.clone();
+        options.validation.target_language = self.translation.target_language.clone();
+        options.execution.batch_size = self.translation.batch_size;
+        options.execution.batch_token_budget = self.translation.batch_token_budget;
+        options.execution.request_token_budget = self.translation.request_token_budget;
+        options.execution.confirmed_context_lines = self.translation.confirmed_context_lines;
+        options.execution.confirmed_context_token_budget =
+            self.translation.confirmed_context_token_budget;
+        options.execution.translation_concurrency = self.translation.translation_concurrency;
+        options.execution.review_concurrency = self.translation.review_concurrency;
+        options.rendering.bilingual = self.output.bilingual;
+        options.rendering.bilingual_order = self.output.bilingual_order;
+        options.rendering.bilingual_font_scale = self.output.bilingual_font_scale;
+        options.execution.mode = self.translation.mode;
+        options.execution.review_policy = self.translation.review_policy;
+        options.execution.terminology_preflight = self.translation.terminology_preflight;
+        options.execution.online_terminology = self.translation.online_terminology;
+        options.execution.allow_degraded_preflight = self.translation.allow_degraded_preflight;
+        options.validation.preserve_names = self.translation.preserve_names;
+        options.validation.max_characters_per_second = self.translation.max_characters_per_second;
+        options.validation.max_characters_per_line = self.translation.max_characters_per_line;
+        options.validation.max_lines = self.translation.max_lines;
+        options.execution.dry_run = self.translation.dry_run;
+        options.execution.resume = self.translation.resume;
+        options.execution.use_cache = self.translation.use_cache;
+        options.execution.retries = self.translation.retries;
+        options.execution.agent = self.translation.agent;
+        options.execution.agent_repair_attempts = self.translation.agent_repair_attempts;
+        options.execution.max_requests = self.translation.max_requests;
+        options.execution.max_tokens = self.translation.max_tokens;
+        options.identity.runtime_dir = self.storage.runtime_dir.clone();
+        options.identity.glossary_path = self.storage.glossary_path.clone();
         options
     }
 

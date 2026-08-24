@@ -9,10 +9,10 @@ pub fn run(args: EvaluateArgs) -> CliResult<()> {
     let reference = read_document(&args.reference_path)?;
     let report = evaluate(&candidate, &reference).map_err(AdapterError::from)?;
     if args.json {
-        let json = serde_json::to_string_pretty(&report).map_err(|error| {
+        let result = serde_json::to_value(&report).map_err(|error| {
             AdapterError::invalid_input(format!("encode evaluation report: {error}"))
         })?;
-        println!("{json}");
+        crate::output::print_json_value("evaluation_report", result);
     } else {
         println!("Segments: {}", report.segments);
         println!("Exact matches: {}", report.exact_matches);

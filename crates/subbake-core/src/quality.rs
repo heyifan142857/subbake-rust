@@ -13,6 +13,25 @@ pub enum QualitySeverity {
     Error,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityGate {
+    #[default]
+    Never,
+    Error,
+    Warning,
+}
+
+impl QualityGate {
+    pub const fn fails(self, report: &QualityReport) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Error => report.errors > 0,
+            Self::Warning => report.errors > 0 || report.warnings > 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualityIssueKind {

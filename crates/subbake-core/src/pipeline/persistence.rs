@@ -1,7 +1,7 @@
 use crate::entities::{PipelineOptions, SubtitleSegment, Usage};
 use crate::error::{CoreError, CoreResult};
 use crate::memory::ContextMemory;
-use crate::ports::{BatchShardKind, RuntimeStore};
+use crate::ports::{BatchShardKind, CheckpointShard, RuntimeCheckpoint, RuntimeStore};
 use crate::storage::{InputSignature, ResumeSnapshot, RunState, build_translation_fingerprint};
 use crate::validation::validate_full_alignment;
 
@@ -17,7 +17,7 @@ impl PipelinePersistence<'_> {
         batches: &[Vec<SubtitleSegment>],
         memory: &mut ContextMemory,
     ) -> CoreResult<ResumeSnapshot> {
-        if !self.options.resume {
+        if !self.options.execution.resume {
             return Ok(ResumeSnapshot::default());
         }
         let (Some(input_signature), Some(store)) = (self.input_signature, self.store) else {
@@ -84,17 +84,45 @@ impl PipelinePersistence<'_> {
         validation_completed: bool,
         usage: Usage,
     ) -> CoreResult<()> {
-        let (Some(store), Some(input_signature)) = (self.store, self.input_signature) else {
-            return Ok(());
-        };
-        store.save_run_state(&RunState::new(
-            self.options,
-            input_signature.clone(),
-            usage,
-            memory.clone(),
+        self.commit_checkpoint(
+            memory,
             translation_batches_completed,
             review_batches_completed,
             validation_completed,
-        ))
+            usage,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn commit_checkpoint(
+        &self,
+        memory: &ContextMemory,
+        translation_batches_completed: usize,
+        review_batches_completed: usize,
+        validation_completed: bool,
+        usage: Usage,
+        shards: Vec<CheckpointShard>,
+    ) -> CoreResult<()> {
+        let Some(store) = self.store else {
+            return Ok(());
+        };
+        let Some(input_signature) = self.input_signature else {
+            for shard in shards {
+                store.save_batch_segments(shard.kind, shard.batch_index, &shard.segments)?;
+            }
+            return Ok(());
+        };
+        store.commit_checkpoint(&RuntimeCheckpoint {
+            shards,
+            state: RunState::new(
+                self.options,
+                input_signature.clone(),
+                usage,
+                memory.clone(),
+                translation_batches_completed,
+                review_batches_completed,
+                validation_completed,
+            ),
+        })
     }
 }

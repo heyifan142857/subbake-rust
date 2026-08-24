@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::Value as JsonValue;
 use subbake_core::AgentToolOutcome;
 
-use crate::tools::{ToolExecutor, find_tool_spec};
+use crate::tools::{ToolExecutor, find_tool_handler};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolActivityText {
@@ -50,7 +50,7 @@ fn activity_text(
     outcome: Option<&AgentToolOutcome>,
     elapsed: Option<Duration>,
 ) -> ToolActivityText {
-    let executor = find_tool_spec(name).map(|spec| spec.executor);
+    let executor = find_tool_handler(name).map(|handler| handler.executor());
     let action = action_label(executor, arguments, phase);
     let target = target_label(executor, name, arguments);
     let headline = target.map_or_else(

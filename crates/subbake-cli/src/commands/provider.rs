@@ -12,6 +12,6 @@ pub fn run(args: ProviderArgs) -> CliResult<()> {
         },
         cancellation.guard(),
     )?;
-    print_provider_check_outcome(&outcome);
+    print_provider_check_outcome(&outcome, args.json);
     Ok(())
 }

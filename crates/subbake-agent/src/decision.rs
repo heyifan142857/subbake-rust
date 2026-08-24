@@ -24,7 +24,7 @@ use crate::event::{
 };
 use crate::guard::ExternalPathGuard;
 use crate::profile_coordinator::ProfileCoordinator;
-use crate::tools::{ToolValidationError, find_tool_spec, validate_tool_call};
+use crate::tools::{ToolValidationError, find_tool_handler, validate_tool_call};
 
 mod model;
 mod prompts;
@@ -369,7 +369,7 @@ impl AgentEngine {
             calls
                 .iter()
                 .filter_map(|call| {
-                    find_tool_spec(&call.name)
+                    find_tool_handler(&call.name)
                         .filter(|spec| spec.model_visible)
                         .filter(|spec| {
                             spec.mutates_with(&call.arguments)
@@ -419,7 +419,8 @@ impl AgentEngine {
             if contains_external_delete
                 && call.name != "delete_external_path"
                 && self.is_in_plan_mode()
-                && find_tool_spec(&call.name).is_some_and(|spec| spec.mutates_with(&call.arguments))
+                && find_tool_handler(&call.name)
+                    .is_some_and(|spec| spec.mutates_with(&call.arguments))
                 && validate_tool_call(&call.name, &call.arguments).is_ok()
             {
                 return Ok(ProcessedCalls::AwaitingCommandApproval {
@@ -445,7 +446,7 @@ impl AgentEngine {
             let activity_id = new_activity_id();
             let started = self.start_tool_activity(&activity_id, &call.name, &call.arguments)?;
             let call_key = CallKey::new(&call.name, &call.arguments);
-            let feedback = match find_tool_spec(&call.name) {
+            let feedback = match find_tool_handler(&call.name) {
                 None => ToolFeedback::failure(
                     &call.name,
                     format!("unknown tool `{}`", call.name),
@@ -729,7 +730,7 @@ impl AgentEngine {
             arguments: pending.tool_call.arguments.clone(),
         };
         let successful_mutation = feedback.success
-            && find_tool_spec(&pending.tool_call.tool_name)
+            && find_tool_handler(&pending.tool_call.tool_name)
                 .is_some_and(|spec| spec.mutates_with(&pending.tool_call.arguments));
         if successful_mutation {
             state.completed_mutations.insert(CallKey::new(

@@ -70,3 +70,49 @@ fn ass_preserves_script_styles_and_dialogue_fields() {
 
     assert_eq!(rendered, text);
 }
+
+#[test]
+fn ssa_preserves_v4_styles_and_marked_dialogue_fields() {
+    let text = "[Script Info]\nTitle: SSA sample\n\n[V4 Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\n\n[Events]\nFormat: Marked, Start, End, Style, Name, Text\nDialogue: Marked=0,0:00:00.00,0:00:01.00,Default,Alice,Hello\n";
+    let document =
+        parse_document_text(Path::new("sample.ssa"), text, None).expect("parse SSA document");
+    let rendered = render_document(
+        &document,
+        &document.segments,
+        &RenderOptions::new(false, None),
+    )
+    .expect("render SSA document");
+
+    assert_eq!(document.format, "ssa");
+    assert_eq!(
+        document.segments[0].semantic.speaker.as_deref(),
+        Some("Alice")
+    );
+    assert_eq!(rendered, text);
+}
+
+#[test]
+fn ttml_round_trips_timing_entities_and_line_breaks() {
+    let text = "<?xml version=\"1.0\"?><tt xmlns=\"http://www.w3.org/ns/ttml\"><body><div><p xml:id=\"cue-1\" begin=\"00:00:01.250\" end=\"00:00:03.500\">Hello<br/>world &amp; friends</p></div></body></tt>";
+    let document =
+        parse_document_text(Path::new("sample.ttml"), text, None).expect("parse TTML document");
+    let rendered = render_document(
+        &document,
+        &document.segments,
+        &RenderOptions::new(false, None),
+    )
+    .expect("render TTML document");
+    let reparsed = parse_document_text(Path::new("rendered.ttml"), &rendered, None)
+        .expect("reparse rendered TTML");
+
+    assert_eq!(reparsed.segments, document.segments);
+    assert!(rendered.contains("Hello<br/>world &amp; friends"));
+
+    let srt = render_document(
+        &document,
+        &document.segments,
+        &RenderOptions::new(false, Some("srt".to_owned())),
+    )
+    .expect("convert TTML to SRT");
+    assert!(srt.contains("00:00:01,250 --> 00:00:03,500"));
+}

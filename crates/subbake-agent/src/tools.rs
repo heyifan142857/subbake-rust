@@ -35,7 +35,20 @@ pub struct ToolSpec {
     pub required_capability: Option<ToolCapability>,
     pub description: &'static str,
     pub arguments: &'static [ToolArgSpec],
-    pub(crate) executor: ToolExecutor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolHandler {
+    pub spec: ToolSpec,
+    executor: ToolExecutor,
+}
+
+impl std::ops::Deref for ToolHandler {
+    type Target = ToolSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +117,12 @@ impl ToolSpec {
     pub fn arguments(&self) -> &'static [ToolArgSpec] {
         self.arguments
     }
+}
+
+impl ToolHandler {
+    pub(crate) const fn executor(&self) -> ToolExecutor {
+        self.executor
+    }
 
     pub(crate) fn mutates_with(&self, arguments: &serde_json::Value) -> bool {
         if self.executor == ToolExecutor::RunCommand {
@@ -113,7 +132,7 @@ impl ToolSpec {
                 .is_some_and(|outputs| !outputs.is_empty());
         }
         if self.executor != ToolExecutor::ManageWhisper {
-            return self.mutating;
+            return self.spec.mutating;
         }
         !matches!(
             arguments
@@ -137,9 +156,11 @@ impl ToolSpec {
                 crate::command_policy::CommandApproval::AskUser(_)
             );
         }
-        self.requires_approval && self.mutates_with(arguments)
+        self.spec.requires_approval && self.mutates_with(arguments)
     }
+}
 
+impl ToolSpec {
     pub fn prompt_line(&self) -> String {
         let arguments = self
             .arguments()
@@ -283,7 +304,7 @@ const TRANSLATE_FILE_ARGS: &[ToolArgSpec] = &[
         "output_format",
         StringArg,
         false,
-        "srt, vtt, txt, or ass output format for this call",
+        "srt, vtt, txt, ass, ssa, ttml, or dfxp output format for this call",
     ),
     arg(
         "output_path",
@@ -371,7 +392,7 @@ const TRANSLATE_SERIES_ARGS: &[ToolArgSpec] = &[
         "output_format",
         StringArg,
         false,
-        "srt, vtt, txt, or ass output format for this call",
+        "srt, vtt, txt, ass, ssa, ttml, or dfxp output format for this call",
     ),
     arg(
         "output_dir",
@@ -406,6 +427,12 @@ const EDIT_SUBTITLE_ARGS: &[ToolArgSpec] = &[
         BooleanArg,
         false,
         "allow editing a source file",
+    ),
+    arg(
+        "dry_run",
+        BooleanArg,
+        false,
+        "validate and return the proposed changes without writing the subtitle",
     ),
 ];
 const TRANSCRIBE_AUDIO_ARGS: &[ToolArgSpec] = &[
@@ -544,36 +571,40 @@ const RUN_COMMAND_ARGS: &[ToolArgSpec] = &[
 
 macro_rules! tool {
     ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $visible:literal, $description:literal, $arguments:expr, $executor:ident) => {
-        ToolSpec {
-            name: $name,
-            category: ToolKind::$category,
-            mutating: $mutating,
-            requires_approval: $approval,
-            discovery: $discovery,
-            model_visible: $visible,
-            required_capability: None,
-            description: $description,
-            arguments: $arguments,
+        ToolHandler {
+            spec: ToolSpec {
+                name: $name,
+                category: ToolKind::$category,
+                mutating: $mutating,
+                requires_approval: $approval,
+                discovery: $discovery,
+                model_visible: $visible,
+                required_capability: None,
+                description: $description,
+                arguments: $arguments,
+            },
             executor: ToolExecutor::$executor,
         }
     };
     ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $visible:literal, $description:literal, $arguments:expr, $executor:ident, requires $capability:ident) => {
-        ToolSpec {
-            name: $name,
-            category: ToolKind::$category,
-            mutating: $mutating,
-            requires_approval: $approval,
-            discovery: $discovery,
-            model_visible: $visible,
-            required_capability: Some(ToolCapability::$capability),
-            description: $description,
-            arguments: $arguments,
+        ToolHandler {
+            spec: ToolSpec {
+                name: $name,
+                category: ToolKind::$category,
+                mutating: $mutating,
+                requires_approval: $approval,
+                discovery: $discovery,
+                model_visible: $visible,
+                required_capability: Some(ToolCapability::$capability),
+                description: $description,
+                arguments: $arguments,
+            },
             executor: ToolExecutor::$executor,
         }
     };
 }
 
-pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
+pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
     tool!(
         "run_command",
         Command,
@@ -797,8 +828,22 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
     ),
 ];
 
+/// Public schema view derived from the executable handler registry.
+pub static ALL_TOOL_SPECS: std::sync::LazyLock<Vec<ToolSpec>> = std::sync::LazyLock::new(|| {
+    ALL_TOOL_HANDLERS
+        .iter()
+        .map(|handler| handler.spec.clone())
+        .collect()
+});
+
 pub fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
-    ALL_TOOL_SPECS.iter().find(|spec| spec.name == name)
+    find_tool_handler(name).map(|handler| &handler.spec)
+}
+
+pub(crate) fn find_tool_handler(name: &str) -> Option<&'static ToolHandler> {
+    ALL_TOOL_HANDLERS
+        .iter()
+        .find(|handler| handler.spec.name == name)
 }
 
 fn tool_is_available_for(
@@ -826,8 +871,9 @@ impl ToolRegistry {
     }
 
     pub(crate) fn model_visible_specs(self) -> Vec<&'static ToolSpec> {
-        ALL_TOOL_SPECS
+        ALL_TOOL_HANDLERS
             .iter()
+            .map(|handler| &handler.spec)
             .filter(|spec| spec.model_visible && self.is_available(spec))
             .collect()
     }
@@ -840,8 +886,9 @@ impl ToolRegistry {
     }
 
     pub(crate) fn specs_for_categories(self, categories: &[ToolKind]) -> Vec<&'static ToolSpec> {
-        let mut result = ALL_TOOL_SPECS
+        let mut result = ALL_TOOL_HANDLERS
             .iter()
+            .map(|handler| &handler.spec)
             .filter(|spec| categories.contains(&spec.category) && self.is_available(spec))
             .collect::<Vec<_>>();
         result.sort_by_key(|spec| spec.name);
@@ -980,7 +1027,7 @@ pub fn validate_tool_call(
 /// still use JSON internally, but they can no longer receive an unknown tool,
 /// extra field, missing required field, or a value of the wrong primitive type.
 pub(crate) struct ValidatedToolCall<'a> {
-    spec: &'static ToolSpec,
+    handler: &'static ToolHandler,
     arguments: &'a serde_json::Value,
 }
 
@@ -990,14 +1037,14 @@ impl<'a> ValidatedToolCall<'a> {
         arguments: &'a serde_json::Value,
     ) -> Result<Self, ToolValidationError> {
         validate_tool_call(name, arguments)?;
-        let spec = find_tool_spec(name).ok_or_else(|| ToolValidationError::UnknownTool {
+        let handler = find_tool_handler(name).ok_or_else(|| ToolValidationError::UnknownTool {
             name: name.to_owned(),
         })?;
-        Ok(Self { spec, arguments })
+        Ok(Self { handler, arguments })
     }
 
     pub(crate) fn executor(&self) -> ToolExecutor {
-        self.spec.executor
+        self.handler.executor()
     }
 
     pub(crate) fn arguments(&self) -> &'a serde_json::Value {
@@ -1140,7 +1187,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            find_tool_spec("delete_external_path")
+            find_tool_handler("delete_external_path")
                 .expect("external delete spec")
                 .requires_approval_with(&serde_json::json!({
                     "path":"/tmp/file",
@@ -1151,7 +1198,7 @@ mod tests {
 
     #[test]
     fn whisper_observations_are_read_only_but_asset_changes_require_approval() {
-        let spec = find_tool_spec("manage_whisper").expect("manage_whisper");
+        let spec = find_tool_handler("manage_whisper").expect("manage_whisper");
         for action in ["status", "list-models", "list-vad-models", "list-versions"] {
             let arguments = serde_json::json!({"action": action});
             assert!(!spec.mutates_with(&arguments));
@@ -1221,11 +1268,15 @@ mod tests {
 
     #[test]
     fn registry_has_unique_names_and_executors() {
-        for (index, spec) in ALL_TOOL_SPECS.iter().enumerate() {
-            assert_eq!(find_tool_spec(spec.name), Some(spec));
-            for other in &ALL_TOOL_SPECS[index + 1..] {
-                assert_ne!(spec.name, other.name, "duplicate tool name");
-                assert_ne!(spec.executor, other.executor, "duplicate tool executor");
+        for (index, handler) in ALL_TOOL_HANDLERS.iter().enumerate() {
+            assert_eq!(find_tool_spec(handler.name), Some(&handler.spec));
+            for other in &ALL_TOOL_HANDLERS[index + 1..] {
+                assert_ne!(handler.name, other.name, "duplicate tool name");
+                assert_ne!(
+                    handler.executor(),
+                    other.executor(),
+                    "duplicate tool executor"
+                );
             }
         }
     }

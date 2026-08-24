@@ -400,13 +400,6 @@ where
     }
 }
 
-pub trait DashboardSink {
-    fn set_total_steps(&mut self, _total_steps: usize) {}
-    fn mark_running(&mut self, _stage: &str) {}
-    fn mark_done(&mut self, _stage: &str) {}
-    fn add_usage(&mut self, _usage: Usage) {}
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptionFormat {
     Srt,
@@ -457,11 +450,6 @@ pub trait TranscriberBackend {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct NoopDashboard;
-
-impl DashboardSink for NoopDashboard {}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchShardKind {
     Translated,
@@ -469,10 +457,12 @@ pub enum BatchShardKind {
     Finalized,
 }
 
-pub trait RuntimeStore {
+pub trait RuntimeLayoutStore {
     fn paths(&self) -> &RuntimePaths;
     fn ensure_layout(&self) -> CoreResult<()>;
+}
 
+pub trait RuntimeMemoryStore {
     fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()>;
     fn load_glossary(&self) -> CoreResult<Vec<(String, String)>>;
 
@@ -483,7 +473,22 @@ pub trait RuntimeStore {
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;
     fn load_translation_memory(&self) -> CoreResult<Vec<(String, String)>>;
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointShard {
+    pub kind: BatchShardKind,
+    pub batch_index: usize,
+    pub segments: Vec<SubtitleSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeCheckpoint {
+    pub shards: Vec<CheckpointShard>,
+    pub state: RunState,
+}
+
+pub trait RuntimeCheckpointStore {
     fn save_batch_segments(
         &self,
         kind: BatchShardKind,
@@ -500,6 +505,18 @@ pub trait RuntimeStore {
 
     fn load_run_state(&self) -> CoreResult<Option<RunState>>;
 
+    /// Commit immutable shards first and publish the run-state pointer last.
+    /// A crash can therefore leave an unreferenced shard, but never a state
+    /// that claims a missing mutation completed.
+    fn commit_checkpoint(&self, checkpoint: &RuntimeCheckpoint) -> CoreResult<()> {
+        for shard in &checkpoint.shards {
+            self.save_batch_segments(shard.kind, shard.batch_index, &shard.segments)?;
+        }
+        self.save_run_state(&checkpoint.state)
+    }
+}
+
+pub trait RuntimeCacheStore {
     fn save_cached_response(
         &self,
         stage: CacheStage,
@@ -512,23 +529,88 @@ pub trait RuntimeStore {
         stage: CacheStage,
         request_hash: &str,
     ) -> CoreResult<Option<BackendJsonResult>>;
+}
 
+pub trait RuntimeDiagnosticStore {
     fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf>;
 
     fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf>;
 }
 
+pub trait RuntimeStore:
+    RuntimeLayoutStore
+    + RuntimeMemoryStore
+    + RuntimeCheckpointStore
+    + RuntimeCacheStore
+    + RuntimeDiagnosticStore
+{
+}
+
+impl<T> RuntimeStore for T where
+    T: RuntimeLayoutStore
+        + RuntimeMemoryStore
+        + RuntimeCheckpointStore
+        + RuntimeCacheStore
+        + RuntimeDiagnosticStore
+        + ?Sized
+{
+}
+
 #[cfg(test)]
 mod tool_tests {
+    use std::cell::RefCell;
+
     use super::{
-        BatchExecutionOptions, ChatMessage, GenerationInput, GenerationRequest, GenerationResponse,
-        LlmBackend, ReasoningPolicy, ToolContinuation,
+        BatchExecutionOptions, BatchShardKind, ChatMessage, CheckpointShard, GenerationInput,
+        GenerationRequest, GenerationResponse, LlmBackend, ReasoningPolicy, RuntimeCheckpoint,
+        RuntimeCheckpointStore, ToolContinuation,
     };
     use crate::CancellationToken;
     use crate::entities::Usage;
     use crate::error::LlmCallError;
 
     struct BatchBackend;
+
+    struct OrderedCheckpointStore {
+        events: RefCell<Vec<String>>,
+        fail_at: Option<usize>,
+    }
+
+    impl RuntimeCheckpointStore for OrderedCheckpointStore {
+        fn save_batch_segments(
+            &self,
+            _kind: BatchShardKind,
+            batch_index: usize,
+            _segments: &[crate::SubtitleSegment],
+        ) -> crate::CoreResult<()> {
+            self.events
+                .borrow_mut()
+                .push(format!("shard-{batch_index}"));
+            if self.fail_at == Some(batch_index) {
+                return Err(crate::CoreError::DataInvariant(
+                    "injected failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn load_batch_segments(
+            &self,
+            _kind: BatchShardKind,
+            _completed_batches: usize,
+        ) -> crate::CoreResult<Vec<crate::SubtitleSegment>> {
+            Ok(Vec::new())
+        }
+
+        fn save_run_state(&self, _state: &crate::storage::RunState) -> crate::CoreResult<()> {
+            self.events.borrow_mut().push("state".to_owned());
+            Ok(())
+        }
+
+        fn load_run_state(&self) -> crate::CoreResult<Option<crate::storage::RunState>> {
+            Ok(None)
+        }
+    }
 
     impl LlmBackend for BatchBackend {
         fn provider_name(&self) -> &str {
@@ -588,6 +670,66 @@ mod tool_tests {
         let structured =
             GenerationRequest::json(vec![ChatMessage::user("translate")]).without_reasoning();
         assert_eq!(structured.reasoning, ReasoningPolicy::Disabled);
+    }
+
+    #[test]
+    fn checkpoint_publishes_state_only_after_every_shard_succeeds() {
+        let checkpoint = RuntimeCheckpoint {
+            shards: vec![
+                CheckpointShard {
+                    kind: BatchShardKind::Translated,
+                    batch_index: 1,
+                    segments: Vec::new(),
+                },
+                CheckpointShard {
+                    kind: BatchShardKind::Translated,
+                    batch_index: 2,
+                    segments: Vec::new(),
+                },
+            ],
+            state: crate::storage::RunState::new(
+                &crate::PipelineOptions::new("clip.srt".into()),
+                crate::storage::InputSignature {
+                    sha1: "input".to_owned(),
+                    size: 1,
+                    mtime_ns: None,
+                },
+                crate::Usage::default(),
+                crate::ContextMemory::default(),
+                2,
+                0,
+                false,
+            ),
+        };
+        let failing = OrderedCheckpointStore {
+            events: RefCell::new(Vec::new()),
+            fail_at: Some(2),
+        };
+
+        failing
+            .commit_checkpoint(&checkpoint)
+            .expect_err("second shard failure must abort the checkpoint");
+
+        assert_eq!(
+            failing.events.into_inner(),
+            vec!["shard-1".to_owned(), "shard-2".to_owned()]
+        );
+
+        let successful = OrderedCheckpointStore {
+            events: RefCell::new(Vec::new()),
+            fail_at: None,
+        };
+        successful
+            .commit_checkpoint(&checkpoint)
+            .expect("commit checkpoint");
+        assert_eq!(
+            successful.events.into_inner(),
+            vec![
+                "shard-1".to_owned(),
+                "shard-2".to_owned(),
+                "state".to_owned()
+            ]
+        );
     }
 
     #[test]

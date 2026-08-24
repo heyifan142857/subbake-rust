@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use subbake_core::QualityGate;
+
 mod transcription;
 mod translation;
 
@@ -33,6 +35,17 @@ pub struct TranslateArgs {
     pub profile: Option<String>,
     pub settings: TranslationSettings,
     pub json: bool,
+    pub qa_fail_on: QualityGate,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditArgs {
+    pub target_path: PathBuf,
+    pub instruction: String,
+    pub allow_non_generated: bool,
+    pub dry_run: bool,
+    pub json: bool,
+    pub settings: TranslationSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +57,7 @@ pub struct PipelineArgs {
     pub settings: TranslationSettings,
     pub transcription_settings: TranscriptionSettings,
     pub json: bool,
+    pub qa_fail_on: QualityGate,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +70,7 @@ struct ParsedFileTranslationArgs {
     settings: TranslationSettings,
     transcription_settings: TranscriptionSettings,
     json: bool,
+    qa_fail_on: QualityGate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +88,8 @@ pub struct BatchArgs {
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub translate: BatchTranslateOptions,
+    pub json: bool,
+    pub qa_fail_on: QualityGate,
 }
 
 #[derive(Debug, Clone)]
@@ -81,11 +98,14 @@ pub struct TranscribeArgs {
     pub output: Option<PathBuf>,
     pub overwrite: bool,
     pub settings: TranscriptionSettings,
+    pub json: bool,
+    pub qa_fail_on: QualityGate,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderArgs {
     pub config: BackendConfig,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +113,7 @@ pub struct RuntimeArgs {
     pub action: RuntimeAction,
     pub target_path: PathBuf,
     pub runtime_dir: Option<PathBuf>,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +122,7 @@ pub struct WhisperArgs {
     pub binary_path: Option<PathBuf>,
     pub models_dir: Option<PathBuf>,
     pub build_variant: WhisperBuildVariant,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -125,12 +147,7 @@ pub struct EvaluateArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QaFailOn {
-    Never,
-    Error,
-    Warning,
-}
+pub type QaFailOn = QualityGate;
 
 #[derive(Debug, Clone)]
 pub struct QaArgs {
@@ -140,10 +157,20 @@ pub struct QaArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProjectArgs {
+    pub root: PathBuf,
+    pub recursive: bool,
+    pub output: Option<PathBuf>,
+    pub json: bool,
+    pub fail_on: QualityGate,
+}
+
+#[derive(Debug, Clone)]
 pub struct MemoryArgs {
     pub action: MemoryAction,
     pub target_path: PathBuf,
     pub settings: TranslationSettings,
+    pub json: bool,
 }
 
 impl TranslateArgs {
@@ -156,6 +183,7 @@ impl TranslateArgs {
             profile: None,
             settings: TranslationSettings::default(),
             json: false,
+            qa_fail_on: QualityGate::Never,
         }
     }
 }
@@ -171,6 +199,7 @@ impl ParsedFileTranslationArgs {
             settings: TranslationSettings::default(),
             transcription_settings: TranscriptionSettings::default(),
             json: false,
+            qa_fail_on: QualityGate::Never,
         }
     }
 
@@ -183,6 +212,7 @@ impl ParsedFileTranslationArgs {
             profile: self.profile,
             settings: self.settings,
             json: self.json,
+            qa_fail_on: self.qa_fail_on,
         }
     }
 
@@ -195,6 +225,7 @@ impl ParsedFileTranslationArgs {
             settings: self.settings,
             transcription_settings: self.transcription_settings,
             json: self.json,
+            qa_fail_on: self.qa_fail_on,
         }
     }
 }
@@ -231,6 +262,55 @@ pub fn parse_resume_args(args: &[String]) -> CliResult<AgentArgs> {
 pub fn parse_translate_args(args: &[String]) -> CliResult<TranslateArgs> {
     parse_file_translation_args(args, "translate requires a subtitle path", "translate")
         .map(ParsedFileTranslationArgs::into_translate)
+}
+
+pub fn parse_edit_args(args: &[String]) -> CliResult<EditArgs> {
+    let target_path = args
+        .first()
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::usage("edit requires a subtitle path"))?;
+    let (explicit_config, explicit_profile) = extract_config_and_profile(args);
+    let mut instruction = None;
+    let mut allow_non_generated = false;
+    let mut dry_run = false;
+    let mut json = false;
+    let mut translation_options = TranslationOptionGroup::default();
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--instruction" => {
+                instruction = Some(required_value(args, &mut index, "--instruction")?)
+            }
+            "--allow-non-generated" => allow_non_generated = true,
+            "--dry-run" => dry_run = true,
+            "--json" => json = true,
+            "--config" | "--profile" => skip_two(args, &mut index)?,
+            value if is_container_translation_option(value) => {
+                return Err(CliError::usage(format!(
+                    "{value} is not valid with `sbake edit`"
+                )));
+            }
+            value if translation_options.parse(value, args, &mut index)? => {}
+            other => return Err(CliError::usage(format!("unknown edit option `{other}`"))),
+        }
+        index += 1;
+    }
+    let instruction = instruction
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CliError::usage("edit requires a non-empty --instruction"))?;
+    let resolved = resolve_settings(
+        explicit_config,
+        explicit_profile,
+        translation_options.into_overrides(),
+    )?;
+    Ok(EditArgs {
+        target_path,
+        instruction,
+        allow_non_generated,
+        dry_run,
+        json,
+        settings: resolved.settings,
+    })
 }
 
 pub fn parse_pipeline_args(args: &[String]) -> CliResult<PipelineArgs> {
@@ -329,16 +409,7 @@ pub fn parse_qa_args(args: &[String]) -> CliResult<QaArgs> {
             "--json" => json = true,
             "--fail-on" => {
                 let value = required_value(args, &mut index, "--fail-on")?;
-                fail_on = match value.as_str() {
-                    "never" => QaFailOn::Never,
-                    "error" => QaFailOn::Error,
-                    "warning" => QaFailOn::Warning,
-                    _ => {
-                        return Err(CliError::usage(
-                            "--fail-on must be one of: never, error, warning",
-                        ));
-                    }
-                };
+                fail_on = parse_quality_gate(&value, "--fail-on")?;
             }
             other => return Err(CliError::usage(format!("unknown qa option `{other}`"))),
         }
@@ -349,6 +420,36 @@ pub fn parse_qa_args(args: &[String]) -> CliResult<QaArgs> {
         json,
         fail_on,
     })
+}
+
+pub fn parse_project_args(args: &[String]) -> CliResult<ProjectArgs> {
+    let root = args
+        .first()
+        .ok_or_else(|| CliError::usage("project requires a directory"))?;
+    let mut parsed = ProjectArgs {
+        root: PathBuf::from(root),
+        recursive: false,
+        output: None,
+        json: false,
+        fail_on: QualityGate::Never,
+    };
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--recursive" => parsed.recursive = true,
+            "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
+            "--json" => parsed.json = true,
+            "--fail-on" => {
+                parsed.fail_on = parse_quality_gate(
+                    &required_value(args, &mut index, "--fail-on")?,
+                    "--fail-on",
+                )?;
+            }
+            other => return Err(CliError::usage(format!("unknown project option `{other}`"))),
+        }
+        index += 1;
+    }
+    Ok(parsed)
 }
 
 pub fn parse_memory_args(args: &[String]) -> CliResult<MemoryArgs> {
@@ -393,6 +494,7 @@ pub fn parse_memory_args(args: &[String]) -> CliResult<MemoryArgs> {
         action,
         target_path: target.into(),
         settings: parsed.settings,
+        json: parsed.json,
     })
 }
 
@@ -423,6 +525,12 @@ fn parse_file_translation_args(
                 skip_two(args, &mut index)?;
             }
             "--json" => parsed.json = true,
+            "--qa-fail-on" => {
+                parsed.qa_fail_on = parse_quality_gate(
+                    &required_value(args, &mut index, "--qa-fail-on")?,
+                    "--qa-fail-on",
+                )?;
+            }
             value if command_name != "pipeline" && is_container_translation_option(value) => {
                 return Err(CliError::usage(format!(
                     "{value} is only valid with `sbake pipeline`"
@@ -516,6 +624,8 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
         config_path: None,
         profile: None,
         translate: BatchTranslateOptions::default(),
+        json: false,
+        qa_fail_on: QualityGate::Never,
     };
 
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
@@ -527,6 +637,13 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
             "--recursive" => parsed.recursive = true,
             "--overwrite" => parsed.overwrite = true,
             "--fail-fast" => parsed.fail_fast = true,
+            "--json" => parsed.json = true,
+            "--qa-fail-on" => {
+                parsed.qa_fail_on = parse_quality_gate(
+                    &required_value(args, &mut index, "--qa-fail-on")?,
+                    "--qa-fail-on",
+                )?;
+            }
             "--retry-failed" => {
                 parsed.retry_failed = Some(required_path(args, &mut index, "--retry-failed")?)
             }
@@ -570,6 +687,17 @@ fn resolve_settings(
         .map_err(CliError::from)
 }
 
+fn parse_quality_gate(value: &str, flag: &str) -> CliResult<QualityGate> {
+    match value {
+        "never" => Ok(QualityGate::Never),
+        "error" => Ok(QualityGate::Error),
+        "warning" => Ok(QualityGate::Warning),
+        _ => Err(CliError::usage(format!(
+            "{flag} must be one of: never, error, warning"
+        ))),
+    }
+}
+
 pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
     let media_path = args
         .first()
@@ -579,6 +707,8 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
         output: None,
         overwrite: false,
         settings: TranscriptionSettings::default(),
+        json: false,
+        qa_fail_on: QualityGate::Never,
     };
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
     let mut overrides = SettingsOverrides::default();
@@ -589,6 +719,13 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
             "--overwrite" => parsed.overwrite = true,
+            "--json" => parsed.json = true,
+            "--qa-fail-on" => {
+                parsed.qa_fail_on = parse_quality_gate(
+                    &required_value(args, &mut index, "--qa-fail-on")?,
+                    "--qa-fail-on",
+                )?;
+            }
             "--config" | "--profile" => skip_two(args, &mut index)?,
             "--runtime-dir" => {
                 overrides.storage.runtime_dir =
@@ -631,10 +768,12 @@ pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
 
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
     let mut overrides = SettingsOverrides::default();
+    let mut json = false;
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "--config" | "--profile" => skip_two(args, &mut index)?,
+            "--json" => json = true,
             "--provider" => {
                 overrides.backend.id = Some(required_value(args, &mut index, "--provider")?)
             }
@@ -688,6 +827,7 @@ pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
 
     Ok(ProviderArgs {
         config: resolved.settings.backend_config(),
+        json,
     })
 }
 
@@ -704,12 +844,14 @@ pub fn parse_runtime_args(args: &[String]) -> CliResult<RuntimeArgs> {
     let mut clean_cache = false;
     let mut clean_glossary = false;
     let mut clean_all = false;
+    let mut json = false;
     let mut index = 2usize;
     while index < args.len() {
         match args[index].as_str() {
             "--runtime-dir" => {
                 runtime_dir = Some(required_path(args, &mut index, "--runtime-dir")?)
             }
+            "--json" => json = true,
             "--yes" if command == "clean" => yes = true,
             "--runs" if command == "clean" => clean_runs = true,
             "--cache" if command == "clean" => clean_cache = true,
@@ -738,6 +880,7 @@ pub fn parse_runtime_args(args: &[String]) -> CliResult<RuntimeArgs> {
         action,
         target_path: PathBuf::from(target_path),
         runtime_dir,
+        json,
     })
 }
 
@@ -785,6 +928,7 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
         binary_path: None,
         models_dir: None,
         build_variant: WhisperBuildVariant::Cpu,
+        json: false,
     };
     let mut overrides = SettingsOverrides::default();
 
@@ -797,6 +941,7 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
             "--keep-models" => {
                 parsed.action = WhisperAction::Uninstall { keep_models: true };
             }
+            "--json" => parsed.json = true,
             "--variant" => {
                 let value = required_value(args, &mut index, "--variant")?;
                 parsed.build_variant = WhisperBuildVariant::parse(&value).ok_or_else(|| {
@@ -1378,6 +1523,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_quality_gates_for_output_producing_commands() {
+        let config = empty_config("quality-gates");
+        let config_value = config.to_string_lossy().into_owned();
+        let translate = parse_translate_args(&[
+            "movie.srt".to_owned(),
+            "--config".to_owned(),
+            config_value.clone(),
+            "--qa-fail-on".to_owned(),
+            "warning".to_owned(),
+        ])
+        .expect("translate QA gate");
+        let batch = parse_batch_args(&[
+            ".".to_owned(),
+            "--config".to_owned(),
+            config_value,
+            "--qa-fail-on".to_owned(),
+            "error".to_owned(),
+        ])
+        .expect("batch QA gate");
+        let transcribe = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--qa-fail-on".to_owned(),
+            "warning".to_owned(),
+        ])
+        .expect("transcription QA gate");
+        let _ = std::fs::remove_file(config);
+
+        assert_eq!(translate.qa_fail_on, QualityGate::Warning);
+        assert_eq!(batch.qa_fail_on, QualityGate::Error);
+        assert_eq!(transcribe.qa_fail_on, QualityGate::Warning);
+    }
+
+    #[test]
     fn parse_transcribe_accepts_local_whisper_options() {
         let args = vec![
             "movie.mp4".to_owned(),
@@ -1401,6 +1579,19 @@ mod tests {
             parsed.settings.sidecar_path,
             Some(PathBuf::from("movie.srt"))
         );
+    }
+
+    #[test]
+    fn parse_transcribe_controls_postprocessing_and_speaker_labels() {
+        let parsed = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--no-normalize-transcript".to_owned(),
+            "--no-speaker-labels".to_owned(),
+        ])
+        .expect("transcription post-processing options");
+
+        assert_eq!(parsed.settings.normalize_text, Some(false));
+        assert_eq!(parsed.settings.speaker_labels, Some(false));
     }
 
     #[test]

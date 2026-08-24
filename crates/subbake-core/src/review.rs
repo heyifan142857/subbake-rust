@@ -337,8 +337,10 @@ pub(crate) fn build_review_messages(
     memory: &ContextMemory,
     required_glossary: &BTreeMap<String, String>,
 ) -> Vec<ChatMessage> {
-    let language_rules =
-        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    let language_rules = LanguageRuleRegistry::resolve(
+        &options.validation.source_language,
+        &options.validation.target_language,
+    );
     build_review_messages_with_rules(options, &language_rules, batch, memory, required_glossary)
 }
 
@@ -388,8 +390,8 @@ pub(crate) fn build_review_messages_with_rules(
         .map(|(source, target)| (source.clone(), target.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut payload = serde_json::json!({
-        "tgt": options.target_language,
-        "policy": options.review_policy.as_str(),
+        "tgt": options.validation.target_language,
+        "policy": options.execution.review_policy.as_str(),
         "reasons": reasons,
         "expected_count": candidate_reasons.len(),
         "expected_ids": candidate_reasons.keys().collect::<Vec<_>>(),
@@ -409,12 +411,12 @@ pub(crate) fn build_review_messages_with_rules(
                     std::slice::from_ref(source),
                     std::slice::from_ref(translated),
                     required_glossary,
-                    &options.source_language,
-                    &options.target_language,
+                    &options.validation.source_language,
+                    &options.validation.target_language,
                     FinalValidationPolicy {
-                        max_characters_per_second: options.max_characters_per_second,
-                        max_characters_per_line: options.max_characters_per_line,
-                        max_lines: options.max_lines,
+                        max_characters_per_second: options.validation.max_characters_per_second,
+                        max_characters_per_line: options.validation.max_characters_per_line,
+                        max_lines: options.validation.max_lines,
                     },
                 ).unwrap_or_default().into_iter().map(|issue| issue.message).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
@@ -455,7 +457,7 @@ pub(crate) fn build_review_messages_with_rules(
     }
     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
     let language_guidance = language_rules.review_guidance().unwrap_or_default();
-    let (system, response_shape, instructions) = match options.review_policy {
+    let (system, response_shape, instructions) = match options.execution.review_policy {
         ReviewPolicy::Full => (
             format!(
                 "You are SubBake's document-level targeted subtitle revision adjudicator.\n\
@@ -464,7 +466,7 @@ pub(crate) fn build_review_messages_with_rules(
                  First resolve every deterministic_issues entry. Treat required_glossary values as mandatory exact targets; terminology_hints are advisory and never override them.\n\
                  Treat document_guide as frozen evidence, but do not force advisory character or terminology guidance when local meaning clearly differs. Preserve facts, numbers, formatting markers, required terminology, tone, humor, emotion, profanity, and intentionally incomplete phrasing across cue boundaries.\n\
                  Do not replace a sound translation with a merely different synonym.{}\n{language_guidance}",
-                options.target_language,
+                options.validation.target_language,
                 if options.policy().review_strategy == ReviewStrategy::Adjudicated {
                     " Independently determine the intended translation for each editable line before comparing it with the supplied candidate, then keep whichever is materially better."
                 } else {
@@ -479,7 +481,7 @@ pub(crate) fn build_review_messages_with_rules(
                 "You are SubBake's targeted deterministic subtitle repair reviewer.\n\
                  Return valid JSON only.\n\
                  Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording. Ambiguous number-expression candidates require verification, not automatic rewriting; preserve idioms and lexicalized expressions when they do not state a numeric fact.",
-                options.target_language
+                options.validation.target_language
             ),
             "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\"}]}",
             "Make the smallest change that fixes each stated candidate reason. Omit candidates that already satisfy the stated requirement.",
@@ -883,7 +885,7 @@ mod tests {
         memory.load_glossary(&[("two".to_owned(), "二".to_owned())]);
         let plan = build_full_review_plan(&batches, &translated, &memory, "English", "Chinese");
         let mut options = PipelineOptions::new("review.srt".into());
-        options.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
 
         let messages = build_review_messages(&options, &plan[0], &memory, &BTreeMap::new());
         let payload = messages[1]
@@ -926,7 +928,7 @@ mod tests {
             "Chinese",
         );
         let mut options = PipelineOptions::new("review.ass".into());
-        options.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
 
         let messages = build_review_messages(
             &options,
@@ -967,8 +969,8 @@ mod tests {
         let mut translated = source.clone();
         translated[0].text = "再次离开学校。".to_owned();
         let mut full = PipelineOptions::new("review.srt".into());
-        full.mode = TranslationMode::Cinema;
-        full.review_policy = ReviewPolicy::Full;
+        full.execution.mode = TranslationMode::Cinema;
+        full.execution.review_policy = ReviewPolicy::Full;
         let required_glossary = BTreeMap::from([("school".to_owned(), "学校".to_owned())]);
         let mut memory = ContextMemory::default();
         memory.load_glossary(&[("leave school".to_owned(), "退学".to_owned())]);
@@ -991,7 +993,7 @@ mod tests {
         assert!(!full_messages[0].content.contains("targeted subtitle QA"));
 
         let mut targeted = full;
-        targeted.review_policy = ReviewPolicy::Targeted;
+        targeted.execution.review_policy = ReviewPolicy::Targeted;
         let targeted_messages =
             build_review_messages(&targeted, &plan[0], &memory, &required_glossary);
         assert!(

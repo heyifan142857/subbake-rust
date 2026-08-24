@@ -827,12 +827,20 @@ pub(crate) fn execute_translation_tool_with_services(
                         .get("allow_non_generated")
                         .and_then(JsonValue::as_bool)
                         .unwrap_or(false),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false),
                 },
                 cancellation,
             )?;
             TranslationExecutionOutcome {
                 outcome: AgentToolOutcome::SubtitleEdit(SubtitleEditToolOutcome {
-                    status: ToolExecutionStatus::Written,
+                    status: if edited.dry_run {
+                        ToolExecutionStatus::DryRun
+                    } else {
+                        ToolExecutionStatus::Written
+                    },
                     target_path: edited.target_path,
                     target_language: edited.target_language,
                     modified_entries: edited.modified_entries,
@@ -1272,6 +1280,7 @@ mod tests {
                 subtitle_entries: 1,
                 container_change: None,
                 runtime_dir: None,
+                quality: None,
             })
         }
 

@@ -56,8 +56,10 @@ impl ReviewStage {
         required_glossary: &BTreeMap<String, String>,
         resume: ReviewResumeInput<'_>,
     ) -> CoreResult<Self> {
-        let language_rules =
-            LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+        let language_rules = LanguageRuleRegistry::resolve(
+            &options.validation.source_language,
+            &options.validation.target_language,
+        );
         Self::new_with_rules(
             options,
             &language_rules,
@@ -87,14 +89,14 @@ impl ReviewStage {
         let plan = if translated.is_empty() {
             Vec::new()
         } else {
-            match options.review_policy {
+            match options.execution.review_policy {
                 ReviewPolicy::Off => Vec::new(),
                 ReviewPolicy::Targeted => build_review_plan(
                     batches,
                     translated,
                     memory,
-                    &options.source_language,
-                    &options.target_language,
+                    &options.validation.source_language,
+                    &options.validation.target_language,
                 ),
                 ReviewPolicy::Full => {
                     build_full_review_plan_with_rules(batches, translated, memory, language_rules)
@@ -142,14 +144,14 @@ impl ReviewStage {
             restored_duration_ms: restored_report
                 .map(|report| report.review.duration_ms)
                 .unwrap_or_default(),
-            review_policy: options.review_policy,
+            review_policy: options.execution.review_policy,
             required_glossary: required_glossary.clone(),
-            source_language: options.source_language.clone(),
-            target_language: options.target_language.clone(),
+            source_language: options.validation.source_language.clone(),
+            target_language: options.validation.target_language.clone(),
             final_validation_policy: FinalValidationPolicy {
-                max_characters_per_second: options.max_characters_per_second,
-                max_characters_per_line: options.max_characters_per_line,
-                max_lines: options.max_lines,
+                max_characters_per_second: options.validation.max_characters_per_second,
+                max_characters_per_line: options.validation.max_characters_per_line,
+                max_lines: options.validation.max_lines,
             },
             annotations,
             cache_hits_before,
@@ -464,8 +466,8 @@ mod tests {
             .map(|line| vec![line])
             .collect::<Vec<_>>();
         let mut options = PipelineOptions::new("review.ass".into());
-        options.mode = TranslationMode::Cinema;
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.mode = TranslationMode::Cinema;
+        options.execution.review_policy = ReviewPolicy::Full;
         let mut stage = ReviewStage::new(
             &options,
             &batches,
@@ -512,7 +514,7 @@ mod tests {
         translated[0].text = "版本十三".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
-        options.review_policy = ReviewPolicy::Targeted;
+        options.execution.review_policy = ReviewPolicy::Targeted;
         let mut stage = ReviewStage::new(
             &options,
             &batches,
@@ -560,7 +562,7 @@ mod tests {
         translated[0].text = "Rick来了".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.review_policy = ReviewPolicy::Full;
         let required_glossary = BTreeMap::from([("Rick".to_owned(), "Rick".to_owned())]);
         let memory = advisory_candidate_memory("here", "在此");
         let mut stage = ReviewStage::new(
@@ -605,7 +607,7 @@ mod tests {
         translated[0].text = "等2分钟".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.review_policy = ReviewPolicy::Full;
         let memory = advisory_candidate_memory("Wait", "请稍候");
         let mut stage = ReviewStage::new(
             &options,
@@ -651,8 +653,8 @@ mod tests {
         translated[0].text = "过来".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.srt".into());
-        options.review_policy = ReviewPolicy::Full;
-        options.max_characters_per_second = Some(4.0);
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.validation.max_characters_per_second = Some(4.0);
         let memory = advisory_candidate_memory("Come", "来吧");
         let mut stage = ReviewStage::new(
             &options,

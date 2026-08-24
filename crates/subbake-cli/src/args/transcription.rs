@@ -51,6 +51,10 @@ impl TranscriptionOptionGroup {
             }
             (_, "--filter-hallucinations") => settings.filter_hallucinations = true,
             (_, "--no-filter-hallucinations") => settings.filter_hallucinations = false,
+            (_, "--normalize-transcript") => settings.normalize_text = Some(true),
+            (_, "--no-normalize-transcript") => settings.normalize_text = Some(false),
+            (_, "--speaker-labels") => settings.speaker_labels = Some(true),
+            (_, "--no-speaker-labels") => settings.speaker_labels = Some(false),
             (TranscriptionOptionSurface::Direct, "--vad")
             | (TranscriptionOptionSurface::Pipeline, "--vad" | "--transcribe-vad") => {
                 settings.vad_enabled = Some(true)

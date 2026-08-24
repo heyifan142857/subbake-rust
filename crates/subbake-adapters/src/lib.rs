@@ -13,6 +13,7 @@ pub mod overnight;
 pub mod pipeline;
 pub mod platform;
 mod process;
+pub mod project;
 pub mod providers;
 pub mod runtime;
 pub mod runtime_store;
@@ -33,7 +34,8 @@ pub use config_edit::{
 };
 pub use diagnostics::{diagnose_failure_path, format_diagnostic_report, load_diagnostic_reports};
 pub use editing::{
-    SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle, edit_subtitle_cancellable,
+    SubtitleEditChange, SubtitleEditOutcome, SubtitleEditRequest, edit_subtitle,
+    edit_subtitle_cancellable,
 };
 pub use embedded_subtitles::{
     SubtitlePayloadFormat, default_embedded_translation_output_path,
@@ -55,10 +57,12 @@ pub use overnight::{
 };
 pub use pipeline::{
     PipelineOutcome, PipelineRequest, run_pipeline, run_pipeline_cancellable_with_progress,
+    run_pipeline_cancellable_with_progress_and_quality,
 };
 pub use platform::{
     Architecture, CapabilitySet, OperatingSystem, PathEntryIdentity, PathIdentity, PlatformPaths,
 };
+pub use project::{ProjectInspectionRequest, inspect_subtitle_project};
 pub use providers::{
     ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
     check_provider, check_provider_cancellable, default_api_key_env, resolve_env_var,
@@ -80,15 +84,18 @@ pub use transcription::{
     TranscriptionRequest, TranscriptionSettings, apply_whisper_configuration,
     apply_whisper_storage, transcribe_media, transcribe_media_cancellable,
     transcribe_media_cancellable_with_progress,
+    transcribe_media_cancellable_with_progress_and_quality,
 };
 pub use translation::{
     BatchTranslationFailure, BatchTranslationOutcome, BatchTranslationRequest,
     ContainerTranslationChange, RuntimeReusePolicy, TranslationOutcome, TranslationRequest,
     batch_translation_output_path, default_translation_output_path, translate_input,
-    translate_input_cancellable, translate_input_cancellable_with_progress, translate_subtitle,
+    translate_input_cancellable, translate_input_cancellable_with_progress,
+    translate_input_cancellable_with_progress_and_quality, translate_subtitle,
     translate_subtitle_batch, translate_subtitle_batch_cancellable,
-    translate_subtitle_batch_with_progress, translate_subtitle_cancellable,
-    translate_subtitle_cancellable_with_progress,
+    translate_subtitle_batch_with_progress, translate_subtitle_batch_with_progress_and_quality,
+    translate_subtitle_cancellable, translate_subtitle_cancellable_with_progress,
+    translate_subtitle_cancellable_with_progress_and_quality,
 };
 pub use whisper::{
     DEFAULT_WHISPER_VAD_MODEL, WhisperAction, WhisperBuildVariant, WhisperModel, WhisperModelList,

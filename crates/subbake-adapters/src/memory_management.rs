@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use subbake_core::ports::RuntimeStore;
+use subbake_core::ports::{RuntimeLayoutStore, RuntimeMemoryStore};
 use subbake_core::storage::build_runtime_paths;
 
 use crate::error::{AdapterError, AdapterResult};

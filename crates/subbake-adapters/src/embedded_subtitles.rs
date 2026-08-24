@@ -14,8 +14,8 @@ use std::process::{Command, Output};
 use serde::Deserialize;
 use subbake_core::storage::input_signature_from_bytes;
 use subbake_core::{
-    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, TaskKind,
-    TaskState,
+    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, QualityGate, SharedProgress,
+    TaskKind, TaskState,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -236,9 +236,23 @@ pub fn translate_embedded_subtitle_cancellable(
 }
 
 pub fn translate_embedded_subtitle_cancellable_with_progress(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<TranslationOutcome> {
+    translate_embedded_subtitle_cancellable_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub(crate) fn translate_embedded_subtitle_cancellable_with_progress_and_quality(
     mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<TranslationOutcome> {
     cancellation.check().map_err(AdapterError::from)?;
     let runtime_dir = prepare_translation_runtime(&mut request)?;
@@ -248,6 +262,7 @@ pub fn translate_embedded_subtitle_cancellable_with_progress(
         progress,
         Path::new(FFMPEG),
         Path::new(FFPROBE),
+        quality_gate,
     )?;
     if runtime_dir.is_some() {
         outcome.runtime_dir = runtime_dir;
@@ -388,6 +403,7 @@ fn translate_embedded_subtitle_with_programs(
     progress: SharedProgress,
     ffmpeg: &Path,
     ffprobe: &Path,
+    quality_gate: QualityGate,
 ) -> AdapterResult<TranslationOutcome> {
     cancellation.check().map_err(AdapterError::from)?;
     normalize_translation_languages(&mut request.settings)?;
@@ -494,6 +510,7 @@ fn translate_embedded_subtitle_with_programs(
         cancellation,
         progress.clone(),
         Some(identity),
+        quality_gate,
     )?;
 
     if outcome.subtitle_entries == 0 {

@@ -15,7 +15,7 @@ use crate::languages::normalize_language_name;
 use crate::memory::ContextMemory;
 use crate::ports::{
     BackendJsonResult, BackendPayload, BatchExecutionOptions, BatchShardKind, CacheStage,
-    ChatMessage, DashboardSink, GenerationRequest, LlmBackend, RuntimeStore,
+    ChatMessage, CheckpointShard, GenerationRequest, LlmBackend, RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
@@ -69,10 +69,9 @@ use crate::entities::ReviewReport;
 #[cfg(test)]
 use support::validate_window_terminology;
 
-pub struct SubtitlePipeline<B, D> {
+pub struct SubtitlePipeline<B> {
     backend: B,
     reviewer: Option<B>,
-    dashboard: D,
     options: PipelineOptions,
     language_rules: ResolvedLanguageRules,
     memory: ContextMemory,
@@ -89,21 +88,23 @@ pub struct SubtitlePipeline<B, D> {
     progress: Option<Box<dyn ProgressSink>>,
 }
 
-impl<B, D> SubtitlePipeline<B, D>
+impl<B> SubtitlePipeline<B>
 where
     B: LlmBackend,
-    D: DashboardSink,
 {
-    pub fn new(backend: B, dashboard: D, mut options: PipelineOptions) -> Self {
-        options.source_language = normalize_language_name(&options.source_language, true);
-        options.target_language = normalize_language_name(&options.target_language, false);
-        let language_rules =
-            LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
-        let accounting = PipelineAccounting::new(options.translation_concurrency);
+    pub fn new(backend: B, mut options: PipelineOptions) -> Self {
+        options.validation.source_language =
+            normalize_language_name(&options.validation.source_language, true);
+        options.validation.target_language =
+            normalize_language_name(&options.validation.target_language, false);
+        let language_rules = LanguageRuleRegistry::resolve(
+            &options.validation.source_language,
+            &options.validation.target_language,
+        );
+        let accounting = PipelineAccounting::new(options.execution.translation_concurrency);
         Self {
             backend,
             reviewer: None,
-            dashboard,
             options,
             language_rules,
             memory: ContextMemory::new(),
@@ -173,8 +174,8 @@ where
     fn reserve_requests(&mut self, additional: usize) -> CoreResult<()> {
         self.accounting.reserve_requests(
             additional,
-            self.options.max_requests,
-            self.options.max_tokens,
+            self.options.execution.max_requests,
+            self.options.execution.max_tokens,
         )
     }
 
@@ -238,7 +239,8 @@ where
             requests_in_flight: in_flight as u64,
             cache_hits: self.accounting.cache_hits() as u64,
             translation_memory_hits: self.accounting.translation_memory_hits() as u64,
-            window_index: committed.div_ceil(self.options.translation_concurrency.max(1)) as u64
+            window_index: committed.div_ceil(self.options.execution.translation_concurrency.max(1))
+                as u64
                 + 1,
             ..crate::progress::TranslationProgress::default()
         });
@@ -253,14 +255,14 @@ where
     pub(super) fn effective_translation_concurrency(&self) -> usize {
         self.accounting.effective_translation_concurrency(
             self.options.policy().concurrency_strategy,
-            self.options.translation_concurrency,
+            self.options.execution.translation_concurrency,
         )
     }
 
     pub(super) fn note_translation_window_success(&mut self) {
         self.accounting.note_translation_window_success(
             self.options.policy().concurrency_strategy,
-            self.options.translation_concurrency,
+            self.options.execution.translation_concurrency,
         );
     }
 
@@ -283,7 +285,7 @@ where
     pub fn run_document(&mut self, document: &SubtitleDocument) -> CoreResult<PipelineRun> {
         self.cancellation.check()?;
         validate_unique_segment_ids(&document.segments, "source")?;
-        if self.options.batch_size == 0 {
+        if self.options.execution.batch_size == 0 {
             return Err(CoreError::InvalidTranslation(
                 "batch size must be greater than zero".to_owned(),
             ));
@@ -296,30 +298,35 @@ where
             self.cancellation.check()?;
             let entries = store.load_glossary()?;
             self.memory.load_glossary(&entries);
-            if self.options.glossary_path.is_some() {
+            if self.options.identity.glossary_path.is_some() {
                 self.required_glossary.extend(entries);
             }
         }
 
         let policy = self.options.policy();
         let deduplication = DeduplicationPlan::new(&document.segments, policy.deduplicate);
-        let batches = BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-            .scene_aware(policy.context_strategy.uses_scene_boundaries())
-            .split(deduplication.canonical());
+        let batches = BatchPlanner::new(
+            self.options.execution.batch_size,
+            self.options.execution.batch_token_budget,
+        )
+        .scene_aware(policy.context_strategy.uses_scene_boundaries())
+        .split(deduplication.canonical());
         let source_contexts = BatchPlanner::source_contexts(
             deduplication.canonical(),
             &batches,
             policy.context_strategy,
-            self.options.batch_token_budget,
+            self.options.execution.batch_token_budget,
         );
         let translation_scene_groups = BatchPlanner::scene_group_ids(&batches);
-        let original_batches =
-            BatchPlanner::new(self.options.batch_size, self.options.batch_token_budget)
-                .scene_aware(
-                    self.options.review_policy != ReviewPolicy::Full
-                        && policy.context_strategy.uses_scene_boundaries(),
-                )
-                .split(&document.segments);
+        let original_batches = BatchPlanner::new(
+            self.options.execution.batch_size,
+            self.options.execution.batch_token_budget,
+        )
+        .scene_aware(
+            self.options.execution.review_policy != ReviewPolicy::Full
+                && policy.context_strategy.uses_scene_boundaries(),
+        )
+        .split(&document.segments);
         let review_scene_groups = BatchPlanner::scene_group_ids(&original_batches);
         let planned_batches = BatchPlanner::describe(&batches);
         let state_path = self
@@ -330,17 +337,17 @@ where
             .store
             .as_ref()
             .map(|store| store.paths().glossary_path.clone())
-            .or_else(|| self.options.glossary_path.clone());
-        if self.options.dry_run {
+            .or_else(|| self.options.identity.glossary_path.clone());
+        if self.options.execution.dry_run {
             return Ok(PipelineRun {
                 result: PipelineResult {
                     output_path: None,
                     batches_translated: 0,
                     review_batches: 0,
                     usage: Usage::default(),
-                    mode: self.options.mode,
+                    mode: self.options.execution.mode,
                     deduplicated_segments: deduplication.duplicates(),
-                    reviewer_fallback: self.options.review_policy != ReviewPolicy::Off
+                    reviewer_fallback: self.options.execution.review_policy != ReviewPolicy::Off
                         && self.reviewer.is_none(),
                     dry_run: true,
                     planned_batches,
@@ -358,11 +365,8 @@ where
             });
         }
 
-        self.dashboard.set_total_steps(2 + batches.len());
-        self.dashboard.mark_running("TRANSLATE");
-
         // Load translation memory from the runtime store at start.
-        if self.options.use_cache
+        if self.options.execution.use_cache
             && let Some(ref store) = self.store
         {
             let tm_entries = store.load_translation_memory()?;
@@ -376,7 +380,7 @@ where
         // Freeze the effective preflight guidance once for this run. Later
         // batches may learn advisory terms, but all Resume writes must retain
         // the same semantic-input fingerprint.
-        self.options.document_guide_fingerprint =
+        self.options.identity.document_guide_fingerprint =
             Some(build_document_guide_fingerprint(&self.memory));
         let translation_memory_scope = translation_memory_scope(&self.options);
         let translation_memory_keys =
@@ -423,9 +427,9 @@ where
             usage,
         )?;
         let final_validation_policy = FinalValidationPolicy {
-            max_characters_per_second: self.options.max_characters_per_second,
-            max_characters_per_line: self.options.max_characters_per_line,
-            max_lines: self.options.max_lines,
+            max_characters_per_second: self.options.validation.max_characters_per_second,
+            max_characters_per_line: self.options.validation.max_characters_per_line,
+            max_lines: self.options.validation.max_lines,
         };
         if resume.validation_completed {
             if resume.finalized_segments.is_empty() {
@@ -441,8 +445,8 @@ where
             &document.segments,
             &output,
             &self.required_glossary,
-            &self.options.source_language,
-            &self.options.target_language,
+            &self.options.validation.source_language,
+            &self.options.validation.target_language,
             final_validation_policy,
         )?;
         if !issues.is_empty() {
@@ -458,11 +462,11 @@ where
             &document.segments,
             &output,
             &self.required_glossary,
-            &self.options.source_language,
-            &self.options.target_language,
+            &self.options.validation.source_language,
+            &self.options.validation.target_language,
             final_validation_policy,
         )?;
-        if self.options.use_cache {
+        if self.options.execution.use_cache {
             update_translation_memory(
                 &mut self.translation_memory,
                 &translation_memory_keys,
@@ -480,12 +484,18 @@ where
                 )?;
             }
         }
-        if let Some(store) = self.store.as_ref() {
-            self.cancellation.check()?;
-            store.save_batch_segments(BatchShardKind::Finalized, 1, &output)?;
-        }
         self.cancellation.check()?;
-        self.save_run_state(batches.len(), review_batches, true, usage)?;
+        self.commit_checkpoint(
+            batches.len(),
+            review_batches,
+            true,
+            usage,
+            vec![CheckpointShard {
+                kind: BatchShardKind::Finalized,
+                batch_index: 1,
+                segments: output.clone(),
+            }],
+        )?;
         self.report(
             "WRITE_OUTPUT",
             TaskState::Running,
@@ -497,13 +507,13 @@ where
 
         Ok(PipelineRun {
             result: PipelineResult {
-                output_path: self.options.output_path.clone(),
+                output_path: self.options.rendering.output_path.clone(),
                 batches_translated: batches.len(),
                 review_batches,
                 usage,
-                mode: self.options.mode,
+                mode: self.options.execution.mode,
                 deduplicated_segments: deduplication.duplicates(),
-                reviewer_fallback: self.options.review_policy != ReviewPolicy::Off
+                reviewer_fallback: self.options.execution.review_policy != ReviewPolicy::Off
                     && self.reviewer.is_none(),
                 dry_run: false,
                 planned_batches,
@@ -528,7 +538,6 @@ where
         let backend = self.reviewer.as_mut().unwrap_or(&mut self.backend);
         TerminologyStage {
             backend,
-            dashboard: &mut self.dashboard,
             options: &self.options,
             language_rules: &self.language_rules,
             memory: &mut self.memory,
@@ -607,7 +616,7 @@ where
             }
             return Ok(());
         }
-        if !self.options.online_terminology {
+        if !self.options.execution.online_terminology {
             return Ok(());
         }
         let mut canonical = self
@@ -636,7 +645,7 @@ where
                 &mut enforced,
                 &candidates,
                 &self.language_rules,
-                self.options.preserve_names,
+                self.options.validation.preserve_names,
             ) {
                 for (source, target) in &enforced {
                     self.required_glossary
@@ -662,7 +671,7 @@ where
                     &mut enforced,
                     &candidates,
                     &self.language_rules,
-                    self.options.preserve_names,
+                    self.options.validation.preserve_names,
                 )
                 .map_err(|retry_error| {
                     CoreError::InvalidTranslation(format!(
@@ -747,7 +756,7 @@ where
                 self.options.policy().compact_wire && self.backend.supports_compact_translation(),
             );
             let hash = request_hash(&self.options, CacheStage::Translate, &messages);
-            let cached = if self.options.use_cache {
+            let cached = if self.options.execution.use_cache {
                 self.store
                     .as_ref()
                     .map(|store| store.load_cached_response(CacheStage::Translate, &hash))
@@ -764,7 +773,7 @@ where
                 };
                 prepare_translation_result(
                     lightweight_name_alignment(&self.options),
-                    self.options.online_terminology,
+                    self.options.execution.online_terminology,
                     marker_candidates(&self.options, &self.memory),
                     batch,
                     &mut payload,
@@ -785,11 +794,11 @@ where
                 );
             } else {
                 let estimated = estimated_request_tokens(&messages, batch);
-                if estimated > self.options.request_token_budget {
+                if estimated > self.options.execution.request_token_budget {
                     if batch.len() == 1 {
                         return Err(CoreError::ResourceBudgetExceeded(format!(
                             "translation batch {batch_index} needs about {estimated} request tokens, exceeding the per-request limit of {}",
-                            self.options.request_token_budget
+                            self.options.execution.request_token_budget
                         )));
                     }
                     let split = split_index(batch);
@@ -839,7 +848,7 @@ where
                 let mut payload = parse_translation_payload(&json)?;
                 prepare_translation_result(
                     lightweight_name_alignment(&self.options),
-                    self.options.online_terminology,
+                    self.options.execution.online_terminology,
                     marker_candidates(&self.options, &self.memory),
                     &batch,
                     &mut payload,
@@ -857,7 +866,7 @@ where
                             glossary_updates: payload.glossary_updates,
                             terminology_updates: payload.terminology_updates,
                             usage: response_usage,
-                            cache_key: self.options.use_cache.then_some(hash),
+                            cache_key: self.options.execution.use_cache.then_some(hash),
                         },
                     );
                 }
@@ -916,7 +925,7 @@ where
         }
         let mut last_error = initial_error;
         let mut attempts = Vec::new();
-        for attempt in 1..=self.options.retries + 1 {
+        for attempt in 1..=self.options.execution.retries + 1 {
             self.cancellation.check()?;
             let mut messages = build_translation_messages_with_rules(
                 (&self.options, &self.language_rules),
@@ -931,7 +940,7 @@ where
                 messages.push(retry_correction_message(error));
             }
             let estimated = estimated_request_tokens(&messages, batch);
-            if estimated > self.options.request_token_budget {
+            if estimated > self.options.execution.request_token_budget {
                 if batch.len() > 1 {
                     return self.translate_split(
                         batch_index,
@@ -942,7 +951,7 @@ where
                 }
                 return Err(CoreError::ResourceBudgetExceeded(format!(
                     "translation batch {batch_index} needs about {estimated} request tokens, exceeding the per-request limit of {}",
-                    self.options.request_token_budget
+                    self.options.execution.request_token_budget
                 )));
             }
             let request_hash = request_hash(&self.options, CacheStage::Translate, &messages);
@@ -975,7 +984,7 @@ where
                         StructuralRecoveryStrategy::CorrectBeforeSplit
                     ) && record_failure
                         && attempt == 1
-                        && self.options.retries > 0;
+                        && self.options.execution.retries > 0;
                     if matches!(error, CoreError::InvalidTranslation(_))
                         && batch.len() > 1
                         && !correct_before_split
@@ -1016,7 +1025,7 @@ where
                     }
                     last_error = Some(error.clone());
                     attempts.push(attempt_log);
-                    if attempt == self.options.retries + 1 {
+                    if attempt == self.options.execution.retries + 1 {
                         if record_failure {
                             return self.finish_translation_failure(
                                 batch_index,
@@ -1043,7 +1052,7 @@ where
         messages: &[ChatMessage],
         request_hash: &str,
     ) -> CoreResult<BatchWithUsage> {
-        let cached_response = if self.options.use_cache {
+        let cached_response = if self.options.execution.use_cache {
             self.cancellation.check()?;
             self.store
                 .as_ref()
@@ -1074,7 +1083,7 @@ where
         };
         prepare_translation_result(
             lightweight_name_alignment(&self.options),
-            self.options.online_terminology,
+            self.options.execution.online_terminology,
             marker_candidates(&self.options, &self.memory),
             batch,
             result,
@@ -1096,7 +1105,8 @@ where
             } else {
                 backend_result.usage
             },
-            cache_key: (!cached && self.options.use_cache).then(|| request_hash.to_owned()),
+            cache_key: (!cached && self.options.execution.use_cache)
+                .then(|| request_hash.to_owned()),
         })
     }
 
@@ -1159,7 +1169,7 @@ where
         }
         let mut last_error = initial_error;
         let mut attempts = Vec::new();
-        for attempt in 1..=self.options.retries + 1 {
+        for attempt in 1..=self.options.execution.retries + 1 {
             self.cancellation.check()?;
             let mut messages = build_review_messages_with_rules(
                 &self.options,
@@ -1191,7 +1201,7 @@ where
                         split_retry: None,
                     });
                     last_error = Some(error.clone());
-                    if attempt == self.options.retries + 1 {
+                    if attempt == self.options.execution.retries + 1 {
                         return self.finish_review_failure(
                             batch_index,
                             batch,
@@ -1231,7 +1241,7 @@ where
                 &self.required_glossary,
             );
             let hash = request_hash(&self.options, CacheStage::Review, &messages);
-            let cached = if self.options.use_cache {
+            let cached = if self.options.execution.use_cache {
                 self.store
                     .as_ref()
                     .map(|store| store.load_cached_response(CacheStage::Review, &hash))
@@ -1271,12 +1281,12 @@ where
         let responses = match self.reviewer.as_mut() {
             Some(reviewer) => reviewer.execute_many(
                 requests,
-                BatchExecutionOptions::new(self.options.review_concurrency),
+                BatchExecutionOptions::new(self.options.execution.review_concurrency),
                 &self.cancellation,
             ),
             None => self.backend.execute_many(
                 requests,
-                BatchExecutionOptions::new(self.options.review_concurrency),
+                BatchExecutionOptions::new(self.options.execution.review_concurrency),
                 &self.cancellation,
             ),
         }
@@ -1292,8 +1302,10 @@ where
         for ((index, batch, hash, _), response) in pending.into_iter().zip(responses) {
             match response.map_err(CoreError::from).and_then(|response| {
                 let (json, usage) = response.into_json().map_err(CoreError::from)?;
-                let mut result =
-                    parse_review_payload(&json, self.options.review_policy == ReviewPolicy::Full)?;
+                let mut result = parse_review_payload(
+                    &json,
+                    self.options.execution.review_policy == ReviewPolicy::Full,
+                )?;
                 validate_review_candidate_ids(&batch, &result.lines)?;
                 result.lines = merge_review_patch(&batch.translated, &result.lines)?;
                 restore_batch_formatting(&batch.source, &mut result.lines);
@@ -1301,7 +1313,7 @@ where
                 Ok((result, usage))
             }) {
                 Ok((result, response_usage)) => {
-                    if self.options.use_cache
+                    if self.options.execution.use_cache
                         && let Some(store) = self.store.as_ref()
                     {
                         store.save_cached_response(
@@ -1337,7 +1349,7 @@ where
         request_hash: &str,
     ) -> CoreResult<ReviewWithUsage> {
         self.cancellation.check()?;
-        let cached_response = if self.options.use_cache {
+        let cached_response = if self.options.execution.use_cache {
             self.store
                 .as_ref()
                 .map(|store| store.load_cached_response(CacheStage::Review, request_hash))
@@ -1356,7 +1368,7 @@ where
                 let (payload, usage) = self.execute_review_json(messages)?;
                 let mut review = parse_review_payload(
                     &payload,
-                    self.options.review_policy == ReviewPolicy::Full,
+                    self.options.execution.review_policy == ReviewPolicy::Full,
                 )?;
                 validate_review_candidate_ids(batch, &review.lines)?;
                 review.lines = merge_review_patch(&batch.translated, &review.lines)?;
@@ -1373,7 +1385,7 @@ where
         };
         restore_batch_formatting(&batch.source, &mut result.lines);
         validate_translation_batch(&batch.source, &result.lines)?;
-        if self.options.use_cache
+        if self.options.execution.use_cache
             && !cached
             && let Some(store) = self.store.as_ref()
         {
@@ -1559,8 +1571,8 @@ where
             &document.segments,
             output,
             &self.required_glossary,
-            &self.options.source_language,
-            &self.options.target_language,
+            &self.options.validation.source_language,
+            &self.options.validation.target_language,
             policy,
         )
     }
@@ -1574,8 +1586,8 @@ where
         initial_error: &CoreError,
         failed_attempts: &[AttemptLog],
     ) -> CoreResult<Option<RepairOutcome>> {
-        if !self.options.agent
-            || self.options.agent_repair_attempts == 0
+        if !self.options.execution.agent
+            || self.options.execution.agent_repair_attempts == 0
             || !is_agent_repairable(initial_error)
         {
             return Ok(None);
@@ -1590,19 +1602,19 @@ where
         let mut attempts = Vec::new();
         let mut total_usage = Usage::default();
         let mut log_path = None;
-        for attempt in 1..=self.options.agent_repair_attempts {
+        for attempt in 1..=self.options.execution.agent_repair_attempts {
             self.cancellation.check()?;
             let messages = build_agent_repair_messages(
                 stage,
                 source,
                 translated,
-                &self.options.target_language,
+                &self.options.validation.target_language,
                 &repair_error,
                 failed_attempts,
                 &attempts,
             );
             let request_hash = request_hash(&self.options, cache_stage, &messages);
-            let cached_response = if self.options.use_cache {
+            let cached_response = if self.options.execution.use_cache {
                 self.store
                     .as_ref()
                     .map(|store| store.load_cached_response(cache_stage, &request_hash))
@@ -1638,7 +1650,7 @@ where
                     BackendPayload::Translation(result) => {
                         prepare_translation_result(
                             lightweight_name_alignment(&self.options),
-                            self.options.online_terminology,
+                            self.options.execution.online_terminology,
                             marker_candidates(&self.options, &self.memory),
                             source,
                             result,
@@ -1674,16 +1686,22 @@ where
                         source,
                         &repaired,
                         &self.required_glossary,
-                        &self.options.source_language,
-                        &self.options.target_language,
+                        &self.options.validation.source_language,
+                        &self.options.validation.target_language,
                         FinalValidationPolicy {
-                            max_characters_per_second: self.options.max_characters_per_second,
-                            max_characters_per_line: self.options.max_characters_per_line,
-                            max_lines: self.options.max_lines,
+                            max_characters_per_second: self
+                                .options
+                                .validation
+                                .max_characters_per_second,
+                            max_characters_per_line: self
+                                .options
+                                .validation
+                                .max_characters_per_line,
+                            max_lines: self.options.validation.max_lines,
                         },
                     )?;
                 }
-                if self.options.use_cache
+                if self.options.execution.use_cache
                     && !cached
                     && let Some(store) = self.store.as_ref()
                 {
@@ -1810,6 +1828,29 @@ where
             usage,
         )
     }
+
+    fn commit_checkpoint(
+        &self,
+        translation_batches_completed: usize,
+        review_batches_completed: usize,
+        validation_completed: bool,
+        usage: Usage,
+        shards: Vec<CheckpointShard>,
+    ) -> CoreResult<()> {
+        PipelinePersistence {
+            options: &self.options,
+            store: self.store.as_deref(),
+            input_signature: self.input_signature.as_ref(),
+        }
+        .commit_checkpoint(
+            &self.memory,
+            translation_batches_completed,
+            review_batches_completed,
+            validation_completed,
+            usage,
+            shards,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1860,8 +1901,8 @@ fn prepare_translation_result(
 
 fn lightweight_name_alignment(options: &PipelineOptions) -> bool {
     options.policy().terminology_strategy == TerminologyStrategy::LightweightNames
-        && !options.online_terminology
-        && !options.preserve_names
+        && !options.execution.online_terminology
+        && !options.validation.preserve_names
 }
 
 fn marker_candidates<'a>(options: &PipelineOptions, memory: &'a ContextMemory) -> &'a [String] {
@@ -1929,7 +1970,7 @@ mod tests {
 
     use crate::entities::{BatchTranslationResult, GlossaryEntry, TerminologyKind};
     use crate::error::LlmCallError;
-    use crate::ports::{GenerationInput, GenerationResponse, NoopDashboard};
+    use crate::ports::{GenerationInput, GenerationResponse};
     use crate::review::build_review_plan;
     use crate::storage::{RunState, RuntimePaths, build_runtime_paths, input_signature_from_bytes};
 
@@ -1945,6 +1986,15 @@ mod tests {
     }
 
     struct EchoBackend;
+
+    #[derive(Clone)]
+    struct RecordingProgress(Arc<Mutex<Vec<ProgressEvent>>>);
+
+    impl ProgressSink for RecordingProgress {
+        fn emit(&self, event: ProgressEvent) {
+            self.0.lock().expect("progress lock").push(event);
+        }
+    }
 
     impl LlmBackend for EchoBackend {
         fn provider_name(&self) -> &str {
@@ -2032,9 +2082,9 @@ mod tests {
     #[test]
     fn translation_requests_disable_provider_reasoning() {
         let mut options = PipelineOptions::new(PathBuf::from("reasoning.srt"));
-        options.terminology_preflight = false;
-        options.agent = false;
-        let mut pipeline = SubtitlePipeline::new(NonThinkingBackend, NoopDashboard, options);
+        options.execution.terminology_preflight = false;
+        options.execution.agent = false;
+        let mut pipeline = SubtitlePipeline::new(NonThinkingBackend, options);
 
         pipeline
             .run_document(&document("reasoning.srt", &["hello"]))
@@ -2044,10 +2094,10 @@ mod tests {
     #[test]
     fn request_budget_stops_before_starting_a_provider_side_effect() {
         let mut options = PipelineOptions::new(PathBuf::from("budget.srt"));
-        options.terminology_preflight = false;
-        options.agent = false;
-        options.max_requests = Some(0);
-        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        options.execution.terminology_preflight = false;
+        options.execution.agent = false;
+        options.execution.max_requests = Some(0);
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
         let error = pipeline
             .run_document(&document("budget.srt", &["hello"]))
             .expect_err("zero request budget must stop before generation");
@@ -3037,9 +3087,9 @@ mod tests {
     #[test]
     fn parallel_backend_response_count_must_match_request_count() {
         let mut options = PipelineOptions::new("clip.txt".into());
-        options.translation_concurrency = 2;
-        options.batch_size = 1;
-        let mut pipeline = SubtitlePipeline::new(ShortParallelBackend, NoopDashboard, options);
+        options.execution.translation_concurrency = 2;
+        options.execution.batch_size = 1;
+        let mut pipeline = SubtitlePipeline::new(ShortParallelBackend, options);
 
         let error = pipeline
             .run_document(&document("clip.txt", &["one", "two"]))
@@ -3056,17 +3106,16 @@ mod tests {
         let limits = Arc::new(Mutex::new(Vec::new()));
         let single_retries = Arc::new(AtomicUsize::new(0));
         let mut options = PipelineOptions::new("adaptive.txt".into());
-        options.batch_size = 1;
-        options.translation_concurrency = 8;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 8;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let mut pipeline = SubtitlePipeline::new(
             AdaptiveParallelBackend {
                 limits: Arc::clone(&limits),
                 batch_calls: 0,
                 single_retries: Arc::clone(&single_retries),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3101,8 +3150,8 @@ mod tests {
             metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("clip.txt".into());
-        options.batch_size = 1;
-        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        options.execution.batch_size = 1;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
         let run = pipeline.run_document(&document).expect("run");
 
         assert_eq!(run.result.batches_translated, 1);
@@ -3110,18 +3159,39 @@ mod tests {
     }
 
     #[test]
+    fn typed_progress_events_cover_translation_completion_and_usage() {
+        let document = document("clip.txt", &["hello"]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let pipeline_progress = RecordingProgress(events.clone());
+        let mut options = PipelineOptions::new("clip.txt".into());
+        options.execution.batch_size = 1;
+        let mut pipeline =
+            SubtitlePipeline::new(EchoBackend, options).with_progress(Box::new(pipeline_progress));
+
+        let run = pipeline.run_document(&document).expect("run");
+        let events = events.lock().expect("progress lock");
+
+        assert!(events.iter().any(|event| {
+            event.stage == "TRANSLATE"
+                && event.state == TaskState::Completed
+                && event.current == 1
+                && event.total == Some(1)
+                && event.usage == run.result.usage
+        }));
+    }
+
+    #[test]
     fn turbo_pipeline_reconciles_lightweight_names_in_subtitle_order() {
         let mut options = PipelineOptions::new("names.txt".into());
-        options.batch_size = 1;
-        options.translation_concurrency = 2;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 2;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
             NameMarkerBackend {
                 calls: Arc::clone(&calls),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3155,7 +3225,7 @@ mod tests {
             metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("clip.txt".into());
-        options.batch_size = 1;
+        options.execution.batch_size = 1;
 
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -3171,8 +3241,7 @@ mod tests {
             data: Arc::clone(&captured),
         };
 
-        let mut pipeline =
-            SubtitlePipeline::new(EchoBackend, NoopDashboard, options).with_store(Box::new(store));
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options).with_store(Box::new(store));
         let run = pipeline.run_document(&document).expect("run");
 
         assert_eq!(run.translated_segments[0].text, "[ECHO] hello");
@@ -3188,7 +3257,7 @@ mod tests {
     fn pipeline_run_state_fingerprints_the_frozen_document_guide() {
         let document = document("resume-glossary.txt", &["hello"]);
         let mut options = PipelineOptions::new("resume-glossary.txt".into());
-        options.terminology_preflight = false;
+        options.execution.terminology_preflight = false;
         let signature = input_signature_from_bytes(b"hello\n", Some(123));
         let loaded_glossary = vec![("Lord".to_owned(), "勋爵".to_owned())];
         let captured = Arc::new(Mutex::new(CapturedStoreData {
@@ -3207,7 +3276,7 @@ mod tests {
             ),
             data: Arc::clone(&captured),
         };
-        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options.clone())
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options.clone())
             .with_store(Box::new(store))
             .with_input_signature(signature.clone());
 
@@ -3231,7 +3300,7 @@ mod tests {
         let mut expected_options = options;
         let mut expected_memory = ContextMemory::new();
         expected_memory.glossary = loaded_glossary.into_iter().collect();
-        expected_options.document_guide_fingerprint =
+        expected_options.identity.document_guide_fingerprint =
             Some(build_document_guide_fingerprint(&expected_memory));
         let expected = crate::storage::build_translation_fingerprint(&expected_options, &signature);
         assert_eq!(state.translation_fingerprint, expected);
@@ -3239,7 +3308,7 @@ mod tests {
         expected_memory.glossary = [("Lord".to_owned(), "领主".to_owned())]
             .into_iter()
             .collect();
-        expected_options.document_guide_fingerprint =
+        expected_options.identity.document_guide_fingerprint =
             Some(build_document_guide_fingerprint(&expected_memory));
         let changed = crate::storage::build_translation_fingerprint(&expected_options, &signature);
         assert!(state.resume_snapshot(&changed).is_none());
@@ -3249,8 +3318,8 @@ mod tests {
     fn contextual_translation_memory_is_scoped_and_ignores_legacy_keys() {
         let source = document("/shows/one/clip.txt", &["Fine."]);
         let mut same_scope_options = PipelineOptions::new("/shows/one/clip.txt".into());
-        same_scope_options.resume = false;
-        same_scope_options.document_guide_fingerprint =
+        same_scope_options.execution.resume = false;
+        same_scope_options.identity.document_guide_fingerprint =
             Some(build_document_guide_fingerprint(&ContextMemory::new()));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&same_scope_options),
@@ -3282,7 +3351,6 @@ mod tests {
                 calls: Arc::clone(&same_scope_calls),
                 fail_on_call: Some(1),
             },
-            NoopDashboard,
             same_scope_options,
         )
         .with_store(Box::new(store.clone()));
@@ -3295,14 +3363,13 @@ mod tests {
 
         let other_source = document("/shows/two/clip.txt", &["Fine."]);
         let mut other_scope_options = PipelineOptions::new("/shows/two/clip.txt".into());
-        other_scope_options.resume = false;
+        other_scope_options.execution.resume = false;
         let other_scope_calls = Arc::new(AtomicUsize::new(0));
         let mut other_scope = SubtitlePipeline::new(
             CountingBackend {
                 calls: Arc::clone(&other_scope_calls),
                 fail_on_call: None,
             },
-            NoopDashboard,
             other_scope_options,
         )
         .with_store(Box::new(store));
@@ -3320,14 +3387,15 @@ mod tests {
     fn changed_required_glossary_invalidates_translation_memory_before_lookup() {
         let source = document("/shows/one/terms.txt", &["The Lord is here."]);
         let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
-        options.glossary_path = Some("glossary.json".into());
-        options.resume = false;
-        options.agent = false;
+        options.identity.glossary_path = Some("glossary.json".into());
+        options.execution.resume = false;
+        options.execution.agent = false;
         let mut key_memory = ContextMemory::new();
         key_memory
             .glossary
             .insert("Lord".to_owned(), "领主".to_owned());
-        options.document_guide_fingerprint = Some(build_document_guide_fingerprint(&key_memory));
+        options.identity.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&key_memory));
         let key = contextual_translation_memory_keys(
             &translation_memory_scope(&options),
             &source.segments,
@@ -3350,8 +3418,8 @@ mod tests {
             ),
             data: captured,
         };
-        let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, NoopDashboard, options)
-            .with_store(Box::new(store));
+        let mut pipeline =
+            SubtitlePipeline::new(GlossaryRegressionBackend, options).with_store(Box::new(store));
 
         let run = pipeline
             .run_document(&source)
@@ -3381,12 +3449,12 @@ mod tests {
             data: Arc::clone(&captured),
         };
         let mut options = PipelineOptions::new("review-terms.txt".into());
-        options.glossary_path = Some("glossary.json".into());
-        options.review_policy = ReviewPolicy::Full;
-        options.terminology_preflight = false;
-        options.resume = false;
-        options.use_cache = false;
-        let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, NoopDashboard, options)
+        options.identity.glossary_path = Some("glossary.json".into());
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.execution.terminology_preflight = false;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(GlossaryRegressionBackend, options)
             .with_store(Box::new(store))
             .with_input_signature(input_signature_from_bytes(b"The Lord is here.\n", Some(1)));
 
@@ -3429,8 +3497,8 @@ mod tests {
             metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("resume.txt".into());
-        options.batch_size = 1;
-        options.retries = 0;
+        options.execution.batch_size = 1;
+        options.execution.retries = 0;
         let signature = input_signature_from_bytes(b"one\ntwo\nthree\n", Some(1));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -3451,7 +3519,6 @@ mod tests {
                 calls: Arc::clone(&first_calls),
                 fail_on_call: Some(2),
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(store.clone()))
@@ -3478,7 +3545,6 @@ mod tests {
                 calls: Arc::clone(&resumed_calls),
                 fail_on_call: None,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store))
@@ -3516,8 +3582,8 @@ mod tests {
             metadata: Default::default(),
         };
         let mut options = PipelineOptions::new("cache.txt".into());
-        options.batch_size = 1;
-        options.resume = false;
+        options.execution.batch_size = 1;
+        options.execution.resume = false;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -3538,7 +3604,6 @@ mod tests {
                 calls: Arc::clone(&first_calls),
                 fail_on_call: None,
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(store.clone()));
@@ -3553,7 +3618,6 @@ mod tests {
                 calls: Arc::clone(&second_calls),
                 fail_on_call: Some(1),
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -3569,15 +3633,14 @@ mod tests {
     fn pipeline_does_not_duplicate_adapter_level_llm_retries() {
         let document = document("retry.txt", &["hello"]);
         let mut options = PipelineOptions::new("retry.txt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 1;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 1;
         let calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
             CountingBackend {
                 calls: Arc::clone(&calls),
                 fail_on_call: Some(1),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3596,16 +3659,15 @@ mod tests {
     fn structural_failures_recursively_split_translation_batch() {
         let document = document("split.txt", &["one", "two", "three", "four"]);
         let mut options = PipelineOptions::new("split.txt".into());
-        options.batch_size = 8;
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 0;
-        options.agent = false;
+        options.execution.batch_size = 8;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 0;
+        options.execution.agent = false;
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             StructuralFailureBackend {
                 call_sizes: Arc::clone(&call_sizes),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3626,18 +3688,17 @@ mod tests {
     fn economy_retries_one_corrected_large_batch_then_splits_structural_failure() {
         let document = document("economy-split.txt", &["one", "two", "three", "four"]);
         let mut options = PipelineOptions::new("economy-split.txt".into());
-        options.mode = crate::entities::TranslationMode::Economy;
-        options.batch_size = 8;
-        options.batch_token_budget = 10_000;
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 1;
-        options.agent = false;
+        options.execution.mode = crate::entities::TranslationMode::Economy;
+        options.execution.batch_size = 8;
+        options.execution.batch_token_budget = 10_000;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 1;
+        options.execution.agent = false;
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             StructuralFailureBackend {
                 call_sizes: Arc::clone(&call_sizes),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3663,11 +3724,11 @@ mod tests {
         let source = source.iter().map(String::as_str).collect::<Vec<_>>();
         let document = document("request-budget.txt", &source);
         let mut options = PipelineOptions::new("request-budget.txt".into());
-        options.mode = crate::entities::TranslationMode::Economy;
-        options.batch_size = 8;
-        options.batch_token_budget = 10_000;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.mode = crate::entities::TranslationMode::Economy;
+        options.execution.batch_size = 8;
+        options.execution.batch_token_budget = 10_000;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let full_messages = build_translation_messages(
             &options,
             1,
@@ -3689,13 +3750,12 @@ mod tests {
         let full_estimate = estimated_request_tokens(&full_messages, &document.segments);
         let one_estimate = estimated_request_tokens(&one_messages, &document.segments[..1]);
         assert!(full_estimate > one_estimate);
-        options.request_token_budget = one_estimate.saturating_add(32);
+        options.execution.request_token_budget = one_estimate.saturating_add(32);
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             BatchSizeCaptureBackend {
                 call_sizes: Arc::clone(&call_sizes),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3713,8 +3773,8 @@ mod tests {
     fn agent_repair_continues_pipeline_and_records_log() {
         let document = document("agent.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent.txt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 0;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 0;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -3736,7 +3796,6 @@ mod tests {
                 repair_calls: Arc::clone(&repair_calls),
                 repair_succeeds: true,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -3760,10 +3819,10 @@ mod tests {
             &["The repair costs 12 dollars.", "There is no number here."],
         );
         let mut options = PipelineOptions::new("final-repair.srt".into());
-        options.batch_size = 8;
-        options.review_policy = ReviewPolicy::Off;
-        options.terminology_preflight = false;
-        options.online_terminology = false;
+        options.execution.batch_size = 8;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.terminology_preflight = false;
+        options.execution.online_terminology = false;
         let signature = input_signature_from_bytes(b"final repair\n", Some(7));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let paths = build_runtime_paths(
@@ -3780,7 +3839,6 @@ mod tests {
             FinalValidationRepairBackend {
                 repair_ids: Arc::clone(&repair_ids),
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(CapturedStore {
@@ -3819,7 +3877,6 @@ mod tests {
             FinalValidationRepairBackend {
                 repair_ids: Arc::clone(&resumed_repair_ids),
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(CapturedStore {
@@ -3839,15 +3896,14 @@ mod tests {
     fn ambiguous_cjk_number_glyphs_publish_without_final_validation_repair() {
         let document = document("ambiguous-cjk.srt", &["Look at all this crazy stuff."]);
         let mut options = PipelineOptions::new("ambiguous-cjk.srt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.terminology_preflight = false;
-        options.online_terminology = false;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.terminology_preflight = false;
+        options.execution.online_terminology = false;
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
             AmbiguousCjkOutputBackend {
                 repair_calls: Arc::clone(&repair_calls),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3864,15 +3920,14 @@ mod tests {
     fn agent_repair_reports_missing_log_path_without_a_runtime_store() {
         let document = document("agent-no-store.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-no-store.txt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 0;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 0;
         let mut pipeline = SubtitlePipeline::new(
             AgentRepairBackend {
                 regular_calls: Arc::new(AtomicUsize::new(0)),
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: true,
             },
-            NoopDashboard,
             options,
         );
 
@@ -3885,9 +3940,9 @@ mod tests {
     fn agent_repair_cache_bypasses_second_repair_call() {
         let document = document("agent-cache.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-cache.txt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 0;
-        options.resume = false;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 0;
+        options.execution.resume = false;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -3907,7 +3962,6 @@ mod tests {
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: true,
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(store.clone()));
@@ -3920,7 +3974,6 @@ mod tests {
                 repair_calls: Arc::clone(&repair_calls),
                 repair_succeeds: false,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -3935,9 +3988,9 @@ mod tests {
     fn agent_can_repair_review_validation_failure() {
         let document = document("review-agent.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-agent.txt".into());
-        options.batch_size = 1;
-        options.retries = 0;
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.batch_size = 1;
+        options.execution.retries = 0;
+        options.execution.review_policy = ReviewPolicy::Full;
         let review_calls = Arc::new(AtomicUsize::new(0));
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -3945,7 +3998,6 @@ mod tests {
                 review_calls: Arc::clone(&review_calls),
                 repair_calls: Arc::clone(&repair_calls),
             },
-            NoopDashboard,
             options,
         );
 
@@ -3965,9 +4017,9 @@ mod tests {
     fn failed_agent_repair_persists_failure_and_attempts() {
         let document = document("agent-fail.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-fail.txt".into());
-        options.review_policy = ReviewPolicy::Off;
-        options.retries = 0;
-        options.agent_repair_attempts = 2;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.retries = 0;
+        options.execution.agent_repair_attempts = 2;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -3987,7 +4039,6 @@ mod tests {
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: false,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -4518,17 +4569,16 @@ mod tests {
             vec!["Alice".to_owned(), "Bob".to_owned()]
         );
         let mut options = PipelineOptions::new("terms.txt".into());
-        options.batch_size = 1;
-        options.resume = false;
-        options.mode = crate::entities::TranslationMode::Cinema;
-        options.terminology_preflight = true;
+        options.execution.batch_size = 1;
+        options.execution.resume = false;
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.terminology_preflight = true;
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             PreflightBackend {
                 contexts: Arc::clone(&contexts),
                 preflight_requests: Arc::new(AtomicUsize::new(0)),
             },
-            NoopDashboard,
             options,
         );
 
@@ -4553,11 +4603,11 @@ mod tests {
     fn explicit_turbo_terminology_preflight_runs_before_translation() {
         let document = document("terms.txt", &["Meet Alice now.", "Alice returned."]);
         let mut options = PipelineOptions::new("terms.txt".into());
-        options.batch_size = 1;
-        options.resume = false;
-        options.mode = crate::entities::TranslationMode::Turbo;
-        options.terminology_preflight = true;
-        options.preserve_names = true;
+        options.execution.batch_size = 1;
+        options.execution.resume = false;
+        options.execution.mode = crate::entities::TranslationMode::Turbo;
+        options.execution.terminology_preflight = true;
+        options.validation.preserve_names = true;
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let preflight_requests = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -4565,7 +4615,6 @@ mod tests {
                 contexts: Arc::clone(&contexts),
                 preflight_requests: Arc::clone(&preflight_requests),
             },
-            NoopDashboard,
             options,
         );
 
@@ -4586,18 +4635,17 @@ mod tests {
     fn terminology_preflight_consumes_the_shared_request_budget() {
         let document = document("terms.txt", &["Meet Alice now.", "Alice returned."]);
         let mut options = PipelineOptions::new("terms.txt".into());
-        options.resume = false;
-        options.mode = crate::entities::TranslationMode::Cinema;
-        options.terminology_preflight = true;
-        options.preserve_names = true;
-        options.max_requests = Some(1);
+        options.execution.resume = false;
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.terminology_preflight = true;
+        options.validation.preserve_names = true;
+        options.execution.max_requests = Some(1);
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             PreflightBackend {
                 contexts: Arc::clone(&contexts),
                 preflight_requests: Arc::new(AtomicUsize::new(0)),
             },
-            NoopDashboard,
             options,
         );
 
@@ -4613,12 +4661,12 @@ mod tests {
     fn cinema_preflight_runs_for_non_latin_documents_without_heuristic_candidates() {
         let document = document("terms.txt", &["量子航行系统启动。", "推进器正常。"]);
         let mut options = PipelineOptions::new("terms.txt".into());
-        options.resume = false;
-        options.mode = crate::entities::TranslationMode::Cinema;
-        options.terminology_preflight = true;
-        options.preserve_names = true;
-        options.source_language = "zh-Hans".to_owned();
-        options.target_language = "zh-Hans".to_owned();
+        options.execution.resume = false;
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.terminology_preflight = true;
+        options.validation.preserve_names = true;
+        options.validation.source_language = "zh-Hans".to_owned();
+        options.validation.target_language = "zh-Hans".to_owned();
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let preflight_requests = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -4626,7 +4674,6 @@ mod tests {
                 contexts,
                 preflight_requests: Arc::clone(&preflight_requests),
             },
-            NoopDashboard,
             options,
         );
 
@@ -4639,12 +4686,12 @@ mod tests {
     #[test]
     fn cinema_strict_preflight_rejects_unsupported_backend_before_translation() {
         let mut options = PipelineOptions::new("strict-preflight.txt".into());
-        options.mode = crate::entities::TranslationMode::Cinema;
-        options.terminology_preflight = true;
-        options.allow_degraded_preflight = false;
-        options.resume = false;
-        options.use_cache = false;
-        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        options.execution.mode = crate::entities::TranslationMode::Cinema;
+        options.execution.terminology_preflight = true;
+        options.execution.allow_degraded_preflight = false;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
 
         let error = pipeline
             .run_document(&document("strict-preflight.txt", &["hello"]))
@@ -4656,9 +4703,9 @@ mod tests {
     #[test]
     fn turbo_reconciles_parallel_terminology_in_subtitle_order() {
         let mut options = PipelineOptions::new("terms.srt".into());
-        options.mode = crate::entities::TranslationMode::Turbo;
-        options.online_terminology = true;
-        let mut pipeline = SubtitlePipeline::new(EchoBackend, NoopDashboard, options);
+        options.execution.mode = crate::entities::TranslationMode::Turbo;
+        options.execution.online_terminology = true;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
         let prepared = vec![
             translation_stage::PreparedBatch {
                 index: 0,
@@ -4726,13 +4773,12 @@ mod tests {
     fn unsafe_terminology_conflict_retries_only_that_batch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut options = PipelineOptions::new("terms.srt".into());
-        options.online_terminology = true;
-        options.use_cache = false;
+        options.execution.online_terminology = true;
+        options.execution.use_cache = false;
         let mut pipeline = SubtitlePipeline::new(
             CorrectedTerminologyBackend {
                 calls: Arc::clone(&calls),
             },
-            NoopDashboard,
             options,
         );
         pipeline
@@ -4800,9 +4846,9 @@ mod tests {
     fn pipeline_reviews_high_risk_batches_and_replaces_output() {
         let document = document("review.txt", &[REVIEW_CANDIDATE_A, "move now."]);
         let mut options = PipelineOptions::new("review.txt".into());
-        options.batch_size = 2;
-        options.resume = false;
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.batch_size = 2;
+        options.execution.resume = false;
+        options.execution.review_policy = ReviewPolicy::Full;
         let translation_calls = Arc::new(AtomicUsize::new(0));
         let review_calls = Arc::new(AtomicUsize::new(0));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
@@ -4824,7 +4870,6 @@ mod tests {
                 review_calls: Arc::clone(&review_calls),
                 fail_on_review_call: None,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -4865,13 +4910,13 @@ mod tests {
         document.segments[1].start = Some("00:00:03,000".to_owned());
         document.segments[1].end = Some("00:00:04,000".to_owned());
         let mut options = PipelineOptions::new("review-scenes.txt".into());
-        options.mode = crate::TranslationMode::Cinema;
-        options.batch_size = 10;
-        options.batch_token_budget = 1_000;
-        options.terminology_preflight = false;
-        options.review_policy = ReviewPolicy::Full;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.mode = crate::TranslationMode::Cinema;
+        options.execution.batch_size = 10;
+        options.execution.batch_token_budget = 1_000;
+        options.execution.terminology_preflight = false;
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let translation_calls = Arc::new(AtomicUsize::new(0));
         let review_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -4880,7 +4925,6 @@ mod tests {
                 review_calls: Arc::clone(&review_calls),
                 fail_on_review_call: None,
             },
-            NoopDashboard,
             options,
         );
 
@@ -4899,13 +4943,13 @@ mod tests {
             &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
         );
         let mut options = PipelineOptions::new("parallel-review.txt".into());
-        options.batch_size = 1;
-        options.translation_concurrency = 2;
-        options.review_concurrency = 2;
-        options.terminology_preflight = false;
-        options.review_policy = ReviewPolicy::Full;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 2;
+        options.execution.review_concurrency = 2;
+        options.execution.terminology_preflight = false;
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let translator_translation_calls = Arc::new(AtomicUsize::new(0));
         let translator_review_calls = Arc::new(AtomicUsize::new(0));
         let reviewer_translation_calls = Arc::new(AtomicUsize::new(0));
@@ -4916,7 +4960,6 @@ mod tests {
                 translation_calls: Arc::clone(&translator_translation_calls),
                 review_calls: Arc::clone(&translator_review_calls),
             },
-            NoopDashboard,
             options,
         )
         .with_reviewer(RoutedParallelBackend {
@@ -4947,17 +4990,16 @@ mod tests {
         );
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut options = PipelineOptions::new("parallel-context.txt".into());
-        options.batch_size = 1;
-        options.translation_concurrency = 2;
-        options.terminology_preflight = false;
-        options.preserve_names = true;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 2;
+        options.execution.terminology_preflight = false;
+        options.validation.preserve_names = true;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let mut pipeline = SubtitlePipeline::new(
             ContextCaptureBackend {
                 contexts: Arc::clone(&contexts),
             },
-            NoopDashboard,
             options,
         );
 
@@ -5009,18 +5051,17 @@ mod tests {
         }
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut options = PipelineOptions::new("cinema-retrieval.srt".into());
-        options.mode = crate::TranslationMode::Cinema;
-        options.batch_size = 1;
-        options.translation_concurrency = 1;
-        options.terminology_preflight = false;
-        options.review_policy = ReviewPolicy::Off;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.mode = crate::TranslationMode::Cinema;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 1;
+        options.execution.terminology_preflight = false;
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let mut pipeline = SubtitlePipeline::new(
             ContextCaptureBackend {
                 contexts: Arc::clone(&contexts),
             },
-            NoopDashboard,
             options,
         );
 
@@ -5042,12 +5083,12 @@ mod tests {
     fn composed_translation_uses_initial_confirmed_context_for_its_first_window() {
         let contexts = Arc::new(Mutex::new(Vec::new()));
         let mut options = PipelineOptions::new("next-chunk.txt".into());
-        options.batch_size = 1;
-        options.terminology_preflight = false;
-        options.preserve_names = true;
-        options.resume = false;
-        options.use_cache = false;
-        options.initial_confirmed_context = vec![crate::ConfirmedTranslationContext {
+        options.execution.batch_size = 1;
+        options.execution.terminology_preflight = false;
+        options.validation.preserve_names = true;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
+        options.execution.initial_confirmed_context = vec![crate::ConfirmedTranslationContext {
             id: "previous".to_owned(),
             source: "Previous line.".to_owned(),
             translation: "上一句。".to_owned(),
@@ -5056,7 +5097,6 @@ mod tests {
             ContextCaptureBackend {
                 contexts: Arc::clone(&contexts),
             },
-            NoopDashboard,
             options,
         );
 
@@ -5079,13 +5119,13 @@ mod tests {
             &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
         );
         let mut options = PipelineOptions::new("parallel-self-review.txt".into());
-        options.batch_size = 1;
-        options.translation_concurrency = 2;
-        options.review_concurrency = 2;
-        options.terminology_preflight = false;
-        options.review_policy = ReviewPolicy::Full;
-        options.resume = false;
-        options.use_cache = false;
+        options.execution.batch_size = 1;
+        options.execution.translation_concurrency = 2;
+        options.execution.review_concurrency = 2;
+        options.execution.terminology_preflight = false;
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.execution.resume = false;
+        options.execution.use_cache = false;
         let translation_calls = Arc::new(AtomicUsize::new(0));
         let review_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
@@ -5094,7 +5134,6 @@ mod tests {
                 translation_calls: Arc::clone(&translation_calls),
                 review_calls: Arc::clone(&review_calls),
             },
-            NoopDashboard,
             options,
         );
 
@@ -5113,9 +5152,9 @@ mod tests {
     fn full_review_records_zero_changes_for_an_empty_patch() {
         let document = document("review-zero.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-zero.txt".into());
-        options.review_policy = ReviewPolicy::Full;
-        options.resume = false;
-        let mut pipeline = SubtitlePipeline::new(NoChangeReviewBackend, NoopDashboard, options);
+        options.execution.review_policy = ReviewPolicy::Full;
+        options.execution.resume = false;
+        let mut pipeline = SubtitlePipeline::new(NoChangeReviewBackend, options);
 
         let run = pipeline.run_document(&document).expect("reviewed run");
 
@@ -5136,9 +5175,9 @@ mod tests {
             &[REVIEW_CANDIDATE_A, REVIEW_CANDIDATE_B],
         );
         let mut options = PipelineOptions::new("review-resume.txt".into());
-        options.batch_size = 1;
-        options.retries = 0;
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.batch_size = 1;
+        options.execution.retries = 0;
+        options.execution.review_policy = ReviewPolicy::Full;
         let signature = input_signature_from_bytes(b"Meet Alice now.\nMeet Bob now.\n", Some(1));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
@@ -5160,7 +5199,6 @@ mod tests {
                 review_calls: Arc::clone(&first_review_calls),
                 fail_on_review_call: Some(2),
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(store.clone()))
@@ -5189,7 +5227,6 @@ mod tests {
                 review_calls: Arc::clone(&resumed_review_calls),
                 fail_on_review_call: None,
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store))
@@ -5222,9 +5259,9 @@ mod tests {
     fn pipeline_reuses_review_request_cache() {
         let document = document("review-cache.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-cache.txt".into());
-        options.batch_size = 1;
-        options.resume = false;
-        options.review_policy = ReviewPolicy::Full;
+        options.execution.batch_size = 1;
+        options.execution.resume = false;
+        options.execution.review_policy = ReviewPolicy::Full;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -5244,7 +5281,6 @@ mod tests {
                 review_calls: Arc::new(AtomicUsize::new(0)),
                 fail_on_review_call: None,
             },
-            NoopDashboard,
             options.clone(),
         )
         .with_store(Box::new(store.clone()));
@@ -5258,7 +5294,6 @@ mod tests {
                 review_calls: Arc::clone(&review_calls),
                 fail_on_review_call: Some(1),
             },
-            NoopDashboard,
             options,
         )
         .with_store(Box::new(store));
@@ -5335,7 +5370,7 @@ mod tests {
         data: Arc<Mutex<CapturedStoreData>>,
     }
 
-    impl RuntimeStore for CapturedStore {
+    impl crate::ports::RuntimeLayoutStore for CapturedStore {
         fn paths(&self) -> &RuntimePaths {
             &self.paths
         }
@@ -5343,7 +5378,9 @@ mod tests {
         fn ensure_layout(&self) -> CoreResult<()> {
             Ok(())
         }
+    }
 
+    impl crate::ports::RuntimeMemoryStore for CapturedStore {
         fn save_glossary(&self, _entries: &[(String, String)]) -> CoreResult<()> {
             Ok(())
         }
@@ -5391,7 +5428,9 @@ mod tests {
                 .last()
                 .cloned())
         }
+    }
 
+    impl crate::ports::RuntimeCheckpointStore for CapturedStore {
         fn save_batch_segments(
             &self,
             kind: BatchShardKind,
@@ -5439,7 +5478,9 @@ mod tests {
         fn load_run_state(&self) -> CoreResult<Option<RunState>> {
             Ok(self.data.lock().expect("capture lock").saved_state.clone())
         }
+    }
 
+    impl crate::ports::RuntimeCacheStore for CapturedStore {
         fn save_cached_response(
             &self,
             stage: CacheStage,
@@ -5470,7 +5511,9 @@ mod tests {
                 })
                 .map(|(_, _, response)| response.clone()))
         }
+    }
 
+    impl crate::ports::RuntimeDiagnosticStore for CapturedStore {
         fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
             self.data
                 .lock()

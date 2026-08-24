@@ -5,12 +5,14 @@ older Python command shapes are not authoritative.
 
 ## What SubBake does
 
-SubBake has four primary workflows:
+SubBake has five primary workflows:
 
 1. Translate subtitle or text files.
 2. Translate an existing text subtitle stream inside a media container.
 3. Transcribe audio or video with local whisper.cpp.
-4. Run an interactive terminal agent that can inspect a project and invoke the
+4. Safely refine a translated subtitle with deterministic validation and a
+   previewable line diff.
+5. Run an interactive terminal agent that can inspect a project and invoke the
    same translation and transcription services under approval and file-safety
    rules.
 
@@ -221,7 +223,7 @@ and common credential paths.
 
 ## Translate subtitle files
 
-Supported subtitle/text formats include SRT, VTT, ASS, and TXT.
+Supported subtitle/text formats include SRT, VTT, ASS/SSA, TTML/DFXP, and TXT.
 
 ```bash
 sbake translate episode.srt \
@@ -327,6 +329,30 @@ sbake translate episode.srt \
   --max-characters-per-line 42 \
   --max-lines 2
 ```
+
+## Safely edit translated subtitles
+
+Refine a generated translation without changing subtitle IDs, order, timing,
+formatting markers, factual numbers, required glossary terms, or configured
+readability limits:
+
+```bash
+sbake edit episode.translated.srt \
+  --instruction "make the dialogue more conversational"
+```
+
+Preview and validate the complete proposed edit without writing the file:
+
+```bash
+sbake edit episode.translated.srt \
+  --instruction "shorten lines that read too quickly" \
+  --dry-run
+```
+
+The command prints a per-entry before/after diff. Generated
+`.translated.*`/`.bilingual.*` names are required by default; use
+`--allow-non-generated` only when intentionally editing another subtitle.
+When `--glossary` is supplied, its terms are hard validation requirements.
 
 ## Translate an embedded subtitle stream
 
@@ -462,6 +488,26 @@ sbake qa candidate.srt
 sbake qa candidate.srt --json --fail-on warning
 ```
 
+Output-producing commands can apply the same threshold before publication:
+
+```bash
+sbake translate episode.srt --qa-fail-on warning
+sbake batch season/ --recursive --qa-fail-on error
+sbake transcribe interview.mp4 --qa-fail-on warning
+sbake pipeline movie.mkv --qa-fail-on error
+```
+
+`never` is the default. `error` blocks structural timing failures; `warning`
+also blocks readability findings. A failed gate leaves the requested output
+unpublished, while JSON results include the QA report for successful runs.
+
+Transcription post-processing normalizes repeated whitespace and spaces before
+punctuation by default. It also recognizes Whisper-style prefixes such as
+`[SPEAKER_01]`, preserves the visible label, and records it as structured
+speaker metadata for translation context. Use `--no-normalize-transcript` or
+`--no-speaker-labels` to disable either behavior; profile configuration accepts
+`transcription.normalize_text` and `transcription.speaker_labels` as well.
+
 Current CLI checks include empty text, invalid/overlapping timing, reading
 speed, line length/count, and repeated segments.
 
@@ -523,6 +569,22 @@ The current implementation supports OpenAI Batch through `openai_chat` or
 `openai_responses`. The saved manifest contains no API secret. Collection
 verifies that the source subtitle has not changed before publishing output.
 
+## Project and season preflight
+
+Before translating a season or a multi-file project, build an inventory and
+consistency report:
+
+```bash
+sbake project season/ --recursive --output season-report.json
+sbake project season/ --recursive --json
+sbake project season/ --recursive --fail-on warning
+```
+
+The versioned manifest classifies source files as pending, translated, or
+bilingual; records segment counts and QA findings; verifies source/output ID
+alignment; and detects identical source lines with divergent translations
+across episodes. `--fail-on` makes QA and consistency findings suitable for CI.
+
 ## Structured output and automation
 
 Translation, QA, and evaluation workflows that support `--json` should be used
@@ -535,6 +597,16 @@ the source of truth:
 ```bash
 sbake --help
 sbake <COMMAND> --help
+```
+
+Command names, summaries, primary options, and subcommands come from one
+declarative command specification. Generate completion from that same source:
+
+```bash
+sbake completion bash
+sbake completion zsh
+sbake completion fish
+sbake completion powershell
 ```
 
 ## Troubleshooting

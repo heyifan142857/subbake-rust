@@ -13,12 +13,14 @@ fn cli_exposes_redesigned_commands() {
         assert!(!names.contains(&"resume"));
     }
     assert!(names.contains(&"translate"));
+    assert!(names.contains(&"edit"));
     assert!(names.contains(&"batch"));
     assert!(names.contains(&"pipeline"));
     assert!(names.contains(&"provider"));
     assert!(names.contains(&"runtime"));
     assert!(names.contains(&"whisper"));
     assert!(names.contains(&"qa"));
+    assert!(names.contains(&"project"));
     assert!(names.contains(&"memory"));
     assert!(names.contains(&"evaluate"));
     assert!(names.contains(&"overnight"));
@@ -29,15 +31,71 @@ fn cli_exposes_redesigned_commands() {
 fn help_is_available_without_required_operands() {
     for args in [
         vec!["translate", "--help"],
+        vec!["edit", "--help"],
         vec!["transcribe", "--help"],
         vec!["runtime", "clean", "--help"],
         vec!["provider", "check", "--help"],
         vec!["qa", "--help"],
+        vec!["project", "--help"],
         vec!["memory", "--help"],
     ] {
         subbake_cli::run(args.into_iter().map(str::to_owned).collect())
             .expect("help should not execute or require operands");
     }
+}
+
+#[test]
+fn project_command_writes_a_versioned_manifest() {
+    let root = temp_root("project-report");
+    std::fs::create_dir_all(&root).expect("create root");
+    std::fs::write(
+        root.join("episode.srt"),
+        "1\n00:00:00,000 --> 00:00:02,000\nHello\n",
+    )
+    .expect("write source");
+    let report_path = root.join("report.json");
+
+    subbake_cli::run(vec![
+        "project".to_owned(),
+        root.to_string_lossy().into_owned(),
+        "--output".to_owned(),
+        report_path.to_string_lossy().into_owned(),
+    ])
+    .expect("inspect project");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("read project report"))
+            .expect("parse project report");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["summary"]["pending"], 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn edit_dry_run_validates_and_preserves_the_target() {
+    let root = temp_root("edit-dry-run");
+    std::fs::create_dir_all(&root).expect("create root");
+    let target = root.join("clip.translated.txt");
+    std::fs::write(&target, "hello\n").expect("write target");
+    let config = root.join("config.toml");
+    std::fs::write(&config, "version = 1\n").expect("write config");
+
+    subbake_cli::run(vec![
+        "edit".to_owned(),
+        target.to_string_lossy().into_owned(),
+        "--instruction".to_owned(),
+        "make it uppercase".to_owned(),
+        "--dry-run".to_owned(),
+        "--config".to_owned(),
+        config.to_string_lossy().into_owned(),
+    ])
+    .expect("edit preview");
+
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read target"),
+        "hello\n"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

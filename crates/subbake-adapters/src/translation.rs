@@ -10,17 +10,16 @@ use serde::{Deserialize, Serialize};
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::normalize_language;
 use subbake_core::pipeline::SubtitlePipeline;
-use subbake_core::ports::NoopDashboard;
-use subbake_core::ports::RuntimeStore;
+use subbake_core::ports::RuntimeLayoutStore;
 use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
 use subbake_core::{
     CancellationGuard, ConfirmedTranslationContext, CoreError, NoopProgress, PipelineResult,
-    SharedProgress,
+    QualityGate, QualityPolicy, QualityReport, SharedProgress, inspect_quality,
 };
 
 use crate::embedded_subtitles::{
     default_embedded_translation_output_path, is_supported_subtitle_container_path,
-    translate_embedded_subtitle_cancellable_with_progress,
+    translate_embedded_subtitle_cancellable_with_progress_and_quality,
 };
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
@@ -57,6 +56,7 @@ pub struct TranslationOutcome {
     /// The runtime directory allocated for this request when fresh runtime
     /// isolation was requested. Configured runtimes are intentionally omitted.
     pub runtime_dir: Option<PathBuf>,
+    pub quality: Option<QualityReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,21 +153,43 @@ pub fn translate_input_cancellable(
 }
 
 pub fn translate_input_cancellable_with_progress(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<TranslationOutcome> {
+    translate_input_cancellable_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub fn translate_input_cancellable_with_progress_and_quality(
     mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<TranslationOutcome> {
     check_cancelled(cancellation)?;
     if is_supported_subtitle_path(&request.input_path) {
         let runtime_dir = prepare_translation_runtime(&mut request)?;
-        let mut outcome =
-            translate_subtitle_cancellable_with_progress(request, cancellation, progress)?;
+        let mut outcome = translate_subtitle_cancellable_with_progress_and_quality(
+            request,
+            cancellation,
+            progress,
+            quality_gate,
+        )?;
         outcome.runtime_dir = runtime_dir;
         Ok(outcome)
     } else if is_supported_subtitle_container_path(&request.input_path) {
         let runtime_dir = prepare_translation_runtime(&mut request)?;
-        let mut outcome =
-            translate_embedded_subtitle_cancellable_with_progress(request, cancellation, progress)?;
+        let mut outcome = translate_embedded_subtitle_cancellable_with_progress_and_quality(
+            request,
+            cancellation,
+            progress,
+            quality_gate,
+        )?;
         outcome.runtime_dir = runtime_dir;
         Ok(outcome)
     } else {
@@ -212,7 +234,27 @@ pub fn translate_subtitle_cancellable_with_progress(
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<TranslationOutcome> {
-    translate_subtitle_cancellable_with_progress_and_identity(request, cancellation, progress, None)
+    translate_subtitle_cancellable_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub fn translate_subtitle_cancellable_with_progress_and_quality(
+    request: TranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+    quality_gate: QualityGate,
+) -> AdapterResult<TranslationOutcome> {
+    translate_subtitle_cancellable_with_progress_and_identity(
+        request,
+        cancellation,
+        progress,
+        None,
+        quality_gate,
+    )
 }
 
 pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
@@ -220,6 +262,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     cancellation: &CancellationGuard,
     progress: SharedProgress,
     identity: Option<TranslationInputIdentity>,
+    quality_gate: QualityGate,
 ) -> AdapterResult<TranslationOutcome> {
     check_cancelled(cancellation)?;
     normalize_translation_languages(&mut request.settings)?;
@@ -289,10 +332,10 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     let mut options = request
         .settings
         .to_pipeline_options(stable_input_path.clone(), Some(runtime_output_path));
-    options.execution_fingerprint = identity
+    options.identity.execution_fingerprint = identity
         .as_ref()
         .and_then(|identity| identity.execution_fingerprint.clone());
-    options.initial_confirmed_context = identity
+    options.execution.initial_confirmed_context = identity
         .as_ref()
         .map(|identity| identity.initial_confirmed_context.clone())
         .unwrap_or_default();
@@ -320,7 +363,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     store.ensure_layout().map_err(AdapterError::from)?;
 
     let terminal_progress = progress.clone();
-    let mut pipeline = SubtitlePipeline::new(backend, NoopDashboard, options)
+    let mut pipeline = SubtitlePipeline::new(backend, options)
         .with_input_signature(input_signature)
         .with_cancellation(cancellation.clone())
         .with_progress(Box::new(progress));
@@ -365,6 +408,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
             subtitle_entries: document.segments.len(),
             container_change: None,
             runtime_dir,
+            quality: None,
         });
     }
 
@@ -374,6 +418,10 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     )
     .with_bilingual_order(request.settings.output.bilingual_order)
     .with_bilingual_font_scale(request.settings.output.bilingual_font_scale);
+    let mut quality_document = document.clone();
+    quality_document.segments = run.translated_segments.clone();
+    let quality = inspect_quality(&quality_document, quality_policy(&request.settings));
+    enforce_quality_gate(&quality, quality_gate)?;
     check_cancelled(cancellation)?;
     render_and_write_document(
         &document,
@@ -401,7 +449,33 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         subtitle_entries: document.segments.len(),
         container_change: None,
         runtime_dir,
+        quality: Some(quality),
     })
+}
+
+fn quality_policy(settings: &TranslationSettings) -> QualityPolicy {
+    let defaults = QualityPolicy::default();
+    QualityPolicy {
+        max_characters_per_second: settings
+            .translation
+            .max_characters_per_second
+            .unwrap_or(defaults.max_characters_per_second),
+        max_characters_per_line: settings
+            .translation
+            .max_characters_per_line
+            .unwrap_or(defaults.max_characters_per_line),
+        max_lines: settings.translation.max_lines.unwrap_or(defaults.max_lines),
+    }
+}
+
+fn enforce_quality_gate(report: &QualityReport, gate: QualityGate) -> AdapterResult<()> {
+    if gate.fails(report) {
+        return Err(AdapterError::invalid_input(format!(
+            "subtitle QA threshold failed before publication with {} error(s) and {} warning(s)",
+            report.errors, report.warnings
+        )));
+    }
+    Ok(())
 }
 
 pub fn translate_subtitle_batch(
@@ -418,9 +492,23 @@ pub fn translate_subtitle_batch_cancellable(
 }
 
 pub fn translate_subtitle_batch_with_progress(
+    request: BatchTranslationRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<BatchTranslationOutcome> {
+    translate_subtitle_batch_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub fn translate_subtitle_batch_with_progress_and_quality(
     mut request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<BatchTranslationOutcome> {
     normalize_translation_languages(&mut request.settings)?;
     request.output_language_tag = request
@@ -484,7 +572,7 @@ pub fn translate_subtitle_batch_with_progress(
             Some(total_files as u64),
             subbake_core::ProgressUnit::Files,
         ));
-        let outcome = translate_subtitle_cancellable_with_progress(
+        let outcome = translate_subtitle_cancellable_with_progress_and_quality(
             TranslationRequest {
                 input_path: input_path.clone(),
                 output_path: Some(output_path),
@@ -495,6 +583,7 @@ pub fn translate_subtitle_batch_with_progress(
             },
             cancellation,
             progress.clone(),
+            quality_gate,
         );
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -1026,6 +1115,41 @@ mod tests {
 
         assert!(outcome.result.dry_run);
         assert!(!output_exists);
+    }
+
+    #[test]
+    fn qa_gate_rejects_translation_before_output_is_published() {
+        let temporary = temp_root("qa-gate");
+        let root = temporary.path().to_path_buf();
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("clip.txt");
+        fs::write(
+            &input_path,
+            "this subtitle line is deliberately much longer than the default readability limit\n",
+        )
+        .expect("write input");
+        let output_path = root.join("custom.txt");
+        let mut settings = TranslationSettings::default();
+        settings.translation.target_language = "en".to_owned();
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+
+        let error = translate_subtitle_cancellable_with_progress_and_quality(
+            TranslationRequest {
+                input_path,
+                output_path: Some(output_path.clone()),
+                output_language_tag: None,
+                overwrite: true,
+                runtime_reuse: RuntimeReusePolicy::Configured,
+                settings,
+            },
+            &CancellationGuard::never(),
+            std::sync::Arc::new(NoopProgress),
+            QualityGate::Warning,
+        )
+        .expect_err("QA warning gate should reject a long line");
+
+        assert!(error.to_string().contains("QA threshold failed"));
+        assert!(!output_path.exists());
     }
 
     #[test]

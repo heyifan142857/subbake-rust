@@ -126,6 +126,8 @@ fn edit_subtitles(prompt: &str) -> CoreResult<SubtitleEditPayload> {
             let current = entry["translation"].as_str().unwrap_or_default();
             let translation = if current.trim().is_empty() {
                 String::new()
+            } else if instruction.contains("change number") {
+                current.replace("10", "11")
             } else if instruction.contains("uppercase") || instruction.contains("大写") {
                 current.to_uppercase()
             } else {

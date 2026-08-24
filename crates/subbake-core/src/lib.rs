@@ -13,6 +13,7 @@ pub mod overnight;
 pub mod pipeline;
 pub mod ports;
 pub mod progress;
+pub mod project;
 pub mod quality;
 mod recovery;
 mod review;
@@ -29,13 +30,15 @@ pub use entities::{
     AgentLog, AgentRepairRecord, AssDialogueRecord, AssDocumentMetadata, AssRecord, AttemptLog,
     BatchPlanEntry, BatchTranslationResult, BilingualOrder, ConcurrencyStrategy,
     ConfirmedTranslationContext, ContextStrategy, DocumentCharacter, DocumentGuide, FailureLog,
-    GlossaryEntry, PassthroughBlock, PipelineOptions, PipelineResult, PreflightFailurePolicy,
-    PromptCacheStrategy, ReviewAnnotation, ReviewChange, ReviewIssueKind, ReviewPolicy,
-    ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, ReviewStrategy, SplitRetryLog,
-    StructuralRecoveryStrategy, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
-    SubtitleSemanticContext, TerminologyEntity, TerminologyKind, TerminologyPreflightResult,
-    TerminologyStats, TerminologyStrategy, TranslationLine, TranslationMode, TranslationPolicy,
-    TranslationReadabilityDefaults, Usage, translation_readability_defaults,
+    GlossaryEntry, PassthroughBlock, PipelineExecutionOptions, PipelineOptions,
+    PipelineRenderingOptions, PipelineResult, PipelineRuntimeIdentity, PipelineValidationOptions,
+    PreflightFailurePolicy, PromptCacheStrategy, ReviewAnnotation, ReviewChange, ReviewIssueKind,
+    ReviewPolicy, ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, ReviewStrategy,
+    SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleDocumentMetadata,
+    SubtitleSegment, SubtitleSemanticContext, TerminologyEntity, TerminologyKind,
+    TerminologyPreflightResult, TerminologyStats, TerminologyStrategy, TranslationLine,
+    TranslationMode, TranslationPolicy, TranslationReadabilityDefaults, Usage,
+    translation_readability_defaults,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use evaluation::{
@@ -55,8 +58,13 @@ pub use progress::{
     NoopProgress, ProgressEvent, ProgressSink, ProgressUnit, SharedProgress, TaskKind, TaskState,
     TranslationProgress,
 };
+pub use project::{
+    ProjectConsistencyIssue, ProjectConsistencyOccurrence, ProjectDocumentPair, ProjectFileReport,
+    ProjectReport, ProjectSummary, ProjectTranslationStatus, inspect_project,
+};
 pub use quality::{
-    QualityIssue, QualityIssueKind, QualityPolicy, QualityReport, QualitySeverity, inspect_quality,
+    QualityGate, QualityIssue, QualityIssueKind, QualityPolicy, QualityReport, QualitySeverity,
+    inspect_quality,
 };
 pub use term_matcher::{TermMatch, TermMatcher};
 pub use tool_outcome::{

@@ -1,15 +1,22 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use subbake_core::CancellationGuard;
 use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_payload};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::{is_language_tag, normalize_language};
-use subbake_core::ports::{GenerationRequest, LlmBackend};
+use subbake_core::ports::{GenerationRequest, LlmBackend, RuntimeMemoryStore};
+use subbake_core::storage::build_runtime_paths;
+use subbake_core::validation::{FinalValidationPolicy, validate_final_output};
 
 use crate::error::{AdapterError, AdapterResult};
-use crate::fs::{is_supported_subtitle_path, read_document, render_and_write_document};
+use crate::fs::{
+    is_supported_subtitle_path, read_document, render_and_write_document, stable_runtime_input_path,
+};
 use crate::providers::build_backend;
+use crate::runtime_store::FileRuntimeStore;
 use crate::settings::TranslationSettings;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,14 +25,24 @@ pub struct SubtitleEditRequest {
     pub instruction: String,
     pub settings: TranslationSettings,
     pub allow_non_generated: bool,
+    pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleEditChange {
+    pub id: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleEditOutcome {
     pub target_path: PathBuf,
     pub target_language: String,
     pub modified_entries: usize,
     pub edit_notes: String,
+    pub dry_run: bool,
+    pub changes: Vec<SubtitleEditChange>,
 }
 
 pub fn edit_subtitle(request: SubtitleEditRequest) -> AdapterResult<SubtitleEditOutcome> {
@@ -80,27 +97,85 @@ pub fn edit_subtitle_cancellable(
     let payload =
         parse_subtitle_edit_payload(payload, &document.segments).map_err(AdapterError::from)?;
 
-    let modified_entries = document
+    let changes = document
         .segments
         .iter()
         .zip(&payload.lines)
         .filter(|(segment, line)| segment.text != line.translation)
-        .count();
+        .map(|(segment, line)| SubtitleEditChange {
+            id: segment.id.clone(),
+            before: segment.text.clone(),
+            after: line.translation.clone(),
+        })
+        .collect::<Vec<_>>();
+    let modified_entries = changes.len();
     let translations = merge_segments(&document.segments, &payload.lines);
-    cancellation.check().map_err(AdapterError::from)?;
-    render_and_write_document(
-        &document,
+    let required_glossary = load_required_glossary(&request)?;
+    let (validation_source, validation_source_language) = source_document
+        .as_ref()
+        .map(|source| {
+            (
+                source.segments.as_slice(),
+                request.settings.translation.source_language.as_str(),
+            )
+        })
+        .unwrap_or((
+            document.segments.as_slice(),
+            request.settings.translation.target_language.as_str(),
+        ));
+    validate_final_output(
+        validation_source,
         &translations,
-        &request.target_path,
-        &RenderOptions::new(false, Some(document.format.clone())),
-    )?;
+        &required_glossary,
+        validation_source_language,
+        &request.settings.translation.target_language,
+        FinalValidationPolicy {
+            max_characters_per_second: request.settings.translation.max_characters_per_second,
+            max_characters_per_line: request.settings.translation.max_characters_per_line,
+            max_lines: request.settings.translation.max_lines,
+        },
+    )
+    .map_err(AdapterError::from)?;
+    cancellation.check().map_err(AdapterError::from)?;
+    if !request.dry_run {
+        render_and_write_document(
+            &document,
+            &translations,
+            &request.target_path,
+            &RenderOptions::new(false, Some(document.format.clone())),
+        )?;
+    }
 
     Ok(SubtitleEditOutcome {
         target_path: request.target_path,
         target_language: request.settings.translation.target_language,
         modified_entries,
         edit_notes: payload.edit_notes,
+        dry_run: request.dry_run,
+        changes,
     })
+}
+
+fn load_required_glossary(
+    request: &SubtitleEditRequest,
+) -> AdapterResult<BTreeMap<String, String>> {
+    if request.settings.storage.glossary_path.is_none() {
+        return Ok(BTreeMap::new());
+    }
+    let stable_path = stable_runtime_input_path(&request.target_path)?;
+    let paths = build_runtime_paths(
+        &request.target_path,
+        &stable_path,
+        request.settings.storage.runtime_dir.as_deref(),
+        request.settings.storage.glossary_path.as_deref(),
+        &request.settings.translation.source_language,
+        &request.settings.translation.target_language,
+        false,
+    );
+    FileRuntimeStore::new(paths)
+        .load_glossary()
+        .map(|entries| entries.into_iter().collect())
+        .map_err(AdapterError::from)
 }
 
 fn merge_segments(
@@ -186,6 +261,7 @@ mod tests {
             instruction: "make it uppercase".to_owned(),
             settings: TranslationSettings::default(),
             allow_non_generated: false,
+            dry_run: false,
         })
         .expect("edit subtitle");
         let content = fs::read_to_string(&path).expect("read edited file");
@@ -208,11 +284,63 @@ mod tests {
             instruction: "rewrite".to_owned(),
             settings: TranslationSettings::default(),
             allow_non_generated: false,
+            dry_run: false,
         })
         .expect_err("source subtitle should fail");
         let _ = fs::remove_dir_all(&root);
 
         assert!(error.to_string().contains("generated"));
+    }
+
+    #[test]
+    fn dry_run_returns_diff_without_writing() {
+        let root = temp_root("edit-dry-run");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("clip.translated.txt");
+        fs::write(&path, "hello\n").expect("write target");
+
+        let outcome = edit_subtitle(SubtitleEditRequest {
+            target_path: path.clone(),
+            instruction: "make it uppercase".to_owned(),
+            settings: TranslationSettings::default(),
+            allow_non_generated: false,
+            dry_run: true,
+        })
+        .expect("preview subtitle edit");
+
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.changes.len(), 1);
+        assert_eq!(outcome.changes[0].before, "hello");
+        assert_eq!(outcome.changes[0].after, "HELLO");
+        assert_eq!(
+            fs::read_to_string(&path).expect("unchanged target"),
+            "hello\n"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deterministic_validation_rejects_changed_number_before_writing() {
+        let root = temp_root("edit-facts");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("clip.translated.txt");
+        fs::write(&path, "It costs 10 dollars.\n").expect("write target");
+
+        let error = edit_subtitle(SubtitleEditRequest {
+            target_path: path.clone(),
+            instruction: "change number".to_owned(),
+            settings: TranslationSettings::default(),
+            allow_non_generated: false,
+            dry_run: false,
+        })
+        .expect_err("changed fact must fail");
+
+        assert!(error.to_string().contains("changes numbers"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("preserved target"),
+            "It costs 10 dollars.\n"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -62,8 +62,10 @@ pub(super) fn build_translation_messages(
     required_glossary: &BTreeMap<String, String>,
     compact_wire: bool,
 ) -> Vec<ChatMessage> {
-    let language_rules =
-        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    let language_rules = LanguageRuleRegistry::resolve(
+        &options.validation.source_language,
+        &options.validation.target_language,
+    );
     build_translation_messages_with_rules(
         (options, &language_rules),
         batch_index,
@@ -86,10 +88,10 @@ pub(super) fn build_translation_messages_with_rules(
 ) -> Vec<ChatMessage> {
     let (options, language_rules) = policy;
     let mut context = serde_json::json!({
-        "src": options.source_language,
-        "tgt": options.target_language,
+        "src": options.validation.source_language,
+        "tgt": options.validation.target_language,
         "batch_index": batch_index,
-        "mode": options.mode.as_str(),
+        "mode": options.execution.mode.as_str(),
         "editable_ids": batch.iter().map(|segment| segment.id.as_str()).collect::<Vec<_>>(),
     });
     let batch_texts = batch
@@ -104,15 +106,15 @@ pub(super) fn build_translation_messages_with_rules(
         .map(|segment| segment.text.as_str())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
-    let term_markers = if options.online_terminology {
+    let term_markers = if options.execution.online_terminology {
         select_term_markers(batch, &memory.terminology_candidates)
     } else {
         Vec::new()
     };
     let lightweight_names = options.policy().terminology_strategy
         == TerminologyStrategy::LightweightNames
-        && !options.online_terminology
-        && !options.preserve_names;
+        && !options.execution.online_terminology
+        && !options.validation.preserve_names;
     let name_markers = if lightweight_names {
         select_name_markers(batch, &memory.name_candidates)
     } else {
@@ -251,7 +253,7 @@ only when they fit the meaning in the current context. CONTEXT_JSON.document_gui
 is frozen document-level guidance; apply its global genre/tone/audience guidance and \
 only the character and terminology records selected for this scene. Do not invent \
 facts or force an advisory form where the local meaning differs.\n{language_guidance}\n{}\n{terminology_rule}",
-        if options.preserve_names {
+        if options.validation.preserve_names {
             "Preserve personal names exactly in their source spelling unless CONTEXT_JSON.glossary explicitly requires another form."
         } else {
             "Translate or transliterate every clearly identified personal name into the target language's conventional script and keep it consistent. Do not leave a personal name unchanged merely because it is absent from the glossary."
@@ -321,13 +323,18 @@ pub(super) fn request_hash(
     if let Some(fingerprint) = fingerprint {
         build_request_hash_v2(&fingerprint, stage.as_str(), messages)
     } else {
-        build_request_hash(&options.provider, &options.model, stage.as_str(), messages)
+        build_request_hash(
+            &options.identity.provider,
+            &options.identity.model,
+            stage.as_str(),
+            messages,
+        )
     }
 }
 
 fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> Option<String> {
     if stage == CacheStage::Review
-        && let Some(reviewer) = &options.reviewer_fingerprint
+        && let Some(reviewer) = &options.identity.reviewer_fingerprint
     {
         return Some(format!(
             "review-routing-v{REVIEW_ROUTING_CACHE_VERSION}:{reviewer}"
@@ -338,11 +345,12 @@ fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> 
         CacheStage::Review | CacheStage::Terminology | CacheStage::AgentReviewRepair
     ) {
         return options
+            .identity
             .reviewer_fingerprint
             .clone()
-            .or_else(|| options.provider_fingerprint.clone());
+            .or_else(|| options.identity.provider_fingerprint.clone());
     }
-    options.provider_fingerprint.clone()
+    options.identity.provider_fingerprint.clone()
 }
 
 pub(super) fn is_agent_repairable(error: &CoreError) -> bool {
@@ -516,17 +524,21 @@ pub(super) fn contextual_translation_memory_keys(
 }
 
 pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
-    let language_rules =
-        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    let language_rules = LanguageRuleRegistry::resolve(
+        &options.validation.source_language,
+        &options.validation.target_language,
+    );
     let project_scope = options
+        .identity
         .input_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_string_lossy();
     let backend_scope = options
+        .identity
         .provider_fingerprint
         .clone()
-        .unwrap_or_else(|| format!("{}:{}", options.provider, options.model));
+        .unwrap_or_else(|| format!("{}:{}", options.identity.provider, options.identity.model));
     stable_hash(&JsonValue::Object(vec![
         (
             "version".to_owned(),
@@ -550,12 +562,13 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         ),
         (
             "mode".to_owned(),
-            JsonValue::String(options.mode.as_str().to_owned()),
+            JsonValue::String(options.execution.mode.as_str().to_owned()),
         ),
         ("backend".to_owned(), JsonValue::String(backend_scope)),
         (
             "reviewer".to_owned(),
             options
+                .identity
                 .reviewer_fingerprint
                 .clone()
                 .map(JsonValue::String)
@@ -563,59 +576,60 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         ),
         (
             "source_language".to_owned(),
-            JsonValue::String(options.source_language.clone()),
+            JsonValue::String(options.validation.source_language.clone()),
         ),
         (
             "target_language".to_owned(),
-            JsonValue::String(options.target_language.clone()),
+            JsonValue::String(options.validation.target_language.clone()),
         ),
         (
             "batch_size".to_owned(),
-            JsonValue::Number(options.batch_size.to_string()),
+            JsonValue::Number(options.execution.batch_size.to_string()),
         ),
         (
             "batch_token_budget".to_owned(),
-            JsonValue::Number(options.batch_token_budget.to_string()),
+            JsonValue::Number(options.execution.batch_token_budget.to_string()),
         ),
         (
             "request_token_budget".to_owned(),
-            JsonValue::Number(options.request_token_budget.to_string()),
+            JsonValue::Number(options.execution.request_token_budget.to_string()),
         ),
         (
             "translation_concurrency".to_owned(),
-            JsonValue::Number(options.translation_concurrency.to_string()),
+            JsonValue::Number(options.execution.translation_concurrency.to_string()),
         ),
         (
             "confirmed_context_lines".to_owned(),
-            JsonValue::Number(options.confirmed_context_lines.to_string()),
+            JsonValue::Number(options.execution.confirmed_context_lines.to_string()),
         ),
         (
             "confirmed_context_token_budget".to_owned(),
-            JsonValue::Number(options.confirmed_context_token_budget.to_string()),
+            JsonValue::Number(options.execution.confirmed_context_token_budget.to_string()),
         ),
         (
             "review_policy".to_owned(),
-            JsonValue::String(options.review_policy.as_str().to_owned()),
+            JsonValue::String(options.execution.review_policy.as_str().to_owned()),
         ),
         (
             "terminology_preflight".to_owned(),
-            JsonValue::Bool(options.terminology_preflight),
+            JsonValue::Bool(options.execution.terminology_preflight),
         ),
         (
             "online_terminology".to_owned(),
-            JsonValue::Bool(options.online_terminology),
+            JsonValue::Bool(options.execution.online_terminology),
         ),
         (
             "allow_degraded_preflight".to_owned(),
-            JsonValue::Bool(options.allow_degraded_preflight),
+            JsonValue::Bool(options.execution.allow_degraded_preflight),
         ),
         (
             "preserve_names".to_owned(),
-            JsonValue::Bool(options.preserve_names),
+            JsonValue::Bool(options.validation.preserve_names),
         ),
         (
             "document_guide".to_owned(),
             options
+                .identity
                 .document_guide_fingerprint
                 .clone()
                 .map(JsonValue::String)
@@ -624,6 +638,7 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         (
             "max_characters_per_second".to_owned(),
             options
+                .validation
                 .max_characters_per_second
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
@@ -631,6 +646,7 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         (
             "max_characters_per_line".to_owned(),
             options
+                .validation
                 .max_characters_per_line
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
@@ -638,6 +654,7 @@ pub(super) fn translation_memory_scope(options: &PipelineOptions) -> String {
         (
             "max_lines".to_owned(),
             options
+                .validation
                 .max_lines
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
@@ -755,14 +772,14 @@ mod tests {
     #[test]
     fn review_routing_cache_version_only_salts_an_explicit_reviewer() {
         let mut options = PipelineOptions::new("episode.srt".into());
-        options.provider_fingerprint = Some("translator-route".to_owned());
+        options.identity.provider_fingerprint = Some("translator-route".to_owned());
 
         assert_eq!(
             request_backend_fingerprint(&options, CacheStage::Review).as_deref(),
             Some("translator-route")
         );
 
-        options.reviewer_fingerprint = Some("reviewer-route".to_owned());
+        options.identity.reviewer_fingerprint = Some("reviewer-route".to_owned());
         assert_eq!(
             request_backend_fingerprint(&options, CacheStage::Review).as_deref(),
             Some("review-routing-v2:reviewer-route")
@@ -811,21 +828,21 @@ mod tests {
     #[test]
     fn translation_memory_scope_covers_behavior_and_frozen_document_guide() {
         let mut baseline = PipelineOptions::new("/shows/one/episode.srt".into());
-        baseline.provider_fingerprint = Some("translator-route".to_owned());
-        baseline.document_guide_fingerprint = Some("guide-one".to_owned());
+        baseline.identity.provider_fingerprint = Some("translator-route".to_owned());
+        baseline.identity.document_guide_fingerprint = Some("guide-one".to_owned());
         let scope = translation_memory_scope(&baseline);
 
         let mut changed_guide = baseline.clone();
-        changed_guide.document_guide_fingerprint = Some("guide-two".to_owned());
+        changed_guide.identity.document_guide_fingerprint = Some("guide-two".to_owned());
         assert_ne!(scope, translation_memory_scope(&changed_guide));
 
         let mut changed_concurrency = baseline.clone();
-        changed_concurrency.translation_concurrency += 1;
+        changed_concurrency.execution.translation_concurrency += 1;
         assert_ne!(scope, translation_memory_scope(&changed_concurrency));
 
         let mut changed_review = baseline.clone();
-        changed_review.review_policy = crate::entities::ReviewPolicy::Full;
-        changed_review.reviewer_fingerprint = Some("reviewer-route".to_owned());
+        changed_review.execution.review_policy = crate::entities::ReviewPolicy::Full;
+        changed_review.identity.reviewer_fingerprint = Some("reviewer-route".to_owned());
         assert_ne!(scope, translation_memory_scope(&changed_review));
     }
 
@@ -862,7 +879,7 @@ mod tests {
         assert!(transliterated[0].content.contains("⟦N<number>⟧"));
         assert!(transliterated[1].content.contains("⟦N0⟧Mary⟦/N0⟧"));
 
-        options.preserve_names = true;
+        options.validation.preserve_names = true;
         let preserved = build_translation_messages(
             &options,
             0,
@@ -875,7 +892,7 @@ mod tests {
         assert!(preserved[0].content.contains("source spelling"));
         assert!(!preserved[0].content.contains("⟦N<number>⟧"));
 
-        options.online_terminology = false;
+        options.execution.online_terminology = false;
         let minimal = build_translation_messages(
             &options,
             0,
@@ -891,8 +908,8 @@ mod tests {
                 .contains("Do not return terms, glossary_updates, or terminology_updates")
         );
 
-        options.preserve_names = false;
-        options.online_terminology = true;
+        options.validation.preserve_names = false;
+        options.execution.online_terminology = true;
         let comprehensive = build_translation_messages(
             &options,
             0,
@@ -908,8 +925,8 @@ mod tests {
     #[test]
     fn translation_prompt_applies_japanese_chinese_guidance_only_to_that_pair() {
         let mut options = PipelineOptions::new("episode.ass".into());
-        options.source_language = "ja".to_owned();
-        options.target_language = "zh-Hans".to_owned();
+        options.validation.source_language = "ja".to_owned();
+        options.validation.target_language = "zh-Hans".to_owned();
         let batch = [segment("1", "田中さん、行きましょう。")];
         let japanese_chinese = build_translation_messages(
             &options,
@@ -926,7 +943,7 @@ mod tests {
             )
         );
 
-        options.source_language = "en".to_owned();
+        options.validation.source_language = "en".to_owned();
         let english_chinese = build_translation_messages(
             &options,
             0,

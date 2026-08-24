@@ -10,13 +10,14 @@ use subbake_core::storage::{
     stable_hash,
 };
 use subbake_core::{
-    CancellationGuard, ConfirmedTranslationContext, NoopProgress, PipelineResult, SharedProgress,
-    SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment, TranslationMode, Usage,
+    CancellationGuard, ConfirmedTranslationContext, NoopProgress, PipelineResult, QualityGate,
+    QualityPolicy, SharedProgress, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
+    TranslationMode, Usage, inspect_quality,
 };
 
 use crate::embedded_subtitles::{
     has_translatable_text_subtitle, is_supported_subtitle_container_path,
-    translate_embedded_subtitle_cancellable_with_progress,
+    translate_embedded_subtitle_cancellable_with_progress_and_quality,
 };
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{
@@ -31,7 +32,6 @@ use crate::transcription::{
 };
 use crate::translation::{
     TranslationInputIdentity, TranslationOutcome, TranslationRequest,
-    translate_subtitle_cancellable_with_progress,
     translate_subtitle_cancellable_with_progress_and_identity,
 };
 
@@ -348,8 +348,22 @@ pub fn run_pipeline_cancellable_with_progress(
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<PipelineOutcome> {
+    run_pipeline_cancellable_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub fn run_pipeline_cancellable_with_progress_and_quality(
+    request: PipelineRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+    quality_gate: QualityGate,
+) -> AdapterResult<PipelineOutcome> {
     if is_supported_subtitle_path(&request.input_path) {
-        let outcome = translate_subtitle_cancellable_with_progress(
+        let outcome = crate::translation::translate_subtitle_cancellable_with_progress_and_quality(
             TranslationRequest {
                 input_path: request.input_path,
                 output_path: request.output_path,
@@ -360,6 +374,7 @@ pub fn run_pipeline_cancellable_with_progress(
             },
             cancellation,
             progress,
+            quality_gate,
         )?;
         return Ok(PipelineOutcome::Subtitle(outcome));
     }
@@ -370,7 +385,7 @@ pub fn run_pipeline_cancellable_with_progress(
             has_translatable_text_subtitle(&request.input_path, cancellation)?,
         )
     {
-        let outcome = translate_embedded_subtitle_cancellable_with_progress(
+        let outcome = translate_embedded_subtitle_cancellable_with_progress_and_quality(
             TranslationRequest {
                 input_path: request.input_path,
                 output_path: request.output_path,
@@ -381,15 +396,18 @@ pub fn run_pipeline_cancellable_with_progress(
             },
             cancellation,
             progress,
+            quality_gate,
         )?;
         return Ok(PipelineOutcome::Subtitle(outcome));
     }
 
     match media_pipeline_strategy(&request.settings) {
         MediaPipelineStrategy::Sequential => {
-            run_sequential_media_pipeline(request, cancellation, progress)
+            run_sequential_media_pipeline(request, cancellation, progress, quality_gate)
         }
-        strategy => run_streaming_media_pipeline(request, strategy, cancellation, progress),
+        strategy => {
+            run_streaming_media_pipeline(request, strategy, cancellation, progress, quality_gate)
+        }
     }
 }
 
@@ -418,6 +436,7 @@ fn run_sequential_media_pipeline(
     request: PipelineRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<PipelineOutcome> {
     let transcription_out = transcribe_media_cancellable_with_progress(
         TranscriptionRequest {
@@ -429,18 +448,20 @@ fn run_sequential_media_pipeline(
         cancellation,
         progress.clone(),
     )?;
-    let translation_out = translate_subtitle_cancellable_with_progress(
-        TranslationRequest {
-            input_path: transcription_out.output_path,
-            output_path: request.output_path,
-            output_language_tag: None,
-            overwrite: true,
-            runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
-            settings: request.settings,
-        },
-        cancellation,
-        progress,
-    )?;
+    let translation_out =
+        crate::translation::translate_subtitle_cancellable_with_progress_and_quality(
+            TranslationRequest {
+                input_path: transcription_out.output_path,
+                output_path: request.output_path,
+                output_language_tag: None,
+                overwrite: true,
+                runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
+                settings: request.settings,
+            },
+            cancellation,
+            progress,
+            quality_gate,
+        )?;
     Ok(PipelineOutcome::Subtitle(translation_out))
 }
 
@@ -449,6 +470,7 @@ fn run_streaming_media_pipeline(
     strategy: MediaPipelineStrategy,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<PipelineOutcome> {
     let store = StreamingPipelineStore::open(&request, strategy)?;
     let (sender, receiver) = sync_channel(STREAMING_CHANNEL_CAPACITY);
@@ -488,7 +510,13 @@ fn run_streaming_media_pipeline(
         Ok::<_, AdapterError>((transcription?, translated?))
     })?;
 
-    finalize_streaming_pipeline(request, store, transcription, translated)
+    finalize_streaming_pipeline_with_quality(
+        request,
+        store,
+        transcription,
+        translated,
+        quality_gate,
+    )
 }
 
 #[derive(Debug)]
@@ -687,6 +715,7 @@ fn translate_chunk_group(
             )),
             initial_confirmed_context: initial_confirmed_context.to_vec(),
         }),
+        subbake_core::QualityGate::Never,
     )?;
     let translated = read_document(&translated_path)?;
     validate_group_alignment(&source_segments, &translated.segments)?;
@@ -792,11 +821,28 @@ fn add_group_result(result: &mut PipelineResult, group: &TranslationGroupShard) 
     result.deduplicated_segments += group.deduplicated_segments;
 }
 
+#[cfg(test)]
 fn finalize_streaming_pipeline(
     request: PipelineRequest,
     store: StreamingPipelineStore,
     transcription: IncrementalTranscriptionOutcome,
+    translated: ConsumedTranslations,
+) -> AdapterResult<PipelineOutcome> {
+    finalize_streaming_pipeline_with_quality(
+        request,
+        store,
+        transcription,
+        translated,
+        QualityGate::Never,
+    )
+}
+
+fn finalize_streaming_pipeline_with_quality(
+    request: PipelineRequest,
+    store: StreamingPipelineStore,
+    transcription: IncrementalTranscriptionOutcome,
     mut translated: ConsumedTranslations,
+    quality_gate: QualityGate,
 ) -> AdapterResult<PipelineOutcome> {
     validate_group_alignment(&transcription.document.segments, &translated.segments)?;
     let source_path = request
@@ -825,6 +871,38 @@ fn finalize_streaming_pipeline(
         .with_bilingual_order(request.settings.output.bilingual_order)
         .with_bilingual_font_scale(request.settings.output.bilingual_font_scale);
 
+    let mut translated_document = transcription.document.clone();
+    translated_document
+        .segments
+        .clone_from(&translated.segments);
+    let defaults = QualityPolicy::default();
+    let quality = inspect_quality(
+        &translated_document,
+        QualityPolicy {
+            max_characters_per_second: request
+                .settings
+                .translation
+                .max_characters_per_second
+                .unwrap_or(defaults.max_characters_per_second),
+            max_characters_per_line: request
+                .settings
+                .translation
+                .max_characters_per_line
+                .unwrap_or(defaults.max_characters_per_line),
+            max_lines: request
+                .settings
+                .translation
+                .max_lines
+                .unwrap_or(defaults.max_lines),
+        },
+    );
+    if quality_gate.fails(&quality) {
+        return Err(AdapterError::invalid_input(format!(
+            "subtitle QA threshold failed before publication with {} error(s) and {} warning(s)",
+            quality.errors, quality.warnings
+        )));
+    }
+
     // User-visible files are published only after transcription coverage and
     // exact source/translation alignment have both succeeded.
     if source_path != output_path {
@@ -849,6 +927,7 @@ fn finalize_streaming_pipeline(
         subtitle_entries: transcription.document.segments.len(),
         container_change: None,
         runtime_dir: None,
+        quality: Some(quality),
     }))
 }
 
@@ -873,7 +952,7 @@ fn streaming_fingerprint(
     let mut options = request
         .settings
         .to_pipeline_options(stable_input.clone(), request.output_path.clone());
-    options.execution_fingerprint = Some(format!(
+    options.identity.execution_fingerprint = Some(format!(
         "streaming-v{STREAMING_PIPELINE_VERSION}:{}",
         strategy.as_str()
     ));

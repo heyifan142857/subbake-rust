@@ -10,17 +10,15 @@ use crate::error::{CoreError, CoreResult};
 use crate::language_rules::{EnglishRules, JapaneseRules, ResolvedLanguageRules};
 use crate::memory::ContextMemory;
 use crate::ports::{
-    BackendJsonResult, BackendPayload, CacheStage, DashboardSink, GenerationRequest, LlmBackend,
-    RuntimeStore,
+    BackendJsonResult, BackendPayload, CacheStage, GenerationRequest, LlmBackend, RuntimeStore,
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::term_matcher::TermMatcher;
 
 use super::accounting::PipelineAccounting;
 
-pub(super) struct TerminologyStage<'a, B, D> {
+pub(super) struct TerminologyStage<'a, B> {
     pub backend: &'a mut B,
-    pub dashboard: &'a mut D,
     pub options: &'a PipelineOptions,
     pub language_rules: &'a ResolvedLanguageRules,
     pub memory: &'a mut ContextMemory,
@@ -30,10 +28,9 @@ pub(super) struct TerminologyStage<'a, B, D> {
     pub accounting: &'a mut PipelineAccounting,
 }
 
-impl<B, D> TerminologyStage<'_, B, D>
+impl<B> TerminologyStage<'_, B>
 where
     B: LlmBackend,
-    D: DashboardSink,
 {
     pub(super) fn run(&mut self, document: &SubtitleDocument) -> CoreResult<TerminologyStats> {
         let started = Instant::now();
@@ -51,7 +48,7 @@ where
             candidates: candidates.len(),
             ..TerminologyStats::default()
         };
-        if !self.options.terminology_preflight {
+        if !self.options.execution.terminology_preflight {
             self.report(TaskState::Skipped, 0, candidates.len(), Usage::default());
             return Ok(stats);
         }
@@ -77,7 +74,7 @@ where
             &document.segments,
         );
         let hash = super::support::request_hash(self.options, CacheStage::Terminology, &messages);
-        let cached = if self.options.use_cache {
+        let cached = if self.options.execution.use_cache {
             self.store
                 .map(|store| store.load_cached_response(CacheStage::Terminology, &hash))
                 .transpose()?
@@ -107,7 +104,7 @@ where
                 };
                 let guide = accept_document_guide(self.memory, payload.guide, &mut stats);
                 stats.entries_added = self.memory.glossary.len().saturating_sub(existing.len());
-                if self.options.use_cache
+                if self.options.execution.use_cache
                     && stats.cache_hits == 0
                     && let Some(store) = self.store
                 {
@@ -145,7 +142,6 @@ where
             }
         }
         stats.duration_ms = super::support::duration_ms(started);
-        self.dashboard.add_usage(stats.usage);
         self.report(
             TaskState::Completed,
             candidates.len(),
@@ -162,12 +158,12 @@ where
         segments: &[SubtitleSegment],
     ) -> CoreResult<BackendJsonResult> {
         let mut last_error = None;
-        for _ in 0..=self.options.retries {
+        for _ in 0..=self.options.execution.retries {
             self.cancellation.check()?;
             self.accounting.reserve_requests(
                 1,
-                self.options.max_requests,
-                self.options.max_tokens,
+                self.options.execution.max_requests,
+                self.options.execution.max_tokens,
             )?;
             let response = self
                 .backend
@@ -572,8 +568,8 @@ fn build_messages(
     segments: &[SubtitleSegment],
 ) -> Vec<crate::ports::ChatMessage> {
     let payload = serde_json::json!({
-        "source_language": options.source_language,
-        "target_language": options.target_language,
+        "source_language": options.validation.source_language,
+        "target_language": options.validation.target_language,
         "candidates": candidates.iter().map(|candidate| serde_json::json!({
             "source": candidate.source,
             "context": candidate.context,
@@ -581,7 +577,7 @@ fn build_messages(
         "document_samples": document_samples(segments),
     });
     let payload = serde_json::to_string(&payload).unwrap_or_default();
-    let name_policy = if options.preserve_names {
+    let name_policy = if options.validation.preserve_names {
         "For personal names, use the exact source spelling as target."
     } else {
         "Include every clearly identified personal name and translate or transliterate it into the target language's conventional script; do not omit a clear personal name merely because its canonical spelling is uncertain."
@@ -893,8 +889,8 @@ mod tests {
     #[test]
     fn japanese_chinese_preflight_requests_exact_honorific_surfaces() {
         let mut options = PipelineOptions::new("episode.ass".into());
-        options.source_language = "ja".to_owned();
-        options.target_language = "zh-Hans".to_owned();
+        options.validation.source_language = "ja".to_owned();
+        options.validation.target_language = "zh-Hans".to_owned();
         let rules = LanguageRuleRegistry::resolve("ja", "zh-Hans");
         let messages = build_messages(
             &options,

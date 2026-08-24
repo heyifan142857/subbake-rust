@@ -2,7 +2,7 @@ use crate::entities::{
     ConcurrencyStrategy, ContextStrategy, ReviewPolicy, SubtitleSegment, TerminologyStats, Usage,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
+use crate::ports::{BatchShardKind, LlmBackend};
 use crate::progress::TaskState;
 use crate::storage::ResumeSnapshot;
 use crate::validation::validate_full_alignment;
@@ -32,14 +32,13 @@ pub(super) struct TranslationRunInput<'a> {
     pub scene_groups: &'a [usize],
 }
 
-pub(super) fn run<B, D>(
-    pipeline: &mut SubtitlePipeline<B, D>,
+pub(super) fn run<B>(
+    pipeline: &mut SubtitlePipeline<B>,
     document: &crate::entities::SubtitleDocument,
     input: TranslationRunInput<'_>,
 ) -> CoreResult<TranslationRun>
 where
     B: LlmBackend,
-    D: DashboardSink,
 {
     let TranslationRunInput {
         batches,
@@ -71,10 +70,6 @@ where
     if resume.translation_batches_completed == 0 {
         usage.add(terminology.usage);
     }
-    if usage != Usage::default() {
-        pipeline.dashboard.add_usage(usage);
-    }
-
     while !stage.is_complete() {
         pipeline.cancellation.check()?;
         let concurrency = if pipeline.backend.supports_parallel_generation() {
@@ -94,19 +89,19 @@ where
             ConcurrencyStrategy::Fixed | ConcurrencyStrategy::AdaptiveQueued { .. } => concurrency,
         };
         let mut previous_confirmed = stage.previous_confirmed_context(
-            pipeline.options.confirmed_context_lines,
-            pipeline.options.confirmed_context_token_budget,
+            pipeline.options.execution.confirmed_context_lines,
+            pipeline.options.execution.confirmed_context_token_budget,
         );
         if previous_confirmed.is_empty() {
             previous_confirmed = bounded_confirmed_context(
-                &pipeline.options.initial_confirmed_context,
-                pipeline.options.confirmed_context_lines,
-                pipeline.options.confirmed_context_token_budget,
+                &pipeline.options.execution.initial_confirmed_context,
+                pipeline.options.execution.confirmed_context_lines,
+                pipeline.options.execution.confirmed_context_token_budget,
             );
         }
         let mut prepared = stage.prepare_window(
             window_size,
-            pipeline.options.use_cache,
+            pipeline.options.execution.use_cache,
             &pipeline.translation_memory,
         );
         for batch in &mut prepared {
@@ -168,7 +163,7 @@ where
             &prepared,
             &generated,
             &pipeline.required_glossary,
-            pipeline.options.review_policy != ReviewPolicy::Off,
+            pipeline.options.execution.review_policy != ReviewPolicy::Off,
         )?;
         for prepared_batch in prepared {
             let result = if prepared_batch.pending.is_empty() {
@@ -191,7 +186,6 @@ where
             let applied = stage.apply(prepared_batch, result)?;
             if let Some(result) = applied.result.as_ref() {
                 usage.add(result.usage);
-                pipeline.dashboard.add_usage(result.usage);
                 pipeline.memory.update("", &result.glossary_updates);
                 pipeline.commit_terminology_updates(&result.terminology_updates);
             }
@@ -208,18 +202,18 @@ where
                         .map(|(source, target)| (source.clone(), target.clone()))
                         .collect::<Vec<_>>(),
                 )?;
-                store.save_batch_segments(
-                    BatchShardKind::Translated,
-                    applied.index + 1,
-                    &applied.translated,
-                )?;
             }
             pipeline.cancellation.check()?;
-            pipeline.save_run_state(
+            pipeline.commit_checkpoint(
                 applied.index + 1,
                 resume.review_batches_completed,
                 false,
                 usage,
+                vec![crate::ports::CheckpointShard {
+                    kind: BatchShardKind::Translated,
+                    batch_index: applied.index + 1,
+                    segments: applied.translated.clone(),
+                }],
             )?;
             pipeline.report(
                 "TRANSLATE",
@@ -248,7 +242,14 @@ where
         resume.validation_completed,
         usage,
     )?;
-    pipeline.dashboard.mark_done("TRANSLATE");
+    pipeline.report(
+        "TRANSLATE",
+        TaskState::Completed,
+        stage.len(),
+        Some(stage.len()),
+        resume.translation_batches_completed,
+        usage,
+    );
     let batches = stage.batches().to_vec();
     Ok(TranslationRun {
         batches,

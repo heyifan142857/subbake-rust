@@ -38,8 +38,8 @@ impl ToolRunner {
             ValidatedToolCall::parse(name, args).map_err(|error| AgentError::ToolArguments {
                 message: error.to_string(),
             })?;
-        if crate::tools::find_tool_spec(name)
-            .is_some_and(|spec| !engine.tool_registry.is_available(spec))
+        if crate::tools::find_tool_handler(name)
+            .is_some_and(|handler| !engine.tool_registry.is_available(&handler.spec))
         {
             return Err(AgentError::ToolArguments {
                 message: format!("tool `{name}` is unavailable on this platform"),

@@ -1,18 +1,22 @@
 #[cfg(feature = "agent")]
 use crate::args::{parse_agent_args, parse_resume_args};
 use crate::args::{
-    parse_batch_args, parse_evaluate_args, parse_memory_args, parse_overnight_args,
-    parse_pipeline_args, parse_provider_args, parse_qa_args, parse_runtime_args,
-    parse_transcribe_args, parse_translate_args, parse_whisper_args,
+    parse_batch_args, parse_edit_args, parse_evaluate_args, parse_memory_args,
+    parse_overnight_args, parse_pipeline_args, parse_project_args, parse_provider_args,
+    parse_qa_args, parse_runtime_args, parse_transcribe_args, parse_translate_args,
+    parse_whisper_args,
 };
 use crate::{CliError, CliResult};
 
 #[cfg(feature = "agent")]
 mod agent;
+mod completion;
+mod edit;
 mod evaluate;
 mod memory;
 mod overnight;
 mod pipeline;
+mod project;
 mod provider;
 mod qa;
 mod runtime;
@@ -20,24 +24,17 @@ mod transcribe;
 mod translate;
 mod whisper;
 
-pub(crate) const COMMAND_NAMES: &[&str] = &[
-    #[cfg(feature = "agent")]
-    "agent",
-    #[cfg(feature = "agent")]
-    "resume",
-    "translate",
-    "batch",
-    "evaluate",
-    "memory",
-    "qa",
-    "transcribe",
-    "pipeline",
-    "overnight",
-    "provider",
-    "runtime",
-    "whisper",
-    "help",
-];
+pub(crate) struct CommandSpec {
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub help: &'static str,
+    pub options: &'static [&'static str],
+    pub subcommands: &'static [&'static str],
+}
+
+pub(crate) fn command_specs() -> &'static [CommandSpec] {
+    COMMAND_SPECS
+}
 
 pub fn dispatch(args: Vec<String>) -> CliResult<()> {
     if args.is_empty() {
@@ -68,10 +65,13 @@ pub fn dispatch(args: Vec<String>) -> CliResult<()> {
         #[cfg(feature = "agent")]
         "resume" => agent::run(parse_resume_args(&args[1..])?),
         "translate" => translate::translate_file(parse_translate_args(&args[1..])?).map(|_| ()),
+        "edit" => edit::run(parse_edit_args(&args[1..])?),
         "batch" => translate::translate_batch(parse_batch_args(&args[1..])?),
         "evaluate" => evaluate::run(parse_evaluate_args(&args[1..])?),
         "memory" => memory::run(parse_memory_args(&args[1..])?),
         "qa" => qa::run(parse_qa_args(&args[1..])?),
+        "project" => project::run(parse_project_args(&args[1..])?),
+        "completion" => completion::run(&args[1..]),
         "transcribe" => transcribe::run(parse_transcribe_args(&args[1..])?),
         "pipeline" => pipeline::run(parse_pipeline_args(&args[1..])?),
         "overnight" => overnight::run(parse_overnight_args(&args[1..])?),
@@ -100,6 +100,11 @@ fn requested_help(args: &[String]) -> Option<&'static str> {
 }
 
 pub(crate) fn help_text(command: &[String]) -> &'static str {
+    if let [name] = command
+        && let Some(spec) = command_specs().iter().find(|spec| spec.name == name)
+    {
+        return spec.help;
+    }
     match command
         .iter()
         .map(String::as_str)
@@ -112,10 +117,12 @@ pub(crate) fn help_text(command: &[String]) -> &'static str {
         #[cfg(feature = "agent")]
         ["resume"] => RESUME_HELP,
         ["translate"] => TRANSLATE_HELP,
+        ["edit"] => EDIT_HELP,
         ["batch"] => BATCH_HELP,
         ["evaluate"] => EVALUATE_HELP,
         ["memory"] | ["memory", _] => MEMORY_HELP,
         ["qa"] => QA_HELP,
+        ["project"] => PROJECT_HELP,
         ["transcribe"] => TRANSCRIBE_HELP,
         ["pipeline"] => PIPELINE_HELP,
         ["overnight"]
@@ -142,10 +149,13 @@ Commands:
   agent       Start the interactive agent (also the default with no command)
   resume      Resume the latest or a specified agent session
   translate   Translate a subtitle file
+  edit        Safely refine an existing translated subtitle
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
   memory      Inspect, export, import, or prune glossary and translation memory
   qa          Inspect subtitle timing and readability without a reference
+  project     Build a project manifest and consistency report
+  completion  Generate shell completion scripts
   transcribe  Transcribe audio or video into subtitles
   pipeline    Transcribe media when needed, then translate it
   overnight   Submit, check, and collect a provider-managed economy batch
@@ -174,10 +184,13 @@ Usage: sbake [OPTIONS] [COMMAND]
 
 Commands:
   translate   Translate a subtitle file
+  edit        Safely refine an existing translated subtitle
   batch       Translate subtitle files in a directory
   evaluate    Compare a subtitle output with a reference offline
   memory      Inspect, export, import, or prune glossary and translation memory
   qa          Inspect subtitle timing and readability without a reference
+  project     Build a project manifest and consistency report
+  completion  Generate shell completion scripts
   transcribe  Transcribe audio or video into subtitles
   pipeline    Transcribe media when needed, then translate it
   overnight   Submit, check, and collect a provider-managed economy batch
@@ -224,7 +237,7 @@ Options:
       --target-lang <LANGUAGE>     Target language
       --provider <NAME>            Provider name
       --model <NAME>               Model name
-      --output-format <FORMAT>     Output subtitle format: srt, vtt, txt, or ass
+      --output-format <FORMAT>     Output format: srt, vtt, txt, ass, ssa, or ttml
       --bilingual                  Include source and translated text
       --bilingual-font-scale <N>   Scale bilingual ASS fonts (default: 1.0)
       --online-terminology         Merge comprehensive terminology while translating (default in cinema)
@@ -246,6 +259,7 @@ Options:
       --max-characters-per-line <N>
                                    Reject subtitle lines longer than N characters
       --max-lines <N>              Reject subtitle entries with more than N lines
+      --qa-fail-on <LEVEL>         Block publication on QA error or warning
       --fast                       Deprecated alias for --mode turbo
       --dry-run                    Prepare work without provider calls
       --max-requests <N>           Stop before exceeding N provider requests
@@ -256,6 +270,27 @@ Options:
 Additional provider, batching, concurrency, cache, retry, glossary, and runtime
 options are accepted. Media input is rejected; use `sbake transcribe` or
 `sbake pipeline` for media workflows.
+"#;
+const EDIT_HELP: &str = r#"Safely refine an existing translated subtitle
+
+Usage: sbake edit <SUBTITLE> --instruction <TEXT> [OPTIONS]
+
+Options:
+      --instruction <TEXT>      Requested subtitle edit
+      --dry-run                 Validate and show the proposed diff without writing
+      --allow-non-generated     Allow editing a file without a translated/bilingual name
+      --config <PATH>           Configuration file
+      --profile <NAME>          Named provider profile
+      --source-lang <LANGUAGE>  Original source language
+      --target-lang <LANGUAGE>  Edited subtitle language
+      --provider <NAME>         Provider name
+      --model <NAME>            Model name
+      --glossary <PATH>         Required glossary used by deterministic validation
+      --json                    Emit structured JSON output
+  -h, --help                    Print help
+
+The edit is rejected before publication if it changes IDs, formatting markers,
+numbers, dates, amounts, required terminology, or configured readability limits.
 "#;
 const BATCH_HELP: &str = r#"Translate subtitle files in a directory
 
@@ -272,6 +307,8 @@ Options:
       --bilingual              Include source and translated text
       --bilingual-font-scale <N>
                               Scale bilingual ASS fonts (default: 1.0)
+      --json                  Emit structured JSON output
+      --qa-fail-on <LEVEL>    Block publication on QA error or warning
   -h, --help                   Print help
 
 Translation provider, model, review, batching, cache, retry, and runtime options
@@ -291,6 +328,21 @@ Usage: sbake qa <SUBTITLE> [--json] [--fail-on <LEVEL>]
 LEVEL is never (default), error, or warning. Checks empty text, invalid and
 overlapping timing, reading speed, line length/count, and repeated segments.
 "#;
+const PROJECT_HELP: &str = r#"Inspect a subtitle project or season
+
+Usage: sbake project <DIR> [OPTIONS]
+
+Options:
+      --recursive          Include nested episode directories
+  -o, --output <PATH>      Atomically write the versioned JSON report
+      --json               Emit the report as structured JSON
+      --fail-on <LEVEL>    Fail on error or warning findings
+  -h, --help               Print help
+
+The report inventories pending, translated, and bilingual files; runs QA on
+source and output subtitles; checks segment alignment; and reports identical
+source lines that have divergent translations across episodes.
+"#;
 const MEMORY_HELP: &str = r#"Manage glossary and translation-memory data
 
 Usage:
@@ -301,7 +353,7 @@ Usage:
 
 Bundles use a versioned JSON shape. Import merges entries without replacing
 existing local values; prune removes blank mappings. Runtime, profile, source-language, and target-language
-options are resolved the same way as translation.
+options are resolved the same way as translation. Pass --json for structured output.
 "#;
 const TRANSCRIBE_HELP: &str = r#"Transcribe audio or video into subtitles
 
@@ -321,11 +373,17 @@ Options:
       --vad-min-silence-duration-ms <MS> Minimum silence used to split speech
       --vad-speech-pad-ms <MS> Padding around detected speech
       --no-filter-hallucinations Keep repeated/silence marker segments
+      --normalize-transcript / --no-normalize-transcript
+                              Enable or disable whitespace/punctuation cleanup
+      --speaker-labels / --no-speaker-labels
+                              Detect and preserve Whisper speaker prefixes
       --config <PATH>          Configuration file
       --profile <NAME>         Named profile
       --runtime-dir <DIR>      Runtime storage root
       --whisper-bin <PATH>     Override whisper-cli path
       --whisper-models-dir <DIR> Override whisper model directory
+      --json                   Emit structured JSON output
+      --qa-fail-on <LEVEL>     Block publication on QA error or warning
   -h, --help                   Print help
 "#;
 const PIPELINE_HELP: &str = r#"Transcribe media when needed, then translate it
@@ -344,6 +402,8 @@ Accepts the translation settings from `translate` plus:
       --transcribe-vad-model <NAME|PATH> VAD model name or path
       --whisper-bin <PATH>             Override whisper-cli path
       --whisper-models-dir <DIR>       Override whisper model directory
+      --json                            Emit structured JSON output
+      --qa-fail-on <LEVEL>              Block publication on QA error or warning
   -h, --help                           Print help
 
 For MKV, MP4/M4V/MOV, and WebM inputs, an existing text subtitle stream is
@@ -361,7 +421,8 @@ Usage:
 `submit` supports OpenAI Batch with `openai_chat` or `openai_responses`.
 It saves a non-secret manifest under the subtitle runtime directory. Pass that
 manifest path to `status` and `collect`; collection validates that the source
-subtitle has not changed before writing the translated output.
+subtitle has not changed before writing the translated output. All actions
+accept `--json`.
 "#;
 const PROVIDER_HELP: &str = r#"Validate a model provider configuration
 
@@ -379,6 +440,7 @@ Options:
       --api-key-env <NAME>    API-key environment variable
       --auth-header <NAME>    Authorization header name
       --auth-prefix <PREFIX>  Authorization value prefix
+      --json                  Emit structured JSON output
   -h, --help                  Print help
 "#;
 const RUNTIME_HELP: &str = r#"Inspect or clean runtime artifacts
@@ -394,6 +456,9 @@ Run `sbake runtime <COMMAND> --help` for details.
 const RUNTIME_INSPECT_HELP: &str = r#"Inspect runtime artifacts for a target
 
 Usage: sbake runtime inspect <TARGET> [--runtime-dir <DIR>]
+
+Options:
+      --json  Emit structured JSON output
 "#;
 const RUNTIME_CLEAN_HELP: &str = r#"Remove runtime artifacts for a target
 
@@ -406,6 +471,7 @@ Options:
       --all           Remove all managed translation artifacts; preserve the runtime root and unrelated files
       --runtime-dir <DIR>  Override the runtime directory
       --yes           Confirm deletion
+      --json          Emit structured JSON output
   -h, --help          Print help
 
 At least one of --runs, --cache, --glossary, or --all is required.
@@ -434,6 +500,7 @@ Options:
       --config <PATH>      Configuration file
       --profile <NAME>     Named profile
       --keep-models        Keep models when uninstalling
+      --json               Emit structured JSON output
   -h, --help               Print help
 "#;
 const WHISPER_MODEL_HELP: &str = r#"List or download whisper.cpp models
@@ -450,3 +517,200 @@ Usage:
 
 When NAME is omitted, SubBake downloads silero-v6.2.0.
 "#;
+
+const COMPLETION_HELP: &str = r#"Generate a shell completion script
+
+Usage: sbake completion <SHELL>
+
+SHELL is bash, zsh, fish, or powershell. Print the script to standard output,
+then source it or install it using your shell's normal completion directory.
+"#;
+
+const COMMON_TRANSLATION_OPTIONS: &[&str] = &[
+    "--output",
+    "--config",
+    "--profile",
+    "--source-lang",
+    "--target-lang",
+    "--provider",
+    "--model",
+    "--mode",
+    "--review",
+    "--no-review",
+    "--dry-run",
+    "--json",
+    "--qa-fail-on",
+    "--help",
+];
+
+static COMMAND_SPECS: &[CommandSpec] = &[
+    #[cfg(feature = "agent")]
+    CommandSpec {
+        name: "agent",
+        summary: "Start the interactive agent",
+        help: AGENT_HELP,
+        options: &["--help"],
+        subcommands: &[],
+    },
+    #[cfg(feature = "agent")]
+    CommandSpec {
+        name: "resume",
+        summary: "Resume an agent session",
+        help: RESUME_HELP,
+        options: &["--help"],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "translate",
+        summary: "Translate a subtitle file",
+        help: TRANSLATE_HELP,
+        options: COMMON_TRANSLATION_OPTIONS,
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "edit",
+        summary: "Safely refine a translated subtitle",
+        help: EDIT_HELP,
+        options: &[
+            "--instruction",
+            "--dry-run",
+            "--allow-non-generated",
+            "--config",
+            "--profile",
+            "--json",
+            "--help",
+        ],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "batch",
+        summary: "Translate a directory",
+        help: BATCH_HELP,
+        options: &[
+            "--recursive",
+            "--overwrite",
+            "--fail-fast",
+            "--retry-failed",
+            "--config",
+            "--profile",
+            "--qa-fail-on",
+            "--json",
+            "--help",
+        ],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "evaluate",
+        summary: "Compare against a reference",
+        help: EVALUATE_HELP,
+        options: &["--json", "--help"],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "memory",
+        summary: "Manage glossary and translation memory",
+        help: MEMORY_HELP,
+        options: &["--json", "--help"],
+        subcommands: &["inspect", "export", "import", "prune"],
+    },
+    CommandSpec {
+        name: "qa",
+        summary: "Inspect subtitle quality",
+        help: QA_HELP,
+        options: &["--json", "--fail-on", "--help"],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "project",
+        summary: "Inspect a subtitle project",
+        help: PROJECT_HELP,
+        options: &["--recursive", "--output", "--json", "--fail-on", "--help"],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "transcribe",
+        summary: "Transcribe audio or video",
+        help: TRANSCRIBE_HELP,
+        options: &[
+            "--output",
+            "--overwrite",
+            "--language",
+            "--model",
+            "--format",
+            "--sidecar",
+            "--normalize-transcript",
+            "--no-normalize-transcript",
+            "--speaker-labels",
+            "--no-speaker-labels",
+            "--qa-fail-on",
+            "--json",
+            "--help",
+        ],
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "pipeline",
+        summary: "Transcribe then translate",
+        help: PIPELINE_HELP,
+        options: COMMON_TRANSLATION_OPTIONS,
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "overnight",
+        summary: "Run provider-managed batches",
+        help: OVERNIGHT_HELP,
+        options: &["--config", "--profile", "--json", "--help"],
+        subcommands: &["submit", "status", "collect"],
+    },
+    CommandSpec {
+        name: "provider",
+        summary: "Validate a provider",
+        help: PROVIDER_HELP,
+        options: &["--config", "--profile", "--json", "--help"],
+        subcommands: &["check"],
+    },
+    CommandSpec {
+        name: "runtime",
+        summary: "Inspect or clean runtime data",
+        help: RUNTIME_HELP,
+        options: &["--runtime-dir", "--json", "--help"],
+        subcommands: &["inspect", "clean"],
+    },
+    CommandSpec {
+        name: "whisper",
+        summary: "Manage whisper.cpp",
+        help: WHISPER_HELP,
+        options: &[
+            "--bin",
+            "--models-dir",
+            "--variant",
+            "--config",
+            "--profile",
+            "--json",
+            "--help",
+        ],
+        subcommands: &[
+            "status",
+            "versions",
+            "install",
+            "update",
+            "uninstall",
+            "model",
+            "vad-model",
+        ],
+    },
+    CommandSpec {
+        name: "completion",
+        summary: "Generate shell completions",
+        help: COMPLETION_HELP,
+        options: &["--help"],
+        subcommands: &["bash", "zsh", "fish", "powershell"],
+    },
+    CommandSpec {
+        name: "help",
+        summary: "Print command help",
+        help: TOP_LEVEL_HELP,
+        options: &[],
+        subcommands: &[],
+    },
+];

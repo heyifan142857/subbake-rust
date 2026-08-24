@@ -10,8 +10,8 @@ use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::normalize_language;
 use subbake_core::{
-    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, SharedProgress, SubtitleDocument,
-    TaskKind, TaskState,
+    CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, QualityGate, QualityPolicy,
+    QualityReport, SharedProgress, SubtitleDocument, TaskKind, TaskState, inspect_quality,
 };
 pub use subbake_core::{TranscriberBackend, TranscriptionFormat};
 
@@ -59,6 +59,8 @@ pub struct TranscriptionSettings {
     pub runtime_dir: Option<PathBuf>,
     pub multiple_model_policy: MultipleModelPolicy,
     pub filter_hallucinations: bool,
+    pub normalize_text: Option<bool>,
+    pub speaker_labels: Option<bool>,
     pub vad_enabled: Option<bool>,
     pub vad_model: Option<String>,
     pub vad_threshold: Option<f32>,
@@ -74,7 +76,7 @@ pub enum MultipleModelPolicy {
     PreferRanked,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionOutcome {
     pub output_path: PathBuf,
     pub language: String,
@@ -84,12 +86,15 @@ pub struct TranscriptionOutcome {
     pub output_format: TranscriptionFormat,
     pub subtitle_entries: usize,
     pub cleanup: TranscriptionCleanupStats,
+    pub quality: QualityReport,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptionCleanupStats {
     pub removed_empty_or_silence: usize,
     pub removed_repeated: usize,
+    pub normalized_segments: usize,
+    pub speaker_labels_detected: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +147,8 @@ impl Default for TranscriptionSettings {
             runtime_dir: None,
             multiple_model_policy: MultipleModelPolicy::RequireExplicit,
             filter_hallucinations: true,
+            normalize_text: None,
+            speaker_labels: None,
             vad_enabled: None,
             vad_model: None,
             vad_threshold: None,
@@ -155,6 +162,14 @@ impl Default for TranscriptionSettings {
 impl TranscriptionSettings {
     pub(crate) fn effective_vad_enabled(&self) -> bool {
         self.vad_enabled.unwrap_or(true)
+    }
+
+    pub(crate) fn effective_normalize_text(&self) -> bool {
+        self.normalize_text.unwrap_or(true)
+    }
+
+    pub(crate) fn effective_speaker_labels(&self) -> bool {
+        self.speaker_labels.unwrap_or(true)
     }
 
     pub(crate) fn effective_vad_model(&self) -> &str {
@@ -458,9 +473,23 @@ pub fn transcribe_media_cancellable(
 }
 
 pub fn transcribe_media_cancellable_with_progress(
+    request: TranscriptionRequest,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+) -> AdapterResult<TranscriptionOutcome> {
+    transcribe_media_cancellable_with_progress_and_quality(
+        request,
+        cancellation,
+        progress,
+        QualityGate::Never,
+    )
+}
+
+pub fn transcribe_media_cancellable_with_progress_and_quality(
     mut request: TranscriptionRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
+    quality_gate: QualityGate,
 ) -> AdapterResult<TranscriptionOutcome> {
     check_cancelled(cancellation)?;
     let language = match request.settings.language.as_deref() {
@@ -491,7 +520,25 @@ pub fn transcribe_media_cancellable_with_progress(
 
     if let Some(ref sidecar_path) = request.settings.sidecar_path {
         check_cancelled(cancellation)?;
-        render_sidecar(sidecar_path, &output_path, request.settings.output_format)?;
+        let mut document = read_document(sidecar_path)?;
+        let cleanup = postprocess_transcription_document(&mut document, &request.settings);
+        if request.settings.output_format != TranscriptionFormat::Txt
+            && document
+                .segments
+                .iter()
+                .any(|segment| segment.start.is_none() || segment.end.is_none())
+        {
+            return Err(AdapterError::invalid_input(
+                "sidecar lacks timing data; use --format txt or a timed subtitle file",
+            ));
+        }
+        let quality = inspect_quality(&document, QualityPolicy::default());
+        enforce_quality_gate(&quality, quality_gate)?;
+        let options = RenderOptions::new(
+            false,
+            Some(request.settings.output_format.extension().to_owned()),
+        );
+        render_and_write_document(&document, &document.segments, &output_path, &options)?;
         let mut done = ProgressEvent::running(
             TaskKind::Transcription,
             "COMPLETE",
@@ -501,7 +548,6 @@ pub fn transcribe_media_cancellable_with_progress(
         );
         done.state = TaskState::Completed;
         progress.emit(done);
-        let document = read_document(sidecar_path)?;
         return Ok(TranscriptionOutcome {
             output_path,
             language,
@@ -510,7 +556,8 @@ pub fn transcribe_media_cancellable_with_progress(
             model_auto_selected: false,
             output_format: request.settings.output_format,
             subtitle_entries: document.segments.len(),
-            cleanup: TranscriptionCleanupStats::default(),
+            cleanup,
+            quality,
         });
     }
 
@@ -547,11 +594,7 @@ pub fn transcribe_media_cancellable_with_progress(
         &progress,
     )?;
     let raw_last_timestamp = last_timed_end_ms(&doc);
-    let cleanup = if request.settings.filter_hallucinations {
-        clean_transcription_document(&mut doc)
-    } else {
-        TranscriptionCleanupStats::default()
-    };
+    let cleanup = postprocess_transcription_document(&mut doc, &request.settings);
     validate_transcription_coverage(
         &doc,
         raw_last_timestamp,
@@ -560,6 +603,8 @@ pub fn transcribe_media_cancellable_with_progress(
         0,
     )?;
     shift_document_timestamps(&mut doc, prepared_audio.timeline_offset_ms());
+    let quality = inspect_quality(&doc, QualityPolicy::default());
+    enforce_quality_gate(&quality, quality_gate)?;
 
     check_cancelled(cancellation)?;
     let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
@@ -582,7 +627,18 @@ pub fn transcribe_media_cancellable_with_progress(
         output_format: fmt,
         subtitle_entries: doc.segments.len(),
         cleanup,
+        quality,
     })
+}
+
+fn enforce_quality_gate(report: &QualityReport, gate: QualityGate) -> AdapterResult<()> {
+    if gate.fails(report) {
+        return Err(AdapterError::invalid_input(format!(
+            "subtitle QA threshold failed before publication with {} error(s) and {} warning(s)",
+            report.errors, report.warnings
+        )));
+    }
+    Ok(())
 }
 
 /// Transcribe media without publishing a user-visible subtitle file. Stable
@@ -683,8 +739,30 @@ pub(crate) fn transcribe_media_incremental_with_progress(
     })
 }
 
-fn clean_transcription_document(document: &mut SubtitleDocument) -> TranscriptionCleanupStats {
+fn postprocess_transcription_document(
+    document: &mut SubtitleDocument,
+    settings: &TranscriptionSettings,
+) -> TranscriptionCleanupStats {
     let mut stats = TranscriptionCleanupStats::default();
+    for segment in &mut document.segments {
+        if settings.effective_speaker_labels()
+            && let Some((speaker, dialogue)) = extract_speaker_label(&segment.text)
+        {
+            segment.semantic.speaker = Some(speaker.clone());
+            segment.text = format!("{speaker}: {dialogue}");
+            stats.speaker_labels_detected += 1;
+        }
+        if settings.effective_normalize_text() {
+            let normalized = normalize_transcript_text(&segment.text);
+            if normalized != segment.text {
+                segment.text = normalized;
+                stats.normalized_segments += 1;
+            }
+        }
+    }
+    if !settings.filter_hallucinations {
+        return stats;
+    }
     let mut previous = String::new();
     let mut repeated = 0usize;
     document.segments.retain(|segment| {
@@ -710,6 +788,70 @@ fn clean_transcription_document(document: &mut SubtitleDocument) -> Transcriptio
         true
     });
     stats
+}
+
+fn extract_speaker_label(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((label, dialogue)) = rest.split_once(']')
+        && is_speaker_label(label)
+        && !dialogue.trim_start_matches(':').trim().is_empty()
+    {
+        return Some((
+            normalize_speaker_name(label),
+            dialogue.trim_start_matches(':').trim().to_owned(),
+        ));
+    }
+    let (label, dialogue) = trimmed.split_once(':')?;
+    if !is_speaker_label(label) || dialogue.trim().is_empty() {
+        return None;
+    }
+    Some((normalize_speaker_name(label), dialogue.trim().to_owned()))
+}
+
+fn is_speaker_label(label: &str) -> bool {
+    let normalized = label.trim().to_ascii_lowercase().replace(['_', '-'], " ");
+    normalized == "speaker"
+        || normalized.strip_prefix("speaker ").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+        })
+}
+
+fn normalize_speaker_name(label: &str) -> String {
+    let normalized = label.trim().replace(['_', '-'], " ");
+    let suffix = normalized
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if suffix.is_empty() {
+        "Speaker".to_owned()
+    } else {
+        format!("Speaker {suffix}")
+    }
+}
+
+fn normalize_transcript_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut normalized = String::with_capacity(collapsed.len());
+            for character in collapsed.chars() {
+                if matches!(
+                    character,
+                    ',' | '.' | '!' | '?' | ';' | ':' | '，' | '。' | '！' | '？' | '；' | '：'
+                ) && normalized.ends_with(' ')
+                {
+                    normalized.pop();
+                }
+                normalized.push(character);
+            }
+            normalized
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -860,8 +1002,8 @@ fn transcribe_prepared_audio_incremental(
             }
         };
         let raw_last_timestamp = last_timed_end_ms_on_audio(&document, timeline_offset_ms);
-        let cleanup = if settings.filter_hallucinations && !resumed {
-            clean_transcription_document(&mut document)
+        let cleanup = if !resumed {
+            postprocess_transcription_document(&mut document, settings)
         } else {
             TranscriptionCleanupStats::default()
         };
@@ -987,10 +1129,12 @@ fn transcribe_long_audio_incremental(
         };
         raw_last_timestamp =
             last_timed_end_ms_on_audio(&document, timeline_offset_ms).or(raw_last_timestamp);
-        if settings.filter_hallucinations && !resumed {
-            let chunk_cleanup = clean_transcription_document(&mut document);
+        if !resumed {
+            let chunk_cleanup = postprocess_transcription_document(&mut document, settings);
             cleanup.removed_empty_or_silence += chunk_cleanup.removed_empty_or_silence;
             cleanup.removed_repeated += chunk_cleanup.removed_repeated;
+            cleanup.normalized_segments += chunk_cleanup.normalized_segments;
+            cleanup.speaker_labels_detected += chunk_cleanup.speaker_labels_detected;
         }
         assign_stable_chunk_ids(&mut document.segments, index, whisper_format);
         observer.stable(StableTranscriptionChunk {
@@ -1765,6 +1909,12 @@ pub fn apply_whisper_configuration(
     if transcription.model.is_none() {
         transcription.model = settings.transcription.model.clone();
     }
+    if transcription.normalize_text.is_none() {
+        transcription.normalize_text = Some(settings.transcription.normalize_text);
+    }
+    if transcription.speaker_labels.is_none() {
+        transcription.speaker_labels = Some(settings.transcription.speaker_labels);
+    }
     if transcription.vad_enabled.is_none() {
         transcription.vad_enabled = Some(settings.transcription.vad_enabled);
     }
@@ -1789,23 +1939,6 @@ pub fn apply_whisper_configuration(
 
 fn default_output_path(media_path: &Path, fmt: TranscriptionFormat) -> PathBuf {
     media_path.with_extension(fmt.extension())
-}
-
-fn render_sidecar(path: &Path, output: &Path, fmt: TranscriptionFormat) -> AdapterResult<()> {
-    let doc = read_document(path)?;
-    if fmt != TranscriptionFormat::Txt
-        && doc
-            .segments
-            .iter()
-            .any(|s| s.start.is_none() || s.end.is_none())
-    {
-        return Err(AdapterError::invalid_input(
-            "sidecar lacks timing data; use --format txt or a timed subtitle file",
-        ));
-    }
-    let opts = RenderOptions::new(false, Some(fmt.extension().to_owned()));
-    render_and_write_document(&doc, &doc.segments, output, &opts)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1855,6 +1988,39 @@ mod tests {
     }
 
     #[test]
+    fn qa_gate_rejects_sidecar_before_output_is_published() {
+        let root = t("sidecar-qa-gate");
+        fs::create_dir_all(&root).expect("mkdtemp");
+        let src = root.join("in.srt");
+        fs::write(
+            &src,
+            "1\n00:00:00,000 --> 00:00:02,000\nfirst\n\n2\n00:00:01,000 --> 00:00:03,000\nsecond\n",
+        )
+        .expect("write sidecar");
+        let out = root.join("out.srt");
+
+        let error = transcribe_media_cancellable_with_progress_and_quality(
+            TranscriptionRequest {
+                media_path: root.join("x.mp4"),
+                output_path: Some(out.clone()),
+                overwrite: true,
+                settings: TranscriptionSettings {
+                    sidecar_path: Some(src),
+                    ..Default::default()
+                },
+            },
+            &CancellationGuard::never(),
+            std::sync::Arc::new(NoopProgress),
+            QualityGate::Warning,
+        )
+        .expect_err("overlapping sidecar should fail the QA error gate");
+
+        assert!(error.to_string().contains("QA threshold failed"));
+        assert!(!out.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn conservative_cleanup_removes_silence_markers_and_third_repetition() {
         let mut document = SubtitleDocument {
             path: PathBuf::from("whisper.srt"),
@@ -1876,10 +2042,42 @@ mod tests {
             passthrough_blocks: Vec::new(),
             metadata: Default::default(),
         };
-        let stats = clean_transcription_document(&mut document);
+        let stats =
+            postprocess_transcription_document(&mut document, &TranscriptionSettings::default());
         assert_eq!(stats.removed_empty_or_silence, 1);
         assert_eq!(stats.removed_repeated, 1);
         assert_eq!(document.segments.len(), 2);
+    }
+
+    #[test]
+    fn postprocessing_normalizes_spacing_and_preserves_speaker_labels() {
+        let mut document = SubtitleDocument {
+            path: PathBuf::from("whisper.srt"),
+            format: "srt".to_owned(),
+            segments: vec![SubtitleSegment {
+                id: "1".to_owned(),
+                text: " [SPEAKER_01]   Hello  ,   world ! ".to_owned(),
+                start: None,
+                end: None,
+                identifier: None,
+                settings: None,
+                semantic: Default::default(),
+            }],
+            header: None,
+            passthrough_blocks: Vec::new(),
+            metadata: Default::default(),
+        };
+
+        let stats =
+            postprocess_transcription_document(&mut document, &TranscriptionSettings::default());
+
+        assert_eq!(document.segments[0].text, "Speaker 01: Hello, world!");
+        assert_eq!(
+            document.segments[0].semantic.speaker.as_deref(),
+            Some("Speaker 01")
+        );
+        assert_eq!(stats.speaker_labels_detected, 1);
+        assert_eq!(stats.normalized_segments, 1);
     }
 
     #[test]
@@ -1973,6 +2171,7 @@ mod tests {
             TranscriptionCleanupStats {
                 removed_empty_or_silence: 0,
                 removed_repeated: 250,
+                ..TranscriptionCleanupStats::default()
             },
             0,
         )

@@ -9,7 +9,8 @@ use subbake_core::entities::{
 };
 use subbake_core::error::{CoreError, CoreResult, StorageError, StorageIoKind};
 use subbake_core::ports::{
-    BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeStore,
+    BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeCacheStore,
+    RuntimeCheckpointStore, RuntimeDiagnosticStore, RuntimeLayoutStore, RuntimeMemoryStore,
 };
 use subbake_core::storage::{RunState, RuntimePaths};
 
@@ -67,7 +68,7 @@ struct TerminologyCacheEntry {
     usage: Usage,
 }
 
-impl RuntimeStore for FileRuntimeStore {
+impl RuntimeLayoutStore for FileRuntimeStore {
     fn paths(&self) -> &RuntimePaths {
         &self.paths
     }
@@ -118,7 +119,9 @@ impl RuntimeStore for FileRuntimeStore {
         }
         Ok(())
     }
+}
 
+impl RuntimeMemoryStore for FileRuntimeStore {
     fn save_glossary(&self, entries: &[(String, String)]) -> CoreResult<()> {
         write_json_verified(&self.paths.glossary_path, &string_map_json(entries))
     }
@@ -153,20 +156,6 @@ impl RuntimeStore for FileRuntimeStore {
         })
     }
 
-    fn save_batch_segments(
-        &self,
-        kind: BatchShardKind,
-        batch_index: usize,
-        segments: &[SubtitleSegment],
-    ) -> CoreResult<()> {
-        let path = self.batch_shard_path(kind, batch_index);
-        let payload = serde_json::json!({
-            "batch_index": batch_index,
-            "segments": segments.iter().map(segment_json).collect::<Vec<_>>(),
-        });
-        write_json_verified(&path, &payload)
-    }
-
     fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
         if !self.paths.glossary_path.exists() {
             return Ok(Vec::new());
@@ -189,6 +178,22 @@ impl RuntimeStore for FileRuntimeStore {
         let text = fs::read_to_string(&path)
             .map_err(|error| storage_error("read translation memory", Some(&path), error))?;
         parse_string_map(&text, "translation memory")
+    }
+}
+
+impl RuntimeCheckpointStore for FileRuntimeStore {
+    fn save_batch_segments(
+        &self,
+        kind: BatchShardKind,
+        batch_index: usize,
+        segments: &[SubtitleSegment],
+    ) -> CoreResult<()> {
+        let path = self.batch_shard_path(kind, batch_index);
+        let payload = serde_json::json!({
+            "batch_index": batch_index,
+            "segments": segments.iter().map(segment_json).collect::<Vec<_>>(),
+        });
+        write_json_verified(&path, &payload)
     }
 
     fn load_batch_segments(
@@ -241,7 +246,9 @@ impl RuntimeStore for FileRuntimeStore {
             .map(Some)
             .map_err(|error| CoreError::DataInvariant(format!("run state parse failed: {error}")))
     }
+}
 
+impl RuntimeCacheStore for FileRuntimeStore {
     fn save_cached_response(
         &self,
         stage: CacheStage,
@@ -325,7 +332,9 @@ impl RuntimeStore for FileRuntimeStore {
             }
         }
     }
+}
 
+impl RuntimeDiagnosticStore for FileRuntimeStore {
     fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf> {
         let path = self
             .paths
@@ -826,7 +835,7 @@ mod tests {
         );
         let store = FileRuntimeStore::new(paths);
         let mut options = PipelineOptions::new(root.join("clip.txt"));
-        options.output_path = Some(root.join("clip.translated.txt"));
+        options.rendering.output_path = Some(root.join("clip.translated.txt"));
         let state = RunState::new(
             &options,
             input_signature_from_bytes(b"hello\n", Some(123)),

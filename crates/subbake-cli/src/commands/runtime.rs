@@ -10,6 +10,6 @@ pub fn run(args: RuntimeArgs) -> CliResult<()> {
         target_path: args.target_path,
         runtime_dir: args.runtime_dir,
     })?;
-    print_runtime_outcome(&outcome);
+    print_runtime_outcome(&outcome, args.json);
     Ok(())
 }

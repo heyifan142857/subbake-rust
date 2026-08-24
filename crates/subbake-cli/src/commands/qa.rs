@@ -1,4 +1,4 @@
-use subbake_adapters::{AdapterError, read_document};
+use subbake_adapters::read_document;
 use subbake_core::{QualityPolicy, inspect_quality};
 
 use crate::args::{QaArgs, QaFailOn};
@@ -8,11 +8,11 @@ pub fn run(args: QaArgs) -> CliResult<()> {
     let document = read_document(&args.subtitle_path)?;
     let report = inspect_quality(&document, QualityPolicy::default());
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|error| {
-                AdapterError::invalid_input(format!("encode QA report: {error}"))
-            })?
+        crate::output::print_json_value(
+            "qa_report",
+            serde_json::to_value(&report).map_err(|error| {
+                subbake_adapters::AdapterError::invalid_input(format!("encode QA report: {error}"))
+            })?,
         );
     } else {
         println!("Segments: {}", report.segments);

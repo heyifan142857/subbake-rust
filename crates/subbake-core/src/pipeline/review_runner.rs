@@ -3,7 +3,7 @@ use crate::entities::{
     SubtitleSegment, Usage,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::ports::{BatchShardKind, DashboardSink, LlmBackend};
+use crate::ports::{BatchShardKind, LlmBackend};
 use crate::progress::TaskState;
 use crate::storage::{REVIEW_REPORT_VERSION, ResumeSnapshot};
 use crate::validation::validate_full_alignment;
@@ -25,8 +25,8 @@ pub(super) struct ReviewBatchInput<'a> {
     pub scene_groups: &'a [usize],
 }
 
-pub(super) fn run<B, D>(
-    pipeline: &mut SubtitlePipeline<B, D>,
+pub(super) fn run<B>(
+    pipeline: &mut SubtitlePipeline<B>,
     document: &SubtitleDocument,
     batch_input: ReviewBatchInput<'_>,
     translated: &[SubtitleSegment],
@@ -36,7 +36,6 @@ pub(super) fn run<B, D>(
 ) -> CoreResult<ReviewRun>
 where
     B: LlmBackend,
-    D: DashboardSink,
 {
     let batches = batch_input.review_batches;
     let translation_batches = batch_input.translation_batches;
@@ -51,25 +50,29 @@ where
     } else {
         None
     };
-    let route = (pipeline.options.review_policy != crate::entities::ReviewPolicy::Off).then(|| {
-        ReviewRoute {
+    let route = (pipeline.options.execution.review_policy != crate::entities::ReviewPolicy::Off)
+        .then(|| ReviewRoute {
             kind: if pipeline.reviewer.is_some() {
                 ReviewRouteKind::ConfiguredReviewer
             } else {
                 ReviewRouteKind::TranslatorFallback
             },
             backend_fingerprint: if pipeline.reviewer.is_some() {
-                pipeline.options.reviewer_fingerprint.clone()
+                pipeline.options.identity.reviewer_fingerprint.clone()
             } else {
-                pipeline.options.provider_fingerprint.clone().or_else(|| {
-                    Some(format!(
-                        "{}:{}",
-                        pipeline.options.provider, pipeline.options.model
-                    ))
-                })
+                pipeline
+                    .options
+                    .identity
+                    .provider_fingerprint
+                    .clone()
+                    .or_else(|| {
+                        Some(format!(
+                            "{}:{}",
+                            pipeline.options.identity.provider, pipeline.options.identity.model
+                        ))
+                    })
             },
-        }
-    });
+        });
     let mut stage = ReviewStage::new_with_rules(
         &pipeline.options,
         &pipeline.language_rules,
@@ -84,17 +87,13 @@ where
             cache_hits_before: pipeline.accounting.cache_hits(),
         },
     )?;
-    pipeline
-        .dashboard
-        .set_total_steps(3 + batches.len() + stage.len());
     let resumed = stage.resumed();
     if !stage.is_empty() {
-        pipeline.dashboard.mark_running("FINAL_REVIEW");
         let mut next_review = resumed;
         while next_review < stage.len() {
             pipeline.cancellation.check()?;
             let concurrency = if pipeline.review_backend_supports_parallel_generation() {
-                pipeline.options.review_concurrency.max(1)
+                pipeline.options.execution.review_concurrency.max(1)
             } else {
                 1
             };
@@ -128,7 +127,6 @@ where
                     ))
                 })?;
                 usage.add(reviewed.usage);
-                pipeline.dashboard.add_usage(reviewed.usage);
                 let reviewed_segments = stage.apply(
                     *review_position,
                     &reviewed.lines,
@@ -137,11 +135,6 @@ where
                 )?;
                 if let Some(store) = pipeline.store.as_ref() {
                     pipeline.cancellation.check()?;
-                    store.save_batch_segments(
-                        BatchShardKind::Reviewed,
-                        *review_position,
-                        &reviewed_segments,
-                    )?;
                     let (review, changes) = stage.snapshot(pipeline.accounting.cache_hits());
                     store.save_review_report(&ReviewReport {
                         version: REVIEW_REPORT_VERSION,
@@ -151,7 +144,17 @@ where
                         route: route.clone(),
                     })?;
                 }
-                pipeline.save_run_state(translation_batches, *review_position, false, usage)?;
+                pipeline.commit_checkpoint(
+                    translation_batches,
+                    *review_position,
+                    false,
+                    usage,
+                    vec![crate::ports::CheckpointShard {
+                        kind: BatchShardKind::Reviewed,
+                        batch_index: *review_position,
+                        segments: reviewed_segments,
+                    }],
+                )?;
                 pipeline.report(
                     "FINAL_REVIEW",
                     TaskState::Running,
@@ -164,7 +167,6 @@ where
             next_review += pending.len();
         }
         validate_full_alignment(&document.segments, stage.output())?;
-        pipeline.dashboard.mark_done("FINAL_REVIEW");
     } else {
         pipeline.report(
             "FINAL_REVIEW",
@@ -194,6 +196,16 @@ where
         resume.validation_completed,
         usage,
     )?;
+    if review_batches > 0 {
+        pipeline.report(
+            "FINAL_REVIEW",
+            TaskState::Completed,
+            review_batches,
+            Some(review_batches),
+            resumed,
+            usage,
+        );
+    }
     Ok(ReviewRun {
         output: outcome.output,
         stats: outcome.stats,

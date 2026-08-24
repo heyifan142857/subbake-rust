@@ -116,15 +116,16 @@ impl RunState {
             version: RUN_STATE_VERSION,
             translation_fingerprint: build_translation_fingerprint(options, &input_signature),
             render_fingerprint: build_render_fingerprint(options),
-            input_path: options.input_path.to_string_lossy().into_owned(),
+            input_path: options.identity.input_path.to_string_lossy().into_owned(),
             output_path: options
+                .rendering
                 .output_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             input_signature: Some(input_signature),
-            provider: options.provider.clone(),
-            model: options.model.clone(),
-            batch_size: options.batch_size,
+            provider: options.identity.provider.clone(),
+            model: options.identity.model.clone(),
+            batch_size: options.execution.batch_size,
             translation_batches_completed,
             review_batches_completed,
             validation_completed,
@@ -279,8 +280,10 @@ pub fn build_translation_fingerprint(
     options: &PipelineOptions,
     input_signature: &InputSignature,
 ) -> String {
-    let language_rules =
-        LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
+    let language_rules = LanguageRuleRegistry::resolve(
+        &options.validation.source_language,
+        &options.validation.target_language,
+    );
     let mut fields = vec![
         (
             "version".to_owned(),
@@ -310,6 +313,7 @@ pub fn build_translation_fingerprint(
             "input_format".to_owned(),
             JsonValue::String(
                 options
+                    .identity
                     .input_path
                     .extension()
                     .and_then(|value| value.to_str())
@@ -319,20 +323,23 @@ pub fn build_translation_fingerprint(
         ),
         (
             "provider".to_owned(),
-            JsonValue::String(options.provider.clone()),
+            JsonValue::String(options.identity.provider.clone()),
         ),
-        ("model".to_owned(), JsonValue::String(options.model.clone())),
+        (
+            "model".to_owned(),
+            JsonValue::String(options.identity.model.clone()),
+        ),
         (
             "provider_fingerprint".to_owned(),
-            optional_string(&options.provider_fingerprint),
+            optional_string(&options.identity.provider_fingerprint),
         ),
         (
             "reviewer_fingerprint".to_owned(),
-            optional_string(&options.reviewer_fingerprint),
+            optional_string(&options.identity.reviewer_fingerprint),
         ),
         (
             "document_guide_fingerprint".to_owned(),
-            optional_string(&options.document_guide_fingerprint),
+            optional_string(&options.identity.document_guide_fingerprint),
         ),
         (
             "semantic_versions".to_owned(),
@@ -361,60 +368,61 @@ pub fn build_translation_fingerprint(
         ),
         (
             "batch_size".to_owned(),
-            JsonValue::Number(options.batch_size.to_string()),
+            JsonValue::Number(options.execution.batch_size.to_string()),
         ),
         (
             "batch_token_budget".to_owned(),
-            JsonValue::Number(options.batch_token_budget.to_string()),
+            JsonValue::Number(options.execution.batch_token_budget.to_string()),
         ),
         (
             "request_token_budget".to_owned(),
-            JsonValue::Number(options.request_token_budget.to_string()),
+            JsonValue::Number(options.execution.request_token_budget.to_string()),
         ),
         (
             "translation_concurrency".to_owned(),
-            JsonValue::Number(options.translation_concurrency.to_string()),
+            JsonValue::Number(options.execution.translation_concurrency.to_string()),
         ),
         (
             "review_concurrency".to_owned(),
-            JsonValue::Number(options.review_concurrency.to_string()),
+            JsonValue::Number(options.execution.review_concurrency.to_string()),
         ),
         (
             "confirmed_context_lines".to_owned(),
-            JsonValue::Number(options.confirmed_context_lines.to_string()),
+            JsonValue::Number(options.execution.confirmed_context_lines.to_string()),
         ),
         (
             "confirmed_context_token_budget".to_owned(),
-            JsonValue::Number(options.confirmed_context_token_budget.to_string()),
+            JsonValue::Number(options.execution.confirmed_context_token_budget.to_string()),
         ),
         (
             "terminology_preflight".to_owned(),
-            JsonValue::Bool(options.terminology_preflight),
+            JsonValue::Bool(options.execution.terminology_preflight),
         ),
         (
             "online_terminology".to_owned(),
-            JsonValue::Bool(options.online_terminology),
+            JsonValue::Bool(options.execution.online_terminology),
         ),
         (
             "allow_degraded_preflight".to_owned(),
-            JsonValue::Bool(options.allow_degraded_preflight),
+            JsonValue::Bool(options.execution.allow_degraded_preflight),
         ),
         (
             "preserve_names".to_owned(),
-            JsonValue::Bool(options.preserve_names),
+            JsonValue::Bool(options.validation.preserve_names),
         ),
         (
             "review_policy".to_owned(),
-            JsonValue::String(options.review_policy.as_str().to_owned()),
+            JsonValue::String(options.execution.review_policy.as_str().to_owned()),
         ),
-        ("agent".to_owned(), JsonValue::Bool(options.agent)),
+        ("agent".to_owned(), JsonValue::Bool(options.execution.agent)),
         (
             "agent_repair_attempts".to_owned(),
-            JsonValue::Number(options.agent_repair_attempts.to_string()),
+            JsonValue::Number(options.execution.agent_repair_attempts.to_string()),
         ),
         (
             "max_characters_per_second".to_owned(),
             options
+                .validation
                 .max_characters_per_second
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
@@ -422,6 +430,7 @@ pub fn build_translation_fingerprint(
         (
             "max_characters_per_line".to_owned(),
             options
+                .validation
                 .max_characters_per_line
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
@@ -429,24 +438,25 @@ pub fn build_translation_fingerprint(
         (
             "max_lines".to_owned(),
             options
+                .validation
                 .max_lines
                 .map(|value| JsonValue::Number(value.to_string()))
                 .unwrap_or(JsonValue::Null),
         ),
         (
             "mode".to_owned(),
-            JsonValue::String(options.mode.as_str().to_owned()),
+            JsonValue::String(options.execution.mode.as_str().to_owned()),
         ),
         (
             "source_language".to_owned(),
-            JsonValue::String(options.source_language.clone()),
+            JsonValue::String(options.validation.source_language.clone()),
         ),
         (
             "target_language".to_owned(),
-            JsonValue::String(options.target_language.clone()),
+            JsonValue::String(options.validation.target_language.clone()),
         ),
     ];
-    if let Some(execution_fingerprint) = &options.execution_fingerprint {
+    if let Some(execution_fingerprint) = &options.identity.execution_fingerprint {
         fields.push((
             "pipeline_execution".to_owned(),
             JsonValue::Object(vec![
@@ -461,11 +471,12 @@ pub fn build_translation_fingerprint(
             ]),
         ));
     }
-    if !options.initial_confirmed_context.is_empty() {
+    if !options.execution.initial_confirmed_context.is_empty() {
         fields.push((
             "initial_confirmed_context".to_owned(),
             JsonValue::Array(
                 options
+                    .execution
                     .initial_confirmed_context
                     .iter()
                     .map(|line| {
@@ -498,22 +509,26 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
             "version".to_owned(),
             JsonValue::Number(RENDER_FINGERPRINT_VERSION.to_string()),
         ),
-        ("bilingual".to_owned(), JsonValue::Bool(options.bilingual)),
+        (
+            "bilingual".to_owned(),
+            JsonValue::Bool(options.rendering.bilingual),
+        ),
         (
             "bilingual_order".to_owned(),
-            JsonValue::String(options.bilingual_order.as_str().to_owned()),
+            JsonValue::String(options.rendering.bilingual_order.as_str().to_owned()),
         ),
         (
             "bilingual_font_scale".to_owned(),
-            JsonValue::Number(options.bilingual_font_scale.to_string()),
+            JsonValue::Number(options.rendering.bilingual_font_scale.to_string()),
         ),
         (
             "review_policy".to_owned(),
-            JsonValue::String(format!("{:?}", options.review_policy).to_lowercase()),
+            JsonValue::String(format!("{:?}", options.execution.review_policy).to_lowercase()),
         ),
         (
             "output_format".to_owned(),
             options
+                .rendering
                 .output_format
                 .clone()
                 .map(JsonValue::String)
@@ -522,6 +537,7 @@ pub fn build_render_fingerprint(options: &PipelineOptions) -> String {
         (
             "output_path".to_owned(),
             options
+                .rendering
                 .output_path
                 .as_ref()
                 .map(|path| JsonValue::String(path.to_string_lossy().to_string()))
@@ -741,10 +757,10 @@ mod tests {
     #[test]
     fn translation_fingerprint_matches_python_canonical_json() {
         let mut options = PipelineOptions::new("clip.txt".into());
-        options.batch_size = 2;
+        options.execution.batch_size = 2;
         // Pin the legacy Python-compatible option value independently of the
         // current product default.
-        options.online_terminology = true;
+        options.execution.online_terminology = true;
         let signature = InputSignature {
             sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
             size: 3,
@@ -789,14 +805,16 @@ mod tests {
             .glossary
             .insert("Lord".to_owned(), "勋爵".to_owned());
         let mut baseline = PipelineOptions::new("clip.srt".into());
-        baseline.provider_fingerprint = Some("openai|responses|https://one.example|gpt".to_owned());
-        baseline.reviewer_fingerprint =
+        baseline.identity.provider_fingerprint =
+            Some("openai|responses|https://one.example|gpt".to_owned());
+        baseline.identity.reviewer_fingerprint =
             Some("anthropic|messages|https://review.example|opus".to_owned());
-        baseline.document_guide_fingerprint = Some(build_document_guide_fingerprint(&guidance));
+        baseline.identity.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&guidance));
         let fingerprint = build_translation_fingerprint(&baseline, &signature);
 
         let mut changed_provider = baseline.clone();
-        changed_provider.provider_fingerprint =
+        changed_provider.identity.provider_fingerprint =
             Some("openai|responses|https://two.example|gpt".to_owned());
         assert_ne!(
             fingerprint,
@@ -804,7 +822,7 @@ mod tests {
         );
 
         let mut changed_reviewer = baseline.clone();
-        changed_reviewer.reviewer_fingerprint = None;
+        changed_reviewer.identity.reviewer_fingerprint = None;
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_reviewer, &signature)
@@ -814,7 +832,7 @@ mod tests {
         guidance
             .glossary
             .insert("Lord".to_owned(), "领主".to_owned());
-        changed_guidance.document_guide_fingerprint =
+        changed_guidance.identity.document_guide_fingerprint =
             Some(build_document_guide_fingerprint(&guidance));
         assert_ne!(
             fingerprint,
@@ -823,42 +841,45 @@ mod tests {
 
         guidance.document_guide.tone = "dry satire".to_owned();
         let mut changed_tone = baseline.clone();
-        changed_tone.document_guide_fingerprint = Some(build_document_guide_fingerprint(&guidance));
+        changed_tone.identity.document_guide_fingerprint =
+            Some(build_document_guide_fingerprint(&guidance));
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_tone, &signature)
         );
 
         let mut changed_review = baseline.clone();
-        changed_review.review_policy = crate::entities::ReviewPolicy::Full;
+        changed_review.execution.review_policy = crate::entities::ReviewPolicy::Full;
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_review, &signature)
         );
 
         let mut changed_validation = baseline.clone();
-        changed_validation.max_lines = Some(2);
+        changed_validation.validation.max_lines = Some(2);
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_validation, &signature)
         );
 
         let mut changed_translation_concurrency = baseline.clone();
-        changed_translation_concurrency.translation_concurrency += 1;
+        changed_translation_concurrency
+            .execution
+            .translation_concurrency += 1;
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_translation_concurrency, &signature)
         );
 
         let mut changed_review_concurrency = baseline.clone();
-        changed_review_concurrency.review_concurrency += 1;
+        changed_review_concurrency.execution.review_concurrency += 1;
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_review_concurrency, &signature)
         );
 
         let mut seeded_context = baseline.clone();
-        seeded_context.initial_confirmed_context =
+        seeded_context.execution.initial_confirmed_context =
             vec![crate::entities::ConfirmedTranslationContext {
                 id: "previous".to_owned(),
                 source: "Previous line.".to_owned(),
@@ -870,13 +891,14 @@ mod tests {
         );
 
         let mut streaming = baseline.clone();
-        streaming.execution_fingerprint = Some("streaming-v1:turbo".to_owned());
+        streaming.identity.execution_fingerprint = Some("streaming-v1:turbo".to_owned());
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&streaming, &signature)
         );
         let mut different_streaming_policy = streaming.clone();
-        different_streaming_policy.execution_fingerprint = Some("streaming-v1:economy".to_owned());
+        different_streaming_policy.identity.execution_fingerprint =
+            Some("streaming-v1:economy".to_owned());
         assert_ne!(
             build_translation_fingerprint(&streaming, &signature),
             build_translation_fingerprint(&different_streaming_policy, &signature)
@@ -887,7 +909,7 @@ mod tests {
     fn render_fingerprint_distinguishes_bilingual_order() {
         let target_first = PipelineOptions::new("clip.txt".into());
         let mut source_first = target_first.clone();
-        source_first.bilingual_order = crate::entities::BilingualOrder::SourceFirst;
+        source_first.rendering.bilingual_order = crate::entities::BilingualOrder::SourceFirst;
 
         assert_ne!(
             build_render_fingerprint(&target_first),
@@ -899,7 +921,7 @@ mod tests {
     fn render_fingerprint_distinguishes_bilingual_font_scale() {
         let default_scale = PipelineOptions::new("clip.ass".into());
         let mut smaller = default_scale.clone();
-        smaller.bilingual_font_scale = 0.9;
+        smaller.rendering.bilingual_font_scale = 0.9;
 
         assert_ne!(
             build_render_fingerprint(&default_scale),
@@ -1007,7 +1029,7 @@ mod tests {
     #[test]
     fn run_state_rejects_mismatched_fingerprint() {
         let mut options = PipelineOptions::new("clip.txt".into());
-        options.batch_size = 2;
+        options.execution.batch_size = 2;
         let signature = input_signature_from_bytes(b"one\ntwo\n", Some(1));
         let state = RunState::new(
             &options,
