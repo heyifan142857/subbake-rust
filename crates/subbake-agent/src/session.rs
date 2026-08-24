@@ -668,9 +668,17 @@ fn hex_id() -> String {
 mod tests {
     use super::*;
 
+    fn temporary_root(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create temporary session root")
+    }
+
     #[test]
     fn empty_session_is_not_persisted() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-sessions-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-sessions-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let session = store.create().expect("create session");
         assert_eq!(session.version, SESSION_VERSION);
@@ -698,7 +706,8 @@ mod tests {
 
     #[test]
     fn records_and_persists_events() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-events-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-events-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let mut session = store.create().expect("create session");
         session.record_event(
@@ -721,8 +730,8 @@ mod tests {
     fn session_paths_preserve_an_aliased_project_root_spelling() {
         use std::os::unix::fs::symlink;
 
-        let container =
-            std::env::temp_dir().join(format!("subbake-agent-session-alias-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-session-alias-");
+        let container = temporary.path();
         let actual = container.join("actual");
         let alias = container.join("alias");
         std::fs::create_dir_all(&actual).expect("create actual project root");
@@ -754,7 +763,8 @@ mod tests {
 
     #[test]
     fn rejects_session_ids_that_are_not_plain_safe_components() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-id-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-id-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
 
         for id in ["../escape", "/tmp/escape", "nested/session", "session.json"] {
@@ -767,7 +777,8 @@ mod tests {
 
     #[test]
     fn rejects_a_session_whose_embedded_id_does_not_match_its_filename() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-id-mismatch-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-id-mismatch-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let mut session = AgentSession::new("different-id".to_owned());
         session.record_event("user", "hello", serde_json::json!({}));
@@ -793,7 +804,8 @@ mod tests {
     fn rejects_symlinked_session_files() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!("subbake-agent-symlink-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-symlink-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let path = store.path_for("linked").expect("valid id");
         std::fs::create_dir_all(path.parent().expect("session directory"))
@@ -817,10 +829,10 @@ mod tests {
     fn rejects_symlinked_session_directories() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!("subbake-agent-dir-symlink-{}", hex_id()));
-        let outside = std::env::temp_dir().join(format!("subbake-agent-outside-{}", hex_id()));
-        std::fs::create_dir_all(&dir).expect("create project root");
-        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let temporary = temporary_root("subbake-agent-dir-symlink-");
+        let outside_temporary = temporary_root("subbake-agent-outside-");
+        let dir = temporary.path().to_path_buf();
+        let outside = outside_temporary.path().to_path_buf();
         symlink(&outside, dir.join(".subbake")).expect("create storage symlink");
         let store = AgentSessionStore::new(dir.clone());
         let mut session = store.create().expect("create session");
@@ -847,7 +859,8 @@ mod tests {
 
     #[test]
     fn rejects_an_older_session_version() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-old-version-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-old-version-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let mut session = store.create().expect("create session");
         session.record_event("user", "old", serde_json::json!({}));
@@ -872,7 +885,8 @@ mod tests {
 
     #[test]
     fn sessions_are_ordered_by_latest_activity() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-latest-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-latest-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let mut s1 = store.create().expect("session 1");
         s1.record_event("user", "first", serde_json::json!({}));
@@ -897,7 +911,8 @@ mod tests {
 
     #[test]
     fn list_reports_corrupt_sessions_instead_of_hiding_them() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-corrupt-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-corrupt-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let session_dir = dir.join(".subbake/agent/sessions");
         std::fs::create_dir_all(&session_dir).expect("create session directory");
@@ -914,7 +929,8 @@ mod tests {
 
     #[test]
     fn session_order_is_stable_when_update_times_match() {
-        let dir = std::env::temp_dir().join(format!("subbake-agent-tie-{}", hex_id()));
+        let temporary = temporary_root("subbake-agent-tie-");
+        let dir = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(dir.clone());
         let mut first = AgentSession::new("session-a".to_owned());
         first.record_event("user", "first", serde_json::json!({}));

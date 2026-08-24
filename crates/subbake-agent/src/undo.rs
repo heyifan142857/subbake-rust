@@ -144,16 +144,20 @@ mod tests {
     use super::*;
     use crate::session::{AgentEvent, AgentSession};
 
-    fn setup(label: &str) -> (PathBuf, AgentSessionStore, AgentSession) {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-undo-{label}-{nonce}"));
-        std::fs::create_dir_all(&root).expect("create root");
+    fn setup(label: &str) -> (tempfile::TempDir, PathBuf, AgentSessionStore, AgentSession) {
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("subbake-undo-{label}-"))
+            .tempdir()
+            .expect("create temporary undo root");
+        let root = temporary.path().to_path_buf();
         let store = AgentSessionStore::new(root.clone());
-        let session = AgentSession::new(format!("undo-{label}-{nonce}"));
-        (root, store, session)
+        let session = AgentSession::new(format!(
+            "undo-{label}-{}",
+            root.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("temporary")
+        ));
+        (temporary, root, store, session)
     }
 
     fn operation(data: FileOpEventData) -> AgentEvent {
@@ -162,7 +166,7 @@ mod tests {
 
     #[test]
     fn created_file_undo_removes_the_file_and_persists_progress() {
-        let (root, store, mut session) = setup("created");
+        let (_temporary, root, store, mut session) = setup("created");
         std::fs::write(root.join("created.txt"), "content").expect("write created file");
         session.events.push(operation(FileOpEventData {
             action: "created".to_owned(),
@@ -191,7 +195,7 @@ mod tests {
 
     #[test]
     fn modified_file_undo_rejects_a_missing_backup() {
-        let (root, store, mut session) = setup("missing-backup");
+        let (_temporary, root, store, mut session) = setup("missing-backup");
         std::fs::write(root.join("modified.txt"), "new").expect("write modified file");
         session.events.push(operation(FileOpEventData {
             action: "modified".to_owned(),
@@ -218,7 +222,7 @@ mod tests {
 
     #[test]
     fn renamed_file_undo_validates_backup_before_removing_the_new_path() {
-        let (root, store, mut session) = setup("renamed-missing-backup");
+        let (_temporary, root, store, mut session) = setup("renamed-missing-backup");
         std::fs::write(root.join("new-name.txt"), "only copy").expect("write renamed file");
         session.events.push(operation(FileOpEventData {
             action: "renamed".to_owned(),
@@ -248,7 +252,7 @@ mod tests {
 
     #[test]
     fn created_file_undo_never_recursively_removes_a_directory() {
-        let (root, store, mut session) = setup("created-directory");
+        let (_temporary, root, store, mut session) = setup("created-directory");
         std::fs::create_dir_all(root.join("important")).expect("create important directory");
         std::fs::write(root.join("important/data.txt"), "keep").expect("write important file");
         session.events.push(operation(FileOpEventData {
@@ -278,8 +282,12 @@ mod tests {
     fn undo_rejects_a_leaf_symlink_redirect() {
         use std::os::unix::fs::symlink;
 
-        let (root, store, mut session) = setup("symlink");
-        let outside = std::env::temp_dir().join(format!("subbake-undo-outside-{}", session.id));
+        let (_temporary, root, store, mut session) = setup("symlink");
+        let outside_root = tempfile::Builder::new()
+            .prefix("subbake-undo-outside-")
+            .tempdir()
+            .expect("create outside temporary root");
+        let outside = outside_root.path().join("outside.txt");
         std::fs::write(&outside, "keep").expect("write outside file");
         symlink(&outside, root.join("created.txt")).expect("create redirecting symlink");
         session.events.push(operation(FileOpEventData {

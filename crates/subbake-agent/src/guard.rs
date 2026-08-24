@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use subbake_adapters::{PathIdentity, PlatformPaths};
+use subbake_adapters::{PathEntryIdentity, PathIdentity, PlatformPaths};
 use thiserror::Error;
 
 pub type FileGuardResult<T> = Result<T, FileGuardError>;
@@ -161,45 +161,15 @@ impl ExternalPathGuard {
             });
         }
         let normalized = normalize_path(requested_path.to_path_buf());
-        let metadata =
-            std::fs::symlink_metadata(&normalized).map_err(|source| FileGuardError::Io {
-                operation: "inspect external deletion target",
-                path: Some(normalized.clone()),
-                source,
-            })?;
-        let is_symlink = metadata.file_type().is_symlink();
-        let resolved = if is_symlink {
-            let parent =
-                normalized
-                    .parent()
-                    .ok_or_else(|| FileGuardError::CriticalExternalPath {
-                        path: normalized.clone(),
-                    })?;
-            let canonical_parent = parent.canonicalize().map_err(|source| FileGuardError::Io {
-                operation: "resolve external deletion parent",
-                path: Some(parent.to_path_buf()),
-                source,
-            })?;
-            canonical_parent.join(normalized.file_name().ok_or_else(|| {
-                FileGuardError::CriticalExternalPath {
-                    path: normalized.clone(),
-                }
-            })?)
-        } else {
-            normalized
-                .canonicalize()
-                .map_err(|source| FileGuardError::Io {
-                    operation: "resolve external deletion target",
-                    path: Some(normalized.clone()),
-                    source,
-                })?
-        };
+        let entry =
+            identify_entry_without_following_leaf(&normalized, "resolve external deletion target")?;
+        let resolved = entry.identity().resolved().to_path_buf();
 
         self.reject_critical_path(&resolved)?;
         Ok(PreparedExternalDelete {
             path: resolved,
-            is_directory: metadata.is_dir(),
-            is_symlink,
+            is_directory: entry.is_directory(),
+            is_symlink: entry.is_symlink(),
         })
     }
 
@@ -245,9 +215,8 @@ impl ExternalPathGuard {
     }
 
     fn reject_critical_path(&self, path: &Path) -> FileGuardResult<()> {
-        let project_root = self
-            .project_root
-            .canonicalize()
+        let project_root = PlatformPaths::identify_with_missing_tail(&self.project_root)
+            .map(|identity| identity.resolved().to_path_buf())
             .unwrap_or_else(|_| normalize_path(self.project_root.clone()));
         if path.starts_with(&project_root) {
             return Err(FileGuardError::ExternalPathInsideProject {
@@ -673,21 +642,12 @@ impl FileGuard {
                 ),
             });
         }
-        let safe = anchored
-            .canonicalize()
-            .map_err(|source| FileGuardError::Io {
-                operation: "resolve undo backup",
-                path: Some(anchored.clone()),
-                source,
-            })?;
-        let backup_root = self
-            .backup_root
-            .canonicalize()
-            .map_err(|source| FileGuardError::Io {
-                operation: "resolve undo backup directory",
-                path: Some(self.backup_root.clone()),
-                source,
-            })?;
+        let safe = identify_existing(&anchored, "resolve undo backup")?
+            .resolved()
+            .to_path_buf();
+        let backup_root = identify_existing(&self.backup_root, "resolve undo backup directory")?
+            .resolved()
+            .to_path_buf();
         if !safe.starts_with(&backup_root) {
             return Err(FileGuardError::PathEscape {
                 root: backup_root,
@@ -970,21 +930,36 @@ fn identify_with_missing_tail(
     })
 }
 
+fn identify_entry_without_following_leaf(
+    path: &Path,
+    operation: &'static str,
+) -> FileGuardResult<PathEntryIdentity> {
+    PlatformPaths::identify_entry_without_following_leaf(path).map_err(|source| {
+        FileGuardError::Io {
+            operation,
+            path: Some(path.to_path_buf()),
+            source: std::io::Error::other(source),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup() -> (PathBuf, FileGuard) {
-        let ts = nanos_since_epoch();
-        let root = std::env::temp_dir().join(format!("subbake-guard-{ts}"));
-        std::fs::create_dir_all(&root).expect("create project root");
+    fn setup() -> (tempfile::TempDir, PathBuf, FileGuard) {
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-guard-")
+            .tempdir()
+            .expect("create temporary project root");
+        let root = temporary.path().to_path_buf();
         let guard = FileGuard::new(root.clone()).expect("create file guard");
-        (root, guard)
+        (temporary, root, guard)
     }
 
     #[test]
     fn external_delete_rejects_project_paths_and_filesystem_root() {
-        let (root, _) = setup();
+        let (_temporary, root, _) = setup();
         std::fs::create_dir_all(&root).expect("create project root");
         std::fs::write(root.join("inside.txt"), "keep").expect("write project file");
         let guard = ExternalPathGuard::new(root.clone());
@@ -1014,13 +989,12 @@ mod tests {
 
     #[test]
     fn external_directory_requires_an_explicit_recursive_delete() {
-        let (project_root, _) = setup();
-        let outside = std::env::temp_dir().join(format!(
-            "subbake-external-delete-directory-{}",
-            nanos_since_epoch()
-        ));
-        std::fs::create_dir_all(&project_root).expect("create project root");
-        std::fs::create_dir_all(&outside).expect("create external directory");
+        let (_temporary, project_root, _) = setup();
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-external-delete-directory-")
+            .tempdir()
+            .expect("create external temporary directory");
+        let outside = outside_temporary.path().to_path_buf();
         std::fs::write(outside.join("data.txt"), "data").expect("write external file");
         let guard = ExternalPathGuard::new(project_root.clone());
         let approved = guard.prepare(&outside).expect("prepare external directory");
@@ -1047,11 +1021,12 @@ mod tests {
     fn external_delete_removes_a_leaf_symlink_without_following_it() {
         use std::os::unix::fs::symlink;
 
-        let (project_root, _) = setup();
-        let outside = std::env::temp_dir().join(format!(
-            "subbake-external-delete-symlink-{}",
-            nanos_since_epoch()
-        ));
+        let (_temporary, project_root, _) = setup();
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-external-delete-symlink-")
+            .tempdir()
+            .expect("create external temporary directory");
+        let outside = outside_temporary.path().to_path_buf();
         let target = outside.join("target");
         let link = outside.join("link");
         std::fs::create_dir_all(&project_root).expect("create project root");
@@ -1074,7 +1049,7 @@ mod tests {
 
     #[test]
     fn staged_files_commit_transactionally_and_keep_overwrite_backup() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(&root).expect("create root");
         std::fs::write(root.join("existing.bin"), b"old").expect("old output");
         let staging = guard.create_command_staging().expect("staging");
@@ -1109,7 +1084,7 @@ mod tests {
 
     #[test]
     fn creates_file() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let path = Path::new("test.txt");
         let result = guard.create_file(path, "hello").expect("create");
         assert_eq!(result.action, FileOpAction::Create);
@@ -1122,8 +1097,11 @@ mod tests {
     fn resolves_missing_children_beneath_an_aliased_project_root() {
         use std::os::unix::fs::symlink;
 
-        let container =
-            std::env::temp_dir().join(format!("subbake-guard-root-alias-{}", nanos_since_epoch()));
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-guard-root-alias-")
+            .tempdir()
+            .expect("create alias temporary root");
+        let container = temporary.path();
         let actual_parent = container.join("actual");
         let alias_parent = container.join("alias");
         let actual_root = actual_parent.join("project");
@@ -1146,7 +1124,7 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal_via_dotdot() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let err = guard
             .create_file(Path::new("../etc/passwd"), "data")
             .expect_err("path traversal should be rejected");
@@ -1157,7 +1135,7 @@ mod tests {
 
     #[test]
     fn rejects_protected_path() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let err = guard
             .create_file(Path::new(".git/config"), "data")
             .expect_err("should reject");
@@ -1168,7 +1146,7 @@ mod tests {
 
     #[test]
     fn rejects_secret_files_case_insensitively_but_allows_env_examples() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         for path in [".env", ".EnV.Local", ".SSH/config", "keys/ID_ED25519"] {
             let error = guard
                 .read_file(Path::new(path))
@@ -1188,7 +1166,7 @@ mod tests {
 
     #[test]
     fn append_and_backup() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let path = Path::new("log.txt");
         guard.create_file(path, "line1\n").expect("create");
         let result = guard.append_file(path, "line2\n").expect("append");
@@ -1200,7 +1178,7 @@ mod tests {
 
     #[test]
     fn append_creates_a_missing_file_without_a_fake_backup() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let path = Path::new("new-log.txt");
 
         let result = guard.append_file(path, "first line\n").expect("append");
@@ -1213,7 +1191,7 @@ mod tests {
 
     #[test]
     fn embedded_subtitle_undo_stores_only_the_small_payload() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(&root).expect("create project root");
         let container = root.join("movie.mkv");
         std::fs::write(&container, b"media bytes").expect("write container placeholder");
@@ -1252,7 +1230,7 @@ mod tests {
 
     #[test]
     fn delete_and_restore() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let path = Path::new("del.txt");
         guard.create_file(path, "data").expect("create");
         let result = guard.delete_file(path).expect("delete");
@@ -1266,7 +1244,7 @@ mod tests {
 
     #[test]
     fn rename_moves_file() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         guard
             .create_file(Path::new("a.txt"), "data")
             .expect("create");
@@ -1281,7 +1259,7 @@ mod tests {
 
     #[test]
     fn rejects_absolute_path_outside_root() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         // Even though /tmp exists, the guard's project_root is a subdir,
         // so an absolute path pointing outside should be rejected.
         let err = guard
@@ -1294,7 +1272,7 @@ mod tests {
 
     #[test]
     fn read_nonexistent_fails() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         let err = guard
             .read_file(Path::new("missing.txt"))
             .expect_err("should fail");
@@ -1304,7 +1282,7 @@ mod tests {
 
     #[test]
     fn search_files_supports_wildcards_and_keeps_substring_matching() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(root.join("nested")).expect("create nested directory");
         std::fs::write(root.join("movie.srt"), "one").expect("write srt");
         std::fs::write(root.join("nested/notes.txt"), "two").expect("write txt");
@@ -1335,10 +1313,13 @@ mod tests {
     fn rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
 
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(&root).expect("create root");
-        let outside = std::env::temp_dir().join(format!("subbake-outside-{}", nanos_since_epoch()));
-        std::fs::create_dir_all(&outside).expect("create outside");
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-outside-")
+            .tempdir()
+            .expect("create outside temporary root");
+        let outside = outside_temporary.path().to_path_buf();
         symlink(&outside, root.join("outside-link")).expect("create symlink");
 
         let err = guard
@@ -1355,12 +1336,13 @@ mod tests {
     fn rejects_a_dangling_symlink_parent() {
         use std::os::unix::fs::symlink;
 
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(&root).expect("create root");
-        let outside = std::env::temp_dir().join(format!(
-            "subbake-dangling-symlink-target-{}",
-            nanos_since_epoch()
-        ));
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-dangling-symlink-target-")
+            .tempdir()
+            .expect("create dangling target parent");
+        let outside = outside_temporary.path().join("missing");
         symlink(&outside, root.join("dangling-link")).expect("create dangling symlink");
 
         guard
@@ -1374,10 +1356,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rejects_windows_junction_escape() {
-        let (root, guard) = setup();
+        let (_temporary, root, guard) = setup();
         std::fs::create_dir_all(&root).expect("create root");
-        let outside = std::env::temp_dir().join(format!("subbake-outside-{}", nanos_since_epoch()));
-        std::fs::create_dir_all(&outside).expect("create outside");
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-outside-")
+            .tempdir()
+            .expect("create outside temporary root");
+        let outside = outside_temporary.path().to_path_buf();
         let link = root.join("outside-link");
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -1405,9 +1390,12 @@ mod tests {
     fn recursive_search_skips_external_and_cyclic_symlink_directories() {
         use std::os::unix::fs::symlink;
 
-        let (root, guard) = setup();
-        let outside =
-            std::env::temp_dir().join(format!("subbake-search-outside-{}", nanos_since_epoch()));
+        let (_temporary, root, guard) = setup();
+        let outside_temporary = tempfile::Builder::new()
+            .prefix("subbake-search-outside-")
+            .tempdir()
+            .expect("create search outside root");
+        let outside = outside_temporary.path().to_path_buf();
         std::fs::create_dir_all(root.join("nested")).expect("create project tree");
         std::fs::create_dir_all(&outside).expect("create outside tree");
         std::fs::write(root.join("nested/inside.srt"), "inside").expect("write inside file");

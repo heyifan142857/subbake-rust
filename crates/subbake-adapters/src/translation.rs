@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
@@ -29,12 +31,20 @@ use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
 use crate::settings::TranslationSettings;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeReusePolicy {
+    #[default]
+    Configured,
+    Fresh,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranslationRequest {
     pub input_path: PathBuf,
     pub output_path: Option<PathBuf>,
     pub output_language_tag: Option<String>,
     pub overwrite: bool,
+    pub runtime_reuse: RuntimeReusePolicy,
     pub settings: TranslationSettings,
 }
 
@@ -44,6 +54,9 @@ pub struct TranslationOutcome {
     pub output_path: Option<PathBuf>,
     pub subtitle_entries: usize,
     pub container_change: Option<ContainerTranslationChange>,
+    /// The runtime directory allocated for this request when fresh runtime
+    /// isolation was requested. Configured runtimes are intentionally omitted.
+    pub runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +89,7 @@ pub struct BatchTranslationRequest {
     pub retry_manifest: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
     pub output_language_tag: Option<String>,
+    pub runtime_reuse: RuntimeReusePolicy,
     pub settings: TranslationSettings,
 }
 
@@ -93,6 +107,7 @@ pub struct BatchTranslationOutcome {
     pub resumed_translation_batches: usize,
     pub resumed_review_batches: usize,
     pub translation_memory_hits: usize,
+    pub runtime_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,14 +153,23 @@ pub fn translate_input_cancellable(
 }
 
 pub fn translate_input_cancellable_with_progress(
-    request: TranslationRequest,
+    mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<TranslationOutcome> {
+    check_cancelled(cancellation)?;
     if is_supported_subtitle_path(&request.input_path) {
-        translate_subtitle_cancellable_with_progress(request, cancellation, progress)
+        let runtime_dir = prepare_translation_runtime(&mut request)?;
+        let mut outcome =
+            translate_subtitle_cancellable_with_progress(request, cancellation, progress)?;
+        outcome.runtime_dir = runtime_dir;
+        Ok(outcome)
     } else if is_supported_subtitle_container_path(&request.input_path) {
-        translate_embedded_subtitle_cancellable_with_progress(request, cancellation, progress)
+        let runtime_dir = prepare_translation_runtime(&mut request)?;
+        let mut outcome =
+            translate_embedded_subtitle_cancellable_with_progress(request, cancellation, progress)?;
+        outcome.runtime_dir = runtime_dir;
+        Ok(outcome)
     } else {
         Err(AdapterError::invalid_input(
             "`translate` accepts subtitle files or MKV, MP4/M4V/MOV, and WebM containers with text subtitle streams; use `pipeline` when transcription is required",
@@ -211,8 +235,22 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         ));
     }
 
-    let input_bytes = fs::read(&request.input_path)?;
-    let metadata = fs::metadata(&request.input_path)?;
+    let runtime_dir = prepare_translation_runtime(&mut request)?;
+
+    let input_bytes = fs::read(&request.input_path).map_err(|source| {
+        AdapterError::external_io(
+            "read translation input",
+            Some(request.input_path.clone()),
+            source,
+        )
+    })?;
+    let metadata = fs::metadata(&request.input_path).map_err(|source| {
+        AdapterError::external_io(
+            "inspect translation input metadata",
+            Some(request.input_path.clone()),
+            source,
+        )
+    })?;
     let mtime_ns = metadata
         .modified()
         .ok()
@@ -326,6 +364,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
             output_path: None,
             subtitle_entries: document.segments.len(),
             container_change: None,
+            runtime_dir,
         });
     }
 
@@ -361,6 +400,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         output_path: Some(output_path),
         subtitle_entries: document.segments.len(),
         container_change: None,
+        runtime_dir,
     })
 }
 
@@ -393,6 +433,8 @@ pub fn translate_subtitle_batch_with_progress(
         Some(path) => failed_inputs_from_manifest(path, &request.root)?,
         None => discover_subtitle_files(&request.root, request.recursive)?,
     };
+    check_cancelled(cancellation)?;
+    let runtime_dir = prepare_fresh_runtime(&mut request, true)?;
     let total_files = files.len();
     let mut processed = 0usize;
     let mut processed_inputs = Vec::new();
@@ -448,6 +490,7 @@ pub fn translate_subtitle_batch_with_progress(
                 output_path: Some(output_path),
                 output_language_tag: request.output_language_tag.clone(),
                 overwrite: request.overwrite,
+                runtime_reuse: RuntimeReusePolicy::Configured,
                 settings: request.settings.clone(),
             },
             cancellation,
@@ -532,7 +575,143 @@ pub fn translate_subtitle_batch_with_progress(
         resumed_translation_batches,
         resumed_review_batches,
         translation_memory_hits,
+        runtime_dir,
     })
+}
+
+fn prepare_fresh_runtime<T: RuntimeRequest>(
+    request: &mut T,
+    root_is_directory: bool,
+) -> AdapterResult<Option<PathBuf>> {
+    if request.runtime_reuse() == RuntimeReusePolicy::Configured {
+        return Ok(None);
+    }
+
+    let input = request.runtime_input().to_path_buf();
+    let configured_root = request.settings().storage.runtime_dir.clone();
+    let base = configured_root.unwrap_or_else(|| {
+        if root_is_directory {
+            input.join(".subbake")
+        } else {
+            input
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".subbake")
+        }
+    });
+    let fresh_root = base.join("fresh");
+    fs::create_dir_all(&fresh_root).map_err(|source| {
+        AdapterError::external_io(
+            "create fresh runtime root",
+            Some(fresh_root.clone()),
+            source,
+        )
+    })?;
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let label = input
+        .file_stem()
+        .or_else(|| input.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("translation")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    let runtime_dir = loop {
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = fresh_root.join(format!(
+            "{label}-{timestamp}-{}-{nonce}",
+            std::process::id()
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(AdapterError::external_io(
+                    "allocate fresh runtime directory",
+                    Some(candidate),
+                    source,
+                ));
+            }
+        }
+    };
+
+    let settings = request.settings_mut();
+    settings.storage.runtime_dir = Some(runtime_dir.clone());
+    settings.storage.glossary_path = None;
+    settings.translation.resume = false;
+    settings.translation.use_cache = false;
+    request.set_runtime_reuse(RuntimeReusePolicy::Configured);
+    Ok(Some(runtime_dir))
+}
+
+pub(crate) fn prepare_translation_runtime(
+    request: &mut TranslationRequest,
+) -> AdapterResult<Option<PathBuf>> {
+    prepare_fresh_runtime(request, false)
+}
+
+trait RuntimeRequest {
+    fn runtime_input(&self) -> &Path;
+    fn runtime_reuse(&self) -> RuntimeReusePolicy;
+    fn set_runtime_reuse(&mut self, policy: RuntimeReusePolicy);
+    fn settings(&self) -> &TranslationSettings;
+    fn settings_mut(&mut self) -> &mut TranslationSettings;
+}
+
+impl RuntimeRequest for TranslationRequest {
+    fn runtime_input(&self) -> &Path {
+        &self.input_path
+    }
+
+    fn runtime_reuse(&self) -> RuntimeReusePolicy {
+        self.runtime_reuse
+    }
+
+    fn set_runtime_reuse(&mut self, policy: RuntimeReusePolicy) {
+        self.runtime_reuse = policy;
+    }
+
+    fn settings(&self) -> &TranslationSettings {
+        &self.settings
+    }
+
+    fn settings_mut(&mut self) -> &mut TranslationSettings {
+        &mut self.settings
+    }
+}
+
+impl RuntimeRequest for BatchTranslationRequest {
+    fn runtime_input(&self) -> &Path {
+        &self.root
+    }
+
+    fn runtime_reuse(&self) -> RuntimeReusePolicy {
+        self.runtime_reuse
+    }
+
+    fn set_runtime_reuse(&mut self, policy: RuntimeReusePolicy) {
+        self.runtime_reuse = policy;
+    }
+
+    fn settings(&self) -> &TranslationSettings {
+        &self.settings
+    }
+
+    fn settings_mut(&mut self) -> &mut TranslationSettings {
+        &mut self.settings
+    }
 }
 
 fn failed_inputs_from_manifest(path: &Path, expected_root: &Path) -> AdapterResult<Vec<PathBuf>> {
@@ -704,13 +883,13 @@ fn is_generated_output(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     #[test]
     fn translates_txt_with_mock_backend() {
-        let root = temp_root("translate");
+        let temporary = temp_root("translate");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
@@ -723,6 +902,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings,
         })
         .expect("translate");
@@ -736,7 +916,8 @@ mod tests {
 
     #[test]
     fn translates_ass_and_preserves_script_style_metadata() {
-        let root = temp_root("translate-ass");
+        let temporary = temp_root("translate-ass");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.ass");
         fs::write(
@@ -755,6 +936,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings,
         })
         .expect("translate ASS");
@@ -772,7 +954,8 @@ mod tests {
 
     #[test]
     fn cached_translation_can_be_rerendered_as_bilingual_output() {
-        let root = temp_root("bilingual-cache-rerender");
+        let temporary = temp_root("bilingual-cache-rerender");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
@@ -785,6 +968,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: translated_settings,
         })
         .expect("translate source subtitle");
@@ -798,6 +982,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: bilingual_settings,
         })
         .expect("render bilingual subtitle from cache");
@@ -818,7 +1003,8 @@ mod tests {
 
     #[test]
     fn dry_run_does_not_write_output() {
-        let root = temp_root("dry-run");
+        let temporary = temp_root("dry-run");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
@@ -831,6 +1017,7 @@ mod tests {
             output_path: Some(output_path.clone()),
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings,
         })
         .expect("dry run");
@@ -848,6 +1035,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect_err("unsupported media translation must require the explicit pipeline");
@@ -862,6 +1050,7 @@ mod tests {
             output_path: None,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect_err("subtitle-only service must reject a container");
@@ -872,7 +1061,8 @@ mod tests {
 
     #[test]
     fn batch_skips_existing_outputs() {
-        let root = temp_root("batch-skip");
+        let temporary = temp_root("batch-skip");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
@@ -887,6 +1077,7 @@ mod tests {
             retry_manifest: None,
             output_dir: None,
             output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect("batch translate");
@@ -900,7 +1091,8 @@ mod tests {
 
     #[test]
     fn batch_parse_error_identifies_the_malformed_file_and_block() {
-        let root = temp_root("batch-malformed");
+        let temporary = temp_root("batch-malformed");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("broken.srt");
         fs::write(
@@ -917,6 +1109,7 @@ mod tests {
             retry_manifest: None,
             output_dir: None,
             output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect_err("malformed subtitle should stop the batch");
@@ -929,7 +1122,8 @@ mod tests {
 
     #[test]
     fn batch_continues_after_a_file_failure_and_persists_a_complete_manifest() {
-        let root = temp_root("batch-continue");
+        let temporary = temp_root("batch-continue");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create temp root");
         let malformed = root.join("bad.srt");
         let valid = root.join("good.txt");
@@ -944,6 +1138,7 @@ mod tests {
             retry_manifest: None,
             output_dir: None,
             output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect("ordinary file failure should not stop the batch");
@@ -961,6 +1156,7 @@ mod tests {
             retry_manifest: Some(retry_manifest),
             output_dir: None,
             output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect("retry failed inputs only");
@@ -979,7 +1175,8 @@ mod tests {
 
     #[test]
     fn single_translation_rejects_existing_output_without_overwrite() {
-        let root = temp_root("single-overwrite");
+        let temporary = temp_root("single-overwrite");
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         let input = root.join("clip.txt");
         let output = root.join("clip.translated.txt");
@@ -991,6 +1188,7 @@ mod tests {
             output_path: Some(output.clone()),
             output_language_tag: None,
             overwrite: false,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: TranslationSettings::default(),
         })
         .expect_err("existing output must fail");
@@ -1001,11 +1199,131 @@ mod tests {
         assert_eq!(content, "existing\n");
     }
 
-    fn temp_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("subbake-translation-{label}-{nanos}"))
+    #[test]
+    fn fresh_file_and_batch_translation_ignore_configured_reuse_stores() {
+        let temporary = temp_root("fresh-reuse-isolation");
+        let root = temporary.path().to_path_buf();
+        let input = root.join("clip.txt");
+        fs::write(&input, "hello\n").expect("write input");
+
+        let shared_runtime = root.join("shared-runtime");
+        let mut seeded_settings = TranslationSettings::default();
+        seeded_settings.translation.target_language = "en".to_owned();
+        seeded_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        seeded_settings.storage.runtime_dir = Some(shared_runtime.clone());
+        translate_subtitle(TranslationRequest {
+            input_path: input.clone(),
+            output_path: Some(root.join("seeded.txt")),
+            output_language_tag: None,
+            overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Configured,
+            settings: seeded_settings.clone(),
+        })
+        .expect("seed configured translation reuse stores");
+
+        let invalid_shared_glossary = root.join("shared-glossary.json");
+        fs::write(&invalid_shared_glossary, b"not valid glossary JSON")
+            .expect("write invalid shared glossary");
+        let mut fresh_settings = seeded_settings;
+        fresh_settings.storage.glossary_path = Some(invalid_shared_glossary.clone());
+        let fresh_file = translate_subtitle(TranslationRequest {
+            input_path: input.clone(),
+            output_path: Some(root.join("fresh.txt")),
+            output_language_tag: None,
+            overwrite: true,
+            runtime_reuse: RuntimeReusePolicy::Fresh,
+            settings: fresh_settings.clone(),
+        })
+        .expect("fresh file translation must not load shared stores");
+
+        let batch_root = root.join("batch");
+        fs::create_dir(&batch_root).expect("create batch root");
+        fs::write(batch_root.join("episode.txt"), "hello\n").expect("write batch input");
+        let fresh_batch = translate_subtitle_batch(BatchTranslationRequest {
+            root: batch_root,
+            recursive: false,
+            overwrite: true,
+            fail_fast: true,
+            retry_manifest: None,
+            output_dir: None,
+            output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Fresh,
+            settings: fresh_settings,
+        })
+        .expect("fresh batch translation must not load shared stores");
+
+        let file_runtime = fresh_file.runtime_dir.expect("fresh file runtime");
+        let batch_runtime = fresh_batch.runtime_dir.expect("fresh batch runtime");
+        assert_ne!(file_runtime, batch_runtime);
+        assert!(file_runtime.is_dir());
+        assert!(batch_runtime.is_dir());
+        assert!(file_runtime.starts_with(shared_runtime.join("fresh")));
+        assert!(batch_runtime.starts_with(shared_runtime.join("fresh")));
+        assert_eq!(fresh_file.result.cache_hits, 0);
+        assert_eq!(fresh_file.result.resumed_translation_batches, 0);
+        assert_eq!(fresh_file.result.resumed_review_batches, 0);
+        assert_eq!(fresh_file.result.translation_memory_hits, 0);
+        assert_eq!(fresh_batch.cache_hits, 0);
+        assert_eq!(fresh_batch.resumed_translation_batches, 0);
+        assert_eq!(fresh_batch.resumed_review_batches, 0);
+        assert_eq!(fresh_batch.translation_memory_hits, 0);
+        assert_eq!(
+            fs::read_to_string(invalid_shared_glossary).expect("shared glossary remains readable"),
+            "not valid glossary JSON"
+        );
+    }
+
+    #[test]
+    fn concurrent_fresh_runtime_allocation_is_unique_and_creates_directories() {
+        let temporary = temp_root("fresh-runtime-concurrency");
+        let root = temporary.path().to_path_buf();
+        let input = root.join("clip.txt");
+        fs::write(&input, "hello\n").expect("write input");
+        let runtime_root = root.join("runtime");
+
+        let workers = (0..12)
+            .map(|index| {
+                let input = input.clone();
+                let output = root.join(format!("translated-{index}.txt"));
+                let runtime_root = runtime_root.clone();
+                std::thread::spawn(move || {
+                    let mut settings = TranslationSettings::default();
+                    settings.translation.target_language = "en".to_owned();
+                    settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+                    settings.storage.runtime_dir = Some(runtime_root);
+                    translate_subtitle(TranslationRequest {
+                        input_path: input,
+                        output_path: Some(output),
+                        output_language_tag: None,
+                        overwrite: true,
+                        runtime_reuse: RuntimeReusePolicy::Fresh,
+                        settings,
+                    })
+                    .expect("concurrent fresh translation")
+                    .runtime_dir
+                    .expect("fresh runtime path")
+                })
+            })
+            .collect::<Vec<_>>();
+        let runtimes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join fresh translation"))
+            .collect::<Vec<_>>();
+        let unique = runtimes.iter().collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(unique.len(), runtimes.len());
+        assert!(runtimes.iter().all(|path| path.is_dir()));
+        assert!(
+            runtimes
+                .iter()
+                .all(|path| path.starts_with(runtime_root.join("fresh")))
+        );
+    }
+
+    fn temp_root(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("subbake-translation-{label}-"))
+            .tempdir()
+            .expect("create temporary translation root")
     }
 }

@@ -13,12 +13,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 #[test]
 fn termination_signal_cancels_cli_and_terminates_whisper_process_group() {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("subbake-cli-cancel-{nonce}"));
-    std::fs::create_dir_all(&root).expect("create root");
+    let temporary = tempfile::Builder::new()
+        .prefix("subbake-cli-cancel-")
+        .tempdir()
+        .expect("create temporary CLI root");
+    let root = temporary.path().to_path_buf();
     let whisper = root.join("whisper-cli");
     let child_pid_path = root.join("whisper.pid");
     let script = format!(
@@ -122,18 +121,16 @@ sleep 30
         !whisper_alive,
         "whisper child {whisper_pid} survived cancellation"
     );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(windows)]
 #[test]
 fn ctrl_break_cancels_cli_on_windows() {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("subbake-cli-cancel-{nonce}"));
-    std::fs::create_dir_all(&root).expect("create root");
+    let temporary = tempfile::Builder::new()
+        .prefix("subbake-cli-cancel-")
+        .tempdir()
+        .expect("create temporary CLI root");
+    let root = temporary.path().to_path_buf();
     let helper_source = root.join("fake_whisper.rs");
     let whisper = root.join("whisper-cli.exe");
     let ready = root.join("whisper.ready");
@@ -231,5 +228,4 @@ pathlib.Path(result).write_text(str(code), encoding="utf-8")
     );
     let exit_code = std::fs::read_to_string(&result).expect("read exit code");
     assert_eq!(exit_code, "130");
-    let _ = std::fs::remove_dir_all(root);
 }

@@ -14,6 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   whisper:
@@ -70,6 +71,9 @@ jobs:
 
       - name: Build SubBake
         run: cargo build -p subbake-cli
+
+      - name: Run full workspace tests
+        run: cargo test --workspace --no-fail-fast
 
       - name: Run fresh install and transcription smoke test
         run: python scripts/ci/platform_smoke.py

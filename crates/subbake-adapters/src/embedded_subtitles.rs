@@ -22,7 +22,8 @@ use crate::error::{AdapterError, AdapterResult};
 use crate::process::ProcessSupervisor;
 use crate::translation::{
     TranslationInputIdentity, TranslationOutcome, TranslationRequest,
-    normalize_translation_languages, translate_subtitle_cancellable_with_progress_and_identity,
+    normalize_translation_languages, prepare_translation_runtime,
+    translate_subtitle_cancellable_with_progress_and_identity,
 };
 
 const FFMPEG: &str = "ffmpeg";
@@ -235,17 +236,23 @@ pub fn translate_embedded_subtitle_cancellable(
 }
 
 pub fn translate_embedded_subtitle_cancellable_with_progress(
-    request: TranslationRequest,
+    mut request: TranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
 ) -> AdapterResult<TranslationOutcome> {
-    translate_embedded_subtitle_with_programs(
+    cancellation.check().map_err(AdapterError::from)?;
+    let runtime_dir = prepare_translation_runtime(&mut request)?;
+    let mut outcome = translate_embedded_subtitle_with_programs(
         request,
         cancellation,
         progress,
         Path::new(FFMPEG),
         Path::new(FFPROBE),
-    )
+    )?;
+    if runtime_dir.is_some() {
+        outcome.runtime_dir = runtime_dir;
+    }
+    Ok(outcome)
 }
 
 /// Remove a SubBake-managed subtitle track without retaining a full media
@@ -1038,8 +1045,11 @@ fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
+    match (
+        crate::platform::PlatformPaths::identify_existing(left),
+        crate::platform::PlatformPaths::identify_existing(right),
+    ) {
+        (Ok(left), Ok(right)) => left.resolved() == right.resolved(),
         _ => false,
     }
 }
@@ -1049,13 +1059,7 @@ fn embedded_stream_identity(
     stream_index: usize,
     payload_format: SubtitlePayloadFormat,
 ) -> AdapterResult<PathBuf> {
-    let stable_input = input_path.canonicalize().or_else(|_| {
-        if input_path.is_absolute() {
-            Ok(input_path.to_path_buf())
-        } else {
-            std::env::current_dir().map(|dir| dir.join(input_path))
-        }
-    })?;
+    let stable_input = crate::fs::stable_runtime_input_path(input_path)?;
     let name = stable_input
         .file_name()
         .and_then(OsStr::to_str)

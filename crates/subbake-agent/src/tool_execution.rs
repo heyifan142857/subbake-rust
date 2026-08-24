@@ -2,11 +2,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use subbake_adapters::{
-    BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, SettingsOverrides,
-    SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest, TranscriptionSettings,
-    TranslationRequest, TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome,
-    WhisperRequest, default_whisper_binary_path_for, default_whisper_models_dir_for,
-    format_diagnostic_report, is_supported_subtitle_container_path, is_supported_subtitle_path,
+    BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, RuntimeReusePolicy,
+    SettingsOverrides, SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest,
+    TranscriptionSettings, TranslationRequest, TranslationSettings, WhisperAction,
+    WhisperBuildVariant, WhisperOutcome, WhisperRequest, default_whisper_binary_path_for,
+    default_whisper_models_dir_for, format_diagnostic_report, is_supported_subtitle_container_path,
+    is_supported_subtitle_path,
 };
 use subbake_core::diagnostics::diagnose_text;
 use subbake_core::formats::{normalize_format, supported_format_from_path};
@@ -602,8 +603,6 @@ pub(crate) fn execute_translation_tool_with_services(
         ToolExecutor::TranslateFile => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
             let fresh_runtime = optional_bool(args, "fresh_runtime", false);
-            let runtime_dir =
-                fresh_runtime.then(|| isolate_translation_runtime(&mut settings, &input));
             let language_tag =
                 explicit_target_language.then(|| settings.translation.target_language.clone());
             let output_path = if let Some(path) = optional_argument(args, "output_path") {
@@ -641,6 +640,11 @@ pub(crate) fn execute_translation_tool_with_services(
                 output_path: Some(output_path),
                 output_language_tag: language_tag,
                 overwrite,
+                runtime_reuse: if fresh_runtime {
+                    RuntimeReusePolicy::Fresh
+                } else {
+                    RuntimeReusePolicy::Configured
+                },
                 settings: settings.clone(),
             };
             let translated = services.translate(request, cancellation, progress)?;
@@ -700,7 +704,7 @@ pub(crate) fn execute_translation_tool_with_services(
                     resumed_review_batches: translated.result.resumed_review_batches,
                     translation_memory_hits: translated.result.translation_memory_hits,
                     fresh_runtime,
-                    runtime_dir,
+                    runtime_dir: translated.runtime_dir,
                 }),
                 file_operations,
                 group_file_operations: false,
@@ -709,8 +713,6 @@ pub(crate) fn execute_translation_tool_with_services(
         ToolExecutor::TranslateSeries => {
             let input = guard.resolve_path(&required_path(args, "path")?)?;
             let fresh_runtime = optional_bool(args, "fresh_runtime", false);
-            let runtime_dir =
-                fresh_runtime.then(|| isolate_translation_runtime(&mut settings, &input));
             let recursive = args
                 .get("recursive")
                 .and_then(JsonValue::as_bool)
@@ -732,6 +734,11 @@ pub(crate) fn execute_translation_tool_with_services(
                 retry_manifest: None,
                 output_dir,
                 output_language_tag: language_tag,
+                runtime_reuse: if fresh_runtime {
+                    RuntimeReusePolicy::Fresh
+                } else {
+                    RuntimeReusePolicy::Configured
+                },
                 settings: settings.clone(),
             };
             let source_files = if recursive {
@@ -802,7 +809,7 @@ pub(crate) fn execute_translation_tool_with_services(
                     resumed_review_batches: translated.resumed_review_batches,
                     translation_memory_hits: translated.translation_memory_hits,
                     fresh_runtime,
-                    runtime_dir,
+                    runtime_dir: translated.runtime_dir,
                 }),
                 file_operations,
                 group_file_operations: true,
@@ -987,46 +994,6 @@ fn optional_bool(args: &JsonValue, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn isolate_translation_runtime(settings: &mut TranslationSettings, input: &Path) -> PathBuf {
-    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let base = settings.storage.runtime_dir.clone().unwrap_or_else(|| {
-        input
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".subbake")
-    });
-    let stem = input
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("translation");
-    let safe_stem = stem
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let runtime_dir = base.join("fresh").join(format!(
-        "{safe_stem}-{timestamp}-{}-{nonce}",
-        std::process::id()
-    ));
-
-    settings.storage.runtime_dir = Some(runtime_dir.clone());
-    settings.storage.glossary_path = None;
-    settings.translation.resume = false;
-    settings.translation.use_cache = false;
-    runtime_dir
-}
-
 fn nonempty_value(name: &str, value: &str) -> AgentResult<String> {
     if value.trim().is_empty() {
         Err(AgentError::InvalidInput {
@@ -1190,13 +1157,20 @@ fn format_file_list(files: &[PathBuf]) -> String {
 mod tests {
     use std::fs;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
-    use subbake_core::{ProgressEvent, ProgressSink, TaskKind};
+    use subbake_adapters::{
+        AdapterResult, BatchTranslationOutcome, SandboxedCommandOutput, SandboxedCommandRequest,
+        SubtitleEditOutcome, SubtitleEditRequest, TranscriptionOutcome, TranscriptionRequest,
+        TranslationOutcome, WhisperOutcome, WhisperRequest,
+    };
+    use subbake_core::{
+        PipelineResult, ProgressEvent, ProgressSink, ReviewStats, TaskKind, TerminologyStats, Usage,
+    };
 
     use super::*;
     use crate::outcome_render::render_tool_outcome;
+    use crate::services::TestAgentServices;
 
     #[derive(Default)]
     struct RecordingProgress {
@@ -1209,9 +1183,164 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq)]
+    enum RecordedTranslationRequest {
+        File(TranslationRequest),
+        Batch(BatchTranslationRequest),
+    }
+
+    #[derive(Default)]
+    struct RecordingTranslationServices {
+        requests: Mutex<Vec<RecordedTranslationRequest>>,
+    }
+
+    impl RecordingTranslationServices {
+        fn requests(&self) -> Vec<RecordedTranslationRequest> {
+            self.requests.lock().expect("recorded requests").clone()
+        }
+    }
+
+    impl AgentServices for RecordingTranslationServices {
+        fn run_command(
+            &self,
+            request: &SandboxedCommandRequest,
+            cancellation: &CancellationGuard,
+        ) -> AdapterResult<SandboxedCommandOutput> {
+            TestAgentServices.run_command(request, cancellation)
+        }
+
+        fn transcribe(
+            &self,
+            request: TranscriptionRequest,
+            cancellation: &CancellationGuard,
+            progress: Option<SharedProgress>,
+        ) -> AdapterResult<TranscriptionOutcome> {
+            TestAgentServices.transcribe(request, cancellation, progress)
+        }
+
+        fn manage_whisper(
+            &self,
+            request: WhisperRequest,
+            cancellation: &CancellationGuard,
+            progress: Option<SharedProgress>,
+        ) -> AdapterResult<WhisperOutcome> {
+            TestAgentServices.manage_whisper(request, cancellation, progress)
+        }
+
+        fn diagnose_path(&self, path: &Path) -> AdapterResult<String> {
+            TestAgentServices.diagnose_path(path)
+        }
+
+        fn default_translation_output_path(
+            &self,
+            input_path: &Path,
+            output_format: Option<&str>,
+            bilingual: bool,
+            language_tag: Option<&str>,
+            preserve_source_container: bool,
+        ) -> AdapterResult<PathBuf> {
+            TestAgentServices.default_translation_output_path(
+                input_path,
+                output_format,
+                bilingual,
+                language_tag,
+                preserve_source_container,
+            )
+        }
+
+        fn batch_translation_output_path(
+            &self,
+            request: &BatchTranslationRequest,
+            input_path: &Path,
+        ) -> AdapterResult<PathBuf> {
+            TestAgentServices.batch_translation_output_path(request, input_path)
+        }
+
+        fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationGuard,
+            _progress: Option<SharedProgress>,
+        ) -> AdapterResult<TranslationOutcome> {
+            self.requests
+                .lock()
+                .expect("record request")
+                .push(RecordedTranslationRequest::File(request.clone()));
+            Ok(TranslationOutcome {
+                result: recorded_pipeline_result(&request, request.output_path.clone()),
+                output_path: request.output_path,
+                subtitle_entries: 1,
+                container_change: None,
+                runtime_dir: None,
+            })
+        }
+
+        fn translate_batch(
+            &self,
+            request: BatchTranslationRequest,
+            _cancellation: &CancellationGuard,
+            _progress: Option<SharedProgress>,
+        ) -> AdapterResult<BatchTranslationOutcome> {
+            self.requests
+                .lock()
+                .expect("record request")
+                .push(RecordedTranslationRequest::Batch(request.clone()));
+            Ok(BatchTranslationOutcome {
+                processed: 0,
+                inputs: Vec::new(),
+                skipped: Vec::new(),
+                outputs: Vec::new(),
+                failures: Vec::new(),
+                manifest_path: request.root.join("recorded-manifest.json"),
+                subtitle_entries: 0,
+                dry_run: request.settings.translation.dry_run,
+                cache_hits: 0,
+                resumed_translation_batches: 0,
+                resumed_review_batches: 0,
+                translation_memory_hits: 0,
+                runtime_dir: None,
+            })
+        }
+
+        fn edit_subtitle(
+            &self,
+            request: SubtitleEditRequest,
+            cancellation: &CancellationGuard,
+        ) -> AdapterResult<SubtitleEditOutcome> {
+            TestAgentServices.edit_subtitle(request, cancellation)
+        }
+    }
+
+    fn recorded_pipeline_result(
+        request: &TranslationRequest,
+        output_path: Option<PathBuf>,
+    ) -> PipelineResult {
+        PipelineResult {
+            output_path,
+            batches_translated: 1,
+            review_batches: 0,
+            usage: Usage::default(),
+            mode: request.settings.translation.mode,
+            deduplicated_segments: 0,
+            reviewer_fallback: false,
+            dry_run: request.settings.translation.dry_run,
+            planned_batches: Vec::new(),
+            cache_hits: 0,
+            resumed_translation_batches: 0,
+            resumed_review_batches: 0,
+            translation_memory_hits: 0,
+            state_path: None,
+            glossary_path: None,
+            agent_repairs: Vec::new(),
+            terminology: TerminologyStats::default(),
+            review: ReviewStats::default(),
+        }
+    }
+
     #[test]
     fn local_mutation_returns_undo_bookkeeping_data() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("note.txt"), "hello").expect("write source");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
@@ -1235,7 +1364,8 @@ mod tests {
         if !Path::new("/usr/bin/bwrap").is_file() {
             return;
         }
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("source.txt"), b"original").expect("source");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
@@ -1290,7 +1420,8 @@ mod tests {
 
     #[test]
     fn file_list_marks_directories_so_media_discovery_can_descend() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         let directory = root.join("release.with.dots");
         fs::create_dir_all(&directory).expect("create directory");
         fs::write(root.join("movie.mkv"), b"media").expect("write media");
@@ -1304,7 +1435,8 @@ mod tests {
 
     #[test]
     fn non_local_tool_is_left_for_the_service_executor() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
         let outcome = execute_local_tool(ToolExecutor::TranslateFile, &json!({}), &guard, &root)
@@ -1314,7 +1446,8 @@ mod tests {
 
     #[test]
     fn diagnostic_text_is_executed_without_engine_state() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         let guard = FileGuard::new(root).expect("create file guard");
         let outcome = execute_adapter_tool(
@@ -1332,7 +1465,8 @@ mod tests {
 
     #[test]
     fn invalid_whisper_action_is_an_error_not_success_text() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
         let error = execute_adapter_tool(
@@ -1358,7 +1492,8 @@ mod tests {
 
     #[test]
     fn translate_series_forwards_batch_progress() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(
             root.join("episode.srt"),
@@ -1397,7 +1532,8 @@ mod tests {
 
     #[test]
     fn explicit_japanese_override_changes_only_that_call_and_output_name() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(
             root.join("sample.srt"),
@@ -1406,14 +1542,16 @@ mod tests {
         .expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
         let settings = TranslationSettings::default();
+        let services = RecordingTranslationServices::default();
 
-        let japanese = execute_translation_tool(
+        let japanese = execute_translation_tool_with_services(
             ToolExecutor::TranslateFile,
             &json!({"path": "sample.srt", "target_language": "Japanese"}),
             &guard,
             &CancellationGuard::never(),
             None,
             settings.clone(),
+            &services,
         )
         .expect("translate Japanese")
         .expect("Japanese outcome");
@@ -1421,13 +1559,14 @@ mod tests {
             panic!("expected translation facts");
         };
 
-        let profile_default = execute_translation_tool(
+        let profile_default = execute_translation_tool_with_services(
             ToolExecutor::TranslateFile,
             &json!({"path": "sample.srt"}),
             &guard,
             &CancellationGuard::never(),
             None,
             settings,
+            &services,
         )
         .expect("translate profile default")
         .expect("default outcome");
@@ -1445,12 +1584,25 @@ mod tests {
             default_facts.outputs,
             vec![root.join("sample.translated.srt")]
         );
+        let requests = services.requests();
+        let RecordedTranslationRequest::File(japanese_request) = &requests[0] else {
+            panic!("expected file request");
+        };
+        let RecordedTranslationRequest::File(default_request) = &requests[1] else {
+            panic!("expected file request");
+        };
+        assert_eq!(japanese_request.settings.translation.target_language, "ja");
+        assert_eq!(
+            default_request.settings.translation.target_language,
+            "zh-Hans"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn fresh_runtime_is_unique_and_disables_all_translation_reuse() {
-        let root = temp_root();
+    fn fresh_runtime_policy_is_forwarded_without_adapter_side_effects() {
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(
             root.join("sample.srt"),
@@ -1461,54 +1613,71 @@ mod tests {
         let mut settings = TranslationSettings::default();
         settings.storage.runtime_dir = Some(root.join("runtime"));
         settings.storage.glossary_path = Some(root.join("shared-glossary.json"));
+        let services = RecordingTranslationServices::default();
 
-        let run = |output_path: &str| {
-            execute_translation_tool(
-                ToolExecutor::TranslateFile,
-                &json!({
-                    "path": "sample.srt",
-                    "output_path": output_path,
-                    "fresh_runtime": true
-                }),
-                &guard,
-                &CancellationGuard::never(),
-                None,
-                settings.clone(),
-            )
-            .expect("fresh translation")
-            .expect("translation outcome")
-        };
-        let first = run("fresh-one.srt");
-        let second = run("fresh-two.srt");
-        let AgentToolOutcome::Translation(first) = first.outcome else {
-            panic!("expected first translation facts");
-        };
-        let AgentToolOutcome::Translation(second) = second.outcome else {
-            panic!("expected second translation facts");
-        };
+        let file = execute_translation_tool_with_services(
+            ToolExecutor::TranslateFile,
+            &json!({
+                "path": "sample.srt",
+                "output_path": "fresh.srt",
+                "fresh_runtime": true
+            }),
+            &guard,
+            &CancellationGuard::never(),
+            None,
+            settings.clone(),
+            &services,
+        )
+        .expect("record fresh file request")
+        .expect("translation outcome");
+        let batch = execute_translation_tool_with_services(
+            ToolExecutor::TranslateSeries,
+            &json!({"path": ".", "fresh_runtime": true}),
+            &guard,
+            &CancellationGuard::never(),
+            None,
+            settings,
+            &services,
+        )
+        .expect("record fresh batch request")
+        .expect("translation outcome");
 
-        let first_runtime = first.runtime_dir.clone().expect("first runtime");
-        let second_runtime = second.runtime_dir.clone().expect("second runtime");
-        assert!(first.fresh_runtime);
-        assert!(second.fresh_runtime);
-        assert_ne!(first_runtime, second_runtime);
-        assert!(first_runtime.starts_with(root.join("runtime/fresh")));
-        assert!(second_runtime.starts_with(root.join("runtime/fresh")));
-        assert!(first_runtime.is_dir());
-        assert!(second_runtime.is_dir());
-        for facts in [first, second] {
-            assert_eq!(facts.cache_hits, 0);
-            assert_eq!(facts.resumed_translation_batches, 0);
-            assert_eq!(facts.resumed_review_batches, 0);
-            assert_eq!(facts.translation_memory_hits, 0);
+        for outcome in [file, batch] {
+            let AgentToolOutcome::Translation(facts) = outcome.outcome else {
+                panic!("expected translation facts");
+            };
+            assert!(facts.fresh_runtime);
+            assert!(facts.runtime_dir.is_none());
         }
+        let requests = services.requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let (policy, settings) = match request {
+                RecordedTranslationRequest::File(request) => {
+                    (request.runtime_reuse, request.settings)
+                }
+                RecordedTranslationRequest::Batch(request) => {
+                    (request.runtime_reuse, request.settings)
+                }
+            };
+            assert_eq!(policy, RuntimeReusePolicy::Fresh);
+            assert_eq!(settings.storage.runtime_dir, Some(root.join("runtime")));
+            assert_eq!(
+                settings.storage.glossary_path,
+                Some(root.join("shared-glossary.json"))
+            );
+            assert!(settings.translation.resume);
+            assert!(settings.translation.use_cache);
+        }
+        assert!(!root.join("runtime/fresh").exists());
         assert!(!root.join("shared-glossary.json").exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn dry_run_reports_no_output_and_creates_no_undo_operation() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("sample.txt"), "Hello\n").expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
@@ -1538,7 +1707,8 @@ mod tests {
 
     #[test]
     fn invalid_language_fails_before_creating_output_or_undo_data() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("sample.txt"), "Hello\n").expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
@@ -1560,7 +1730,8 @@ mod tests {
 
     #[test]
     fn recursive_series_preserves_relative_structure_in_output_dir() {
-        let root = temp_root();
+        let temporary = temp_root();
+        let root = temporary.path().to_path_buf();
         fs::create_dir_all(root.join("season")).expect("create nested root");
         fs::write(
             root.join("season/episode.srt"),
@@ -1596,11 +1767,10 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn temp_root() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("subbake-local-tools-{nanos}"))
+    fn temp_root() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("subbake-local-tools-")
+            .tempdir()
+            .expect("create temporary test root")
     }
 }

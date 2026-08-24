@@ -83,27 +83,38 @@ impl RuntimeStore for FileRuntimeStore {
             &self.paths.finalized_batches_dir,
             &self.paths.agent_logs_dir,
         ] {
-            fs::create_dir_all(directory).map_err(storage_error)?;
+            fs::create_dir_all(directory).map_err(|error| {
+                storage_error("create runtime directory", Some(directory), error)
+            })?;
         }
         let marker = self.paths.root_dir.join(RUNTIME_MARKER_NAME);
         match fs::symlink_metadata(&marker) {
             Ok(metadata) if metadata.file_type().is_file() => {}
             Ok(_) => {
-                return Err(storage_error(io::Error::other(format!(
-                    "runtime marker is not a regular file: {}",
-                    marker.display()
-                ))));
+                return Err(storage_error(
+                    "validate runtime marker",
+                    Some(&marker),
+                    io::Error::other("runtime marker is not a regular file"),
+                ));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let mut file = fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&marker)
-                    .map_err(storage_error)?;
+                    .map_err(|error| {
+                        storage_error("create runtime marker", Some(&marker), error)
+                    })?;
                 file.write_all(RUNTIME_MARKER_CONTENT.as_bytes())
-                    .map_err(storage_error)?;
+                    .map_err(|error| storage_error("write runtime marker", Some(&marker), error))?;
             }
-            Err(error) => return Err(storage_error(error)),
+            Err(error) => {
+                return Err(storage_error(
+                    "inspect runtime marker",
+                    Some(&marker),
+                    error,
+                ));
+            }
         }
         Ok(())
     }
@@ -130,7 +141,13 @@ impl RuntimeStore for FileRuntimeStore {
         if !self.paths.review_report_path.exists() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&self.paths.review_report_path).map_err(storage_error)?;
+        let text = fs::read_to_string(&self.paths.review_report_path).map_err(|error| {
+            storage_error(
+                "read review report",
+                Some(&self.paths.review_report_path),
+                error,
+            )
+        })?;
         serde_json::from_str(&text).map(Some).map_err(|error| {
             CoreError::DataInvariant(format!("review report parse failed: {error}"))
         })
@@ -154,7 +171,9 @@ impl RuntimeStore for FileRuntimeStore {
         if !self.paths.glossary_path.exists() {
             return Ok(Vec::new());
         }
-        let text = fs::read_to_string(&self.paths.glossary_path).map_err(storage_error)?;
+        let text = fs::read_to_string(&self.paths.glossary_path).map_err(|error| {
+            storage_error("read glossary", Some(&self.paths.glossary_path), error)
+        })?;
         parse_string_map(&text, "glossary")
     }
 
@@ -167,7 +186,8 @@ impl RuntimeStore for FileRuntimeStore {
         let Some(path) = path else {
             return Ok(Vec::new());
         };
-        let text = fs::read_to_string(&path).map_err(storage_error)?;
+        let text = fs::read_to_string(&path)
+            .map_err(|error| storage_error("read translation memory", Some(&path), error))?;
         parse_string_map(&text, "translation memory")
     }
 
@@ -185,7 +205,8 @@ impl RuntimeStore for FileRuntimeStore {
                     path.display()
                 )));
             }
-            let text = fs::read_to_string(&path).map_err(storage_error)?;
+            let text = fs::read_to_string(&path)
+                .map_err(|error| storage_error("read batch shard", Some(&path), error))?;
             let payload: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
                 CoreError::DataInvariant(format!("batch shard parse failed: {error}"))
             })?;
@@ -213,7 +234,9 @@ impl RuntimeStore for FileRuntimeStore {
         if !self.paths.state_path.exists() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&self.paths.state_path).map_err(storage_error)?;
+        let text = fs::read_to_string(&self.paths.state_path).map_err(|error| {
+            storage_error("read run state", Some(&self.paths.state_path), error)
+        })?;
         serde_json::from_str(&text)
             .map(Some)
             .map_err(|error| CoreError::DataInvariant(format!("run state parse failed: {error}")))
@@ -268,7 +291,8 @@ impl RuntimeStore for FileRuntimeStore {
         if !path.exists() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&path).map_err(storage_error)?;
+        let text = fs::read_to_string(&path)
+            .map_err(|error| storage_error("read cached response", Some(&path), error))?;
         match stage {
             CacheStage::Translate | CacheStage::AgentTranslateRepair => {
                 let entry: TranslationCacheEntry =
@@ -448,12 +472,16 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 
 fn atomic_storage_error(error: AdapterError) -> CoreError {
     match error {
-        AdapterError::ExternalIo { source, .. } => storage_error(source),
+        AdapterError::ExternalIo {
+            operation,
+            path,
+            source,
+        } => storage_error(operation, path.as_deref(), source),
         other => CoreError::DataInvariant(format!("atomic runtime write failed: {other}")),
     }
 }
 
-fn storage_error(error: io::Error) -> CoreError {
+fn storage_error(operation: &str, path: Option<&Path>, error: io::Error) -> CoreError {
     let kind = match error.kind() {
         io::ErrorKind::NotFound => StorageIoKind::NotFound,
         io::ErrorKind::PermissionDenied => StorageIoKind::PermissionDenied,
@@ -461,8 +489,8 @@ fn storage_error(error: io::Error) -> CoreError {
         _ => StorageIoKind::Other,
     };
     CoreError::Storage(StorageError::Io {
-        operation: "runtime storage I/O".to_owned(),
-        path: None,
+        operation: operation.to_owned(),
+        path: path.map(|path| path.display().to_string()),
         kind,
         message: error.to_string(),
     })
@@ -470,8 +498,6 @@ fn storage_error(error: io::Error) -> CoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use subbake_core::entities::{
         AgentLog, AttemptLog, BatchTranslationResult, DocumentGuide, FailureLog, GlossaryEntry,
         PipelineOptions, ReviewChange, ReviewReport, ReviewStats, TerminologyEntity,
@@ -483,8 +509,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_io_errors_include_operation_and_path() {
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-runtime-error-")
+            .tempdir()
+            .expect("create temporary directory");
+        let blocked_root = temporary.path().join("runtime-file");
+        fs::write(&blocked_root, "not a directory").expect("write blocking file");
+        let paths = build_runtime_paths(
+            &temporary.path().join("clip.srt"),
+            &temporary.path().join("clip.srt"),
+            Some(&blocked_root),
+            None,
+            "Auto",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+
+        let error = store.ensure_layout().expect_err("layout must fail");
+        let CoreError::Storage(StorageError::Io {
+            operation, path, ..
+        }) = error
+        else {
+            panic!("expected contextual storage I/O error");
+        };
+        assert_eq!(operation, "create runtime directory");
+        let path = path.expect("failed runtime path");
+        assert!(path.contains(&blocked_root.display().to_string()));
+    }
+
+    #[test]
     fn saves_glossary_as_json_object() {
-        let root = temp_root("glossary");
+        let temporary = temp_root("glossary");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -507,7 +565,8 @@ mod tests {
 
     #[test]
     fn round_trips_glossary_via_save_and_load() {
-        let root = temp_root("glossary-rt");
+        let temporary = temp_root("glossary-rt");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -532,7 +591,8 @@ mod tests {
 
     #[test]
     fn invalid_glossary_value_reports_the_key() {
-        let root = temp_root("glossary-invalid");
+        let temporary = temp_root("glossary-invalid");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -562,7 +622,8 @@ mod tests {
 
     #[test]
     fn invalid_translation_memory_value_reports_the_key() {
-        let root = temp_root("translation-memory-invalid");
+        let temporary = temp_root("translation-memory-invalid");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -593,7 +654,8 @@ mod tests {
 
     #[test]
     fn reads_v4_translation_memory_until_v5_is_written() {
-        let root = temp_root("translation-memory-v4");
+        let temporary = temp_root("translation-memory-v4");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -630,7 +692,8 @@ mod tests {
 
     #[test]
     fn load_glossary_returns_empty_when_file_missing() {
-        let root = temp_root("glossary-empty");
+        let temporary = temp_root("glossary-empty");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -648,7 +711,8 @@ mod tests {
 
     #[test]
     fn saves_batch_segments_to_padded_shard_path() {
-        let root = temp_root("batch");
+        let temporary = temp_root("batch");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -699,7 +763,8 @@ mod tests {
 
     #[test]
     fn loads_batch_segments_in_order() {
-        let root = temp_root("batch-load");
+        let temporary = temp_root("batch-load");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -748,7 +813,8 @@ mod tests {
 
     #[test]
     fn round_trips_versioned_run_state_shape() {
-        let root = temp_root("run-state");
+        let temporary = temp_root("run-state");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
             &root.join("clip.txt"),
@@ -794,7 +860,8 @@ mod tests {
 
     #[test]
     fn round_trips_python_compatible_request_cache_shape() {
-        let root = temp_root("request-cache");
+        let temporary = temp_root("request-cache");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
             &root.join("clip.txt"),
@@ -848,7 +915,8 @@ mod tests {
 
     #[test]
     fn round_trips_python_compatible_review_cache_shape() {
-        let root = temp_root("review-cache");
+        let temporary = temp_root("review-cache");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
             &root.join("clip.txt"),
@@ -897,7 +965,8 @@ mod tests {
 
     #[test]
     fn round_trips_terminology_cache_and_writes_review_report() {
-        let root = temp_root("terminology-cache");
+        let temporary = temp_root("terminology-cache");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.srt"),
             &root.join("clip.srt"),
@@ -1002,7 +1071,8 @@ mod tests {
 
     #[test]
     fn writes_python_compatible_failure_and_agent_logs() {
-        let root = temp_root("recovery-logs");
+        let temporary = temp_root("recovery-logs");
+        let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
             &root.join("clip.txt"),
             &root.join("clip.txt"),
@@ -1066,11 +1136,10 @@ mod tests {
         assert_eq!(agent["final_error"], "invalid output");
     }
 
-    fn temp_root(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("subbake-runtime-store-{label}-{nanos}"))
+    fn temp_root(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("subbake-runtime-store-{label}-"))
+            .tempdir()
+            .expect("create temporary runtime store root")
     }
 }

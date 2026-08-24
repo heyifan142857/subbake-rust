@@ -56,7 +56,9 @@ pub use overnight::{
 pub use pipeline::{
     PipelineOutcome, PipelineRequest, run_pipeline, run_pipeline_cancellable_with_progress,
 };
-pub use platform::{Architecture, CapabilitySet, OperatingSystem, PathIdentity, PlatformPaths};
+pub use platform::{
+    Architecture, CapabilitySet, OperatingSystem, PathEntryIdentity, PathIdentity, PlatformPaths,
+};
 pub use providers::{
     ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
     check_provider, check_provider_cancellable, default_api_key_env, resolve_env_var,
@@ -81,7 +83,7 @@ pub use transcription::{
 };
 pub use translation::{
     BatchTranslationFailure, BatchTranslationOutcome, BatchTranslationRequest,
-    ContainerTranslationChange, TranslationOutcome, TranslationRequest,
+    ContainerTranslationChange, RuntimeReusePolicy, TranslationOutcome, TranslationRequest,
     batch_translation_output_path, default_translation_output_path, translate_input,
     translate_input_cancellable, translate_input_cancellable_with_progress, translate_subtitle,
     translate_subtitle_batch, translate_subtitle_batch_cancellable,

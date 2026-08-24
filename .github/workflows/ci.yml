@@ -14,11 +14,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
   linux-quality:
     name: Linux / format, lint, and test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -49,7 +50,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   platform:
     name: ${{ matrix.name }} / lint and test
@@ -58,9 +59,9 @@ jobs:
       matrix:
         include:
           - name: Windows x64
-            os: windows-latest
+            os: windows-2022
           - name: macOS arm64
-            os: macos-latest
+            os: macos-15
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -89,7 +90,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run platform tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       - name: Check CLI without the interactive agent
         run: cargo check -p subbake-cli --all-targets --no-default-features

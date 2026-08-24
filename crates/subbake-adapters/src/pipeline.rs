@@ -355,6 +355,7 @@ pub fn run_pipeline_cancellable_with_progress(
                 output_path: request.output_path,
                 output_language_tag: None,
                 overwrite: true,
+                runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
                 settings: request.settings,
             },
             cancellation,
@@ -375,6 +376,7 @@ pub fn run_pipeline_cancellable_with_progress(
                 output_path: request.output_path,
                 output_language_tag: None,
                 overwrite: true,
+                runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
                 settings: request.settings,
             },
             cancellation,
@@ -433,6 +435,7 @@ fn run_sequential_media_pipeline(
             output_path: request.output_path,
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
             settings: request.settings,
         },
         cancellation,
@@ -669,6 +672,7 @@ fn translate_chunk_group(
             output_path: Some(translated_path.clone()),
             output_language_tag: None,
             overwrite: true,
+            runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
             settings,
         },
         cancellation,
@@ -844,6 +848,7 @@ fn finalize_streaming_pipeline(
         output_path: Some(output_path),
         subtitle_entries: transcription.document.segments.len(),
         container_change: None,
+        runtime_dir: None,
     }))
 }
 

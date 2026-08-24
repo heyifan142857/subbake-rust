@@ -90,6 +90,29 @@ pub struct PathIdentity {
     resolved: PathBuf,
 }
 
+/// Identity and type of an existing directory entry without following a
+/// symbolic-link leaf. Parent aliases are still resolved for authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathEntryIdentity {
+    identity: PathIdentity,
+    is_directory: bool,
+    is_symlink: bool,
+}
+
+impl PathEntryIdentity {
+    pub fn identity(&self) -> &PathIdentity {
+        &self.identity
+    }
+
+    pub const fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    pub const fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+}
+
 impl PathIdentity {
     pub fn logical(&self) -> &Path {
         &self.logical
@@ -130,6 +153,43 @@ impl PlatformPaths {
             AdapterError::external_io("resolve existing path", Some(logical.clone()), source)
         })?;
         Ok(PathIdentity { logical, resolved })
+    }
+
+    /// Identify an existing directory entry while preserving a symbolic-link
+    /// leaf as the entry being operated on. This is the safe identity for
+    /// delete and rename operations that must affect the link, not its target.
+    pub fn identify_entry_without_following_leaf(path: &Path) -> AdapterResult<PathEntryIdentity> {
+        let logical = absolute_lexical(path)?;
+        let metadata = std::fs::symlink_metadata(&logical).map_err(|source| {
+            AdapterError::external_io("inspect path entry", Some(logical.clone()), source)
+        })?;
+        let is_symlink = metadata.file_type().is_symlink();
+        let identity = if is_symlink {
+            let parent = logical.parent().ok_or_else(|| {
+                AdapterError::invalid_input(format!(
+                    "path entry has no parent: {}",
+                    logical.display()
+                ))
+            })?;
+            let parent = Self::identify_existing(parent)?;
+            let file_name = logical.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+                AdapterError::invalid_input(format!(
+                    "path entry has no file name: {}",
+                    logical.display()
+                ))
+            })?;
+            PathIdentity {
+                logical,
+                resolved: parent.resolved.join(file_name),
+            }
+        } else {
+            Self::identify_existing(&logical)?
+        };
+        Ok(PathEntryIdentity {
+            identity,
+            is_directory: metadata.is_dir(),
+            is_symlink,
+        })
     }
 
     /// Identify a path whose final components may not exist yet.
@@ -294,11 +354,11 @@ mod tests {
     fn path_identity_separates_logical_spelling_from_filesystem_identity() {
         use std::os::unix::fs::symlink;
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let container = std::env::temp_dir().join(format!("subbake-path-identity-{nonce}"));
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-path-identity-")
+            .tempdir()
+            .expect("create temporary directory");
+        let container = temporary.path();
         let actual = container.join("actual");
         let alias = container.join("alias");
         std::fs::create_dir_all(&actual).expect("create actual directory");
@@ -315,7 +375,6 @@ mod tests {
                 .expect("canonical actual directory")
                 .join("new/file.srt")
         );
-        let _ = std::fs::remove_dir_all(container);
     }
 
     #[cfg(unix)]
@@ -323,17 +382,140 @@ mod tests {
     fn path_identity_rejects_a_dangling_symlink_ancestor() {
         use std::os::unix::fs::symlink;
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let container = std::env::temp_dir().join(format!("subbake-path-dangling-{nonce}"));
-        std::fs::create_dir_all(&container).expect("create container");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-path-dangling-")
+            .tempdir()
+            .expect("create temporary directory");
+        let container = temporary.path();
         symlink(container.join("missing"), container.join("link")).expect("create dangling link");
 
         PlatformPaths::identify_with_missing_tail(&container.join("link/file.srt"))
             .expect_err("dangling symlink must not be treated as a missing directory");
-        let _ = std::fs::remove_dir_all(container);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_symlink_identity_preserves_the_link_entry() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-path-leaf-link-")
+            .tempdir()
+            .expect("create temporary directory");
+        let target = temporary.path().join("target.txt");
+        let link = temporary.path().join("link.txt");
+        std::fs::write(&target, "target").expect("write target");
+        symlink(&target, &link).expect("create link");
+
+        let entry = PlatformPaths::identify_entry_without_following_leaf(&link)
+            .expect("identify leaf symlink");
+
+        assert!(entry.is_symlink());
+        assert!(!entry.is_directory());
+        assert_eq!(entry.identity().logical(), link);
+        assert_eq!(
+            entry.identity().resolved(),
+            temporary
+                .path()
+                .canonicalize()
+                .expect("resolve temporary directory")
+                .join("link.txt")
+        );
+        assert_ne!(
+            entry.identity().resolved(),
+            target.canonicalize().expect("resolve target")
+        );
+    }
+
+    #[test]
+    fn missing_tail_keeps_logical_spelling_and_resolves_existing_parent() {
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-path-missing-tail-")
+            .tempdir()
+            .expect("create temporary directory");
+        let missing = temporary.path().join("not-created/child.srt");
+
+        let identity = PlatformPaths::identify_with_missing_tail(&missing)
+            .expect("identify path with missing tail");
+
+        assert_eq!(identity.logical(), missing);
+        assert_eq!(
+            identity.resolved(),
+            temporary
+                .path()
+                .canonicalize()
+                .expect("resolve temporary directory")
+                .join("not-created/child.srt")
+        );
+    }
+
+    #[test]
+    fn temporary_test_directories_are_unique_and_cleanup_during_unwind() {
+        let parent = tempfile::Builder::new()
+            .prefix("subbake-tempdir-parent-")
+            .tempdir()
+            .expect("create temporary parent");
+        let roots = (0..16)
+            .map(|_| {
+                let parent = parent.path().to_path_buf();
+                std::thread::spawn(move || {
+                    tempfile::Builder::new()
+                        .prefix("parallel-")
+                        .tempdir_in(parent)
+                        .expect("create parallel temporary directory")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().expect("join temporary directory worker"))
+            .collect::<Vec<_>>();
+        let unique = roots
+            .iter()
+            .map(tempfile::TempDir::path)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), roots.len());
+        assert!(roots.iter().all(|root| root.path().is_dir()));
+        drop(roots);
+        assert!(
+            std::fs::read_dir(parent.path())
+                .expect("read temporary parent")
+                .next()
+                .is_none()
+        );
+
+        let panic_path = parent.path().join("panic-cleanup");
+        let child_path = panic_path.clone();
+        let result = std::thread::spawn(move || {
+            let temporary = tempfile::Builder::new()
+                .prefix("panic-cleanup")
+                .tempdir_in(child_path.parent().expect("panic cleanup parent"))
+                .expect("create panic cleanup directory");
+            let created = temporary.path().to_path_buf();
+            assert!(created.is_dir());
+            panic!("exercise TempDir cleanup during unwind");
+        })
+        .join();
+        assert!(result.is_err());
+        assert!(
+            std::fs::read_dir(parent.path())
+                .expect("read temporary parent after panic")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_does_not_leak_verbatim_spelling_to_logical_path() {
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-windows-path-")
+            .tempdir()
+            .expect("create temporary directory");
+        let identity = PlatformPaths::identify_existing(temporary.path())
+            .expect("identify Windows temporary directory");
+
+        assert!(!identity.logical().to_string_lossy().starts_with(r"\\?\"));
+        assert!(identity.resolved().is_absolute());
     }
 
     #[cfg(windows)]

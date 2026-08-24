@@ -11,6 +11,7 @@ use subbake_core::formats::{
 };
 
 use crate::error::{AdapterError, AdapterResult};
+use crate::platform::PlatformPaths;
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -21,16 +22,11 @@ pub fn is_supported_subtitle_path(path: &Path) -> bool {
 /// Resolve the filesystem-dependent identity used to isolate runtime data.
 ///
 /// Existing paths are canonicalized to preserve historical run keys. Missing
-/// paths retain their absolute spelling, or are anchored to the current
-/// directory when relative.
+/// tails are appended to the resolved identity of their deepest existing
+/// ancestor, so aliases cannot create distinct runtime keys.
 pub fn stable_runtime_input_path(path: &Path) -> AdapterResult<PathBuf> {
-    match path.canonicalize() {
-        Ok(canonical) => Ok(canonical),
-        Err(_) if path.is_absolute() => Ok(path.to_path_buf()),
-        Err(_) => std::env::current_dir()
-            .map(|current_dir| current_dir.join(path))
-            .map_err(|source| AdapterError::external_io("resolve current directory", None, source)),
-    }
+    PlatformPaths::identify_with_missing_tail(path)
+        .map(|identity| identity.resolved().to_path_buf())
 }
 
 pub fn read_document(path: &Path) -> AdapterResult<SubtitleDocument> {
@@ -358,25 +354,21 @@ pub fn default_output_path_with_language(
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     #[test]
     fn stable_runtime_path_canonicalizes_an_existing_path() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-stable-path-{nonce}"));
-        fs::create_dir_all(&root).expect("create root");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-stable-path-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let input = root.join("clip.srt");
         fs::write(&input, b"1\n").expect("write input");
 
         let stable = stable_runtime_input_path(&input).expect("stable path");
         let expected = input.canonicalize().expect("canonical path");
-        let _ = fs::remove_dir_all(&root);
-
         assert_eq!(stable, expected);
     }
 
@@ -394,11 +386,19 @@ mod tests {
     }
 
     #[test]
-    fn stable_runtime_path_preserves_a_missing_absolute_path() {
-        let absolute = std::env::temp_dir().join("subbake-path-that-does-not-exist.srt");
+    fn stable_runtime_path_resolves_the_parent_of_a_missing_absolute_path() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let absolute = temporary.path().join("missing.srt");
         let stable = stable_runtime_input_path(&absolute).expect("stable path");
 
-        assert_eq!(stable, absolute);
+        assert_eq!(
+            stable,
+            temporary
+                .path()
+                .canonicalize()
+                .expect("resolve temporary directory")
+                .join("missing.srt")
+        );
     }
 
     #[test]
@@ -436,12 +436,11 @@ mod tests {
 
     #[test]
     fn atomic_writer_replaces_existing_file_without_leaving_staging_files() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-atomic-replace-{nonce}"));
-        fs::create_dir_all(&root).expect("create root");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-atomic-replace-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let output = root.join("translated.srt");
         fs::write(&output, b"old subtitle").expect("write old output");
 
@@ -449,14 +448,13 @@ mod tests {
 
         assert_eq!(fs::read(&output).expect("read output"), b"new subtitle");
         assert_eq!(
-            fs::read_dir(&root)
+            fs::read_dir(root)
                 .expect("list root")
                 .filter_map(Result::ok)
                 .count(),
             1,
             "atomic replacement left a lock, backup, or staging file"
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -464,12 +462,11 @@ mod tests {
     fn atomic_writer_replaces_contents_and_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-atomic-output-{nonce}"));
-        fs::create_dir_all(&root).expect("create root");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-atomic-output-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let output = root.join("translated.srt");
         fs::write(&output, b"old").expect("write old output");
         fs::set_permissions(&output, fs::Permissions::from_mode(0o640))
@@ -490,23 +487,21 @@ mod tests {
             0o640
         );
         assert_eq!(
-            fs::read_dir(&root)
+            fs::read_dir(root)
                 .expect("list root")
                 .filter_map(Result::ok)
                 .count(),
             1
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn atomic_writer_serializes_concurrent_replacements() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-atomic-concurrent-{nonce}"));
-        fs::create_dir_all(&root).expect("create root");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-atomic-concurrent-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let output = Arc::new(root.join("state.json"));
         fs::write(output.as_ref(), b"initial").expect("write initial file");
         let barrier = Arc::new(Barrier::new(8));
@@ -529,23 +524,21 @@ mod tests {
         let content = fs::read_to_string(output.as_ref()).expect("read final file");
         assert!(content.starts_with("writer-"));
         assert_eq!(
-            fs::read_dir(&root)
+            fs::read_dir(root)
                 .expect("list root")
                 .filter_map(Result::ok)
                 .count(),
             1
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn atomic_writer_waits_for_a_slow_concurrent_writer() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-atomic-slow-writer-{nonce}"));
-        fs::create_dir_all(&root).expect("create root");
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-atomic-slow-writer-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let output = root.join("state.json");
         fs::write(&output, b"initial").expect("write initial file");
         let lock = AtomicWriteLock::acquire(&output).expect("acquire competing lock");
@@ -558,29 +551,27 @@ mod tests {
         releaser.join().expect("release competing lock");
 
         assert_eq!(fs::read(&output).expect("read replacement"), b"replacement");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn failed_atomic_publish_removes_its_staged_file() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("subbake-atomic-failure-{nonce}"));
+        let temporary = tempfile::Builder::new()
+            .prefix("subbake-atomic-failure-")
+            .tempdir()
+            .expect("create temporary directory");
+        let root = temporary.path();
         let output = root.join("directory-target.srt");
         fs::create_dir_all(&output).expect("create conflicting directory");
 
         write_file_atomically(&output, b"subtitle")
             .expect_err("a directory cannot be replaced as a subtitle file");
 
-        let staged = fs::read_dir(&root)
+        let staged = fs::read_dir(root)
             .expect("list root")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains("subbake-tmp"))
             .count();
         assert_eq!(staged, 0);
         assert!(output.is_dir());
-        let _ = fs::remove_dir_all(root);
     }
 }

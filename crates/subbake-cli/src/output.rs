@@ -454,6 +454,7 @@ mod tests {
             resumed_translation_batches: 0,
             resumed_review_batches: 0,
             translation_memory_hits: 0,
+            runtime_dir: None,
         };
 
         assert_eq!(batch_text(&outcome), "No subtitle files found.\n");

@@ -4,8 +4,8 @@ use crate::CliResult;
 use crate::args::{BatchArgs, TranslateArgs};
 use crate::output::{print_batch_translation_outcome, print_translation_outcome};
 use subbake_adapters::{
-    BatchTranslationRequest, TranslationRequest, translate_subtitle_batch_with_progress,
-    translate_subtitle_cancellable_with_progress,
+    BatchTranslationRequest, RuntimeReusePolicy, TranslationRequest,
+    translate_subtitle_batch_with_progress, translate_subtitle_cancellable_with_progress,
 };
 
 pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
@@ -16,6 +16,7 @@ pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
             output_path: args.output.clone(),
             output_language_tag: None,
             overwrite: args.overwrite,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: args.settings.clone(),
         },
         cancellation.guard(),
@@ -35,6 +36,7 @@ pub fn translate_batch(args: BatchArgs) -> CliResult<()> {
             retry_manifest: args.retry_failed,
             output_dir: None,
             output_language_tag: None,
+            runtime_reuse: RuntimeReusePolicy::Configured,
             settings: args.translate.settings,
         },
         cancellation.guard(),

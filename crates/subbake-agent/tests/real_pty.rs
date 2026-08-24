@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use subbake_agent::{
@@ -48,8 +48,8 @@ fn real_pty_restores_terminal_and_exercises_interactions() {
     }
 
     let test_binary = std::env::current_exe().expect("locate PTY test binary");
-    let test_dir = unique_test_dir();
-    std::fs::create_dir_all(&test_dir).expect("create PTY test directory");
+    let temporary = unique_test_dir();
+    let test_dir = temporary.path();
     let action_log = test_dir.join("actions.log");
 
     let pair = native_pty_system()
@@ -191,7 +191,6 @@ exit "$status"
     send_text(&writer, "pty_profile");
     send(&writer, enter_key);
     wait_for_action(&action_log, "CreateProfile:pty_profile", &transcript);
-    wait_for_output(&transcript, b"\x1b[?1049l", STEP_TIMEOUT);
     wait_for_output(&transcript, b"profile created", STEP_TIMEOUT);
 
     let config_checkpoint = transcript_len(&transcript);
@@ -213,6 +212,7 @@ exit "$status"
         })
         .expect("resize PTY configuration editor");
     send(&writer, b"\t\x1b[B");
+    let config_resize_checkpoint = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -221,14 +221,13 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("widen PTY configuration editor");
-    let config_close_checkpoint = transcript_len(&transcript);
-    send(&writer, b"q");
-    wait_for_output_after(
+    wait_for_output_growth_and_quiet(
         &transcript,
-        config_close_checkpoint,
-        b"\x1b[?1049l",
+        config_resize_checkpoint,
+        Duration::from_millis(50),
         STEP_TIMEOUT,
     );
+    send(&writer, b"q");
 
     send_text(&writer, "make a plan");
     send(&writer, enter_key);
@@ -329,8 +328,6 @@ exit "$status"
             .any(|window| window == b"private subtitle body"),
         "observation contents must not leak into the activity summary"
     );
-
-    let _ = std::fs::remove_dir_all(test_dir);
 }
 
 #[test]
@@ -649,6 +646,52 @@ fn wait_for_output_after(
     }
 }
 
+fn wait_for_output_growth_and_quiet(
+    transcript: &Transcript,
+    checkpoint: usize,
+    quiet_period: Duration,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    let mut bytes = transcript.bytes.lock().expect("lock PTY transcript");
+    while bytes.len() <= checkpoint {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!(
+                "timed out waiting for PTY output growth; transcript: {}",
+                escape_bytes(&bytes)
+            );
+        }
+        let (next, _) = transcript
+            .changed
+            .wait_timeout(bytes, deadline.saturating_duration_since(now))
+            .expect("wait for PTY output growth");
+        bytes = next;
+    }
+
+    loop {
+        let before = bytes.len();
+        let now = Instant::now();
+        if now >= deadline {
+            panic!(
+                "timed out waiting for PTY output to settle; transcript: {}",
+                escape_bytes(&bytes)
+            );
+        }
+        let (next, result) = transcript
+            .changed
+            .wait_timeout(
+                bytes,
+                quiet_period.min(deadline.saturating_duration_since(now)),
+            )
+            .expect("wait for PTY output to settle");
+        bytes = next;
+        if result.timed_out() && bytes.len() == before {
+            return;
+        }
+    }
+}
+
 fn wait_for_action(path: &Path, expected: &str, transcript: &Transcript) {
     let deadline = Instant::now() + STEP_TIMEOUT;
     loop {
@@ -686,12 +729,11 @@ fn wait_for_child(
     }
 }
 
-fn unique_test_dir() -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!("subbake-real-pty-{}-{nonce}", std::process::id()))
+fn unique_test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("subbake-real-pty-")
+        .tempdir()
+        .expect("create PTY test directory")
 }
 
 fn transcript_bytes(transcript: &Transcript) -> Vec<u8> {

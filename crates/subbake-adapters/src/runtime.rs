@@ -187,23 +187,19 @@ fn rebase_runtime_path(
 }
 
 fn managed_target(root: &Path, path: &Path) -> AdapterResult<PathBuf> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path.to_path_buf()),
-        Err(source) => {
-            return Err(AdapterError::external_io(
-                "inspect runtime artifact",
-                Some(path.to_path_buf()),
-                source,
-            ));
+    let entry = match PlatformPaths::identify_entry_without_following_leaf(path) {
+        Ok(entry) => entry,
+        Err(AdapterError::ExternalIo { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(path.to_path_buf());
         }
+        Err(error) => return Err(error),
     };
-    if metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
+    if entry.is_symlink() {
+        return Ok(entry.identity().logical().to_path_buf());
     }
-    let resolved = path.canonicalize().map_err(|source| {
-        AdapterError::external_io("resolve runtime artifact", Some(path.to_path_buf()), source)
-    })?;
+    let resolved = entry.identity().resolved().to_path_buf();
     if !resolved.starts_with(root) {
         return Err(AdapterError::invalid_input(format!(
             "refusing to clean runtime artifact that resolves outside `{}`: {}",
