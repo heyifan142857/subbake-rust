@@ -158,7 +158,6 @@ exit "$status"
     send_text(&writer, "/profile");
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:/profile", &transcript);
-    wait_for_output(&transcript, b"\x1b[?1049h", STEP_TIMEOUT);
     wait_for_output(&transcript, b"Choose a model profile", STEP_TIMEOUT);
 
     pair.master
@@ -296,11 +295,24 @@ exit "$status"
         );
     }
 
-    assert_eq!(
-        count_subslice(&output, b"\x1b[?1049h"),
-        count_subslice(&output, b"\x1b[?1049l"),
-        "alternate-screen enter/leave must be paired"
-    );
+    // Unix crossterm uses ANSI alternate-screen commands, while Windows
+    // crossterm switches ConPTY screen buffers through WinAPI. Only assert on
+    // transport bytes where those bytes are the platform contract; the
+    // cross-platform interaction assertions above prove the overlay opened,
+    // closed, and returned control to the main TUI.
+    #[cfg(unix)]
+    {
+        let alternate_screen_enters = count_subslice(&output, b"\x1b[?1049h");
+        assert!(
+            alternate_screen_enters > 0,
+            "the Unix PTY session must enter the alternate screen"
+        );
+        assert_eq!(
+            alternate_screen_enters,
+            count_subslice(&output, b"\x1b[?1049l"),
+            "alternate-screen enter/leave must be paired"
+        );
+    }
     assert_eq!(
         count_subslice(&output, b"\x1b[>1u"),
         count_subslice(&output, b"\x1b[<1u"),

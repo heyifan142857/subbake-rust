@@ -374,13 +374,25 @@ mod tests {
 
     #[test]
     fn stable_runtime_path_anchors_a_missing_relative_path() {
-        let relative = Path::new("missing/subtitle.srt");
-        let stable = stable_runtime_input_path(relative).expect("stable path");
+        let temporary = tempfile::Builder::new()
+            .prefix(".subbake-relative-path-")
+            .tempdir_in(".")
+            .expect("create relative temporary directory");
+        let relative = PathBuf::from(
+            temporary
+                .path()
+                .file_name()
+                .expect("temporary directory file name"),
+        )
+        .join("missing/subtitle.srt");
+        let stable = stable_runtime_input_path(&relative).expect("stable path");
 
         assert_eq!(
             stable,
             std::env::current_dir()
                 .expect("current directory")
+                .canonicalize()
+                .expect("resolve current directory")
                 .join(relative)
         );
     }
