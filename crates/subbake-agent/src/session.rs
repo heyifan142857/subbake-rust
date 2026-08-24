@@ -379,7 +379,10 @@ pub struct AgentSessionStore {
 
 impl AgentSessionStore {
     pub fn new(project_root: PathBuf) -> Self {
-        let project_root = project_root.canonicalize().unwrap_or(project_root);
+        // Preserve the caller-owned logical spelling. Canonicalizing here
+        // would leak macOS aliases and Windows verbatim paths into session
+        // locations after FileGuard has already separated logical identity
+        // from filesystem identity at the engine boundary.
         Self {
             root: project_root.join(".subbake/agent/sessions"),
             project_root,
@@ -711,6 +714,42 @@ mod tests {
         assert_eq!(loaded.events[0].data["path"], "hello.srt");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_paths_preserve_an_aliased_project_root_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let container =
+            std::env::temp_dir().join(format!("subbake-agent-session-alias-{}", hex_id()));
+        let actual = container.join("actual");
+        let alias = container.join("alias");
+        std::fs::create_dir_all(&actual).expect("create actual project root");
+        symlink(&actual, &alias).expect("create project-root alias");
+
+        let store = AgentSessionStore::new(alias.clone());
+        let mut session = store.create().expect("create session");
+        session.record_event("user", "hello", serde_json::json!({}));
+        store
+            .save(&session)
+            .expect("save through project-root alias");
+
+        let logical_path = store.path_for(&session.id).expect("session path");
+        assert_eq!(
+            logical_path,
+            alias
+                .join(".subbake/agent/sessions")
+                .join(format!("{}.json", session.id))
+        );
+        assert!(
+            actual
+                .join(".subbake/agent/sessions")
+                .join(format!("{}.json", session.id))
+                .is_file()
+        );
+
+        let _ = std::fs::remove_dir_all(container);
     }
 
     #[test]
