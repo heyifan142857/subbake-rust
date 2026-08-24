@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -16,6 +16,7 @@ use subbake_agent::{
 
 const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
 const ACTION_LOG_ENV: &str = "SUBBAKE_REAL_PTY_ACTION_LOG";
+#[cfg(unix)]
 const TEST_BIN_ENV: &str = "SUBBAKE_REAL_PTY_TEST_BIN";
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const STEP_TIMEOUT: Duration = Duration::from_secs(4);
@@ -54,10 +55,12 @@ fn real_pty_restores_terminal_and_exercises_interactions() {
             pixel_height: 0,
         })
         .expect("open PTY");
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.arg("-c");
-    command.arg(
-        r#"before=$(stty -g) || exit 90
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg(
+            r#"before=$(stty -g) || exit 90
 printf 'PTY_STTY_BEFORE:%s\n' "$before"
 "$SUBBAKE_REAL_PTY_TEST_BIN" --exact pty_child_driver --nocapture --test-threads=1
 status=$?
@@ -66,9 +69,23 @@ printf 'PTY_STTY_AFTER:%s\n' "$after"
 printf 'PTY_SHELL_STATUS:%s\n' "$status"
 exit "$status"
 "#,
-    );
+        );
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = CommandBuilder::new(&test_binary);
+        command.args([
+            "--exact",
+            "pty_child_driver",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        command
+    };
     command.env(CHILD_ENV, "1");
     command.env(ACTION_LOG_ENV, &action_log);
+    #[cfg(unix)]
     command.env(TEST_BIN_ENV, &test_binary);
 
     let mut child = pair
@@ -220,13 +237,16 @@ exit "$status"
     reader_thread.join().expect("join PTY reader");
 
     let output = transcript_bytes(&transcript);
-    let before = marker_value(&output, "PTY_STTY_BEFORE:").expect("stty before marker");
-    let after = marker_value(&output, "PTY_STTY_AFTER:").expect("stty after marker");
-    assert_eq!(before, after, "terminal attributes were not restored");
-    assert_eq!(
-        marker_value(&output, "PTY_SHELL_STATUS:").as_deref(),
-        Some("0")
-    );
+    #[cfg(unix)]
+    {
+        let before = marker_value(&output, "PTY_STTY_BEFORE:").expect("stty before marker");
+        let after = marker_value(&output, "PTY_STTY_AFTER:").expect("stty after marker");
+        assert_eq!(before, after, "terminal attributes were not restored");
+        assert_eq!(
+            marker_value(&output, "PTY_SHELL_STATUS:").as_deref(),
+            Some("0")
+        );
+    }
 
     assert_eq!(
         count_subslice(&output, b"\x1b[?1049h"),
@@ -623,6 +643,7 @@ fn escape_bytes(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).escape_debug().to_string()
 }
 
+#[cfg(unix)]
 fn marker_value(bytes: &[u8], marker: &str) -> Option<String> {
     String::from_utf8_lossy(bytes).lines().find_map(|line| {
         line.strip_prefix(marker)

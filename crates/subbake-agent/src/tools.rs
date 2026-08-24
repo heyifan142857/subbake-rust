@@ -779,10 +779,21 @@ pub fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     ALL_TOOL_SPECS.iter().find(|spec| spec.name == name)
 }
 
+fn tool_is_available(spec: &ToolSpec) -> bool {
+    tool_is_available_for(spec, subbake_adapters::platform::CapabilitySet::current())
+}
+
+fn tool_is_available_for(
+    spec: &ToolSpec,
+    capabilities: subbake_adapters::platform::CapabilitySet,
+) -> bool {
+    spec.executor != ToolExecutor::RunCommand || capabilities.supports_command_sandbox()
+}
+
 pub(crate) fn model_visible_tool_specs() -> Vec<&'static ToolSpec> {
     ALL_TOOL_SPECS
         .iter()
-        .filter(|spec| spec.model_visible)
+        .filter(|spec| spec.model_visible && tool_is_available(spec))
         .collect()
 }
 
@@ -799,7 +810,7 @@ pub fn tool_specs_for_categories<'a>(
 ) -> Vec<&'a ToolSpec> {
     let mut result = specs
         .iter()
-        .filter(|spec| categories.contains(&spec.category))
+        .filter(|spec| categories.contains(&spec.category) && tool_is_available(spec))
         .collect::<Vec<_>>();
     result.sort_by_key(|spec| spec.name);
     result
@@ -973,8 +984,26 @@ mod tests {
         assert!(names.contains(&"translate_series"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
-        assert!(names.contains(&"run_command"));
+        assert_eq!(
+            names.contains(&"run_command"),
+            subbake_adapters::platform::CapabilitySet::current().supports_command_sandbox()
+        );
         assert!(names.contains(&"delete_external_path"));
+    }
+
+    #[test]
+    fn command_tool_is_advertised_only_on_linux() {
+        let command = find_tool_spec("run_command").expect("command tool");
+        let translate = find_tool_spec("translate_file").expect("translation tool");
+        let linux = subbake_adapters::platform::CapabilitySet::from_target("linux", "x86_64");
+        let windows = subbake_adapters::platform::CapabilitySet::from_target("windows", "x86_64");
+        let mac = subbake_adapters::platform::CapabilitySet::from_target("macos", "aarch64");
+
+        assert!(tool_is_available_for(command, linux));
+        assert!(!tool_is_available_for(command, windows));
+        assert!(!tool_is_available_for(command, mac));
+        assert!(tool_is_available_for(translate, windows));
+        assert!(tool_is_available_for(translate, mac));
     }
 
     proptest! {

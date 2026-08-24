@@ -1283,6 +1283,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_junction_escape() {
+        let (root, guard) = setup();
+        std::fs::create_dir_all(&root).expect("create root");
+        let outside = std::env::temp_dir().join(format!("subbake-outside-{}", nanos_since_epoch()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let link = root.join("outside-link");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .expect("create junction");
+        assert!(status.success(), "mklink failed with {status}");
+
+        let error = guard
+            .create_file(Path::new("outside-link/escape.txt"), "data")
+            .expect_err("junction escape should be rejected");
+
+        assert!(
+            error.to_string().contains("escapes project root"),
+            "{error}"
+        );
+        std::fs::remove_dir(&link).expect("remove junction");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     #[cfg(unix)]
     #[test]
     fn recursive_search_skips_external_and_cyclic_symlink_directories() {

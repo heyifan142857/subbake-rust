@@ -115,12 +115,12 @@ fn config_dir_with(
     operating_system: OperatingSystem,
     lookup: impl Fn(&str) -> Option<OsString> + Copy,
 ) -> Option<PathBuf> {
-    if let Some(path) = lookup("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(path));
-    }
     if operating_system == OperatingSystem::Windows
         && let Some(path) = lookup("APPDATA")
     {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(path) = lookup("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(path));
     }
     home_dir_with(operating_system, lookup).map(|home| home.join(".config"))
@@ -141,6 +141,7 @@ mod tests {
     fn windows_paths_use_native_environment_fallbacks() {
         let values = [
             ("HOME", "/home/msys-user"),
+            ("XDG_CONFIG_HOME", "/home/msys-user/.config"),
             ("USERPROFILE", r"C:\Users\Alice"),
             ("APPDATA", r"C:\Config"),
         ];
@@ -166,5 +167,16 @@ mod tests {
         assert!(!mac.supports_command_sandbox());
         assert!(!mac.has_prebuilt_whisper());
         assert!(windows.has_prebuilt_whisper());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_home_drive_and_path_form_an_absolute_native_path() {
+        let values = [("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\Alice")];
+
+        assert_eq!(
+            home_dir_with(OperatingSystem::Windows, |key| lookup(&values, key)),
+            Some(PathBuf::from(r"C:\Users\Alice"))
+        );
     }
 }

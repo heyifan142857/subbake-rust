@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use command_group::{CommandGroup, GroupChild};
 use subbake_core::CancellationGuard;
 
 use crate::error::{AdapterError, AdapterResult};
@@ -102,20 +103,17 @@ impl ProcessSupervisor {
         mut on_line: impl FnMut(&str),
     ) -> AdapterResult<Output> {
         cancellation.check().map_err(AdapterError::from)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command
-            .spawn()
+            .group_spawn()
             .map_err(|source| io::Error::other(format!("{context}: {source}")))?;
         let stdout = child
+            .inner()
             .stdout
             .take()
             .ok_or_else(|| io::Error::other(format!("{context}: stdout pipe unavailable")))?;
         let stderr = child
+            .inner()
             .stderr
             .take()
             .ok_or_else(|| io::Error::other(format!("{context}: stderr pipe unavailable")))?;
@@ -145,16 +143,14 @@ impl ProcessSupervisor {
             }
             if cancellation.is_cancelled() {
                 Self::terminate(&mut child);
-                drop(stdout_reader);
-                drop(stderr_reader);
+                join_readers_after_termination(stdout_reader, stderr_reader, context)?;
                 return Err(AdapterError::Cancelled);
             }
             if let Some(limit) = timeout
                 && started.elapsed() >= limit
             {
                 Self::terminate(&mut child);
-                drop(stdout_reader);
-                drop(stderr_reader);
+                join_readers_after_termination(stdout_reader, stderr_reader, context)?;
                 return Err(AdapterError::Timeout {
                     message: format!("{context} exceeded its {} second timeout", limit.as_secs()),
                 });
@@ -167,10 +163,12 @@ impl ProcessSupervisor {
         while let Ok(line) = receiver.try_recv() {
             on_line(&line);
         }
+        let stdout = join_reader(stdout_reader, context, "stdout");
+        let stderr = join_reader(stderr_reader, context, "stderr");
         Ok(Output {
             status,
-            stdout: join_reader(stdout_reader, context, "stdout")?,
-            stderr: join_reader(stderr_reader, context, "stderr")?,
+            stdout: stdout?,
+            stderr: stderr?,
         })
     }
 
@@ -188,28 +186,9 @@ impl ProcessSupervisor {
         Ok(output)
     }
 
-    pub(crate) fn terminate(child: &mut std::process::Child) {
-        #[cfg(unix)]
-        terminate_child_process_group(child);
+    pub(crate) fn terminate(child: &mut GroupChild) {
         let _ = child.kill();
         let _ = child.wait();
-    }
-}
-
-#[cfg(unix)]
-fn terminate_child_process_group(child: &std::process::Child) {
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::{Pid, getpgid};
-
-    let Ok(raw_pid) = i32::try_from(child.id()) else {
-        return;
-    };
-    let child_pid = Pid::from_raw(raw_pid);
-    // Never signal a group inherited from the parent (for example a CI runner
-    // job group). Commands configured with `process_group(0)` are safe group
-    // targets only after the child is confirmed as that group's leader.
-    if getpgid(Some(child_pid)) == Ok(child_pid) {
-        let _ = killpg(child_pid, Signal::SIGTERM);
     }
 }
 
@@ -230,8 +209,22 @@ fn join_reader(
         .map_err(AdapterError::from)
 }
 
-#[cfg(all(test, unix))]
+fn join_readers_after_termination(
+    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    context: &str,
+) -> AdapterResult<()> {
+    let stdout = join_reader(stdout_reader, context, "stdout");
+    let stderr = join_reader(stderr_reader, context, "stderr");
+    let _ = stdout?;
+    let _ = stderr?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Write;
     use std::process::Command;
     use std::thread;
     use std::time::Duration;
@@ -239,6 +232,48 @@ mod tests {
     use subbake_core::CancellationToken;
 
     use super::*;
+
+    const HELPER_MODE: &str = "SUBBAKE_PROCESS_TEST_HELPER";
+    const HELPER_SENTINEL: &str = "SUBBAKE_PROCESS_TEST_SENTINEL";
+
+    #[test]
+    fn process_test_helper() {
+        let Some(mode) = std::env::var_os(HELPER_MODE) else {
+            return;
+        };
+        match mode.to_string_lossy().as_ref() {
+            "sleep" => thread::sleep(Duration::from_secs(30)),
+            "grandchild" => {
+                thread::sleep(Duration::from_millis(500));
+                let path = std::env::var_os(HELPER_SENTINEL).expect("sentinel path");
+                fs::write(path, b"survived").expect("write sentinel");
+            }
+            "tree" => {
+                let mut grandchild = helper_command("grandchild")
+                    .spawn()
+                    .expect("spawn grandchild");
+                let _ = grandchild.wait();
+            }
+            "output" => {
+                let block = vec![b'x'; 128 * 1024];
+                std::io::stdout().write_all(&block).expect("write stdout");
+                std::io::stderr().write_all(&block).expect("write stderr");
+            }
+            other => panic!("unknown helper mode {other}"),
+        }
+    }
+
+    fn helper_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "process::tests::process_test_helper",
+                "--nocapture",
+            ])
+            .env(HELPER_MODE, mode);
+        command
+    }
 
     #[test]
     fn cancellation_terminates_a_running_child() {
@@ -248,33 +283,17 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             token.cancel();
         });
-        let error = ProcessSupervisor::run(
-            Command::new("sh").args(["-c", "while true; do sleep 1; done"]),
-            &guard,
-            "test child",
-        )
-        .expect_err("child should be cancelled");
+        let error = ProcessSupervisor::run(&mut helper_command("sleep"), &guard, "test child")
+            .expect_err("child should be cancelled");
         canceller.join().expect("join canceller");
 
         assert!(error.is_cancelled());
     }
 
     #[test]
-    fn termination_never_signals_an_inherited_process_group() {
-        let mut child = Command::new("sh")
-            .args(["-c", "while true; do sleep 1; done"])
-            .spawn()
-            .expect("spawn child in inherited process group");
-
-        ProcessSupervisor::terminate(&mut child);
-
-        assert!(child.try_wait().expect("poll terminated child").is_some());
-    }
-
-    #[test]
     fn timeout_uses_the_same_termination_path_as_cancellation() {
         let error = ProcessSupervisor::run_with_timeout(
-            Command::new("sh").args(["-c", "while true; do sleep 1; done"]),
+            &mut helper_command("sleep"),
             &CancellationGuard::never(),
             "test child",
             Duration::from_millis(25),
@@ -282,5 +301,51 @@ mod tests {
         .expect_err("child should time out");
 
         assert!(matches!(error, AdapterError::Timeout { .. }));
+    }
+
+    #[test]
+    fn continuously_drains_both_output_streams() {
+        let output = ProcessSupervisor::run(
+            &mut helper_command("output"),
+            &CancellationGuard::never(),
+            "test output child",
+        )
+        .expect("run output helper");
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 128 * 1024);
+        assert!(output.stderr.len() >= 128 * 1024);
+    }
+
+    #[test]
+    fn cancellation_terminates_descendant_processes() {
+        let root = std::env::temp_dir().join(format!(
+            "subbake-process-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create test root");
+        let sentinel = root.join("survived.txt");
+        let token = CancellationToken::default();
+        let guard = token.guard();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            token.cancel();
+        });
+        let error = ProcessSupervisor::run(
+            helper_command("tree").env(HELPER_SENTINEL, &sentinel),
+            &guard,
+            "test process tree",
+        )
+        .expect_err("process tree should be cancelled");
+        canceller.join().expect("join canceller");
+        thread::sleep(Duration::from_millis(650));
+
+        assert!(error.is_cancelled());
+        assert!(!sentinel.exists(), "grandchild survived process-group kill");
+        let _ = fs::remove_dir_all(root);
     }
 }

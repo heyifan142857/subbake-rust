@@ -42,6 +42,22 @@ sbake --version
 sbake --help
 ```
 
+### Platform support
+
+SubBake is developed and maintained primarily on Linux. Windows and macOS are
+tested on real GitHub-hosted runners, but remain experimental support targets.
+
+| Platform | Status | Tested behavior and limitations |
+| --- | --- | --- |
+| Linux x64 | Primary | Full CLI, TUI, transcription, and the bubblewrap-backed agent `run_command` tool |
+| Windows x64 | Experimental | Translation, transcription, managed prebuilt whisper.cpp, and TUI; no agent command sandbox |
+| macOS arm64 and Intel | Experimental | Translation, transcription, source-built whisper.cpp, and TUI; no agent command sandbox |
+
+Windows ARM, every GPU/CUDA/Metal combination, every terminal emulator, and
+arbitrary system FFmpeg codec builds are outside the current compatibility
+guarantee. Platform bug reports should include the OS version, CPU architecture,
+terminal, FFmpeg and whisper.cpp versions, and the smallest reproducing command.
+
 ## Configuration
 
 ### Discovery and precedence
@@ -56,8 +72,9 @@ SubBake resolves configuration in this order:
 Use `--config <PATH>` to select a file directly. Without that flag, SubBake
 checks the user configuration location and then the current directory:
 
-- `$XDG_CONFIG_HOME/subbake/config.toml`, when `XDG_CONFIG_HOME` is set;
-- otherwise `$HOME/.config/subbake/config.toml`;
+- `%APPDATA%\subbake\config.toml` on Windows;
+- `$XDG_CONFIG_HOME/subbake/config.toml` on non-Windows systems when set;
+- otherwise `$HOME/.config/subbake/config.toml` on non-Windows systems;
 - `./subbake.toml`;
 - `./.subbake.toml`.
 

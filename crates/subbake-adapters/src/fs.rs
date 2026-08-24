@@ -409,6 +409,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn atomic_writer_replaces_existing_file_without_leaving_staging_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-atomic-replace-{nonce}"));
+        fs::create_dir_all(&root).expect("create root");
+        let output = root.join("translated.srt");
+        fs::write(&output, b"old subtitle").expect("write old output");
+
+        write_file_atomically(&output, b"new subtitle").expect("publish replacement");
+
+        assert_eq!(fs::read(&output).expect("read output"), b"new subtitle");
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("list root")
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "atomic replacement left a lock, backup, or staging file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_writer_replaces_contents_and_preserves_permissions() {

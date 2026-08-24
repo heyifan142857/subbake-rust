@@ -1,0 +1,84 @@
+name: Platform smoke
+
+on:
+  schedule:
+    - cron: "17 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  whisper:
+    name: ${{ matrix.name }} / real FFmpeg and whisper.cpp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS arm64
+            os: macos-latest
+          - name: macOS Intel
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version --verbose
+
+      - name: Select Python for the smoke harness
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: smoke-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: smoke-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Windows media dependency
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+
+      - name: Install macOS build and media dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
+      - name: Build SubBake
+        run: cargo build -p subbake-cli
+
+      - name: Run fresh install and transcription smoke test
+        run: python scripts/ci/platform_smoke.py
+
+      - name: Upload smoke diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-smoke-${{ runner.os }}-${{ runner.arch }}
+          path: target/platform-smoke-logs
+          if-no-files-found: ignore
+          retention-days: 7

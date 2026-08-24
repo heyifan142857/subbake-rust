@@ -6,6 +6,20 @@ SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写 CLI，也�
 
 > 当前版本仍处于早期开发阶段，命令和配置格式可能继续调整。
 
+## 平台兼容性
+
+本项目目前主要在 Linux 上开发和维护。Windows 与 macOS 会通过真实 GitHub
+Actions runner 做编译、测试和定期 Whisper/FFmpeg 冒烟验证，但仍属于实验性支持。
+
+| 平台 | 支持级别 | 当前边界 |
+| --- | --- | --- |
+| Linux x64 | 主要支持 | 完整 CLI、TUI、转写及基于 bubblewrap 的 Agent `run_command` |
+| Windows x64 | 实验性 | 翻译、转写、Whisper 预编译安装和 TUI；不提供 `run_command` 沙箱 |
+| macOS arm64/Intel | 实验性 | 翻译、转写、Whisper 源码构建和 TUI；不提供 `run_command` 沙箱 |
+
+当前不承诺 Windows ARM、所有 GPU/CUDA/Metal 组合、所有终端模拟器或任意系统
+FFmpeg codec 都可用。
+
 ## 功能
 
 - 翻译 SRT、ASS、VTT 等字幕与文本文件

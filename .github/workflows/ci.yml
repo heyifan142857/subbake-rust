@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -15,8 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Format, lint, and test
+  linux-quality:
+    name: Linux / format, lint, and test
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -49,3 +50,46 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  platform:
+    name: ${{ matrix.name }} / lint and test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+          - name: macOS arm64
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust with Clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version --verbose
+          cargo --version
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run platform Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run platform tests
+        run: cargo test --workspace
+
+      - name: Check CLI without the interactive agent
+        run: cargo check -p subbake-cli --all-targets --no-default-features

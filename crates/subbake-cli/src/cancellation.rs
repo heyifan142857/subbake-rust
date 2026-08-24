@@ -1,73 +1,43 @@
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
 use subbake_core::{CancellationGuard, CancellationToken};
 
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_TOKENS: OnceLock<Mutex<BTreeMap<u64, CancellationToken>>> = OnceLock::new();
+static SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
 /// Owns the process-level cancellation bridge for one non-interactive command.
-/// Dropping it closes and joins the signal listener before command shutdown.
+///
+/// The OS handler is installed once per process. Each active command registers
+/// its own generation token, which keeps repeated in-process CLI tests and
+/// independent concurrent callers isolated while still making Ctrl+C cancel all
+/// work owned by this process.
 pub(crate) struct CliCancellation {
     guard: CancellationGuard,
-    #[cfg(unix)]
-    signal_ids: Vec<signal_hook::SigId>,
-    #[cfg(unix)]
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(unix)]
-    listener: Option<std::thread::JoinHandle<()>>,
+    registration: u64,
 }
 
 impl CliCancellation {
-    pub(crate) fn new() -> std::io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
+        let mut active = active_tokens()
+            .lock()
+            .map_err(|_| io::Error::other("CLI cancellation registry is poisoned"))?;
+        // Hold the registry lock while installing the handler and publishing the
+        // token. A signal arriving during setup blocks in the handler until the
+        // token and its original generation are both visible.
+        ensure_signal_handler()?;
         let token = CancellationToken::default();
-        // Capture the generation before the listener starts so a very early
-        // SIGINT cannot be lost by creating the guard afterwards.
         let guard = token.guard();
-
-        #[cfg(unix)]
-        {
-            use std::sync::Arc;
-            use std::sync::atomic::{AtomicBool, Ordering};
-
-            use signal_hook::consts::{SIGINT, SIGTERM};
-
-            let requested = Arc::new(AtomicBool::new(false));
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let sigint = signal_hook::flag::register(SIGINT, requested.clone())?;
-            let sigterm = match signal_hook::flag::register(SIGTERM, requested.clone()) {
-                Ok(id) => id,
-                Err(error) => {
-                    signal_hook::low_level::unregister(sigint);
-                    return Err(error);
-                }
-            };
-            let listener_shutdown = shutdown.clone();
-            let listener = match std::thread::Builder::new()
-                .name("subbake-sigint".to_owned())
-                .spawn(move || {
-                    while !listener_shutdown.load(Ordering::Acquire) {
-                        if requested.swap(false, Ordering::AcqRel) {
-                            eprintln!("Cancellation requested; stopping current operation…");
-                            token.cancel();
-                        }
-                        std::thread::park_timeout(std::time::Duration::from_millis(10));
-                    }
-                }) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    signal_hook::low_level::unregister(sigint);
-                    signal_hook::low_level::unregister(sigterm);
-                    return Err(error);
-                }
-            };
-            Ok(Self {
-                guard,
-                signal_ids: vec![sigint, sigterm],
-                shutdown,
-                listener: Some(listener),
-            })
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = token;
-            Ok(Self { guard })
-        }
+        let registration = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        active.insert(registration, token);
+        drop(active);
+        Ok(Self {
+            guard,
+            registration,
+        })
     }
 
     pub(crate) fn guard(&self) -> &CancellationGuard {
@@ -75,18 +45,32 @@ impl CliCancellation {
     }
 }
 
-#[cfg(unix)]
 impl Drop for CliCancellation {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-
-        for id in self.signal_ids.drain(..) {
-            signal_hook::low_level::unregister(id);
+        if let Ok(mut active) = active_tokens().lock() {
+            active.remove(&self.registration);
         }
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(listener) = self.listener.take() {
-            listener.thread().unpark();
-            let _ = listener.join();
+    }
+}
+
+fn active_tokens() -> &'static Mutex<BTreeMap<u64, CancellationToken>> {
+    ACTIVE_TOKENS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn ensure_signal_handler() -> io::Result<()> {
+    match SIGNAL_HANDLER
+        .get_or_init(|| ctrlc::set_handler(request_cancellation).map_err(|error| error.to_string()))
+    {
+        Ok(()) => Ok(()),
+        Err(message) => Err(io::Error::other(message.clone())),
+    }
+}
+
+fn request_cancellation() {
+    eprintln!("Cancellation requested; stopping current operation…");
+    if let Ok(active) = active_tokens().lock() {
+        for token in active.values() {
+            token.cancel();
         }
     }
 }

@@ -1,9 +1,14 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 #[test]
 fn termination_signal_cancels_cli_and_terminates_whisper_process_group() {
     let nonce = std::time::SystemTime::now()
@@ -105,5 +110,114 @@ sleep 30
         !whisper_alive,
         "whisper child {whisper_pid} survived cancellation"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn ctrl_break_cancels_cli_on_windows() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("subbake-cli-cancel-{nonce}"));
+    std::fs::create_dir_all(&root).expect("create root");
+    let helper_source = root.join("fake_whisper.rs");
+    let whisper = root.join("whisper-cli.exe");
+    let ready = root.join("whisper.ready");
+    let result = root.join("result.txt");
+    std::fs::write(
+        &helper_source,
+        r#"use std::{env, fs, thread, time::Duration};
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--version") {
+        println!("whisper.cpp fake");
+        return;
+    }
+    if args.iter().any(|arg| arg == "--help") {
+        eprintln!("--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context --vad --vad-model");
+        return;
+    }
+    fs::write(env::var_os("SUBBAKE_TEST_READY").expect("ready path"), b"ready")
+        .expect("write ready marker");
+    thread::sleep(Duration::from_secs(30));
+}
+"#,
+    )
+    .expect("write fake whisper source");
+    let compiled = Command::new("rustc")
+        .args(["--edition", "2024"])
+        .arg(&helper_source)
+        .arg("-o")
+        .arg(&whisper)
+        .status()
+        .expect("compile fake whisper");
+    assert!(compiled.success(), "rustc failed with {compiled}");
+
+    let audio = root.join("audio.wav");
+    std::fs::write(&audio, b"fake wav").expect("write audio");
+    std::fs::write(root.join("ggml-fake.bin"), b"fake model").expect("write model");
+    std::fs::write(root.join("ggml-silero-v6.2.0.bin"), b"fake VAD model")
+        .expect("write VAD model");
+    let driver = root.join("send_ctrl_break.py");
+    std::fs::write(
+        &driver,
+        r#"import os, pathlib, signal, subprocess, sys, time
+sbake, audio, whisper, root, ready, result = sys.argv[1:]
+env = os.environ.copy()
+env["SUBBAKE_TEST_READY"] = ready
+command = [
+    sbake, "transcribe", audio,
+    "--whisper-bin", whisper,
+    "--whisper-models-dir", root,
+    "--model", "fake",
+    "--output", str(pathlib.Path(root) / "cancelled.srt"),
+]
+process = subprocess.Popen(
+    command,
+    env=env,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+)
+deadline = time.monotonic() + 10
+while not pathlib.Path(ready).exists():
+    if process.poll() is not None:
+        raise RuntimeError(f"sbake exited before whisper started: {process.returncode}")
+    if time.monotonic() >= deadline:
+        process.kill()
+        raise RuntimeError("whisper did not start")
+    time.sleep(0.02)
+process.send_signal(signal.CTRL_BREAK_EVENT)
+try:
+    code = process.wait(timeout=10)
+except subprocess.TimeoutExpired:
+    process.kill()
+    process.wait()
+    raise
+pathlib.Path(result).write_text(str(code), encoding="utf-8")
+"#,
+    )
+    .expect("write Ctrl+Break driver");
+
+    let driver_status = Command::new("python")
+        .arg(&driver)
+        .args([
+            env!("CARGO_BIN_EXE_sbake"),
+            audio.to_str().expect("audio path"),
+            whisper.to_str().expect("whisper path"),
+            root.to_str().expect("root path"),
+            ready.to_str().expect("ready path"),
+            result.to_str().expect("result path"),
+        ])
+        .status()
+        .expect("run Ctrl+Break driver");
+    assert!(
+        driver_status.success(),
+        "driver failed with {driver_status}"
+    );
+    let exit_code = std::fs::read_to_string(&result).expect("read exit code");
+    assert_eq!(exit_code, "130");
     let _ = std::fs::remove_dir_all(root);
 }
