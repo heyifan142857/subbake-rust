@@ -219,43 +219,46 @@ exit "$status"
         CURSOR_SHOW,
         STEP_TIMEOUT,
     );
-    let stateful_checkpoint = transcript_len(&transcript);
-    let resize_bytes = transcript_bytes(&transcript);
-    let mut terminal_state = vt100::Parser::new(30, 100, 200);
-    terminal_state.process(&resize_bytes[..narrow_reflow_checkpoint]);
-    terminal_state.screen_mut().set_size(30, 40);
-    terminal_state.process(&resize_bytes[narrow_reflow_checkpoint..wide_reflow_checkpoint]);
-    terminal_state.screen_mut().set_size(30, 120);
-    terminal_state.process(&resize_bytes[wide_reflow_checkpoint..height_reflow_checkpoint]);
-    terminal_state.screen_mut().set_size(20, 120);
-    terminal_state.process(&resize_bytes[height_reflow_checkpoint..stateful_checkpoint]);
-    let visible = terminal_state.screen().contents();
-    assert_eq!(
-        visible
-            .lines()
-            .filter(|line| line.trim_start().starts_with("> "))
-            .count(),
-        1,
-        "stateful terminal contains a duplicated composer after resize:\n{visible}"
-    );
-    assert!(
-        visible.contains("resize accepted"),
-        "history was not replayed: {visible}"
-    );
-    terminal_state.screen_mut().set_scrollback(usize::MAX);
-    let scrollback_rows = terminal_state.screen().scrollback();
-    for offset in (0..=scrollback_rows).step_by(20) {
-        terminal_state.screen_mut().set_scrollback(offset);
-        let page = terminal_state.screen().contents();
-        assert!(
-            page.lines()
+    #[cfg(unix)]
+    {
+        let stateful_checkpoint = transcript_len(&transcript);
+        let resize_bytes = transcript_bytes(&transcript);
+        let mut terminal_state = vt100::Parser::new(30, 100, 200);
+        terminal_state.process(&resize_bytes[..narrow_reflow_checkpoint]);
+        terminal_state.screen_mut().set_size(30, 40);
+        terminal_state.process(&resize_bytes[narrow_reflow_checkpoint..wide_reflow_checkpoint]);
+        terminal_state.screen_mut().set_size(30, 120);
+        terminal_state.process(&resize_bytes[wide_reflow_checkpoint..height_reflow_checkpoint]);
+        terminal_state.screen_mut().set_size(20, 120);
+        terminal_state.process(&resize_bytes[height_reflow_checkpoint..stateful_checkpoint]);
+        let visible = terminal_state.screen().contents();
+        assert_eq!(
+            visible
+                .lines()
                 .filter(|line| line.trim_start().starts_with("> "))
-                .count()
-                <= 1,
-            "stateful scrollback page contains duplicate composers at offset {offset}:\n{page}"
+                .count(),
+            1,
+            "stateful terminal contains a duplicated composer after resize:\n{visible}"
         );
+        assert!(
+            visible.contains("resize accepted"),
+            "history was not replayed: {visible}"
+        );
+        terminal_state.screen_mut().set_scrollback(usize::MAX);
+        let scrollback_rows = terminal_state.screen().scrollback();
+        for offset in (0..=scrollback_rows).step_by(20) {
+            terminal_state.screen_mut().set_scrollback(offset);
+            let page = terminal_state.screen().contents();
+            assert!(
+                page.lines()
+                    .filter(|line| line.trim_start().starts_with("> "))
+                    .count()
+                    <= 1,
+                "stateful scrollback page contains duplicate composers at offset {offset}:\n{page}"
+            );
+        }
+        terminal_state.screen_mut().set_scrollback(0);
     }
-    terminal_state.screen_mut().set_scrollback(0);
     let restored_checkpoint = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
