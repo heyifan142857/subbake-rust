@@ -27,6 +27,7 @@ const KEYBOARD_RESPONSE: &[u8] = b"\x1b[?1u\x1b[?1;2c";
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+#[cfg(unix)]
 const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 const ENHANCED_ENTER_KEY: &[u8] = b"\x1b[13u";
 const ENHANCED_ESCAPE_KEY: &[u8] = b"\x1b[27u";
@@ -352,10 +353,18 @@ exit "$status"
     );
     let config_close_checkpoint = transcript_len(&transcript);
     send(&writer, escape_key);
+    #[cfg(unix)]
     wait_for_output_after(
         &transcript,
         config_close_checkpoint,
         ALT_SCREEN_LEAVE,
+        STEP_TIMEOUT,
+    );
+    #[cfg(windows)]
+    wait_for_output_after(
+        &transcript,
+        config_close_checkpoint,
+        b"/pty-test",
         STEP_TIMEOUT,
     );
 
