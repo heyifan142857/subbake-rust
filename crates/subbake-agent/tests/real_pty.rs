@@ -26,6 +26,9 @@ const KEYBOARD_QUERY: &[u8] = b"\x1b[?u\x1b[c";
 const KEYBOARD_RESPONSE: &[u8] = b"\x1b[?1u\x1b[?1;2c";
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
+const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
+const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 const ENHANCED_ENTER_KEY: &[u8] = b"\x1b[13u";
 const ENHANCED_ESCAPE_KEY: &[u8] = b"\x1b[27u";
 const ENHANCED_SHIFT_TAB_KEY: &[u8] = b"\x1b[9;2u";
@@ -129,7 +132,7 @@ exit "$status"
     } else {
         LEGACY_SHIFT_TAB_KEY
     };
-    let resize_checkpoint = transcript_len(&transcript);
+    let narrow_resize_request = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -138,16 +141,24 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY to narrow composer");
+    let narrow_reflow_checkpoint =
+        wait_for_output_after(&transcript, narrow_resize_request, b"\x1b[3J", STEP_TIMEOUT);
+    let narrow_history_checkpoint = wait_for_output_after(
+        &transcript,
+        narrow_reflow_checkpoint,
+        b"/pty-test",
+        STEP_TIMEOUT,
+    );
     wait_for_output_after(
         &transcript,
-        resize_checkpoint,
-        "────────────────────────────────────────".as_bytes(),
+        narrow_history_checkpoint + b"/pty-test".len(),
+        CURSOR_SHOW,
         STEP_TIMEOUT,
     );
     {
         let resize_bytes = transcript.bytes.lock().expect("lock PTY transcript");
         let resize_output = resize_bytes
-            .get(resize_checkpoint..)
+            .get(narrow_reflow_checkpoint..)
             .expect("resize output starts at checkpoint");
         assert!(
             contains_subslice(resize_output, b"\x1b[3J"),
@@ -168,7 +179,7 @@ exit "$status"
     }
     send_text(&writer, "after ");
     thread::sleep(Duration::from_millis(200));
-    let wide_resize_checkpoint = transcript_len(&transcript);
+    let wide_resize_request = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -177,17 +188,31 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY to wide composer");
+    let wide_reflow_checkpoint =
+        wait_for_output_after(&transcript, wide_resize_request, b"\x1b[3J", STEP_TIMEOUT);
+    let wide_history_checkpoint = wait_for_output_after(
+        &transcript,
+        wide_reflow_checkpoint,
+        b"/pty-test",
+        STEP_TIMEOUT,
+    );
+    wait_for_output_after(
+        &transcript,
+        wide_history_checkpoint + b"/pty-test".len(),
+        CURSOR_SHOW,
+        STEP_TIMEOUT,
+    );
+    let response_checkpoint = transcript_len(&transcript);
     send_text(&writer, "resize");
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:after resize", &transcript);
-    wait_for_output(&transcript, b"resize accepted", STEP_TIMEOUT);
-    wait_for_output_growth_and_quiet(
+    wait_for_output_after(
         &transcript,
-        wide_resize_checkpoint,
-        Duration::from_millis(100),
+        response_checkpoint,
+        b"resize accepted",
         STEP_TIMEOUT,
     );
-    let height_resize_checkpoint = transcript_len(&transcript);
+    let height_resize_request = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 20,
@@ -196,28 +221,30 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY height");
-    wait_for_output_after(
+    let height_reflow_checkpoint =
+        wait_for_output_after(&transcript, height_resize_request, b"\x1b[3J", STEP_TIMEOUT);
+    let height_history_checkpoint = wait_for_output_after(
         &transcript,
-        height_resize_checkpoint,
-        b"\x1b[3J",
+        height_reflow_checkpoint,
+        b"resize accepted",
         STEP_TIMEOUT,
     );
-    wait_for_output_growth_and_quiet(
+    wait_for_output_after(
         &transcript,
-        height_resize_checkpoint,
-        Duration::from_millis(100),
+        height_history_checkpoint + b"resize accepted".len(),
+        CURSOR_SHOW,
         STEP_TIMEOUT,
     );
     let stateful_checkpoint = transcript_len(&transcript);
     let resize_bytes = transcript_bytes(&transcript);
     let mut terminal_state = vt100::Parser::new(30, 100, 200);
-    terminal_state.process(&resize_bytes[..resize_checkpoint]);
+    terminal_state.process(&resize_bytes[..narrow_reflow_checkpoint]);
     terminal_state.screen_mut().set_size(30, 40);
-    terminal_state.process(&resize_bytes[resize_checkpoint..wide_resize_checkpoint]);
+    terminal_state.process(&resize_bytes[narrow_reflow_checkpoint..wide_reflow_checkpoint]);
     terminal_state.screen_mut().set_size(30, 120);
-    terminal_state.process(&resize_bytes[wide_resize_checkpoint..height_resize_checkpoint]);
+    terminal_state.process(&resize_bytes[wide_reflow_checkpoint..height_reflow_checkpoint]);
     terminal_state.screen_mut().set_size(20, 120);
-    terminal_state.process(&resize_bytes[height_resize_checkpoint..stateful_checkpoint]);
+    terminal_state.process(&resize_bytes[height_reflow_checkpoint..stateful_checkpoint]);
     let visible = terminal_state.screen().contents();
     assert_eq!(
         visible
@@ -309,13 +336,20 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("widen PTY configuration editor");
-    wait_for_output_growth_and_quiet(
+    wait_for_output_after(
         &transcript,
         config_resize_checkpoint,
-        Duration::from_millis(50),
+        CURSOR_HIDE,
         STEP_TIMEOUT,
     );
+    let config_close_checkpoint = transcript_len(&transcript);
     send(&writer, b"q");
+    wait_for_output_after(
+        &transcript,
+        config_close_checkpoint,
+        ALT_SCREEN_LEAVE,
+        STEP_TIMEOUT,
+    );
 
     send_text(&writer, "make a plan");
     send(&writer, enter_key);
@@ -722,7 +756,7 @@ fn wait_for_output_after(
     checkpoint: usize,
     needle: &[u8],
     timeout: Duration,
-) {
+) -> usize {
     let deadline = Instant::now() + timeout;
     let mut bytes = transcript.bytes.lock().expect("lock PTY transcript");
     while !bytes
@@ -755,52 +789,14 @@ fn wait_for_output_after(
             );
         }
     }
-}
-
-fn wait_for_output_growth_and_quiet(
-    transcript: &Transcript,
-    checkpoint: usize,
-    quiet_period: Duration,
-    timeout: Duration,
-) {
-    let deadline = Instant::now() + timeout;
-    let mut bytes = transcript.bytes.lock().expect("lock PTY transcript");
-    while bytes.len() <= checkpoint {
-        let now = Instant::now();
-        if now >= deadline {
-            panic!(
-                "timed out waiting for PTY output growth; transcript: {}",
-                escape_bytes(&bytes)
-            );
-        }
-        let (next, _) = transcript
-            .changed
-            .wait_timeout(bytes, deadline.saturating_duration_since(now))
-            .expect("wait for PTY output growth");
-        bytes = next;
-    }
-
-    loop {
-        let before = bytes.len();
-        let now = Instant::now();
-        if now >= deadline {
-            panic!(
-                "timed out waiting for PTY output to settle; transcript: {}",
-                escape_bytes(&bytes)
-            );
-        }
-        let (next, result) = transcript
-            .changed
-            .wait_timeout(
-                bytes,
-                quiet_period.min(deadline.saturating_duration_since(now)),
-            )
-            .expect("wait for PTY output to settle");
-        bytes = next;
-        if result.timed_out() && bytes.len() == before {
-            return;
-        }
-    }
+    checkpoint
+        + bytes
+            .get(checkpoint..)
+            .and_then(|tail| {
+                tail.windows(needle.len())
+                    .position(|window| window == needle)
+            })
+            .expect("waited-for PTY output is present")
 }
 
 fn wait_for_action(path: &Path, expected: &str, transcript: &Transcript) {
