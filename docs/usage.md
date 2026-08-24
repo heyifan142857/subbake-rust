@@ -8,7 +8,7 @@ older Python command shapes are not authoritative.
 SubBake has five primary workflows:
 
 1. Translate subtitle or text files.
-2. Translate an existing text subtitle stream inside a media container.
+2. Translate an existing text or bitmap subtitle stream inside a media container.
 3. Transcribe audio or video with local whisper.cpp.
 4. Safely refine a translated subtitle with deterministic validation and a
    previewable line diff.
@@ -43,6 +43,82 @@ Confirm the installation:
 sbake --version
 sbake --help
 ```
+
+### FFmpeg for media operations
+
+FFmpeg supplies both the `ffmpeg` and `ffprobe` commands used by SubBake.
+Install the package for your platform:
+
+```bash
+# Debian / Ubuntu
+sudo apt install ffmpeg
+
+# Arch Linux
+sudo pacman -S ffmpeg
+
+# Fedora (official repository build)
+sudo dnf install ffmpeg-free
+
+# macOS with Homebrew
+brew install ffmpeg
+```
+
+Fedora's official `ffmpeg-free` package provides both commands but intentionally
+supports fewer codecs than some third-party FFmpeg builds. If SubBake reports a
+missing decoder after installation, use an FFmpeg build permitted by your
+system's repository and codec policies.
+
+On Windows, install an FFmpeg distribution and add its `bin` directory to
+`PATH`. Verify that both commands are visible before processing media:
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+If either command is missing, SubBake and the interactive Agent name the
+missing dependency and verification commands instead of returning a raw
+process-spawn error. Platform-specific installation commands remain in this
+guide rather than being hard-coded into runtime errors.
+
+### Tesseract for bitmap subtitles
+
+Translating PGS, VobSub, or DVB bitmap subtitles requires the external
+Tesseract executable and trained language data for the language shown in the
+source subtitle. The source language data is required, not merely the target
+translation language.
+
+Install the engine plus the languages you need. For example, for English and
+Simplified Chinese:
+
+```bash
+# Debian / Ubuntu
+sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim
+
+# Arch Linux
+sudo pacman -S tesseract tesseract-data-eng tesseract-data-chi_sim
+
+# Fedora
+sudo dnf install tesseract tesseract-langpack-eng tesseract-langpack-chi_sim
+
+# macOS with Homebrew; tesseract-lang supplies additional languages
+brew install tesseract tesseract-lang
+```
+
+On Windows, install a Tesseract 5 distribution, add `tesseract.exe` to `PATH`,
+and install the required `.traineddata` files in its `tessdata` directory.
+Verify both the executable and languages before starting a long translation:
+
+```bash
+tesseract --version
+tesseract --list-langs
+```
+
+Common Tesseract language identifiers include `eng`, `chi_sim`, `chi_tra`,
+`jpn`, and `kor`. If the language list does not contain the identifier needed
+by the selected subtitle stream, install that language package and retry. See
+the [official Tesseract installation guide](https://tesseract-ocr.github.io/tessdoc/Installation.html)
+for other operating systems and language packages.
 
 ### Platform support
 
@@ -357,7 +433,7 @@ When `--glossary` is supplied, its terms are hard validation requirements.
 ## Translate an embedded subtitle stream
 
 MKV, MP4/M4V/MOV, and WebM inputs may be used when they already contain a
-supported text subtitle stream:
+supported text subtitle stream or a PGS, VobSub, or DVB bitmap subtitle stream:
 
 ```bash
 sbake translate movie.mkv \
@@ -365,7 +441,9 @@ sbake translate movie.mkv \
   --target-lang English
 ```
 
-SubBake selects a compatible subtitle codec, copies existing streams, verifies
+Text subtitles are extracted directly. Bitmap subtitles are rendered and OCRed
+with Tesseract while retaining their timing, then pass through the normal
+translation and validation pipeline. SubBake copies existing streams, verifies
 the output, and atomically replaces the source container by default. Preserve
 the source and write a separate translated container with:
 
@@ -376,8 +454,9 @@ sbake translate movie.mkv \
   --output movie.translated.mkv
 ```
 
-If the media has no usable text subtitle stream, use `pipeline`; `translate`
-does not silently transcribe audio.
+If the media has neither a supported text track nor a usable bitmap track,
+`translate` reports that boundary instead of silently transcribing audio. Use
+`pipeline` only when speech recognition is actually intended.
 
 ## Batch translation
 

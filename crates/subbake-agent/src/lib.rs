@@ -30,8 +30,8 @@ pub use config_editor::{
 };
 pub use decision::EchoDecisionBackend;
 pub use engine::{
-    AgentEngine, AgentRuntimePolicy, CommandDecision, EngineObserver, PlanDecision,
-    StreamingObserver, is_known_slash_command,
+    AgentEngine, AgentRuntimePolicy, ApprovalKind, ApprovalPrompt, CommandDecision, EngineObserver,
+    PlanDecision, StreamingObserver, is_known_slash_command,
 };
 pub use error::{AgentError, AgentResult};
 pub use guard::FileGuard;

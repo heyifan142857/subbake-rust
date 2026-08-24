@@ -1,4 +1,4 @@
-use crate::engine::{ProfileChoice, SessionChoice};
+use crate::engine::{ApprovalPrompt, ProfileChoice, SessionChoice};
 use crate::{ConfigChange, ConfigEditorSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,11 +28,8 @@ pub enum TuiInteraction {
     Message {
         message: String,
     },
-    PlanApproval {
-        message: String,
-    },
-    CommandApproval {
-        message: String,
+    Approval {
+        prompt: ApprovalPrompt,
     },
     ProfilePicker {
         message: String,
@@ -56,7 +53,7 @@ pub enum TuiInteraction {
         events: Vec<crate::session::AgentEvent>,
         plan_mode: bool,
         model: String,
-        command_approval: bool,
+        approval: Option<ApprovalPrompt>,
     },
     SessionPicker {
         message: String,
@@ -74,10 +71,9 @@ pub enum TuiInteraction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
     SubmitText(String),
-    ApprovePlan,
-    RejectPlan,
-    ApproveCommand,
-    RejectCommand,
+    ApproveApproval,
+    RejectApproval,
+    ReviseApproval(String),
     SelectProfile(String),
     CreateProfile(String),
     SelectConfigProfile(String),

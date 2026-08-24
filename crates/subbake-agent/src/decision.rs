@@ -20,7 +20,7 @@ use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{
     EventKind, PendingAgentTurn, PendingAggregateFailureCount, PendingFailureCount,
-    PendingToolCall, PendingToolExchange, ToolCallDraft,
+    PendingSourceFallback, PendingToolCall, PendingToolExchange, ToolCallDraft,
 };
 use crate::guard::ExternalPathGuard;
 use crate::profile_coordinator::ProfileCoordinator;
@@ -128,6 +128,7 @@ impl AgentEngine {
             failure_counts: HashMap::new(),
             aggregate_failure_counts: HashMap::new(),
             completed_mutations: HashSet::new(),
+            source_fallback: None,
             steps_used: 0,
         };
         self.run_turn(backend, state, None)
@@ -162,6 +163,8 @@ impl AgentEngine {
                     return self.finish_response(nonempty_question(decision.text), true);
                 }
                 DecisionAction::ToolCalls => {
+                    let commentary =
+                        self.announce_commentary(&decision.text, &state.input, &decision.calls)?;
                     let continuation = decision.continuation;
                     let processed = self.process_tool_calls(
                         decision.calls,
@@ -169,6 +172,7 @@ impl AgentEngine {
                         &mut state.failure_counts,
                         &mut state.aggregate_failure_counts,
                         &mut state.completed_mutations,
+                        &mut state.source_fallback,
                     )?;
                     match processed {
                         ProcessedCalls::Continue(results) => {
@@ -177,13 +181,16 @@ impl AgentEngine {
                                 results,
                             });
                         }
-                        ProcessedCalls::Planned => {
+                        ProcessedCalls::Planned(tool_calls) => {
+                            self.store_plan(&commentary, tool_calls)?;
                             self.clear_pending_agent_turn()?;
-                            return self.finish_response(self.pending_plan_summary(), false);
+                            return Ok(self.pending_plan_summary());
                         }
                         ProcessedCalls::AwaitingCommandApproval {
                             call,
                             reason,
+                            purpose,
+                            kind,
                             completed_results,
                             remaining_calls,
                         } => {
@@ -193,7 +200,12 @@ impl AgentEngine {
                                     results: completed_results,
                                 }
                             });
-                            self.store_command_approval(
+                            let purpose = if purpose.is_empty() {
+                                commentary
+                            } else {
+                                purpose
+                            };
+                            self.store_tool_approval(
                                 ToolCallDraft {
                                     tool_name: call.name,
                                     arguments: call.arguments,
@@ -204,10 +216,11 @@ impl AgentEngine {
                                     .map(PendingToolCall::from)
                                     .collect(),
                                 reason,
+                                kind,
+                                purpose,
                                 state.into_pending(),
                             )?;
-                            return self
-                                .finish_response(self.pending_command_approval_summary(), false);
+                            return Ok(self.pending_command_approval_summary());
                         }
                         ProcessedCalls::RepeatedFailure(message) => {
                             self.clear_pending_agent_turn()?;
@@ -248,6 +261,24 @@ impl AgentEngine {
                 true,
             ),
         }
+    }
+
+    fn announce_commentary(
+        &mut self,
+        model_text: &str,
+        input: &str,
+        calls: &[ModelToolCall],
+    ) -> AgentResult<String> {
+        let text = if model_text.trim().is_empty() {
+            fallback_commentary(input, calls)
+        } else {
+            model_text.trim().to_owned()
+        };
+        self.record_if_active(EventKind::Commentary { text: text.clone() })?;
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_commentary(&text);
+        }
+        Ok(text)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -355,6 +386,7 @@ impl AgentEngine {
         failure_counts: &mut HashMap<FailureKey, usize>,
         aggregate_failure_counts: &mut HashMap<AggregateFailureKey, usize>,
         completed_mutations: &mut HashSet<CallKey>,
+        source_fallback: &mut Option<PendingSourceFallback>,
     ) -> AgentResult<ProcessedCalls> {
         if calls.is_empty() {
             return Ok(ProcessedCalls::RepeatedFailure(
@@ -391,8 +423,7 @@ impl AgentEngine {
                 .collect::<Vec<_>>()
         };
         if !planned.is_empty() {
-            self.store_plan("", planned)?;
-            return Ok(ProcessedCalls::Planned);
+            return Ok(ProcessedCalls::Planned(planned));
         }
 
         let available_tools = self
@@ -405,6 +436,91 @@ impl AgentEngine {
         let mut calls = VecDeque::from(calls);
         while let Some(mut call) = calls.pop_front() {
             self.check_cancelled()?;
+            if let Some(fallback) = source_fallback
+                .as_ref()
+                .filter(|fallback| !fallback.approved && !fallback.sidecar_search_completed)
+            {
+                if call.name == "candidate_subtitles" {
+                    let container = std::path::Path::new(&fallback.container_path);
+                    if let Some(arguments) = call.arguments.as_object_mut() {
+                        arguments.insert(
+                            "query".to_owned(),
+                            JsonValue::String(
+                                container
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(&fallback.container_path)
+                                    .to_owned(),
+                            ),
+                        );
+                        arguments.entry("path".to_owned()).or_insert_with(|| {
+                            JsonValue::String(
+                                container
+                                    .parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                    .map_or_else(
+                                        || ".".to_owned(),
+                                        |parent| parent.to_string_lossy().into_owned(),
+                                    ),
+                            )
+                        });
+                    }
+                } else {
+                    let call_key = CallKey::new(&call.name, &call.arguments);
+                    let feedback = ToolFeedback::failure(
+                        &call.name,
+                        "search for a matching text subtitle with `candidate_subtitles` before changing subtitle sources"
+                            .to_owned(),
+                        "source_sidecar_search_required",
+                        available_tools.clone(),
+                    );
+                    let recorded = self.record_tool_feedback(
+                        &call,
+                        &call_key,
+                        feedback,
+                        task,
+                        failure_counts,
+                        aggregate_failure_counts,
+                    )?;
+                    native_results.push(recorded.result);
+                    return Ok(recorded.stop_message.map_or_else(
+                        || ProcessedCalls::Continue(native_results),
+                        ProcessedCalls::RepeatedFailure,
+                    ));
+                }
+            }
+            if source_fallback
+                .as_ref()
+                .is_some_and(|fallback| !fallback.approved)
+                && requires_source_substitution_approval(&call.name)
+                && validate_tool_call(&call.name, &call.arguments).is_ok()
+            {
+                let Some(fallback) = source_fallback.as_ref() else {
+                    continue;
+                };
+                let stream_summary = if fallback.streams.is_empty() {
+                    "no embedded subtitle streams".to_owned()
+                } else {
+                    fallback.streams.join(", ")
+                };
+                return Ok(ProcessedCalls::AwaitingCommandApproval {
+                    call,
+                    reason: fallback.ocr_failure.as_ref().map_or_else(
+                        || format!(
+                            "the container has no supported text, PGS, VobSub, or DVB subtitle source; detected {stream_summary}. Audio transcription creates new text from dialogue instead of translating the existing subtitle track"
+                        ),
+                        |failure| format!(
+                            "the existing bitmap subtitle was selected, but OCR did not complete: {failure}. Audio transcription would create new text from dialogue instead of translating that subtitle track"
+                        ),
+                    ),
+                    purpose:
+                        "Use audio transcription as a substitute subtitle source for this task"
+                            .to_owned(),
+                    kind: crate::event::PendingApprovalKind::SourceSubstitution,
+                    completed_results: native_results,
+                    remaining_calls: calls.into(),
+                });
+            }
             if call.name == "delete_external_path"
                 && validate_tool_call(&call.name, &call.arguments).is_ok()
                 && let Ok(reason) = prepare_external_delete_call(&mut call, &self.project_root)
@@ -412,6 +528,8 @@ impl AgentEngine {
                 return Ok(ProcessedCalls::AwaitingCommandApproval {
                     call,
                     reason,
+                    purpose: String::new(),
+                    kind: crate::event::PendingApprovalKind::Command,
                     completed_results: native_results,
                     remaining_calls: calls.into(),
                 });
@@ -426,6 +544,8 @@ impl AgentEngine {
                 return Ok(ProcessedCalls::AwaitingCommandApproval {
                     reason: "plan mode requires approval before this mutation; an external deletion in the same tool batch will receive its own separate approval".to_owned(),
                     call,
+                    purpose: String::new(),
+                    kind: crate::event::PendingApprovalKind::Command,
                     completed_results: native_results,
                     remaining_calls: calls.into(),
                 });
@@ -439,6 +559,8 @@ impl AgentEngine {
                 return Ok(ProcessedCalls::AwaitingCommandApproval {
                     call,
                     reason,
+                    purpose: String::new(),
+                    kind: crate::event::PendingApprovalKind::Command,
                     completed_results: native_results,
                     remaining_calls: calls.into(),
                 });
@@ -480,6 +602,24 @@ impl AgentEngine {
                     }
                     Ok(()) => match self.run_tool(&call.name, &call.arguments) {
                         Ok(outcome) => {
+                            if call.name == "candidate_subtitles"
+                                && let Some(fallback) = source_fallback.as_mut()
+                            {
+                                fallback.sidecar_search_completed = true;
+                            }
+                            if call.name == "translate_file"
+                                && call
+                                    .arguments
+                                    .get("path")
+                                    .and_then(JsonValue::as_str)
+                                    .is_some_and(|path| {
+                                        !subbake_adapters::is_supported_subtitle_container_path(
+                                            std::path::Path::new(path),
+                                        )
+                                    })
+                            {
+                                *source_fallback = None;
+                            }
                             if spec.mutates_with(&call.arguments) {
                                 completed_mutations.insert(call_key.clone());
                             }
@@ -503,6 +643,31 @@ impl AgentEngine {
                         }
                         Err(error) => {
                             let category = error.tool_failure_category();
+                            if call.name == "translate_file"
+                                && matches!(
+                                    category.as_str(),
+                                    "no_translatable_text_subtitle" | "bitmap_subtitle_ocr"
+                                )
+                            {
+                                let ocr_failure =
+                                    (category == "bitmap_subtitle_ocr").then(|| error.to_string());
+                                *source_fallback = Some(PendingSourceFallback {
+                                    container_path: call
+                                        .arguments
+                                        .get("path")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    streams: error
+                                        .no_translatable_text_subtitle_streams()
+                                        .or_else(|| error.bitmap_subtitle_ocr_streams())
+                                        .unwrap_or_default()
+                                        .to_vec(),
+                                    approved: false,
+                                    sidecar_search_completed: false,
+                                    ocr_failure,
+                                });
+                            }
                             ToolFeedback::failure(
                                 &call.name,
                                 error.to_string(),
@@ -653,6 +818,29 @@ impl AgentEngine {
         };
 
         let mut state = AgentTurnState::from_pending(persisted_turn);
+        if decision == crate::engine::CommandDecision::Reject
+            && pending.kind == crate::event::PendingApprovalKind::SourceSubstitution
+        {
+            self.pending_native_continuation = None;
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| AgentError::invalid_state("no active session"))?;
+            session.pending_command_approval = None;
+            session.pending_agent_turn = None;
+            self.record(EventKind::CommandRejected)?;
+            return self.finish_response(
+                "Audio transcription was not run. Provide a matching text subtitle such as SRT, ASS, or VTT if you want to translate the existing subtitles."
+                    .to_owned(),
+                false,
+            );
+        }
+        if decision == crate::engine::CommandDecision::Approve
+            && pending.kind == crate::event::PendingApprovalKind::SourceSubstitution
+            && let Some(source_fallback) = state.source_fallback.as_mut()
+        {
+            source_fallback.approved = true;
+        }
         let available_tools = self
             .tool_registry
             .model_visible_names()
@@ -782,6 +970,7 @@ impl AgentEngine {
                 &mut state.failure_counts,
                 &mut state.aggregate_failure_counts,
                 &mut state.completed_mutations,
+                &mut state.source_fallback,
             )?
         };
         match processed {
@@ -796,6 +985,8 @@ impl AgentEngine {
             ProcessedCalls::AwaitingCommandApproval {
                 call,
                 reason,
+                purpose,
+                kind,
                 completed_results,
                 remaining_calls,
             } => {
@@ -805,7 +996,7 @@ impl AgentEngine {
                         continuation,
                         results: accumulated_results,
                     });
-                self.store_command_approval(
+                self.store_tool_approval(
                     ToolCallDraft {
                         tool_name: call.name,
                         arguments: call.arguments,
@@ -816,19 +1007,50 @@ impl AgentEngine {
                         .map(PendingToolCall::from)
                         .collect(),
                     reason,
+                    kind,
+                    purpose,
                     state.into_pending(),
                 )?;
-                self.finish_response(self.pending_command_approval_summary(), false)
+                Ok(self.pending_command_approval_summary())
             }
-            ProcessedCalls::Planned => {
+            ProcessedCalls::Planned(tool_calls) => {
+                self.store_plan(&pending.purpose, tool_calls)?;
                 self.clear_pending_agent_turn()?;
-                self.finish_response(self.pending_plan_summary(), false)
+                Ok(self.pending_plan_summary())
             }
             ProcessedCalls::RepeatedFailure(message) => {
                 self.clear_pending_agent_turn()?;
                 self.finish_response(message, false)
             }
         }
+    }
+
+    pub fn revise_pending_approval(
+        &mut self,
+        instruction: &str,
+        backend: &mut dyn LlmBackend,
+    ) -> AgentResult<String> {
+        let instruction = instruction.trim();
+        if instruction.is_empty() {
+            return Err(AgentError::invalid_input(
+                "replacement instructions cannot be empty",
+            ));
+        }
+        if self.has_pending_plan() {
+            self.reject_plan()?;
+        } else if self.has_pending_command_approval() {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| AgentError::invalid_state("no active session"))?;
+            session.pending_command_approval = None;
+            session.pending_agent_turn = None;
+            self.pending_native_continuation = None;
+            self.record(EventKind::CommandRejected)?;
+        } else {
+            return Err(AgentError::invalid_state("no approval awaiting revision"));
+        }
+        self.run_line(instruction, backend)
     }
 
     fn clear_pending_agent_turn(&mut self) -> AgentResult<()> {
@@ -1099,6 +1321,7 @@ struct AgentTurnState {
     failure_counts: HashMap<FailureKey, usize>,
     aggregate_failure_counts: HashMap<AggregateFailureKey, usize>,
     completed_mutations: HashSet<CallKey>,
+    source_fallback: Option<PendingSourceFallback>,
     steps_used: usize,
 }
 
@@ -1157,6 +1380,7 @@ impl AgentTurnState {
                 .collect(),
             steps_used: self.steps_used,
             legacy_mode: self.legacy_mode,
+            source_fallback: self.source_fallback.clone(),
         }
     }
 
@@ -1213,6 +1437,7 @@ impl AgentTurnState {
                 .into_iter()
                 .map(|call| CallKey::new(&call.tool_name, &call.arguments))
                 .collect(),
+            source_fallback: pending.source_fallback,
             steps_used: pending.steps_used,
         }
     }
@@ -1278,6 +1503,38 @@ fn nonempty_question(text: String) -> String {
     }
 }
 
+fn fallback_commentary(input: &str, calls: &[ModelToolCall]) -> String {
+    let phase = calls
+        .iter()
+        .take(2)
+        .map(|call| {
+            crate::tool_presentation::running_activity(&call.name, &call.arguments).headline
+        })
+        .collect::<Vec<_>>()
+        .join(", then ");
+    if input
+        .chars()
+        .any(|character| matches!(character, '\u{3400}'..='\u{9fff}'))
+    {
+        if phase.is_empty() {
+            "我先确认下一步操作。".to_owned()
+        } else {
+            format!("我先执行这一阶段：{phase}。")
+        }
+    } else if phase.is_empty() {
+        "I’ll confirm the next action first.".to_owned()
+    } else {
+        format!("I’ll handle this phase next: {phase}.")
+    }
+}
+
+fn requires_source_substitution_approval(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "manage_whisper" | "transcribe_audio" | "run_command"
+    )
+}
+
 fn truncate_text(text: &str, limit: usize) -> String {
     let value = text.chars().take(limit).collect::<String>();
     if text.chars().count() > limit {
@@ -1321,10 +1578,12 @@ struct RecordedToolFeedback {
 
 enum ProcessedCalls {
     Continue(Vec<ModelToolResult>),
-    Planned,
+    Planned(Vec<ToolCallDraft>),
     AwaitingCommandApproval {
         call: ModelToolCall,
         reason: String,
+        purpose: String,
+        kind: crate::event::PendingApprovalKind,
         completed_results: Vec<ModelToolResult>,
         remaining_calls: Vec<ModelToolCall>,
     },
@@ -1433,6 +1692,7 @@ mod tests {
 
     enum NativeStep {
         Calls(Vec<ModelToolCall>),
+        CallsWithText(String, Vec<ModelToolCall>),
         Text(String),
     }
 
@@ -1492,6 +1752,12 @@ mod tests {
                     continuation: Some(ToolContinuation::new("native-test", ())),
                     usage: Usage::default(),
                 }),
+                NativeStep::CallsWithText(text, tool_calls) => Ok(GenerationResponse {
+                    content: GenerationContent::Text(text),
+                    tool_calls,
+                    continuation: Some(ToolContinuation::new("native-test", ())),
+                    usage: Usage::default(),
+                }),
                 NativeStep::Text(text) => Ok(GenerationResponse {
                     content: GenerationContent::Text(text),
                     tool_calls: Vec::new(),
@@ -1535,6 +1801,103 @@ mod tests {
     }
 
     #[test]
+    fn json_commentary_is_persisted_before_the_tool_event() {
+        let root = temp_root("json-commentary-order");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({
+                    "action":"tool_call",
+                    "commentary":"我先检查目录，再确认字幕文件。",
+                    "tool_name":"list_files",
+                    "arguments":{"path":"."}
+                }),
+                json!({"action":"respond","text":"完成。"}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine.run_line("检查字幕", &mut backend).expect("run");
+        let events = engine.session_events();
+        let commentary = events
+            .iter()
+            .position(|event| event.tag() == crate::session::EventTag::Commentary)
+            .expect("commentary");
+        let tool = events
+            .iter()
+            .position(|event| event.tag() == crate::session::EventTag::ToolStarted)
+            .expect("tool started");
+        assert!(commentary < tool);
+        assert_eq!(events[commentary].text, "我先检查目录，再确认字幕文件。");
+
+        let session_id = engine.session.as_ref().expect("session").id.clone();
+        drop(engine);
+        let mut resumed = test_engine(root.clone());
+        resumed
+            .resume_session(Some(&session_id))
+            .expect("resume session");
+        assert_eq!(
+            resumed
+                .session_events()
+                .iter()
+                .filter(|event| event.tag() == crate::session::EventTag::Commentary)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_and_empty_commentary_are_emitted_before_tools() {
+        let root = temp_root("native-commentary-order");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = NativeSequenceBackend {
+            steps: VecDeque::from([
+                NativeStep::CallsWithText(
+                    "I’ll inspect the directory first.".to_owned(),
+                    vec![ModelToolCall {
+                        id: "native-list".to_owned(),
+                        name: "list_files".to_owned(),
+                        arguments: json!({"path":"."}),
+                    }],
+                ),
+                NativeStep::Calls(vec![ModelToolCall {
+                    id: "native-search".to_owned(),
+                    name: "search_files".to_owned(),
+                    arguments: json!({"path":".","pattern":"*.srt"}),
+                }]),
+                NativeStep::Text("done".to_owned()),
+            ]),
+            definitions: Vec::new(),
+            continued_results: Vec::new(),
+        };
+
+        engine
+            .run_line("检查 subtitle files", &mut backend)
+            .expect("run");
+        let events = engine.session_events();
+        let commentary = events
+            .iter()
+            .filter(|event| event.tag() == crate::session::EventTag::Commentary)
+            .collect::<Vec<_>>();
+        assert_eq!(commentary.len(), 2);
+        assert_eq!(commentary[0].text, "I’ll inspect the directory first.");
+        assert!(!commentary[1].text.trim().is_empty());
+        for event in commentary {
+            let position = events
+                .iter()
+                .position(|candidate| {
+                    candidate.created_at == event.created_at && candidate.text == event.text
+                })
+                .expect("commentary position");
+            assert!(events[position + 1].tag() == crate::session::EventTag::ToolStarted);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn whisper_status_is_an_intermediate_observation_not_a_pending_plan() {
         let root = temp_root("whisper-status-continuation");
         std::fs::create_dir_all(&root).expect("root");
@@ -1555,6 +1918,269 @@ mod tests {
         assert_eq!(response, "Whisper checked; continued the task.");
         assert!(!engine.has_pending_plan());
         assert_eq!(backend.prompts.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pgs_source_blocks_every_audio_substitution_tool_before_approval() {
+        for (label, tool_name, arguments) in [
+            ("whisper", "manage_whisper", json!({"action":"status"})),
+            (
+                "transcribe",
+                "transcribe_audio",
+                json!({"path":"movie.pgs-only.mkv"}),
+            ),
+            (
+                "command",
+                "run_command",
+                json!({"command":"printf blocked"}),
+            ),
+        ] {
+            let root = temp_root(&format!("pgs-block-{label}"));
+            std::fs::create_dir_all(&root).expect("root");
+            std::fs::write(root.join("movie.pgs-only.mkv"), b"test media").expect("media");
+            let mut engine = active_engine(root.clone());
+            let mut backend = JsonSequenceBackend {
+                decisions: VecDeque::from([
+                    json!({
+                        "action":"tool_call",
+                        "commentary":"我先翻译容器里的现有字幕。",
+                        "tool_name":"translate_file",
+                        "arguments":{"path":"movie.pgs-only.mkv","bilingual":true}
+                    }),
+                    json!({
+                        "action":"tool_call",
+                        "commentary":"容器只有图片字幕；我先查找同名文本字幕。",
+                        "tool_name":"candidate_subtitles",
+                        "arguments":{"path":".","query":"movie.pgs-only.mkv"}
+                    }),
+                    json!({
+                        "action":"tool_call",
+                        "commentary":"没有找到文本字幕；下一步需要更换字幕来源。",
+                        "tool_name":tool_name,
+                        "arguments":arguments
+                    }),
+                    json!({"action":"respond","text":"should not run yet"}),
+                ]),
+                prompts: Vec::new(),
+            };
+
+            engine
+                .run_line("翻译现有字幕", &mut backend)
+                .expect("pause");
+            let prompt = engine.pending_approval_prompt().expect("source approval");
+            assert_eq!(prompt.kind, crate::engine::ApprovalKind::SourceSubstitution);
+            assert!(prompt.reason.contains("instead of translating"));
+            assert!(!engine.session_events().iter().any(|event| {
+                matches!(
+                    event.typed(),
+                    Some(EventKind::ToolStarted { tool_name: started, .. }) if started == tool_name
+                )
+            }));
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn failed_pgs_ocr_searches_sidecar_then_explains_audio_substitution() {
+        let root = temp_root("pgs-ocr-failure-policy");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("movie.pgs-ocr-fails.mkv"), b"test media").expect("media");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-ocr-fails.mkv"}}),
+                json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"wrong"}}),
+                json!({"action":"tool_call","tool_name":"transcribe_audio","arguments":{"path":"movie.pgs-ocr-fails.mkv"}}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine
+            .run_line("翻译现有 PGS 字幕", &mut backend)
+            .expect("pause for source substitution");
+
+        let prompt = engine.pending_approval_prompt().expect("source approval");
+        assert_eq!(prompt.kind, crate::engine::ApprovalKind::SourceSubstitution);
+        assert!(prompt.reason.contains("OCR did not complete"));
+        assert!(
+            prompt
+                .reason
+                .contains("Tesseract language `eng` is not installed")
+        );
+        let pending = engine
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_agent_turn.as_ref())
+            .and_then(|turn| turn.source_fallback.as_ref())
+            .expect("source fallback state");
+        assert_eq!(
+            pending.ocr_failure.as_deref(),
+            Some("bitmap subtitle OCR failed: Tesseract language `eng` is not installed")
+        );
+        assert!(engine.session_events().iter().all(|event| {
+            !matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "transcribe_audio"
+            )
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pgs_source_requires_a_matching_sidecar_search_before_fallback_approval() {
+        let root = temp_root("pgs-forces-sidecar-search");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("movie.pgs-only.mkv"), b"test media").expect("media");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
+                json!({"action":"tool_call","tool_name":"transcribe_audio","arguments":{"path":"movie.pgs-only.mkv"}}),
+                json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"wrong query"}}),
+                json!({"action":"tool_call","tool_name":"transcribe_audio","arguments":{"path":"movie.pgs-only.mkv"}}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine
+            .run_line("翻译现有字幕", &mut backend)
+            .expect("pause");
+        let exchanges = &engine
+            .session
+            .as_ref()
+            .and_then(|session| session.pending_agent_turn.as_ref())
+            .expect("pending turn")
+            .exchanges;
+        assert!(exchanges.iter().any(|exchange| {
+            exchange.tool_name == "transcribe_audio"
+                && exchange.feedback.contains("source_sidecar_search_required")
+        }));
+        let candidate = exchanges
+            .iter()
+            .find(|exchange| exchange.tool_name == "candidate_subtitles")
+            .expect("candidate search");
+        assert_eq!(candidate.arguments["query"], "movie.pgs-only.mkv");
+        assert_eq!(
+            engine
+                .pending_approval_prompt()
+                .expect("source approval")
+                .kind,
+            crate::engine::ApprovalKind::SourceSubstitution
+        );
+        assert!(!engine.session_events().iter().any(|event| {
+            matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "transcribe_audio"
+            )
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pgs_source_approval_reject_and_revision_have_distinct_outcomes() {
+        let setup = |label: &str| {
+            let root = temp_root(label);
+            std::fs::create_dir_all(&root).expect("root");
+            std::fs::write(root.join("movie.pgs-only.mkv"), b"test media").expect("media");
+            let engine = active_engine(root.clone());
+            let backend = JsonSequenceBackend {
+                decisions: VecDeque::from([
+                    json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
+                    json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"movie.pgs-only.mkv"}}),
+                    json!({"action":"tool_call","tool_name":"run_command","arguments":{"command":"printf approved"}}),
+                    json!({"action":"respond","text":"continued after approval"}),
+                ]),
+                prompts: Vec::new(),
+            };
+            (root, engine, backend)
+        };
+
+        let (root, mut engine, mut backend) = setup("pgs-approve");
+        engine
+            .run_line("翻译现有字幕", &mut backend)
+            .expect("pause");
+        assert_eq!(
+            engine
+                .handle_command_decision(crate::engine::CommandDecision::Approve, &mut backend)
+                .expect("approve"),
+            "continued after approval"
+        );
+        assert!(engine.session_events().iter().any(|event| {
+            matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "run_command"
+            )
+        }));
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, mut engine, mut backend) = setup("pgs-reject");
+        engine
+            .run_line("翻译现有字幕", &mut backend)
+            .expect("pause");
+        let response = engine
+            .handle_command_decision(crate::engine::CommandDecision::Reject, &mut backend)
+            .expect("reject");
+        assert!(response.contains("Audio transcription was not run"));
+        assert!(!engine.has_pending_command_approval());
+        assert!(!engine.session_events().iter().any(|event| {
+            matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "run_command"
+            )
+        }));
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, mut engine, mut backend) = setup("pgs-revise");
+        engine
+            .run_line("翻译现有字幕", &mut backend)
+            .expect("pause");
+        let mut revised_backend = JsonSequenceBackend {
+            decisions: VecDeque::from([json!({
+                "action":"respond",
+                "text":"请提供同名 SRT，我不会转录音频。"
+            })]),
+            prompts: Vec::new(),
+        };
+        let response = engine
+            .revise_pending_approval("不要转录，等我提供 SRT", &mut revised_backend)
+            .expect("revise");
+        assert!(response.contains("不会转录音频"));
+        assert!(!engine.has_pending_command_approval());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn matching_sidecar_clears_the_source_substitution_gate() {
+        let root = temp_root("pgs-matching-sidecar");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("movie.pgs-only.mkv"), b"test media").expect("media");
+        std::fs::write(
+            root.join("movie.pgs-only.en.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .expect("sidecar");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
+                json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"movie.pgs-only.mkv"}}),
+                json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.en.srt","bilingual":true}}),
+                json!({"action":"tool_call","tool_name":"run_command","arguments":{"command":"printf embed"}}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        engine
+            .run_line("翻译并内嵌字幕", &mut backend)
+            .expect("pause");
+        assert_eq!(
+            engine
+                .pending_approval_prompt()
+                .expect("command approval")
+                .kind,
+            crate::engine::ApprovalKind::Command
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -111,7 +111,7 @@ impl ConversationPresenter {
             .filter_map(|event| {
                 let label = match event.tag() {
                     EventTag::User => "You",
-                    EventTag::Assistant | EventTag::AskUser => "Agent",
+                    EventTag::Assistant | EventTag::Commentary | EventTag::AskUser => "Agent",
                     EventTag::ToolCompleted => "Tool",
                     EventTag::ToolFailed | EventTag::Error => "Error",
                     _ => return None,
@@ -153,6 +153,7 @@ impl ConversationPresenter {
                 let label = match event.tag() {
                     EventTag::User => "User",
                     EventTag::Assistant => "Assistant",
+                    EventTag::Commentary => "Assistant update",
                     EventTag::AskUser => "Assistant question",
                     EventTag::ToolCompleted => "Tool",
                     EventTag::FileOperation => "File operation",

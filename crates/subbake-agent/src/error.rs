@@ -105,12 +105,34 @@ impl AgentError {
             Self::Io { .. } => "external_io".to_owned(),
         }
     }
+
+    pub(crate) fn no_translatable_text_subtitle_streams(&self) -> Option<&[String]> {
+        match self {
+            Self::Adapter(source) => source.no_translatable_text_subtitle_streams(),
+            Self::AdapterContext { source, .. } => source.no_translatable_text_subtitle_streams(),
+            Self::Reported { source, .. } => source.no_translatable_text_subtitle_streams(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bitmap_subtitle_ocr_streams(&self) -> Option<&[String]> {
+        match self {
+            Self::Adapter(source) => source.bitmap_subtitle_ocr_streams(),
+            Self::AdapterContext { source, .. } => source.bitmap_subtitle_ocr_streams(),
+            Self::Reported { source, .. } => source.bitmap_subtitle_ocr_streams(),
+            _ => None,
+        }
+    }
 }
 
 fn adapter_failure_category(error: &AdapterError) -> String {
     match error {
         AdapterError::Cancelled => "cancelled".to_owned(),
         AdapterError::InvalidInput { .. } => "invalid_input".to_owned(),
+        AdapterError::NoTranslatableTextSubtitle { .. } => {
+            "no_translatable_text_subtitle".to_owned()
+        }
+        AdapterError::BitmapSubtitleOcr { .. } => "bitmap_subtitle_ocr".to_owned(),
         AdapterError::Configuration(_) | AdapterError::ConfigurationFile { .. } => {
             "configuration".to_owned()
         }

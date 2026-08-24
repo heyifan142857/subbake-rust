@@ -179,6 +179,12 @@ fn render_translation_outcome(
                 quality.errors, quality.warnings
             ));
         }
+        if let Some(ocr) = &outcome.source_ocr {
+            rendered.push_str(&format!(
+                "Bitmap OCR ({}): {} cue(s), {} low-confidence cue(s)\n",
+                ocr.codec, ocr.cues, ocr.low_confidence_cues
+            ));
+        }
         rendered
     };
 
@@ -522,11 +528,21 @@ pub fn result_json(result: &PipelineResult) -> String {
 }
 
 fn translation_outcome_json(outcome: &TranslationOutcome) -> String {
-    serde_json::to_string(&json_envelope(
-        "translation_result",
-        translation_result_value(&outcome.result, outcome.quality.as_ref()),
-    ))
-    .unwrap_or_else(|_| "{}".to_owned())
+    let mut result = translation_result_value(&outcome.result, outcome.quality.as_ref());
+    if let Some(ocr) = &outcome.source_ocr
+        && let Some(result) = result.as_object_mut()
+    {
+        result.insert(
+            "source_ocr".to_owned(),
+            serde_json::json!({
+                "codec": ocr.codec,
+                "cues": ocr.cues,
+                "low_confidence_cues": ocr.low_confidence_cues,
+            }),
+        );
+    }
+    serde_json::to_string(&json_envelope("translation_result", result))
+        .unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn translation_result_value(

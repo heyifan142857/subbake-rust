@@ -3,16 +3,12 @@ use crate::tui::TuiAction;
 use crate::{ConfigChange, ConfigEditorSnapshot, ConfigFieldId, ConfigFieldKind, ConfigSection};
 
 pub(crate) const APPROVAL_OPTIONS: &[(&str, &str)] = &[
-    ("approve", "execute the pending plan"),
-    ("reject", "discard the pending plan"),
+    ("Approve once", "run only this exact operation"),
+    ("Reject", "do not run this operation"),
     (
-        "tell agent what to do",
-        "revise the plan with your instructions",
+        "Tell the agent what to do instead",
+        "send replacement instructions",
     ),
-];
-pub(crate) const COMMAND_APPROVAL_OPTIONS: &[(&str, &str)] = &[
-    ("approve", "run the exact sandboxed command"),
-    ("reject", "discard the pending command"),
 ];
 
 pub(crate) struct TuiPicker {
@@ -33,8 +29,8 @@ pub(crate) enum InputMode {
     CreatingConfigProfile,
     ConfigEditor,
     ChoosingSession(SessionPicker),
-    AwaitingPlanDecision,
-    AwaitingCommandDecision,
+    AwaitingApproval,
+    RevisingApproval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,14 +235,14 @@ pub(crate) enum ProfilePickerChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EmptyModeChoice {
     Submit(TuiAction),
-    RevisePlan,
+    ReviseApproval,
     CreateProfile,
 }
 
 pub(crate) fn approval_choice(index: usize) -> ApprovalChoice {
     match index.min(APPROVAL_OPTIONS.len() - 1) {
-        0 => ApprovalChoice::Submit(TuiAction::ApprovePlan),
-        1 => ApprovalChoice::Submit(TuiAction::RejectPlan),
+        0 => ApprovalChoice::Submit(TuiAction::ApproveApproval),
+        1 => ApprovalChoice::Submit(TuiAction::RejectApproval),
         _ => ApprovalChoice::Revise,
     }
 }
@@ -262,10 +258,7 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         InputMode::ChoosingSession(picker) if !picker.options.is_empty() => {
             VerticalNavigation::Selection(picker.options.len())
         }
-        InputMode::AwaitingPlanDecision if suggestion_count > 0 => {
-            VerticalNavigation::Selection(suggestion_count)
-        }
-        InputMode::AwaitingCommandDecision if suggestion_count > 0 => {
+        InputMode::AwaitingApproval if suggestion_count > 0 => {
             VerticalNavigation::Selection(suggestion_count)
         }
         InputMode::Editing if suggestion_count > 0 => {
@@ -275,8 +268,8 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
         InputMode::ChoosingProfile(_)
         | InputMode::ChoosingConfigProfile(_)
         | InputMode::ChoosingSession(_)
-        | InputMode::AwaitingPlanDecision
-        | InputMode::AwaitingCommandDecision
+        | InputMode::AwaitingApproval
+        | InputMode::RevisingApproval
         | InputMode::CreatingProfile
         | InputMode::CreatingConfigProfile
         | InputMode::ConfigEditor => VerticalNavigation::Disabled,
@@ -285,15 +278,10 @@ pub(crate) fn vertical_navigation(mode: &InputMode, suggestion_count: usize) -> 
 
 pub(crate) fn empty_mode_choice(mode: &InputMode, index: usize) -> Option<EmptyModeChoice> {
     match mode {
-        InputMode::AwaitingPlanDecision => match approval_choice(index) {
+        InputMode::AwaitingApproval => match approval_choice(index) {
             ApprovalChoice::Submit(action) => Some(EmptyModeChoice::Submit(action)),
-            ApprovalChoice::Revise => Some(EmptyModeChoice::RevisePlan),
+            ApprovalChoice::Revise => Some(EmptyModeChoice::ReviseApproval),
         },
-        InputMode::AwaitingCommandDecision => Some(EmptyModeChoice::Submit(if index == 0 {
-            TuiAction::ApproveCommand
-        } else {
-            TuiAction::RejectCommand
-        })),
         InputMode::ChoosingProfile(picker) => match profile_picker_choice(picker, index)? {
             ProfilePickerChoice::Select(name) => {
                 Some(EmptyModeChoice::Submit(TuiAction::SelectProfile(name)))
@@ -379,15 +367,19 @@ mod tests {
     }
 
     #[test]
-    fn command_approval_picker_is_typed_and_has_no_plan_revision_action() {
+    fn every_approval_kind_uses_the_same_three_typed_actions() {
         assert_eq!(
-            empty_mode_choice(&InputMode::AwaitingCommandDecision, 0),
-            Some(EmptyModeChoice::Submit(TuiAction::ApproveCommand))
+            empty_mode_choice(&InputMode::AwaitingApproval, 0),
+            Some(EmptyModeChoice::Submit(TuiAction::ApproveApproval))
         );
         assert_eq!(
-            empty_mode_choice(&InputMode::AwaitingCommandDecision, 1),
-            Some(EmptyModeChoice::Submit(TuiAction::RejectCommand))
+            empty_mode_choice(&InputMode::AwaitingApproval, 1),
+            Some(EmptyModeChoice::Submit(TuiAction::RejectApproval))
         );
+        assert!(matches!(
+            empty_mode_choice(&InputMode::AwaitingApproval, 2),
+            Some(EmptyModeChoice::ReviseApproval)
+        ));
     }
 
     #[test]

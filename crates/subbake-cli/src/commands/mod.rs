@@ -224,9 +224,9 @@ Usage: sbake resume [SESSION_ID]
 
 Omit SESSION_ID to resume the latest session.
 "#;
-const TRANSLATE_HELP: &str = r#"Translate a subtitle file
+const TRANSLATE_HELP: &str = r#"Translate a subtitle file or an embedded subtitle track
 
-Usage: sbake translate <SUBTITLE> [OPTIONS]
+Usage: sbake translate <SUBTITLE_OR_CONTAINER> [OPTIONS]
 
 Options:
   -o, --output <PATH>              Output file path
@@ -235,6 +235,9 @@ Options:
       --profile <NAME>             Named provider profile
       --source-lang <LANGUAGE>     Source language
       --target-lang <LANGUAGE>     Target language
+      --subtitle-stream <INDEX>    Embedded text or bitmap stream index
+      --preserve-source-container  Write a separate translated media file
+      --in-place-container         Replace the source container (default)
       --provider <NAME>            Provider name
       --model <NAME>               Model name
       --output-format <FORMAT>     Output format: srt, vtt, txt, ass, ssa, or ttml
@@ -268,8 +271,11 @@ Options:
   -h, --help                       Print help
 
 Additional provider, batching, concurrency, cache, retry, glossary, and runtime
-options are accepted. Media input is rejected; use `sbake transcribe` or
-`sbake pipeline` for media workflows.
+options are accepted. MKV, MP4/M4V/MOV, and WebM inputs use an existing embedded
+subtitle: text tracks are extracted directly, while PGS, VobSub, and DVB bitmap
+tracks are OCRed with the installed Tesseract executable and matching language data. Audio is
+never transcribed by this command; use `sbake transcribe` or `sbake pipeline`
+when speech recognition is intended.
 "#;
 const EDIT_HELP: &str = r#"Safely refine an existing translated subtitle
 

@@ -61,15 +61,26 @@ fn dispatch_event(
                 _ if is_insert_newline_key(key)
                     && !matches!(
                         app.interaction_state.input_mode(),
-                        InputMode::CreatingProfile
+                        InputMode::CreatingProfile | InputMode::AwaitingApproval
                     ) =>
                 {
                     app.input.insert_newline();
-                    app.interaction_state.set_input_mode(InputMode::Editing);
+                    if !matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::RevisingApproval
+                    ) {
+                        app.interaction_state.set_input_mode(InputMode::Editing);
+                    }
                     app.suggestion_index = 0;
                 }
                 KeyCode::Enter => handle_enter(app, request_tx)?,
                 KeyCode::Char(character) => {
+                    if matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::AwaitingApproval
+                    ) {
+                        return Ok(());
+                    }
                     if matches!(
                         app.interaction_state.input_mode(),
                         InputMode::CreatingProfile
@@ -79,7 +90,7 @@ fn dispatch_event(
                     }
                     if !matches!(
                         app.interaction_state.input_mode(),
-                        InputMode::CreatingProfile
+                        InputMode::CreatingProfile | InputMode::RevisingApproval
                     ) {
                         app.interaction_state.set_input_mode(InputMode::Editing);
                     }
@@ -87,9 +98,15 @@ fn dispatch_event(
                     app.suggestion_index = 0;
                 }
                 KeyCode::Backspace => {
+                    if matches!(
+                        app.interaction_state.input_mode(),
+                        InputMode::AwaitingApproval
+                    ) {
+                        return Ok(());
+                    }
                     if !matches!(
                         app.interaction_state.input_mode(),
-                        InputMode::CreatingProfile
+                        InputMode::CreatingProfile | InputMode::RevisingApproval
                     ) {
                         app.interaction_state.set_input_mode(InputMode::Editing);
                     }
@@ -439,9 +456,9 @@ fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>)
     }
     if matches!(
         app.interaction_state.input_mode(),
-        InputMode::AwaitingCommandDecision
+        InputMode::AwaitingApproval | InputMode::RevisingApproval
     ) {
-        return submit_action(app, request_tx, TuiAction::RejectCommand);
+        return submit_action(app, request_tx, TuiAction::RejectApproval);
     }
     let cancel_exits = matches!(
         app.interaction_state.input_mode(),
@@ -531,8 +548,10 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
     let selected_action = if app.input.is_empty() {
         match empty_mode_choice(app.interaction_state.input_mode(), app.suggestion_index) {
             Some(EmptyModeChoice::Submit(action)) => Some(action),
-            Some(EmptyModeChoice::RevisePlan) => {
-                app.interaction_state.set_input_mode(InputMode::Editing);
+            Some(EmptyModeChoice::ReviseApproval) => {
+                app.interaction_state
+                    .set_input_mode(InputMode::RevisingApproval);
+                app.input.clear();
                 app.suggestion_index = 0;
                 return Ok(());
             }
@@ -587,6 +606,11 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
     if matches!(&action, TuiAction::SubmitText(text) if text.is_empty()) {
         return Ok(());
     }
+    if matches!(&action, TuiAction::ReviseApproval(text) if text.is_empty()) {
+        app.interaction_state
+            .set_input_mode(InputMode::RevisingApproval);
+        return Ok(());
+    }
     if matches!(&action, TuiAction::SubmitText(text) if text == "/exit" || text == "/quit") {
         app.running = false;
         return Ok(());
@@ -605,6 +629,10 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
 
 fn take_input_action(app: &mut SubBakeTui) -> TuiAction {
     let trimmed = app.input.take().trim().to_owned();
+    let revising_approval = matches!(
+        app.interaction_state.input_mode(),
+        InputMode::RevisingApproval
+    );
     let creating_profile = matches!(
         app.interaction_state.input_mode(),
         InputMode::CreatingProfile
@@ -622,7 +650,9 @@ fn take_input_action(app: &mut SubBakeTui) -> TuiAction {
     {
         app.input_history.push(trimmed.clone());
     }
-    if creating_config_profile {
+    if revising_approval {
+        TuiAction::ReviseApproval(trimmed)
+    } else if creating_config_profile {
         TuiAction::CreateConfigProfile(trimmed)
     } else if creating_profile {
         TuiAction::CreateProfile(trimmed)

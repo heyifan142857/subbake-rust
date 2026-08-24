@@ -612,7 +612,7 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         true,
         false,
         true,
-        "Run a sandboxed Linux command. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits.",
+        "Run a sandboxed Linux command. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits. Never use commands to extract audio or invoke speech recognition as a substitute for bitmap subtitles before the runtime obtains current-task source-substitution approval.",
         RUN_COMMAND_ARGS,
         RunCommand,
         requires CommandSandbox
@@ -624,7 +624,7 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         false,
         false,
         true,
-        "Translate one subtitle file, or translate and append a matching text subtitle stream in an MKV, MP4/M4V/MOV, or WebM container without transcribing it.",
+        "Translate one subtitle file, or translate and append a matching subtitle stream in an MKV, MP4/M4V/MOV, or WebM container without transcribing audio. Text streams are extracted directly; PGS, VobSub, and DVB bitmap streams are rendered and OCRed with Tesseract before translation.",
         TRANSLATE_FILE_ARGS,
         TranslateFile
     ),
@@ -657,7 +657,7 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         false,
         false,
         true,
-        "Transcribe a media file to subtitles. When the model is omitted, use the configured model or deterministically select an installed model; explicitly tell the user when the result says model_auto_selected=true.",
+        "Transcribe a media file to subtitles. When an existing subtitle request encounters bitmap-only subtitles, this tool is unavailable until the runtime obtains current-task source-substitution approval. When the model is omitted, use the configured model or deterministically select an installed model; explicitly tell the user when the result says model_auto_selected=true.",
         TRANSCRIBE_AUDIO_ARGS,
         TranscribeAudio
     ),
@@ -668,7 +668,7 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         true,
         false,
         true,
-        "Manage local whisper.cpp. status, list-models, list-vad-models, and list-versions are read-only checks and should be followed immediately by the next task action. VAD defaults to Silero; use download-vad without a model to install the default. For an install request: install the CLI first, install the default VAD model, then call list-models and present the transcription models to the user; do not choose or download a transcription model until the user selects one. Use list-versions to fetch upstream releases.",
+        "Manage local whisper.cpp. Do not inspect or install Whisper as a workaround for bitmap-only subtitles before the runtime obtains current-task source-substitution approval. status, list-models, list-vad-models, and list-versions are read-only checks and should be followed immediately by the next task action. VAD defaults to Silero; use download-vad without a model to install the default. For an install request: install the CLI first, install the default VAD model, then call list-models and present the transcription models to the user; do not choose or download a transcription model until the user selects one. Use list-versions to fetch upstream releases.",
         MANAGE_WHISPER_ARGS,
         ManageWhisper
     ),

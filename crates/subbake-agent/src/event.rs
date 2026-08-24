@@ -30,6 +30,9 @@ pub enum EventKind {
     Assistant {
         text: String,
     },
+    Commentary {
+        text: String,
+    },
     AskUser {
         text: String,
     },
@@ -112,7 +115,19 @@ pub struct PendingCommandApproval {
     #[serde(default)]
     pub remaining_tool_calls: Vec<PendingToolCall>,
     pub reason: String,
+    #[serde(default)]
+    pub kind: PendingApprovalKind,
+    #[serde(default)]
+    pub purpose: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingApprovalKind {
+    #[default]
+    Command,
+    SourceSubstitution,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +159,21 @@ pub struct PendingAgentTurn {
     pub steps_used: usize,
     #[serde(default)]
     pub legacy_mode: bool,
+    #[serde(default)]
+    pub source_fallback: Option<PendingSourceFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSourceFallback {
+    pub container_path: String,
+    #[serde(default)]
+    pub streams: Vec<String>,
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default)]
+    pub sidecar_search_completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

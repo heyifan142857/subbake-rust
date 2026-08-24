@@ -18,7 +18,7 @@ pub(crate) fn rank_subtitle_candidates(
                 .is_some_and(|suffix| {
                     matches!(
                         suffix.to_lowercase().as_str(),
-                        "srt" | "vtt" | "txt" | "ass"
+                        "srt" | "vtt" | "txt" | "ass" | "ssa" | "ttml" | "dfxp"
                     )
                 })
         })
@@ -36,6 +36,7 @@ pub(crate) fn rank_subtitle_candidates(
             let score = token_hits * 10 + usize::from(exact) * 25;
             (score, name, path)
         })
+        .filter(|(score, _, _)| tokens.is_empty() || *score > 0)
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     candidates
@@ -67,7 +68,22 @@ mod tests {
                 .iter()
                 .all(|path| path.file_stem().is_some_and(|stem| stem == "The Matrix"))
         );
-        assert_eq!(ranked[2], root.join("other.srt"));
-        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked.len(), 2);
+    }
+
+    #[test]
+    fn excludes_zero_match_text_files_when_query_is_present() {
+        let root = Path::new("/project");
+        let ranked = rank_subtitle_candidates(
+            vec![
+                root.join("source.txt"),
+                root.join("download notes.srt"),
+                root.join("Batman v Superman.en.srt"),
+            ],
+            "Batman.v.Superman.Dawn.of.Justice.2016.mkv",
+            root,
+        );
+
+        assert_eq!(ranked, vec![root.join("Batman v Superman.en.srt")]);
     }
 }

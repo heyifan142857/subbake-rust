@@ -18,6 +18,7 @@ pub const SESSION_VERSION: u64 = 2;
 pub enum EventTag {
     User,
     Assistant,
+    Commentary,
     AskUser,
     ToolStarted,
     ToolCompleted,
@@ -43,6 +44,7 @@ impl EventTag {
         match value {
             "user" => Self::User,
             "assistant" => Self::Assistant,
+            "commentary" => Self::Commentary,
             "ask_user" => Self::AskUser,
             "tool_started" => Self::ToolStarted,
             "tool_completed" => Self::ToolCompleted,
@@ -103,6 +105,7 @@ impl AgentEvent {
         let (kind, text, data) = match event {
             EventKind::User { text } => ("user", text.clone(), serde_json::json!({})),
             EventKind::Assistant { text } => ("assistant", text.clone(), serde_json::json!({})),
+            EventKind::Commentary { text } => ("commentary", text.clone(), serde_json::json!({})),
             EventKind::AskUser { text } => ("ask_user", text.clone(), serde_json::json!({})),
             EventKind::ToolStarted {
                 call_id,
@@ -229,6 +232,9 @@ impl AgentEvent {
                 text: self.text.clone(),
             }),
             EventTag::Assistant => Some(EventKind::Assistant {
+                text: self.text.clone(),
+            }),
+            EventTag::Commentary => Some(EventKind::Commentary {
                 text: self.text.clone(),
             }),
             EventTag::AskUser => Some(EventKind::AskUser {
@@ -702,6 +708,25 @@ mod tests {
             serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read v2 mode"),
             SessionMode::Chat
         );
+    }
+
+    #[test]
+    fn legacy_command_approval_defaults_to_a_normal_command_prompt() {
+        let pending: crate::event::PendingCommandApproval =
+            serde_json::from_value(serde_json::json!({
+                "tool_call": {
+                    "tool_name": "run_command",
+                    "arguments": {"command": "printf hello"}
+                },
+                "call_id": "legacy-call",
+                "remaining_tool_calls": [],
+                "reason": "legacy approval",
+                "created_at": "2026-08-24T00:00:00Z"
+            }))
+            .expect("read legacy approval");
+
+        assert_eq!(pending.kind, crate::event::PendingApprovalKind::Command);
+        assert!(pending.purpose.is_empty());
     }
 
     #[test]

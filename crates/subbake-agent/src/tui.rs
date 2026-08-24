@@ -15,20 +15,23 @@
 
 use std::io;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use crossterm::cursor::MoveTo;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{Clear, ClearType};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::engine::SessionChoice;
+use crate::engine::{ApprovalPrompt, SessionChoice};
 use crate::error::AgentResult;
 use crate::input_editor::InputEditor;
 use crate::tui_state::{
-    APPROVAL_OPTIONS, COMMAND_APPROVAL_OPTIONS, ConfigEditorState, EmptyModeChoice, InputMode,
-    InteractionState, SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice,
-    history_down, history_up, vertical_navigation,
+    APPROVAL_OPTIONS, ConfigEditorState, EmptyModeChoice, InputMode, InteractionState,
+    SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_up,
+    vertical_navigation,
 };
 use subbake_core::{CancellationGuard, CancellationToken};
 use subbake_core::{ProgressEvent, TaskState};
@@ -55,6 +58,42 @@ use text::{display_width, truncate_with_ellipsis};
 use worker::{TuiWorker, WorkerRequest};
 
 const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const RESIZE_REFLOW_DEBOUNCE: Duration = Duration::from_millis(75);
+
+#[derive(Debug, Clone)]
+struct ResizeReflowState {
+    last_observed: (u16, u16),
+    last_rebuilt: (u16, u16),
+    pending: Option<((u16, u16), Instant)>,
+}
+
+impl ResizeReflowState {
+    fn new(size: (u16, u16)) -> Self {
+        Self {
+            last_observed: size,
+            last_rebuilt: size,
+            pending: None,
+        }
+    }
+
+    fn observe(&mut self, size: (u16, u16), now: Instant) {
+        if size != self.last_observed {
+            self.last_observed = size;
+            self.pending = Some((size, now + RESIZE_REFLOW_DEBOUNCE));
+        }
+    }
+
+    fn due_size(&self, now: Instant) -> Option<(u16, u16)> {
+        self.pending
+            .filter(|(size, deadline)| *size != self.last_rebuilt && now >= *deadline)
+            .map(|(size, _)| size)
+    }
+
+    fn rebuilt(&mut self, size: (u16, u16)) {
+        self.last_rebuilt = size;
+        self.pending = None;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TUI App
@@ -63,7 +102,7 @@ const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 pub struct SubBakeTui {
     terminal_session: TerminalSessionGuard,
     terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    inline_terminal_size: (u16, u16),
+    resize_reflow: ResizeReflowState,
     overlay_terminal: Option<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>>,
     msg_view: std::sync::Arc<std::sync::Mutex<MsgView>>,
     progress: std::sync::Arc<std::sync::Mutex<Option<(ProgressEvent, std::time::Instant)>>>,
@@ -80,6 +119,7 @@ pub struct SubBakeTui {
     history_cursor: usize,
     startup_pending: bool,
     config_editor: Option<ConfigEditorState>,
+    approval_prompt: Option<ApprovalPrompt>,
     active_layout: Option<ActiveLayout>,
 }
 
@@ -91,7 +131,7 @@ impl SubBakeTui {
         Ok(Self {
             terminal_session,
             terminal,
-            inline_terminal_size,
+            resize_reflow: ResizeReflowState::new(inline_terminal_size),
             overlay_terminal: None,
             // The terminal emulator owns scrollback retention. Keep the source
             // items for this process lifetime so the commit cursor stays stable.
@@ -110,6 +150,7 @@ impl SubBakeTui {
             history_cursor: 0,
             startup_pending: true,
             config_editor: None,
+            approval_prompt: None,
             active_layout: None,
         })
     }
@@ -122,10 +163,11 @@ impl SubBakeTui {
         self.plan_mode = enabled;
     }
 
-    pub fn set_command_approval_pending(&mut self, pending: bool) {
-        if pending {
+    pub fn set_pending_approval(&mut self, prompt: Option<ApprovalPrompt>) {
+        self.approval_prompt = prompt;
+        if self.approval_prompt.is_some() {
             self.interaction_state
-                .set_input_mode(InputMode::AwaitingCommandDecision);
+                .set_input_mode(InputMode::AwaitingApproval);
         }
     }
 
@@ -204,6 +246,9 @@ impl SubBakeTui {
                     ),
                     crate::session::EventTag::Assistant | crate::session::EventTag::AskUser => {
                         (MsgStyle::Response, format!("➔ {}", event.text))
+                    }
+                    crate::session::EventTag::Commentary => {
+                        (MsgStyle::Commentary, format!("➔ {}", event.text))
                     }
                     crate::session::EventTag::ToolStarted => {
                         let Some(crate::event::EventKind::ToolStarted {
@@ -352,21 +397,16 @@ impl SubBakeTui {
                     let plan_mode_rollback = self.interaction_state.finish();
                     match result {
                         Ok(TuiInteraction::Message { message }) => {
+                            self.approval_prompt = None;
                             self.interaction_state.set_input_mode(InputMode::Editing);
                             self.suggestion_index = 0;
                             self.render_response(message);
                         }
-                        Ok(TuiInteraction::PlanApproval { message }) => {
+                        Ok(TuiInteraction::Approval { prompt }) => {
+                            self.approval_prompt = Some(prompt);
                             self.interaction_state
-                                .set_input_mode(InputMode::AwaitingPlanDecision);
+                                .set_input_mode(InputMode::AwaitingApproval);
                             self.suggestion_index = 0;
-                            self.render_response(message);
-                        }
-                        Ok(TuiInteraction::CommandApproval { message }) => {
-                            self.interaction_state
-                                .set_input_mode(InputMode::AwaitingCommandDecision);
-                            self.suggestion_index = 0;
-                            self.render_response(message);
                         }
                         Ok(TuiInteraction::ProfilePicker { message, options }) => {
                             self.open_fullscreen_overlay()?;
@@ -415,14 +455,17 @@ impl SubBakeTui {
                             events,
                             plan_mode,
                             model,
-                            command_approval,
+                            approval,
                         }) => {
                             self.input_history = input_history;
-                            self.interaction_state.set_input_mode(if command_approval {
-                                InputMode::AwaitingCommandDecision
-                            } else {
-                                InputMode::Editing
-                            });
+                            self.approval_prompt = approval;
+                            self.interaction_state.set_input_mode(
+                                if self.approval_prompt.is_some() {
+                                    InputMode::AwaitingApproval
+                                } else {
+                                    InputMode::Editing
+                                },
+                            );
                             self.suggestion_index = 0;
                             self.set_session_replay(events);
                             self.plan_mode = plan_mode;
@@ -563,6 +606,9 @@ Or just type what you want, e.g. "translate @clip.srt""#
             return Ok(());
         }
         self.sync_inline_terminal_size()?;
+        if self.resize_reflow.pending.is_some() {
+            return Ok(());
+        }
         let width = self.terminal.size()?.width.max(1);
         if self.startup_pending {
             self.startup_pending = false;
@@ -600,28 +646,35 @@ Or just type what you want, e.g. "translate @clip.srt""#
 
     fn draw(&mut self) -> io::Result<()> {
         self.sync_inline_terminal_size()?;
+        if self.overlay_terminal.is_none() && self.resize_reflow.pending.is_some() {
+            return Ok(());
+        }
         render::draw(self)
     }
 
-    /// Keep Ratatui's inline terminal synchronized without using its resize
-    /// path. Ratatui 0.30 clears the entire visible screen when an inline
-    /// viewport becomes narrower, which also erases committed history above
-    /// the viewport. A fresh inline terminal clears only its active viewport;
-    /// the terminal emulator remains responsible for reflowing native
-    /// scrollback at the new width.
+    /// Rebuild the inline terminal from the saved transcript after resize
+    /// events settle. Terminal-native wrapping cannot be reversed reliably,
+    /// so the previous visible screen and scrollback are deliberately purged.
     fn sync_inline_terminal_size(&mut self) -> io::Result<()> {
+        let size = crossterm::terminal::size()?;
+        let now = Instant::now();
+        self.resize_reflow.observe(size, now);
         if self.overlay_terminal.is_some() {
             return Ok(());
         }
-        let size = crossterm::terminal::size()?;
-        if size == self.inline_terminal_size {
+        let Some(size) = self.resize_reflow.due_size(now) else {
             return Ok(());
-        }
-
-        let mut terminal = create_inline_terminal(size.1)?;
-        terminal.clear()?;
-        self.terminal = terminal;
-        self.inline_terminal_size = size;
+        };
+        crossterm::execute!(
+            io::stdout(),
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        self.terminal = create_inline_terminal(size.1)?;
+        self.resize_reflow.rebuilt(size);
+        self.history_cursor = 0;
+        self.startup_pending = true;
         self.invalidate_layout();
         Ok(())
     }
@@ -680,6 +733,7 @@ fn message_lines(message: &Msg) -> Vec<Line<'static>> {
             .add_modifier(Modifier::BOLD),
         MsgStyle::Observation => Style::default().fg(Color::DarkGray),
         MsgStyle::Response => Style::default().fg(Color::White),
+        MsgStyle::Commentary => Style::default().fg(Color::Gray),
         MsgStyle::Error => Style::default().fg(Color::Red),
         MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
         MsgStyle::ToolCall | MsgStyle::ToolFailure | MsgStyle::ToolCancelled => unreachable!(),
@@ -817,13 +871,9 @@ fn is_insert_newline_key(key: KeyEvent) -> bool {
 fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
     match mode {
         InputMode::BrowsingHistory { .. } => Vec::new(),
-        InputMode::AwaitingPlanDecision if input.is_empty() => APPROVAL_OPTIONS
+        InputMode::AwaitingApproval if input.is_empty() => APPROVAL_OPTIONS
             .iter()
             .map(|(label, description)| ((*label).to_owned(), (*description).to_owned()))
-            .collect(),
-        InputMode::AwaitingCommandDecision if input.is_empty() => COMMAND_APPROVAL_OPTIONS
-            .iter()
-            .map(|(command, description)| ((*command).to_owned(), (*description).to_owned()))
             .collect(),
         InputMode::ChoosingProfile(_) => Vec::new(),
         InputMode::CreatingProfile => Vec::new(),
@@ -891,11 +941,11 @@ mod tests {
     };
 
     use super::{
-        EmptyModeChoice, InputMode, Msg, MsgStyle, StartupInfo, TuiAction, TuiPicker,
-        VerticalNavigation, empty_mode_choice, history_down, history_lines_height, history_up,
-        is_insert_newline_key, is_profile_name_character, message_lines, picker_viewport,
-        previous_suggestion, push_immediate_response, slash_suggestions, startup_panel_lines,
-        suggestions_for, vertical_navigation,
+        EmptyModeChoice, InputMode, Msg, MsgStyle, ResizeReflowState, StartupInfo, TuiAction,
+        TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_lines_height,
+        history_up, is_insert_newline_key, is_profile_name_character, message_lines,
+        picker_viewport, previous_suggestion, push_immediate_response, slash_suggestions,
+        startup_panel_lines, suggestions_for, vertical_navigation,
     };
 
     #[test]
@@ -904,6 +954,45 @@ mod tests {
         assert_eq!(super::inline_viewport_height(12), 11);
         assert_eq!(super::inline_viewport_height(2), 1);
         assert_eq!(super::inline_viewport_height(1), 1);
+    }
+
+    #[test]
+    fn resize_reflow_debounces_width_and_height_to_the_latest_size() {
+        let start = std::time::Instant::now();
+        let mut state = ResizeReflowState::new((100, 30));
+        state.observe((40, 30), start);
+        assert_eq!(
+            state.due_size(start + std::time::Duration::from_millis(74)),
+            None
+        );
+        state.observe((120, 30), start + std::time::Duration::from_millis(50));
+        assert_eq!(
+            state.due_size(start + std::time::Duration::from_millis(124)),
+            None
+        );
+        assert_eq!(
+            state.due_size(start + std::time::Duration::from_millis(125)),
+            Some((120, 30))
+        );
+        state.rebuilt((120, 30));
+        state.observe((120, 20), start + std::time::Duration::from_millis(130));
+        assert_eq!(
+            state.due_size(start + std::time::Duration::from_millis(205)),
+            Some((120, 20))
+        );
+    }
+
+    #[test]
+    fn overdue_resize_remains_pending_until_the_overlay_can_close() {
+        let start = std::time::Instant::now();
+        let mut state = ResizeReflowState::new((80, 24));
+        state.observe((40, 24), start);
+        let due = start + std::time::Duration::from_millis(100);
+        assert_eq!(state.due_size(due), Some((40, 24)));
+        assert_eq!(
+            state.due_size(due + std::time::Duration::from_secs(1)),
+            Some((40, 24))
+        );
     }
 
     #[test]
@@ -1007,7 +1096,7 @@ mod tests {
             VerticalNavigation::Selection(11)
         );
         assert_eq!(
-            vertical_navigation(&InputMode::AwaitingPlanDecision, 3),
+            vertical_navigation(&InputMode::AwaitingApproval, 3),
             VerticalNavigation::Selection(3)
         );
     }
@@ -1141,8 +1230,8 @@ mod tests {
         });
         assert!(suggestions_for("", &profile).is_empty());
         assert_eq!(
-            suggestions_for("", &InputMode::AwaitingPlanDecision)[0].0,
-            "approve"
+            suggestions_for("", &InputMode::AwaitingApproval)[0].0,
+            "Approve once"
         );
         let history = InputMode::BrowsingHistory {
             index: 0,
@@ -1163,24 +1252,24 @@ mod tests {
     fn all_plan_approval_choices_have_distinct_typed_outcomes() {
         assert_eq!(
             approval_choice(0),
-            ApprovalChoice::Submit(TuiAction::ApprovePlan)
+            ApprovalChoice::Submit(TuiAction::ApproveApproval)
         );
         assert_eq!(
             approval_choice(1),
-            ApprovalChoice::Submit(TuiAction::RejectPlan)
+            ApprovalChoice::Submit(TuiAction::RejectApproval)
         );
         assert_eq!(approval_choice(2), ApprovalChoice::Revise);
         assert_eq!(
-            empty_mode_choice(&InputMode::AwaitingPlanDecision, 0),
-            Some(EmptyModeChoice::Submit(TuiAction::ApprovePlan))
+            empty_mode_choice(&InputMode::AwaitingApproval, 0),
+            Some(EmptyModeChoice::Submit(TuiAction::ApproveApproval))
         );
         assert_eq!(
-            empty_mode_choice(&InputMode::AwaitingPlanDecision, 1),
-            Some(EmptyModeChoice::Submit(TuiAction::RejectPlan))
+            empty_mode_choice(&InputMode::AwaitingApproval, 1),
+            Some(EmptyModeChoice::Submit(TuiAction::RejectApproval))
         );
         assert_eq!(
-            empty_mode_choice(&InputMode::AwaitingPlanDecision, 2),
-            Some(EmptyModeChoice::RevisePlan)
+            empty_mode_choice(&InputMode::AwaitingApproval, 2),
+            Some(EmptyModeChoice::ReviseApproval)
         );
     }
 

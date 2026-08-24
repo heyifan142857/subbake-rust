@@ -28,6 +28,7 @@ use crate::translation::{
 
 const FFMPEG: &str = "ffmpeg";
 const FFPROBE: &str = "ffprobe";
+const TESSERACT: &str = "tesseract";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubtitleContainerKind {
@@ -134,10 +135,51 @@ struct SubtitleStream {
     forced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedSubtitleSource<'a> {
+    Text(&'a SubtitleStream),
+    Bitmap(&'a SubtitleStream, BitmapSubtitleKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitmapSubtitleKind {
+    Pgs,
+    VobSub,
+    Dvb,
+}
+
+impl<'a> EmbeddedSubtitleSource<'a> {
+    const fn stream(self) -> &'a SubtitleStream {
+        match self {
+            Self::Text(stream) | Self::Bitmap(stream, _) => stream,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ProbeResponse {
     #[serde(default)]
     streams: Vec<ProbeStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PacketProbeResponse {
+    #[serde(default)]
+    packets: Vec<ProbePacket>,
+    #[serde(default)]
+    streams: Vec<ProbePacketStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbePacket {
+    pts: Option<i64>,
+    data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbePacketStream {
+    index: usize,
+    time_base: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,33 +498,121 @@ fn translate_embedded_subtitle_with_programs(
 
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Running);
     let streams = probe_subtitle_streams(ffprobe, &request.input_path, cancellation)?;
-    let source = select_text_stream(
+    let source = select_embedded_source(
         &streams,
         &request.settings.translation.source_language,
         request.settings.translation.subtitle_stream_index,
     )?;
-    let payload_format = translated_payload_format(container_kind, &source.codec);
+    let source_stream = source.stream();
+    let payload_format = match source {
+        EmbeddedSubtitleSource::Text(stream) => {
+            translated_payload_format(container_kind, &stream.codec)
+        }
+        EmbeddedSubtitleSource::Bitmap(_, _) => SubtitlePayloadFormat::Srt,
+    };
     emit_stage(&progress, "INSPECT_SUBTITLES", TaskState::Completed);
 
     let temporary = unique_temp_dir()?;
     let extracted_path = temporary
         .path()
         .join(format!("source.{}", payload_format.extension()));
+    let mut source_ocr = None;
     emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Running);
-    extract_subtitle(
-        ffmpeg,
-        &request.input_path,
-        source.index,
-        &extracted_path,
-        payload_format,
-        cancellation,
-    )?;
-    if payload_format == SubtitlePayloadFormat::Srt
-        && matches!(source.codec.as_str(), "ass" | "ssa")
-    {
-        sanitize_ass_derived_srt_file(&extracted_path)?;
+    match source {
+        EmbeddedSubtitleSource::Text(stream) => {
+            extract_subtitle(
+                ffmpeg,
+                &request.input_path,
+                stream.index,
+                &extracted_path,
+                payload_format,
+                cancellation,
+            )?;
+            if payload_format == SubtitlePayloadFormat::Srt
+                && matches!(stream.codec.as_str(), "ass" | "ssa")
+            {
+                sanitize_ass_derived_srt_file(&extracted_path)?;
+            }
+        }
+        EmbeddedSubtitleSource::Bitmap(stream, kind) => {
+            let bitmap_path = match kind {
+                BitmapSubtitleKind::Pgs => temporary.path().join("source.sup"),
+                BitmapSubtitleKind::VobSub => temporary.path().join("source.mks"),
+                BitmapSubtitleKind::Dvb => temporary.path().join("source.dvb.pes"),
+            };
+            match kind {
+                BitmapSubtitleKind::Pgs => extract_pgs_subtitle(
+                    ffmpeg,
+                    &request.input_path,
+                    stream.index,
+                    &bitmap_path,
+                    cancellation,
+                )?,
+                BitmapSubtitleKind::VobSub => extract_vobsub_subtitle(
+                    ffmpeg,
+                    &request.input_path,
+                    stream.index,
+                    &bitmap_path,
+                    cancellation,
+                )?,
+                BitmapSubtitleKind::Dvb => extract_dvb_subtitle(
+                    ffprobe,
+                    &request.input_path,
+                    stream.index,
+                    &bitmap_path,
+                    cancellation,
+                )?,
+            }
+            emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Completed);
+            let ocr = match kind {
+                BitmapSubtitleKind::Pgs => crate::bitmap_ocr::convert_sup_to_srt(
+                    &bitmap_path,
+                    &extracted_path,
+                    &request.settings.translation.source_language,
+                    stream.language.as_deref(),
+                    Path::new(TESSERACT),
+                    cancellation,
+                    &progress,
+                ),
+                BitmapSubtitleKind::VobSub => crate::bitmap_ocr::convert_vobsub_mks_to_srt(
+                    &bitmap_path,
+                    &extracted_path,
+                    &request.settings.translation.source_language,
+                    stream.language.as_deref(),
+                    Path::new(TESSERACT),
+                    cancellation,
+                    &progress,
+                ),
+                BitmapSubtitleKind::Dvb => crate::bitmap_ocr::convert_dvb_pes_to_srt(
+                    &bitmap_path,
+                    &extracted_path,
+                    &request.settings.translation.source_language,
+                    stream.language.as_deref(),
+                    Path::new(TESSERACT),
+                    cancellation,
+                    &progress,
+                ),
+            }
+            .map_err(|error| match error {
+                AdapterError::Cancelled => AdapterError::Cancelled,
+                other => AdapterError::BitmapSubtitleOcr {
+                    streams: vec![stream.title.as_ref().map_or_else(
+                        || stream.codec.clone(),
+                        |title| format!("{} ({title})", stream.codec),
+                    )],
+                    message: other.to_string(),
+                },
+            })?;
+            source_ocr = Some(crate::translation::BitmapSubtitleOcrSummary {
+                codec: stream.codec.clone(),
+                cues: ocr.cue_count,
+                low_confidence_cues: ocr.low_confidence_cues,
+            });
+        }
     }
-    emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Completed);
+    if matches!(source, EmbeddedSubtitleSource::Text(_)) {
+        emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Completed);
+    }
 
     let extracted_bytes = fs::read(&extracted_path).map_err(|source| {
         AdapterError::external_io(
@@ -492,7 +622,7 @@ fn translate_embedded_subtitle_with_programs(
         )
     })?;
     let identity = TranslationInputIdentity {
-        path: embedded_stream_identity(&request.input_path, source.index, payload_format)?,
+        path: embedded_stream_identity(&request.input_path, source_stream.index, payload_format)?,
         signature: input_signature_from_bytes(&extracted_bytes, None),
         output_path: final_output.clone(),
         execution_fingerprint: None,
@@ -512,11 +642,12 @@ fn translate_embedded_subtitle_with_programs(
         Some(identity),
         quality_gate,
     )?;
+    outcome.source_ocr = source_ocr;
 
     if outcome.subtitle_entries == 0 {
         return Err(AdapterError::invalid_input(format!(
             "selected embedded subtitle stream {} contains no subtitle entries",
-            source.index
+            source_stream.index
         )));
     }
 
@@ -686,24 +817,17 @@ fn select_text_stream<'a>(
         })
         .collect::<Vec<_>>();
     if text_streams.is_empty() {
-        let message = if streams.is_empty() {
-            "container contains no embedded subtitle streams".to_owned()
-        } else {
-            format!(
-                "container contains no translatable text subtitle stream; found only: {}",
-                streams
-                    .iter()
-                    .map(|stream| {
-                        stream.title.as_ref().map_or_else(
-                            || stream.codec.clone(),
-                            |title| format!("{} ({title})", stream.codec),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        return Err(AdapterError::invalid_input(message));
+        return Err(AdapterError::NoTranslatableTextSubtitle {
+            streams: streams
+                .iter()
+                .map(|stream| {
+                    stream.title.as_ref().map_or_else(
+                        || stream.codec.clone(),
+                        |title| format!("{} ({title})", stream.codec),
+                    )
+                })
+                .collect(),
+        });
     }
 
     if let Some(index) = requested_index {
@@ -769,6 +893,120 @@ fn select_text_stream<'a>(
         .ok_or_else(|| AdapterError::invalid_input("container contains no selectable subtitle"))
 }
 
+fn select_embedded_source<'a>(
+    streams: &'a [SubtitleStream],
+    source_language: &str,
+    requested_index: Option<usize>,
+) -> AdapterResult<EmbeddedSubtitleSource<'a>> {
+    if let Some(index) = requested_index {
+        let stream = streams
+            .iter()
+            .find(|stream| stream.index == index)
+            .ok_or_else(|| {
+                let available = streams
+                    .iter()
+                    .map(|stream| format!("{}:{}", stream.index, stream.codec))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                AdapterError::invalid_input(format!(
+                    "subtitle stream {index} does not exist; available subtitle streams: {available}"
+                ))
+            })?;
+        if is_text_subtitle_codec(&stream.codec) {
+            return Ok(EmbeddedSubtitleSource::Text(stream));
+        }
+        if let Some(kind) = bitmap_subtitle_kind(&stream.codec) {
+            return Ok(EmbeddedSubtitleSource::Bitmap(stream, kind));
+        }
+        return Err(AdapterError::invalid_input(format!(
+            "subtitle stream {index} uses unsupported subtitle codec `{}`; SubBake OCR supports PGS, VobSub, and DVB bitmap subtitles",
+            stream.codec
+        )));
+    }
+
+    match select_text_stream(streams, source_language, None) {
+        Ok(stream) => Ok(EmbeddedSubtitleSource::Text(stream)),
+        Err(AdapterError::NoTranslatableTextSubtitle { .. }) => {
+            let stream = select_bitmap_stream(streams, source_language)?;
+            let kind = bitmap_subtitle_kind(&stream.codec).ok_or_else(|| {
+                AdapterError::invalid_input("selected bitmap subtitle codec is unsupported")
+            })?;
+            Ok(EmbeddedSubtitleSource::Bitmap(stream, kind))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn select_bitmap_stream<'a>(
+    streams: &'a [SubtitleStream],
+    source_language: &str,
+) -> AdapterResult<&'a SubtitleStream> {
+    let bitmap_streams = streams
+        .iter()
+        .filter(|stream| bitmap_subtitle_kind(&stream.codec).is_some())
+        .collect::<Vec<_>>();
+    if bitmap_streams.is_empty() {
+        return Err(AdapterError::NoTranslatableTextSubtitle {
+            streams: streams
+                .iter()
+                .map(|stream| {
+                    stream.title.as_ref().map_or_else(
+                        || stream.codec.clone(),
+                        |title| format!("{} ({title})", stream.codec),
+                    )
+                })
+                .collect(),
+        });
+    }
+
+    let requested_language = normalized_primary_language(source_language);
+    let candidates = if requested_language
+        .as_deref()
+        .is_some_and(|value| value != "auto")
+    {
+        let matching = bitmap_streams
+            .iter()
+            .copied()
+            .filter(|stream| {
+                stream
+                    .language
+                    .as_deref()
+                    .and_then(normalized_primary_language)
+                    .as_deref()
+                    == requested_language.as_deref()
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            let available = bitmap_streams
+                .iter()
+                .map(|stream| {
+                    format!(
+                        "{}:{}",
+                        stream.index,
+                        stream.language.as_deref().unwrap_or("und")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AdapterError::invalid_input(format!(
+                "no bitmap subtitle stream matches source language `{source_language}`; available bitmap streams: {available}"
+            )));
+        }
+        matching
+    } else {
+        bitmap_streams
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|stream| stream.default && !stream.forced)
+        .or_else(|| candidates.iter().copied().find(|stream| !stream.forced))
+        .or_else(|| candidates.first().copied())
+        .ok_or_else(|| {
+            AdapterError::invalid_input("container contains no selectable bitmap subtitle")
+        })
+}
+
 fn is_text_subtitle_codec(codec: &str) -> bool {
     matches!(
         codec,
@@ -787,6 +1025,15 @@ fn is_text_subtitle_codec(codec: &str) -> bool {
             | "subviewer"
             | "subviewer1"
     )
+}
+
+fn bitmap_subtitle_kind(codec: &str) -> Option<BitmapSubtitleKind> {
+    match codec {
+        "hdmv_pgs_subtitle" | "pgssub" => Some(BitmapSubtitleKind::Pgs),
+        "dvd_subtitle" | "dvdsub" => Some(BitmapSubtitleKind::VobSub),
+        "dvb_subtitle" | "dvbsub" => Some(BitmapSubtitleKind::Dvb),
+        _ => None,
+    }
 }
 
 fn normalized_primary_language(value: &str) -> Option<String> {
@@ -845,6 +1092,292 @@ fn extract_subtitle(
         });
     }
     Ok(())
+}
+
+fn extract_pgs_subtitle(
+    ffmpeg: &Path,
+    input_path: &Path,
+    stream_index: usize,
+    output_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
+    let map = format!("0:{stream_index}");
+    let output = ProcessSupervisor::run(
+        Command::new(ffmpeg).args([
+            OsStr::new("-nostdin"),
+            OsStr::new("-hide_banner"),
+            OsStr::new("-v"),
+            OsStr::new("error"),
+            OsStr::new("-y"),
+            OsStr::new("-i"),
+            input_path.as_os_str(),
+            OsStr::new("-map"),
+            OsStr::new(&map),
+            OsStr::new("-vn"),
+            OsStr::new("-an"),
+            OsStr::new("-dn"),
+            OsStr::new("-c:s"),
+            OsStr::new("copy"),
+            OsStr::new("-f"),
+            OsStr::new("sup"),
+            output_path.as_os_str(),
+        ]),
+        cancellation,
+        "ffmpeg PGS subtitle extraction",
+    )?;
+    if !output.status.success() {
+        return Err(child_process_error(
+            "ffmpeg",
+            &output,
+            "failed to extract embedded PGS subtitle",
+        ));
+    }
+    if !output_path.is_file() {
+        return Err(AdapterError::ChildProcess {
+            program: "ffmpeg",
+            status: output.status.code(),
+            message: "ffmpeg did not create the extracted PGS subtitle".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn extract_vobsub_subtitle(
+    ffmpeg: &Path,
+    input_path: &Path,
+    stream_index: usize,
+    output_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
+    let map = format!("0:{stream_index}");
+    let output = ProcessSupervisor::run(
+        Command::new(ffmpeg).args([
+            OsStr::new("-nostdin"),
+            OsStr::new("-hide_banner"),
+            OsStr::new("-v"),
+            OsStr::new("error"),
+            OsStr::new("-y"),
+            OsStr::new("-copyts"),
+            OsStr::new("-i"),
+            input_path.as_os_str(),
+            OsStr::new("-map"),
+            OsStr::new(&map),
+            OsStr::new("-vn"),
+            OsStr::new("-an"),
+            OsStr::new("-dn"),
+            OsStr::new("-c:s"),
+            OsStr::new("copy"),
+            OsStr::new("-f"),
+            OsStr::new("matroska"),
+            output_path.as_os_str(),
+        ]),
+        cancellation,
+        "ffmpeg VobSub subtitle extraction",
+    )?;
+    if !output.status.success() {
+        return Err(child_process_error(
+            "ffmpeg",
+            &output,
+            "failed to extract embedded VobSub subtitle",
+        ));
+    }
+    if !output_path.is_file() {
+        return Err(AdapterError::ChildProcess {
+            program: "ffmpeg",
+            status: output.status.code(),
+            message: "ffmpeg did not create the extracted VobSub subtitle".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn extract_dvb_subtitle(
+    ffprobe: &Path,
+    input_path: &Path,
+    stream_index: usize,
+    output_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<()> {
+    const MAX_PACKET_PROBE_BYTES: usize = 256 * 1024 * 1024;
+
+    let selector = stream_index.to_string();
+    let output = ProcessSupervisor::run(
+        Command::new(ffprobe).args([
+            OsStr::new("-v"),
+            OsStr::new("error"),
+            OsStr::new("-select_streams"),
+            OsStr::new(&selector),
+            OsStr::new("-show_packets"),
+            OsStr::new("-show_entries"),
+            OsStr::new("stream=index,time_base:packet=pts,data"),
+            OsStr::new("-show_data"),
+            OsStr::new("-of"),
+            OsStr::new("json"),
+            input_path.as_os_str(),
+        ]),
+        cancellation,
+        "ffprobe DVB subtitle packets",
+    )?;
+    if !output.status.success() {
+        return Err(child_process_error(
+            "ffprobe",
+            &output,
+            "failed to extract embedded DVB subtitle packets",
+        ));
+    }
+    if output.stdout.len() > MAX_PACKET_PROBE_BYTES {
+        return Err(AdapterError::invalid_input(
+            "DVB subtitle packet metadata exceeds the 256 MiB safety limit",
+        ));
+    }
+    let response: PacketProbeResponse =
+        serde_json::from_slice(&output.stdout).map_err(|source| AdapterError::Serialization {
+            context: "parse ffprobe DVB subtitle packet response",
+            source,
+        })?;
+    let time_base = response
+        .streams
+        .iter()
+        .find(|stream| stream.index == stream_index)
+        .map(|stream| stream.time_base.as_str())
+        .ok_or_else(|| AdapterError::invalid_input("ffprobe omitted the DVB stream time base"))?;
+    let (time_base_numerator, time_base_denominator) = parse_time_base(time_base)?;
+    let mut pes = Vec::new();
+    for packet in response.packets {
+        cancellation.check().map_err(AdapterError::from)?;
+        let pts = packet
+            .pts
+            .ok_or_else(|| AdapterError::invalid_input("DVB subtitle packet has no PTS"))?;
+        let payload = decode_ffprobe_hex_data(
+            packet
+                .data
+                .as_deref()
+                .ok_or_else(|| AdapterError::invalid_input("DVB subtitle packet has no data"))?,
+        )?;
+        let pts_90khz = rescale_pts_to_90khz(pts, time_base_numerator, time_base_denominator)?;
+        append_private_stream_pes(&mut pes, pts_90khz, &payload)?;
+    }
+    if pes.is_empty() {
+        return Err(AdapterError::invalid_input(
+            "DVB subtitle stream contains no packets",
+        ));
+    }
+    fs::write(output_path, pes).map_err(|source| {
+        AdapterError::external_io(
+            "write extracted DVB subtitle",
+            Some(output_path.to_path_buf()),
+            source,
+        )
+    })?;
+    Ok(())
+}
+
+fn parse_time_base(value: &str) -> AdapterResult<(u64, u64)> {
+    let (numerator, denominator) = value.split_once('/').ok_or_else(|| {
+        AdapterError::invalid_input(format!("invalid DVB stream time base `{value}`"))
+    })?;
+    let numerator = numerator.parse::<u64>().map_err(|source| {
+        AdapterError::invalid_input(format!(
+            "invalid DVB time-base numerator `{numerator}`: {source}"
+        ))
+    })?;
+    let denominator = denominator.parse::<u64>().map_err(|source| {
+        AdapterError::invalid_input(format!(
+            "invalid DVB time-base denominator `{denominator}`: {source}"
+        ))
+    })?;
+    if numerator == 0 || denominator == 0 {
+        return Err(AdapterError::invalid_input(
+            "DVB stream time base must be positive",
+        ));
+    }
+    Ok((numerator, denominator))
+}
+
+fn rescale_pts_to_90khz(pts: i64, numerator: u64, denominator: u64) -> AdapterResult<u64> {
+    const MAX_MPEG_PTS: u64 = (1_u64 << 33) - 1;
+
+    let pts = u64::try_from(pts)
+        .map_err(|_| AdapterError::invalid_input("DVB subtitle packet has a negative PTS"))?;
+    let scaled = u128::from(pts)
+        .checked_mul(u128::from(numerator))
+        .and_then(|value| value.checked_mul(90_000))
+        .ok_or_else(|| AdapterError::invalid_input("DVB subtitle PTS rescaling overflowed"))?
+        / u128::from(denominator);
+    let scaled = u64::try_from(scaled)
+        .map_err(|_| AdapterError::invalid_input("DVB subtitle PTS is too large"))?;
+    if scaled > MAX_MPEG_PTS {
+        return Err(AdapterError::invalid_input(
+            "DVB subtitle PTS exceeds the MPEG 33-bit timestamp range",
+        ));
+    }
+    Ok(scaled)
+}
+
+fn decode_ffprobe_hex_data(value: &str) -> AdapterResult<Vec<u8>> {
+    let mut output = Vec::new();
+    for line in value.lines() {
+        let Some((_, encoded_and_ascii)) = line.split_once(':') else {
+            continue;
+        };
+        let encoded = encoded_and_ascii.split("  ").next().unwrap_or_default();
+        let digits = encoded
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        if digits.is_empty() {
+            continue;
+        }
+        if digits.len() % 2 != 0 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AdapterError::invalid_input(
+                "ffprobe returned malformed DVB subtitle packet hex data",
+            ));
+        }
+        for pair in digits.as_bytes().chunks_exact(2) {
+            let pair = std::str::from_utf8(pair).map_err(|source| {
+                AdapterError::invalid_input(format!("invalid ffprobe packet encoding: {source}"))
+            })?;
+            output.push(u8::from_str_radix(pair, 16).map_err(|source| {
+                AdapterError::invalid_input(format!(
+                    "invalid ffprobe packet byte `{pair}`: {source}"
+                ))
+            })?);
+        }
+    }
+    if output.is_empty() {
+        return Err(AdapterError::invalid_input(
+            "ffprobe returned an empty DVB subtitle packet",
+        ));
+    }
+    Ok(output)
+}
+
+fn append_private_stream_pes(
+    output: &mut Vec<u8>,
+    pts_90khz: u64,
+    payload: &[u8],
+) -> AdapterResult<()> {
+    let packet_length = payload
+        .len()
+        .checked_add(8)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| AdapterError::invalid_input("DVB subtitle packet is too large for PES"))?;
+    output.extend_from_slice(&[0x00, 0x00, 0x01, 0xbd]);
+    output.extend_from_slice(&packet_length.to_be_bytes());
+    output.extend_from_slice(&[0x80, 0x80, 0x05]);
+    output.extend_from_slice(&encode_mpeg_pts(pts_90khz));
+    output.extend_from_slice(payload);
+    Ok(())
+}
+
+fn encode_mpeg_pts(pts: u64) -> [u8; 5] {
+    [
+        0x21 | u8::try_from((pts >> 29) & 0x0e).unwrap_or(0),
+        u8::try_from((pts >> 22) & 0xff).unwrap_or(0),
+        0x01 | u8::try_from((pts >> 14) & 0xfe).unwrap_or(0),
+        u8::try_from((pts >> 7) & 0xff).unwrap_or(0),
+        0x01 | u8::try_from((pts << 1) & 0xfe).unwrap_or(0),
+    ]
 }
 
 fn sanitize_ass_derived_srt_file(path: &Path) -> AdapterResult<()> {
@@ -1297,6 +1830,70 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_only_container_selects_pgs_ocr_source() {
+        let streams = vec![
+            stream(2, "hdmv_pgs_subtitle", Some("spa"), true, false),
+            stream(3, "hdmv_pgs_subtitle", Some("eng"), false, false),
+        ];
+
+        let selected =
+            select_embedded_source(&streams, "English", None).expect("select English PGS");
+
+        assert!(matches!(
+            selected,
+            EmbeddedSubtitleSource::Bitmap(stream, BitmapSubtitleKind::Pgs)
+                if stream.index == 3
+        ));
+    }
+
+    #[test]
+    fn text_stream_still_wins_over_pgs_when_both_are_available() {
+        let streams = vec![
+            stream(2, "hdmv_pgs_subtitle", Some("eng"), true, false),
+            stream(3, "subrip", Some("eng"), false, false),
+        ];
+
+        let selected = select_embedded_source(&streams, "Auto", None).expect("select source");
+
+        assert!(matches!(selected, EmbeddedSubtitleSource::Text(stream) if stream.index == 3));
+    }
+
+    #[test]
+    fn explicit_pgs_stream_index_overrides_available_text_stream() {
+        let streams = vec![
+            stream(2, "hdmv_pgs_subtitle", Some("eng"), false, false),
+            stream(3, "subrip", Some("eng"), true, false),
+        ];
+
+        let selected =
+            select_embedded_source(&streams, "Auto", Some(2)).expect("select explicit PGS source");
+
+        assert!(matches!(
+            selected,
+            EmbeddedSubtitleSource::Bitmap(stream, BitmapSubtitleKind::Pgs)
+                if stream.index == 2
+        ));
+    }
+
+    #[test]
+    fn vobsub_and_dvb_streams_are_supported_bitmap_sources() {
+        for (codec, expected_kind) in [
+            ("dvd_subtitle", BitmapSubtitleKind::VobSub),
+            ("dvb_subtitle", BitmapSubtitleKind::Dvb),
+        ] {
+            let streams = vec![stream(2, codec, Some("eng"), true, false)];
+            let selected =
+                select_embedded_source(&streams, "English", None).expect("select bitmap source");
+
+            assert!(matches!(
+                selected,
+                EmbeddedSubtitleSource::Bitmap(stream, kind)
+                    if stream.index == 2 && kind == expected_kind
+            ));
+        }
+    }
+
+    #[test]
     fn default_output_is_in_place_unless_source_container_is_preserved() {
         let in_place = default_embedded_translation_output_path(
             Path::new("movie.mkv"),
@@ -1490,5 +2087,142 @@ mod tests {
         assert!(subtitle_codec_matches("subrip", "srt"));
         assert!(subtitle_codec_matches("ass", "ass"));
         assert!(!subtitle_codec_matches("subrip", "ass"));
+    }
+
+    #[test]
+    fn ffprobe_packet_hex_and_large_dvb_pts_are_preserved() {
+        let encoded = "\n00000000: 0f10 0001 0002 0f20 0f80 0001 0000       ....... ......\n";
+        let payload = decode_ffprobe_hex_data(encoded).expect("decode packet");
+        assert_eq!(
+            payload,
+            [
+                0x0f, 0x10, 0x00, 0x01, 0x00, 0x02, 0x0f, 0x20, 0x0f, 0x80, 0x00, 0x01, 0x00, 0x00
+            ]
+        );
+
+        let pts = rescale_pts_to_90khz(7_171_190_692, 1, 90_000).expect("rescale PTS");
+        assert_eq!(pts, 7_171_190_692);
+        let mut pes = Vec::new();
+        append_private_stream_pes(&mut pes, pts, &payload).expect("encode PES");
+        let (units, consumed) = libbitsub_core::dvb::parse_timed_stream(&pes);
+        assert_eq!(consumed, pes.len());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].pts_ms, 79_679_896);
+        assert_eq!(units[0].payload, payload);
+    }
+
+    #[test]
+    fn malformed_dvb_packet_metadata_is_rejected() {
+        assert!(decode_ffprobe_hex_data("00000000: 0f1").is_err());
+        assert!(parse_time_base("1/0").is_err());
+        assert!(rescale_pts_to_90khz(-1, 1, 90_000).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires SUBBAKE_PGS_SMOKE_INPUT, FFmpeg, and Tesseract"]
+    fn real_pgs_ocr_smoke() {
+        let input = std::env::var_os("SUBBAKE_PGS_SMOKE_INPUT")
+            .map(PathBuf::from)
+            .expect("set SUBBAKE_PGS_SMOKE_INPUT to a PGS-only media container");
+        let cancellation = CancellationGuard::never();
+        let streams = probe_subtitle_streams(Path::new(FFPROBE), &input, &cancellation)
+            .expect("probe subtitle streams");
+        let source = select_bitmap_stream(&streams, "Auto").expect("select PGS stream");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let sup = temporary.path().join("source.sup");
+        let srt = temporary.path().join("source.srt");
+        extract_pgs_subtitle(Path::new(FFMPEG), &input, source.index, &sup, &cancellation)
+            .expect("extract PGS stream");
+
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+        let outcome = crate::bitmap_ocr::convert_sup_to_srt(
+            &sup,
+            &srt,
+            "Auto",
+            source.language.as_deref(),
+            Path::new(TESSERACT),
+            &cancellation,
+            &progress,
+        )
+        .expect("OCR PGS stream");
+
+        assert!(outcome.cue_count > 0);
+        assert!(srt.is_file());
+    }
+
+    #[test]
+    #[ignore = "requires SUBBAKE_VOBSUB_SMOKE_INPUT, FFmpeg, and Tesseract"]
+    fn real_vobsub_ocr_smoke() {
+        let input = std::env::var_os("SUBBAKE_VOBSUB_SMOKE_INPUT")
+            .map(PathBuf::from)
+            .expect("set SUBBAKE_VOBSUB_SMOKE_INPUT to a VobSub media container");
+        let cancellation = CancellationGuard::never();
+        let streams = probe_subtitle_streams(Path::new(FFPROBE), &input, &cancellation)
+            .expect("probe subtitle streams");
+        let source = streams
+            .iter()
+            .find(|stream| bitmap_subtitle_kind(&stream.codec) == Some(BitmapSubtitleKind::VobSub))
+            .expect("find VobSub stream");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mks = temporary.path().join("source.mks");
+        let srt = temporary.path().join("source.srt");
+        extract_vobsub_subtitle(Path::new(FFMPEG), &input, source.index, &mks, &cancellation)
+            .expect("extract VobSub stream");
+
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+        let outcome = crate::bitmap_ocr::convert_vobsub_mks_to_srt(
+            &mks,
+            &srt,
+            "English",
+            source.language.as_deref(),
+            Path::new(TESSERACT),
+            &cancellation,
+            &progress,
+        )
+        .expect("OCR VobSub stream");
+
+        assert!(outcome.cue_count > 0);
+        assert!(srt.is_file());
+    }
+
+    #[test]
+    #[ignore = "requires SUBBAKE_DVB_SMOKE_INPUT, FFprobe, and Tesseract"]
+    fn real_dvb_ocr_smoke() {
+        let input = std::env::var_os("SUBBAKE_DVB_SMOKE_INPUT")
+            .map(PathBuf::from)
+            .expect("set SUBBAKE_DVB_SMOKE_INPUT to a DVB subtitle media container");
+        let cancellation = CancellationGuard::never();
+        let streams = probe_subtitle_streams(Path::new(FFPROBE), &input, &cancellation)
+            .expect("probe subtitle streams");
+        let source = streams
+            .iter()
+            .find(|stream| bitmap_subtitle_kind(&stream.codec) == Some(BitmapSubtitleKind::Dvb))
+            .expect("find DVB stream");
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let pes = temporary.path().join("source.dvb.pes");
+        let srt = temporary.path().join("source.srt");
+        extract_dvb_subtitle(
+            Path::new(FFPROBE),
+            &input,
+            source.index,
+            &pes,
+            &cancellation,
+        )
+        .expect("extract DVB stream");
+
+        let progress: SharedProgress = std::sync::Arc::new(NoopProgress);
+        let outcome = crate::bitmap_ocr::convert_dvb_pes_to_srt(
+            &pes,
+            &srt,
+            "English",
+            source.language.as_deref(),
+            Path::new(TESSERACT),
+            &cancellation,
+            &progress,
+        )
+        .expect("OCR DVB stream");
+
+        assert!(outcome.cue_count > 0);
+        assert!(srt.is_file());
     }
 }

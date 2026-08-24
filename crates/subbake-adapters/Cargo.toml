@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 command-group = "5.0.1"
+libbitsub-core = "1.12.1"
+png = "0.18.0"
 subbake-core = { path = "../subbake-core" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls"] }
 serde = { version = "1", features = ["derive"] }

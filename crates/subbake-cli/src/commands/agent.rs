@@ -5,9 +5,9 @@ use subbake_adapters::{
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
-    AgentActionKind, AgentEngine, AgentError, AgentResult, AgentRuntimePolicy, CommandDecision,
-    ConfigApplyAfter, ConfigChange, EchoDecisionBackend, PlanDecision, StartupInfo, SubBakeTui,
-    TuiAction, TuiInteraction, is_known_slash_command,
+    AgentActionKind, AgentEngine, AgentError, AgentResult, AgentRuntimePolicy, ApprovalKind,
+    CommandDecision, ConfigApplyAfter, ConfigChange, EchoDecisionBackend, PlanDecision,
+    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
 };
 
 use crate::CliResult;
@@ -78,7 +78,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
         tui.set_session_replay(session_events);
     }
     tui.set_plan_mode(initial_plan_mode);
-    tui.set_command_approval_pending(engine.has_pending_command_approval());
+    tui.set_pending_approval(engine.pending_approval_prompt());
     if open_session_picker {
         tui.open_session_picker(engine.session_choices(20)?)?;
     }
@@ -160,13 +160,28 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                     engine.handle_slash_command(input)?
                 }
                 TuiAction::SubmitText(input) => engine.run_line(input, &mut *backend)?,
-                TuiAction::ApprovePlan => engine.handle_plan_decision(PlanDecision::Approve)?,
-                TuiAction::RejectPlan => engine.handle_plan_decision(PlanDecision::Reject)?,
-                TuiAction::ApproveCommand => {
-                    engine.handle_command_decision(CommandDecision::Approve, &mut *backend)?
-                }
-                TuiAction::RejectCommand => {
-                    engine.handle_command_decision(CommandDecision::Reject, &mut *backend)?
+                TuiAction::ApproveApproval => match engine
+                    .pending_approval_prompt()
+                    .ok_or_else(|| AgentError::invalid_state("no approval awaiting a decision"))?
+                    .kind
+                {
+                    ApprovalKind::Plan => engine.handle_plan_decision(PlanDecision::Approve)?,
+                    ApprovalKind::Command | ApprovalKind::SourceSubstitution => {
+                        engine.handle_command_decision(CommandDecision::Approve, &mut *backend)?
+                    }
+                },
+                TuiAction::RejectApproval => match engine
+                    .pending_approval_prompt()
+                    .ok_or_else(|| AgentError::invalid_state("no approval awaiting a decision"))?
+                    .kind
+                {
+                    ApprovalKind::Plan => engine.handle_plan_decision(PlanDecision::Reject)?,
+                    ApprovalKind::Command | ApprovalKind::SourceSubstitution => {
+                        engine.handle_command_decision(CommandDecision::Reject, &mut *backend)?
+                    }
+                },
+                TuiAction::ReviseApproval(instruction) => {
+                    engine.revise_pending_approval(instruction, &mut *backend)?
                 }
                 TuiAction::SelectProfile(name) => engine.select_profile(name)?,
                 TuiAction::CreateProfile(name) => engine.create_profile(name)?,
@@ -290,7 +305,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 events: engine.session_events(),
                 plan_mode: engine.is_plan_mode(),
                 model,
-                command_approval: engine.has_pending_command_approval(),
+                approval: engine.pending_approval_prompt(),
             })
         } else if changed_plan_mode {
             Ok(TuiInteraction::PlanModeChanged {
@@ -312,10 +327,8 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 message: result,
                 options,
             })
-        } else if engine.has_pending_plan() {
-            Ok(TuiInteraction::PlanApproval { message: result })
-        } else if engine.has_pending_command_approval() {
-            Ok(TuiInteraction::CommandApproval { message: result })
+        } else if let Some(prompt) = engine.pending_approval_prompt() {
+            Ok(TuiInteraction::Approval { prompt })
         } else if let Some(options) = profile_options {
             Ok(TuiInteraction::ProfilePicker {
                 message: result,

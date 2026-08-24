@@ -705,6 +705,11 @@ pub(crate) fn execute_translation_tool_with_services(
                     translation_memory_hits: translated.result.translation_memory_hits,
                     fresh_runtime,
                     runtime_dir: translated.runtime_dir,
+                    source_ocr_cues: translated.source_ocr.as_ref().map_or(0, |ocr| ocr.cues),
+                    source_ocr_low_confidence_cues: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.low_confidence_cues),
                 }),
                 file_operations,
                 group_file_operations: false,
@@ -810,6 +815,8 @@ pub(crate) fn execute_translation_tool_with_services(
                     translation_memory_hits: translated.translation_memory_hits,
                     fresh_runtime,
                     runtime_dir: translated.runtime_dir,
+                    source_ocr_cues: 0,
+                    source_ocr_low_confidence_cues: 0,
                 }),
                 file_operations,
                 group_file_operations: true,
@@ -1281,6 +1288,7 @@ mod tests {
                 container_change: None,
                 runtime_dir: None,
                 quality: None,
+                source_ocr: None,
             })
         }
 

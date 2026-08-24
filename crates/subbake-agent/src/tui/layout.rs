@@ -8,6 +8,7 @@ pub(super) enum ActiveSurface {
     Picker,
     ProfileCreation,
     ConfigEditor,
+    Approval,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,11 +122,16 @@ impl ComposerLayout {
 
 impl OverlayLayout {
     fn calculate(area: Rect, surface: ActiveSurface) -> Self {
-        let inner = inset(area, 1, 1);
+        let inner = if matches!(surface, ActiveSurface::Approval) {
+            inset(area, 1, 0)
+        } else {
+            inset(area, 1, 1)
+        };
         let (header_height, footer_height) = match surface {
             ActiveSurface::Picker => (3, 1),
             ActiveSurface::ConfigEditor => (2, 2),
             ActiveSurface::ProfileCreation => (3, 1),
+            ActiveSurface::Approval => (1, 1),
             ActiveSurface::Composer => (0, 0),
         };
         let header_height = header_height.min(inner.height);

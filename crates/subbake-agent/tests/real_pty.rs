@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use subbake_agent::{
-    AgentError, AgentResult, CancellationGuard, CancellationToken, ConfigEditorSnapshot,
-    ConfigFieldId, ConfigFieldView, EngineObserver, ProfileChoice, StartupInfo, SubBakeTui,
-    TuiAction, TuiInteraction, TuiObserver,
+    AgentError, AgentResult, ApprovalKind, ApprovalPrompt, CancellationGuard, CancellationToken,
+    ConfigEditorSnapshot, ConfigFieldId, ConfigFieldView, EngineObserver, ProfileChoice,
+    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,
 };
 
 const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
@@ -138,22 +138,37 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY to narrow composer");
-    wait_for_output_growth_and_quiet(
+    wait_for_output_after(
         &transcript,
         resize_checkpoint,
-        Duration::from_millis(100),
+        "────────────────────────────────────────".as_bytes(),
         STEP_TIMEOUT,
     );
-    assert!(
-        !transcript
-            .bytes
-            .lock()
-            .expect("lock PTY transcript")
+    {
+        let resize_bytes = transcript.bytes.lock().expect("lock PTY transcript");
+        let resize_output = resize_bytes
             .get(resize_checkpoint..)
-            .is_some_and(|tail| contains_subslice(tail, b"\x1b[2J")),
-        "inline width shrink must not clear committed terminal history"
-    );
+            .expect("resize output starts at checkpoint");
+        assert!(
+            contains_subslice(resize_output, b"\x1b[3J"),
+            "resize reflow must purge terminal-native scrollback before replay"
+        );
+        let screen_clear = resize_output
+            .windows(b"\x1b[2J".len())
+            .position(|window| window == b"\x1b[2J")
+            .expect("resize clears the visible screen");
+        let cursor_query = resize_output
+            .windows(DSR_QUERY.len())
+            .position(|window| window == DSR_QUERY)
+            .expect("replacement inline terminal queries the cursor");
+        assert!(
+            screen_clear < cursor_query,
+            "screen and scrollback must be cleared before transcript replay"
+        );
+    }
     send_text(&writer, "after ");
+    thread::sleep(Duration::from_millis(200));
+    let wide_resize_checkpoint = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -166,6 +181,80 @@ exit "$status"
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:after resize", &transcript);
     wait_for_output(&transcript, b"resize accepted", STEP_TIMEOUT);
+    wait_for_output_growth_and_quiet(
+        &transcript,
+        wide_resize_checkpoint,
+        Duration::from_millis(100),
+        STEP_TIMEOUT,
+    );
+    let height_resize_checkpoint = transcript_len(&transcript);
+    pair.master
+        .resize(PtySize {
+            rows: 20,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("resize PTY height");
+    wait_for_output_after(
+        &transcript,
+        height_resize_checkpoint,
+        b"\x1b[3J",
+        STEP_TIMEOUT,
+    );
+    wait_for_output_growth_and_quiet(
+        &transcript,
+        height_resize_checkpoint,
+        Duration::from_millis(100),
+        STEP_TIMEOUT,
+    );
+    let stateful_checkpoint = transcript_len(&transcript);
+    let resize_bytes = transcript_bytes(&transcript);
+    let mut terminal_state = vt100::Parser::new(30, 100, 200);
+    terminal_state.process(&resize_bytes[..resize_checkpoint]);
+    terminal_state.screen_mut().set_size(30, 40);
+    terminal_state.process(&resize_bytes[resize_checkpoint..wide_resize_checkpoint]);
+    terminal_state.screen_mut().set_size(30, 120);
+    terminal_state.process(&resize_bytes[wide_resize_checkpoint..height_resize_checkpoint]);
+    terminal_state.screen_mut().set_size(20, 120);
+    terminal_state.process(&resize_bytes[height_resize_checkpoint..stateful_checkpoint]);
+    let visible = terminal_state.screen().contents();
+    assert_eq!(
+        visible
+            .lines()
+            .filter(|line| line.trim_start().starts_with("> "))
+            .count(),
+        1,
+        "stateful terminal contains a duplicated composer after resize:\n{visible}"
+    );
+    assert!(
+        visible.contains("resize accepted"),
+        "history was not replayed: {visible}"
+    );
+    terminal_state.screen_mut().set_scrollback(usize::MAX);
+    let scrollback_rows = terminal_state.screen().scrollback();
+    for offset in (0..=scrollback_rows).step_by(20) {
+        terminal_state.screen_mut().set_scrollback(offset);
+        let page = terminal_state.screen().contents();
+        assert!(
+            page.lines()
+                .filter(|line| line.trim_start().starts_with("> "))
+                .count()
+                <= 1,
+            "stateful scrollback page contains duplicate composers at offset {offset}:\n{page}"
+        );
+    }
+    terminal_state.screen_mut().set_scrollback(0);
+    let restored_checkpoint = transcript_len(&transcript);
+    pair.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("restore PTY height");
+    wait_for_output_after(&transcript, restored_checkpoint, b"\x1b[3J", STEP_TIMEOUT);
 
     send(&writer, shift_tab_key);
     wait_for_action(&action_log, "TogglePlan", &transcript);
@@ -231,18 +320,18 @@ exit "$status"
     send_text(&writer, "make a plan");
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:make a plan", &transcript);
-    wait_for_output(&transcript, b"pending PTY plan", STEP_TIMEOUT);
+    wait_for_output(&transcript, b"Run this plan?", STEP_TIMEOUT);
     send(&writer, b"\x1b[B");
     send(&writer, enter_key);
-    wait_for_action(&action_log, "RejectPlan", &transcript);
+    wait_for_action(&action_log, "RejectApproval", &transcript);
     wait_for_output(&transcript, b"plan rejected", STEP_TIMEOUT);
 
     send_text(&writer, "run command");
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:run command", &transcript);
-    wait_for_output(&transcript, b"pending PTY command", STEP_TIMEOUT);
+    wait_for_output(&transcript, b"Run this operation?", STEP_TIMEOUT);
     send(&writer, enter_key);
-    wait_for_action(&action_log, "ApproveCommand", &transcript);
+    wait_for_action(&action_log, "ApproveApproval", &transcript);
     wait_for_output(&transcript, b"command continued", STEP_TIMEOUT);
 
     send_text(&writer, "cancel me");
@@ -420,21 +509,32 @@ fn scripted_interaction(
             model: "pty-model".to_owned(),
             cache_enabled: true,
         }),
-        TuiAction::SubmitText(input) if input == "make a plan" => {
-            Ok(TuiInteraction::PlanApproval {
-                message: "pending PTY plan".to_owned(),
-            })
-        }
-        TuiAction::RejectPlan => Ok(TuiInteraction::Message {
+        TuiAction::SubmitText(input) if input == "make a plan" => Ok(TuiInteraction::Approval {
+            prompt: ApprovalPrompt {
+                kind: ApprovalKind::Plan,
+                title: "Run this plan?".to_owned(),
+                purpose: "Exercise plan approval".to_owned(),
+                reason: "The plan changes a test file".to_owned(),
+                operation: vec!["Update sample.srt".to_owned()],
+            },
+        }),
+        TuiAction::RejectApproval => Ok(TuiInteraction::Message {
             message: "plan rejected".to_owned(),
         }),
-        TuiAction::SubmitText(input) if input == "run command" => {
-            Ok(TuiInteraction::CommandApproval {
-                message: "pending PTY command".to_owned(),
-            })
-        }
-        TuiAction::ApproveCommand => Ok(TuiInteraction::Message {
+        TuiAction::SubmitText(input) if input == "run command" => Ok(TuiInteraction::Approval {
+            prompt: ApprovalPrompt {
+                kind: ApprovalKind::Command,
+                title: "Run this operation?".to_owned(),
+                purpose: "Exercise command approval".to_owned(),
+                reason: "The command is outside the auto-run set".to_owned(),
+                operation: vec!["printf pty".to_owned()],
+            },
+        }),
+        TuiAction::ApproveApproval => Ok(TuiInteraction::Message {
             message: "command continued".to_owned(),
+        }),
+        TuiAction::ReviseApproval(input) => Ok(TuiInteraction::Message {
+            message: format!("approval revised: {input}"),
         }),
         TuiAction::SubmitText(input) if input == "cancel me" => {
             while !guard.is_cancelled() {
@@ -506,10 +606,9 @@ fn config_snapshot(profile: &str) -> ConfigEditorSnapshot {
 fn action_label(action: &TuiAction) -> String {
     match action {
         TuiAction::SubmitText(input) => format!("SubmitText:{input}"),
-        TuiAction::ApprovePlan => "ApprovePlan".to_owned(),
-        TuiAction::RejectPlan => "RejectPlan".to_owned(),
-        TuiAction::ApproveCommand => "ApproveCommand".to_owned(),
-        TuiAction::RejectCommand => "RejectCommand".to_owned(),
+        TuiAction::ApproveApproval => "ApproveApproval".to_owned(),
+        TuiAction::RejectApproval => "RejectApproval".to_owned(),
+        TuiAction::ReviseApproval(input) => format!("ReviseApproval:{input}"),
         TuiAction::SelectProfile(name) => format!("SelectProfile:{name}"),
         TuiAction::CreateProfile(name) => format!("CreateProfile:{name}"),
         TuiAction::SelectConfigProfile(name) => format!("SelectConfigProfile:{name}"),

@@ -22,6 +22,7 @@ pub enum MsgStyle {
     ToolCancelled,
     Observation,
     Response,
+    Commentary,
     Error,
     System,
 }
@@ -106,6 +107,12 @@ impl TuiObserver {
 impl EngineObserver for TuiObserver {
     fn on_thinking(&mut self, text: &str) {
         let _ = text;
+    }
+
+    fn on_commentary(&mut self, text: &str) {
+        if let Ok(mut view) = self.view.lock() {
+            view.push(MsgStyle::Commentary, format!("➔ {text}"));
+        }
     }
 
     fn on_tool_call(&mut self, call_id: &str, name: &str, arguments: &serde_json::Value) {

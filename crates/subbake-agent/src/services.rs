@@ -287,6 +287,29 @@ impl AgentServices for TestAgentServices {
         cancellation: &CancellationGuard,
         progress: Option<SharedProgress>,
     ) -> AdapterResult<TranslationOutcome> {
+        if request
+            .input_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pgs-ocr-fails"))
+            && subbake_adapters::is_supported_subtitle_container_path(&request.input_path)
+        {
+            return Err(subbake_adapters::AdapterError::BitmapSubtitleOcr {
+                streams: vec!["hdmv_pgs_subtitle (English PGS)".to_owned()],
+                message: "Tesseract language `eng` is not installed".to_owned(),
+            });
+        }
+        if request
+            .input_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pgs-only"))
+            && subbake_adapters::is_supported_subtitle_container_path(&request.input_path)
+        {
+            return Err(subbake_adapters::AdapterError::NoTranslatableTextSubtitle {
+                streams: vec!["hdmv_pgs_subtitle (English PGS)".to_owned()],
+            });
+        }
         DefaultAgentServices.translate(request, cancellation, progress)
     }
 

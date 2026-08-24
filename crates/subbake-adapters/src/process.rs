@@ -1,4 +1,6 @@
+use std::ffi::OsStr;
 use std::io::{self, BufRead, BufReader, Read};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -104,9 +106,10 @@ impl ProcessSupervisor {
     ) -> AdapterResult<Output> {
         cancellation.check().map_err(AdapterError::from)?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let program = command.get_program().to_os_string();
         let mut child = command
             .group_spawn()
-            .map_err(|source| io::Error::other(format!("{context}: {source}")))?;
+            .map_err(|source| spawn_error(&program, context, source))?;
         let stdout = child
             .inner()
             .stdout
@@ -190,6 +193,33 @@ impl ProcessSupervisor {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn spawn_error(program: &OsStr, context: &str, source: io::Error) -> AdapterError {
+    if source.kind() == io::ErrorKind::NotFound
+        && let Some(hint) = ffmpeg_install_hint(program)
+    {
+        return AdapterError::invalid_input(hint);
+    }
+    AdapterError::from(io::Error::new(
+        source.kind(),
+        format!("{context}: {source}"),
+    ))
+}
+
+fn ffmpeg_install_hint(program: &OsStr) -> Option<String> {
+    let executable = Path::new(program)
+        .file_stem()?
+        .to_str()?
+        .to_ascii_lowercase();
+    let missing = match executable.as_str() {
+        "ffmpeg" => "FFmpeg",
+        "ffprobe" => "ffprobe",
+        _ => return None,
+    };
+    Some(format!(
+        "Required media dependency `{missing}` is missing or not on PATH. Install the FFmpeg package, then verify that both `ffmpeg -version` and `ffprobe -version` work."
+    ))
 }
 
 fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
@@ -315,6 +345,46 @@ mod tests {
         assert!(output.status.success());
         assert!(output.stdout.len() >= 128 * 1024);
         assert!(output.stderr.len() >= 128 * 1024);
+    }
+
+    #[test]
+    fn missing_program_preserves_not_found_category() {
+        let error = ProcessSupervisor::run(
+            &mut Command::new("subbake-test-program-that-does-not-exist"),
+            &CancellationGuard::never(),
+            "test missing program",
+        )
+        .expect_err("missing program should fail");
+
+        assert!(error.is_not_found());
+    }
+
+    #[test]
+    fn missing_ffmpeg_names_dependency_without_hard_coding_a_package_manager() {
+        let missing = std::env::temp_dir()
+            .join("subbake-missing-ffmpeg-test")
+            .join("ffmpeg");
+        let error = ProcessSupervisor::run(
+            &mut Command::new(missing),
+            &CancellationGuard::never(),
+            "test missing FFmpeg",
+        )
+        .expect_err("missing FFmpeg should fail");
+        let message = error.to_string();
+
+        assert!(message.contains("Required media dependency `FFmpeg` is missing"));
+        assert!(message.contains("Install the FFmpeg package"));
+        assert!(message.contains("ffprobe -version"));
+        assert!(!message.contains("sudo "));
+        assert!(!message.contains("brew "));
+    }
+
+    #[test]
+    fn ffprobe_uses_the_same_ffmpeg_package_hint() {
+        let hint = ffmpeg_install_hint(OsStr::new("/missing/ffprobe.exe")).expect("FFmpeg hint");
+
+        assert!(hint.starts_with("Required media dependency `ffprobe` is missing"));
+        assert!(hint.contains("Install the FFmpeg package"));
     }
 
     #[test]

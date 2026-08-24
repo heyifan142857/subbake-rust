@@ -45,10 +45,18 @@ pub struct TranslationToolOutcome {
     pub fresh_runtime: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_cues: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_low_confidence_cues: usize,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

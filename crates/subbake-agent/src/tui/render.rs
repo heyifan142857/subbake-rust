@@ -15,6 +15,7 @@ pub(super) enum OverlaySnapshot {
     Profiles(Vec<ProfileChoice>),
     ProfileCreation,
     Config(ConfigEditorState),
+    Approval(crate::engine::ApprovalPrompt, bool),
 }
 
 pub(super) struct ViewSnapshot {
@@ -46,6 +47,17 @@ impl ViewSnapshot {
             InputMode::CreatingProfile | InputMode::CreatingConfigProfile => {
                 Some(OverlaySnapshot::ProfileCreation)
             }
+            InputMode::AwaitingApproval | InputMode::RevisingApproval => {
+                app.approval_prompt.clone().map(|prompt| {
+                    OverlaySnapshot::Approval(
+                        prompt,
+                        matches!(
+                            app.interaction_state.input_mode(),
+                            InputMode::RevisingApproval
+                        ),
+                    )
+                })
+            }
             _ => app.config_editor.clone().map(OverlaySnapshot::Config),
         };
         let selected_count = match &overlay {
@@ -64,11 +76,21 @@ impl ViewSnapshot {
 
         Self {
             input: app.input.clone(),
-            input_hint: app.input_hint,
+            input_hint: if matches!(
+                app.interaction_state.input_mode(),
+                InputMode::RevisingApproval
+            ) {
+                "Tell the agent what to do instead"
+            } else {
+                app.input_hint
+            },
             suggestions,
             selected_suggestion: app.suggestion_index.min(selected_count.saturating_sub(1)),
             processing,
-            editing: matches!(app.interaction_state.input_mode(), InputMode::Editing),
+            editing: matches!(
+                app.interaction_state.input_mode(),
+                InputMode::Editing | InputMode::RevisingApproval
+            ),
             progress: app.progress.lock().ok().and_then(|value| value.clone()),
             active_tool: app
                 .active_tool
@@ -94,6 +116,7 @@ impl ViewSnapshot {
             }
             Some(OverlaySnapshot::ProfileCreation) => ActiveSurface::ProfileCreation,
             Some(OverlaySnapshot::Config(_)) => ActiveSurface::ConfigEditor,
+            Some(OverlaySnapshot::Approval(_, _)) => ActiveSurface::Approval,
             None => ActiveSurface::Composer,
         }
     }
@@ -290,6 +313,61 @@ mod tests {
             config.overlay = Some(OverlaySnapshot::Config(editor));
             let (_, buffer, cursor) = render_snapshot(width, 12, &config);
             assert_eq!(buffer.area.width, width);
+            assert!(cursor.x < width && cursor.y < 12);
+        }
+    }
+
+    #[test]
+    fn approval_panel_renders_typed_content_at_supported_widths() {
+        use super::OverlaySnapshot;
+        use crate::engine::{ApprovalKind, ApprovalPrompt};
+
+        let operation = "ffmpeg -i movie.mkv -map 0 -map 1 -c copy -metadata:s:s:0 language=zho output-with-a-long-name.mkv";
+        for width in [40, 80, 120] {
+            let mut snapshot = composer_snapshot("");
+            snapshot.suggestions = crate::tui_state::APPROVAL_OPTIONS
+                .iter()
+                .map(|(label, description)| (label.to_string(), description.to_string()))
+                .collect();
+            snapshot.overlay = Some(OverlaySnapshot::Approval(
+                ApprovalPrompt {
+                    kind: ApprovalKind::Command,
+                    title: "Run this operation?".to_owned(),
+                    purpose: "Embed the translated bilingual subtitle".to_owned(),
+                    reason: "The command writes the requested MKV output".to_owned(),
+                    operation: vec![operation.to_owned()],
+                },
+                false,
+            ));
+            let (_, buffer, cursor) = render_snapshot(width, 12, &snapshot);
+            let rendered = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Run this operation?"));
+            assert!(rendered.contains("Purpose:"));
+            assert!(rendered.contains("Reason:"));
+            assert!(rendered.contains("ffmpeg"));
+            assert!(rendered.contains("Approve once"));
+            assert!(cursor.x < width && cursor.y < 12);
+
+            let mut revising = snapshot;
+            revising
+                .input
+                .set_text("Use the matching SRT instead".to_owned());
+            let Some(OverlaySnapshot::Approval(_, mode)) = revising.overlay.as_mut() else {
+                panic!("approval snapshot");
+            };
+            *mode = true;
+            let (_, buffer, cursor) = render_snapshot(width, 12, &revising);
+            let rendered = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Feedback"));
+            assert!(rendered.contains("matching SRT"));
             assert!(cursor.x < width && cursor.y < 12);
         }
     }

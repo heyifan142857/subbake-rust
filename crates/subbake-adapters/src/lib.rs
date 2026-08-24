@@ -1,3 +1,4 @@
+mod bitmap_ocr;
 pub mod command;
 pub mod config;
 pub mod config_edit;
@@ -88,9 +89,9 @@ pub use transcription::{
 };
 pub use translation::{
     BatchTranslationFailure, BatchTranslationOutcome, BatchTranslationRequest,
-    ContainerTranslationChange, RuntimeReusePolicy, TranslationOutcome, TranslationRequest,
-    batch_translation_output_path, default_translation_output_path, translate_input,
-    translate_input_cancellable, translate_input_cancellable_with_progress,
+    BitmapSubtitleOcrSummary, ContainerTranslationChange, RuntimeReusePolicy, TranslationOutcome,
+    TranslationRequest, batch_translation_output_path, default_translation_output_path,
+    translate_input, translate_input_cancellable, translate_input_cancellable_with_progress,
     translate_input_cancellable_with_progress_and_quality, translate_subtitle,
     translate_subtitle_batch, translate_subtitle_batch_cancellable,
     translate_subtitle_batch_with_progress, translate_subtitle_batch_with_progress_and_quality,

@@ -24,8 +24,126 @@ pub(super) fn render(frame: &mut ratatui::Frame<'_>, layout: OverlayLayout, view
         Some(OverlaySnapshot::Config(editor)) => {
             render_config_editor(frame, layout, editor, view);
         }
+        Some(OverlaySnapshot::Approval(prompt, revising)) => {
+            render_approval(frame, layout, prompt, *revising, view);
+        }
         None => {}
     }
+}
+
+fn render_approval(
+    frame: &mut ratatui::Frame<'_>,
+    layout: OverlayLayout,
+    prompt: &crate::engine::ApprovalPrompt,
+    revising: bool,
+    view: &ViewSnapshot,
+) {
+    render_outer(frame, layout.outer, Some(" Approval "));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            prompt.title.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        layout.header,
+    );
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Purpose: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(prompt.purpose.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Reason: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(prompt.reason.clone()),
+        ]),
+    ];
+    for operation in &prompt.operation {
+        lines.push(Line::from(Span::styled(
+            format!("  {operation}"),
+            Style::default().fg(Color::White),
+        )));
+    }
+    if !revising {
+        for (index, (label, _)) in crate::tui_state::APPROVAL_OPTIONS.iter().enumerate() {
+            let style = selection_style(index == view.selected_suggestion);
+            lines.push(Line::from(Span::styled(
+                format!("  {label}"),
+                style.add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    let details_area = if revising {
+        Rect::new(
+            layout.body.x,
+            layout.body.y,
+            layout.body.width,
+            layout.body.height.saturating_sub(2),
+        )
+    } else {
+        layout.body
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        details_area,
+    );
+    if revising && layout.body.height >= 2 {
+        let feedback_area = Rect::new(
+            layout.body.x,
+            layout.body.bottom().saturating_sub(2),
+            layout.body.width,
+            2,
+        );
+        let available = usize::from(feedback_area.width.saturating_sub(2));
+        let (input, style) = if view.input.is_empty() {
+            (
+                truncate_with_ellipsis("Tell the agent what to do instead…", available),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            (
+                tail_by_width(view.input.text(), available),
+                Style::default().fg(Color::White),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Feedback",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(format!("> {input}"), style)),
+            ]),
+            feedback_area,
+        );
+        let cursor_x = feedback_area
+            .x
+            .saturating_add(2)
+            .saturating_add(u16::try_from(display_width(&input)).unwrap_or(u16::MAX))
+            .min(feedback_area.right().saturating_sub(1));
+        frame.set_cursor_position((cursor_x, feedback_area.y.saturating_add(1)));
+    }
+    frame.render_widget(
+        Paragraph::new(if revising {
+            "Enter send feedback · Esc reject"
+        } else {
+            "↑/↓ select · Enter confirm · Esc reject"
+        })
+        .style(Style::default().fg(Color::DarkGray)),
+        layout.footer,
+    );
 }
 
 fn render_sessions(

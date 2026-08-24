@@ -13,7 +13,9 @@ use subbake_core::ports::{ModelToolResult, ToolContinuation};
 use subbake_core::{AgentToolOutcome, CancellationGuard, CancellationToken, SharedProgress};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, ToolCallDraft};
+use crate::event::{
+    EventKind, PendingAgentTurn, PendingApprovalKind, PendingCommandApproval, ToolCallDraft,
+};
 use crate::guard::FileGuard;
 use crate::outcome_render::render_tool_outcome;
 use crate::plan_coordinator::PlanCoordinator;
@@ -38,6 +40,9 @@ use crate::{ConfigChange, ConfigEditorSnapshot};
 pub trait EngineObserver: Send {
     /// The LLM is "thinking" (producing reasoning text).
     fn on_thinking(&mut self, _text: &str) {}
+
+    /// The agent explains the current phase before starting tools.
+    fn on_commentary(&mut self, _text: &str) {}
 
     /// A tool is about to be called.
     fn on_tool_call(&mut self, _call_id: &str, _name: &str, _arguments: &serde_json::Value) {}
@@ -96,6 +101,22 @@ pub enum PlanDecision {
 pub enum CommandDecision {
     Approve,
     Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    Plan,
+    Command,
+    SourceSubstitution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPrompt {
+    pub kind: ApprovalKind,
+    pub title: String,
+    pub purpose: String,
+    pub reason: String,
+    pub operation: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +226,10 @@ impl StreamingObserver {
 impl EngineObserver for StreamingObserver {
     fn on_thinking(&mut self, text: &str) {
         println!("  ⎿  {}…", text.lines().next().unwrap_or(text));
+    }
+
+    fn on_commentary(&mut self, text: &str) {
+        println!("➔ {text}");
     }
 
     fn on_tool_call(&mut self, call_id: &str, name: &str, arguments: &serde_json::Value) {
@@ -483,6 +508,28 @@ impl AgentEngine {
         reason: String,
         turn: PendingAgentTurn,
     ) -> AgentResult<()> {
+        self.store_tool_approval(
+            tool_call,
+            call_id,
+            remaining_tool_calls,
+            reason,
+            PendingApprovalKind::Command,
+            String::new(),
+            turn,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn store_tool_approval(
+        &mut self,
+        tool_call: ToolCallDraft,
+        call_id: String,
+        remaining_tool_calls: Vec<crate::event::PendingToolCall>,
+        reason: String,
+        kind: PendingApprovalKind,
+        purpose: String,
+        turn: PendingAgentTurn,
+    ) -> AgentResult<()> {
         let session = self
             .session
             .as_mut()
@@ -497,6 +544,8 @@ impl AgentEngine {
             call_id,
             remaining_tool_calls,
             reason: reason.clone(),
+            kind,
+            purpose,
             created_at: crate::session::iso_now(),
         });
         session.pending_agent_turn = Some(turn);
@@ -526,6 +575,51 @@ impl AgentEngine {
             "{label} ({})\n{}",
             pending.reason, pending.tool_call.arguments
         )
+    }
+
+    pub fn pending_approval_prompt(&self) -> Option<ApprovalPrompt> {
+        let session = self.session.as_ref()?;
+        if let Some(plan) = session.pending_plan.as_ref() {
+            return Some(ApprovalPrompt {
+                kind: ApprovalKind::Plan,
+                title: "Run this plan?".to_owned(),
+                purpose: nonempty_approval_text(&plan.message, "Carry out the requested changes"),
+                reason: "The plan contains operations that can modify files.".to_owned(),
+                operation: plan
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, call)| {
+                        format!(
+                            "{}. {}",
+                            index + 1,
+                            approval_operation(&call.tool_name, &call.arguments)
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        let pending = session.pending_command_approval.as_ref()?;
+        let (kind, title) = match pending.kind {
+            PendingApprovalKind::Command => (ApprovalKind::Command, "Run this operation?"),
+            PendingApprovalKind::SourceSubstitution => (
+                ApprovalKind::SourceSubstitution,
+                "Use audio transcription instead?",
+            ),
+        };
+        Some(ApprovalPrompt {
+            kind,
+            title: title.to_owned(),
+            purpose: nonempty_approval_text(
+                &pending.purpose,
+                "Run the operation needed for the current task",
+            ),
+            reason: pending.reason.clone(),
+            operation: vec![approval_operation(
+                &pending.tool_call.tool_name,
+                &pending.tool_call.arguments,
+            )],
+        })
     }
 
     pub fn approve_plan(&mut self) -> AgentResult<String> {
@@ -830,6 +924,31 @@ impl AgentEngine {
     }
 }
 
+fn nonempty_approval_text(value: &str, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        value.trim().to_owned()
+    }
+}
+
+fn approval_operation(tool_name: &str, arguments: &serde_json::Value) -> String {
+    if tool_name == "run_command"
+        && let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str)
+    {
+        return command.to_owned();
+    }
+    if tool_name == "delete_external_path"
+        && let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str)
+    {
+        return format!("Delete {path}");
+    }
+    let activity = crate::tool_presentation::running_activity(tool_name, arguments);
+    activity.detail.map_or(activity.headline.clone(), |detail| {
+        format!("{} — {detail}", activity.headline)
+    })
+}
+
 #[cfg(test)]
 mod error_persistence_tests {
     use super::{AgentEngine, CommandDecision, is_known_slash_command};
@@ -870,6 +989,8 @@ mod error_persistence_tests {
             call_id: String::new(),
             remaining_tool_calls: Vec::new(),
             reason: "unknown command".to_owned(),
+            kind: crate::event::PendingApprovalKind::Command,
+            purpose: String::new(),
             created_at: crate::session::iso_now(),
         });
         assert!(engine.has_pending_command_approval());

@@ -58,6 +58,13 @@ pub enum AdapterError {
     Cancelled,
     #[error("{message}")]
     InvalidInput { message: String },
+    #[error("container contains no translatable text subtitle stream{streams_suffix}", streams_suffix = if streams.is_empty() { String::new() } else { format!("; found only: {}", streams.join(", ")) })]
+    NoTranslatableTextSubtitle { streams: Vec<String> },
+    #[error("bitmap subtitle OCR failed: {message}")]
+    BitmapSubtitleOcr {
+        streams: Vec<String>,
+        message: String,
+    },
     #[error(transparent)]
     Configuration(#[from] ConfigError),
     #[error("failed to load config `{path}`: {source}")]
@@ -150,6 +157,20 @@ impl AdapterError {
             self,
             Self::ExternalIo { source, .. } if source.kind() == io::ErrorKind::NotFound
         )
+    }
+
+    pub fn no_translatable_text_subtitle_streams(&self) -> Option<&[String]> {
+        match self {
+            Self::NoTranslatableTextSubtitle { streams } => Some(streams),
+            _ => None,
+        }
+    }
+
+    pub fn bitmap_subtitle_ocr_streams(&self) -> Option<&[String]> {
+        match self {
+            Self::BitmapSubtitleOcr { streams, .. } => Some(streams),
+            _ => None,
+        }
     }
 
     pub fn from_http(service: &'static str, error: reqwest::Error) -> Self {

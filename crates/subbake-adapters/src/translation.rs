@@ -57,6 +57,14 @@ pub struct TranslationOutcome {
     /// isolation was requested. Configured runtimes are intentionally omitted.
     pub runtime_dir: Option<PathBuf>,
     pub quality: Option<QualityReport>,
+    pub source_ocr: Option<BitmapSubtitleOcrSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitmapSubtitleOcrSummary {
+    pub codec: String,
+    pub cues: usize,
+    pub low_confidence_cues: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +417,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
             container_change: None,
             runtime_dir,
             quality: None,
+            source_ocr: None,
         });
     }
 
@@ -450,6 +459,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         container_change: None,
         runtime_dir,
         quality: Some(quality),
+        source_ocr: None,
     })
 }
 

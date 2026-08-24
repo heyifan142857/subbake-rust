@@ -928,6 +928,7 @@ fn finalize_streaming_pipeline_with_quality(
         container_change: None,
         runtime_dir: None,
         quality: Some(quality),
+        source_ocr: None,
     }))
 }
 

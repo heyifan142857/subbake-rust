@@ -134,6 +134,7 @@ pub(super) fn parse_json_decision(value: &JsonValue) -> AgentResult<Decision> {
         })?;
     let text = object
         .get("text")
+        .or_else(|| object.get("commentary"))
         .and_then(JsonValue::as_str)
         .unwrap_or_default()
         .to_owned();
@@ -204,6 +205,8 @@ mod tests {
                 translation_memory_hits: 0,
                 fresh_runtime: false,
                 runtime_dir: None,
+                source_ocr_cues: 0,
+                source_ocr_low_confidence_cues: 0,
             }),
         );
         let json = feedback.json();

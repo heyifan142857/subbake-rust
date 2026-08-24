@@ -24,6 +24,7 @@ thiserror = "2"
 portable-pty = "0.9"
 proptest = "1"
 tempfile.workspace = true
+vt100 = "0.16.2"
 
 [lints]
 workspace = true
