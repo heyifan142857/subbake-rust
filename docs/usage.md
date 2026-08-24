@@ -292,6 +292,13 @@ sbake translate episode.srt --review targeted
 sbake translate episode.srt --review full
 ```
 
+Existing output files are preserved by default. Replace one explicitly with
+`--overwrite`:
+
+```bash
+sbake translate episode.srt --overwrite
+```
+
 When a profile specifies a reviewer backend, that backend performs review.
 Otherwise the translator backend is reused.
 
@@ -388,6 +395,9 @@ sbake transcribe interview.mp4 \
   --format srt \
   --output interview.srt
 ```
+
+Transcription also preserves an existing output unless `--overwrite` is
+passed explicitly.
 
 Disable VAD for a comparison run with `--no-vad`, or tune it with
 `--vad-threshold`, `--vad-min-speech-duration-ms`,

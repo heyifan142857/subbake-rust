@@ -450,7 +450,7 @@ fn resolved_settings(
 }
 
 fn display_config_path(path: &Path) -> String {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = subbake_adapters::PlatformPaths::home_dir();
     home.as_deref()
         .and_then(|home| path.strip_prefix(home).ok())
         .map(|relative| format!("~/{}", relative.display()))

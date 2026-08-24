@@ -1,16 +1,15 @@
 //! Sandboxed execution for the interactive coding agent.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use subbake_core::CancellationGuard;
 
 use crate::error::{AdapterError, AdapterResult};
-use crate::process::terminate_child;
+use crate::platform::{CapabilitySet, PlatformPaths};
+use crate::process::ProcessSupervisor;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
@@ -40,7 +39,7 @@ pub fn run_sandboxed_command(
     cancellation: &CancellationGuard,
 ) -> AdapterResult<SandboxedCommandOutput> {
     cancellation.check().map_err(AdapterError::from)?;
-    if !cfg!(target_os = "linux") {
+    if !CapabilitySet::current().supports_command_sandbox() {
         return Err(AdapterError::invalid_input(
             "run_command currently requires Linux",
         ));
@@ -107,63 +106,34 @@ pub fn run_sandboxed_command(
     }
     command.args(["--", "/bin/bash", "-c", &request.command]);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::null());
     let started = Instant::now();
-    let mut child = command.spawn().map_err(|source| AdapterError::ExternalIo {
-        operation: "start sandboxed command",
-        path: None,
-        source,
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        AdapterError::invalid_input("sandboxed command stdout pipe was unavailable")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        AdapterError::invalid_input("sandboxed command stderr pipe was unavailable")
-    })?;
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
-
-    let status = loop {
-        if cancellation.is_cancelled() || started.elapsed() >= request.timeout {
-            terminate_child(&mut child);
-            drop(stdout_reader);
-            drop(stderr_reader);
-            return if cancellation.is_cancelled() {
-                Err(AdapterError::Cancelled)
-            } else {
-                Err(AdapterError::Timeout {
-                    message: format!(
-                        "command exceeded its {} second timeout",
-                        request.timeout.as_secs()
-                    ),
-                })
-            };
+    let output = match ProcessSupervisor::run_with_timeout(
+        &mut command,
+        cancellation,
+        "sandboxed command",
+        request.timeout,
+    ) {
+        Err(AdapterError::Timeout { .. }) => {
+            return Err(AdapterError::Timeout {
+                message: format!(
+                    "command exceeded its {} second timeout",
+                    request.timeout.as_secs()
+                ),
+            });
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(25));
+        outcome => outcome?,
     };
-    let stdout = join_reader(stdout_reader, "stdout")?;
-    let stderr = join_reader(stderr_reader, "stderr")?;
-    if !status.success() && stderr.starts_with(b"bwrap:") {
+    if !output.status.success() && output.stderr.starts_with(b"bwrap:") {
         return Err(AdapterError::invalid_input(format!(
             "bubblewrap could not start the command sandbox: {}",
-            String::from_utf8_lossy(&stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let (stdout, stdout_truncated) = truncate_output(&stdout);
-    let (stderr, stderr_truncated) = truncate_output(&stderr);
+    let (stdout, stdout_truncated) = truncate_output(&output.stdout);
+    let (stderr, stderr_truncated) = truncate_output(&output.stderr);
     Ok(SandboxedCommandOutput {
-        exit_code: status.code().unwrap_or(-1),
+        exit_code: output.status.code().unwrap_or(-1),
         stdout,
         stderr,
         stdout_truncated,
@@ -193,7 +163,7 @@ fn safe_path() -> String {
 }
 
 fn configure_home_visibility(command: &mut Command, project_root: &Path) -> Vec<(String, String)> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = PlatformPaths::home_dir() else {
         return Vec::new();
     };
     if !home.is_absolute() || home == Path::new("/") {
@@ -264,22 +234,6 @@ fn path_has_program(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|directory| directory.join(program).is_file())
     })
-}
-
-fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn join_reader(
-    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    stream: &'static str,
-) -> AdapterResult<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| AdapterError::invalid_input(format!("{stream} reader panicked")))?
-        .map_err(AdapterError::from)
 }
 
 fn truncate_output(bytes: &[u8]) -> (String, bool) {

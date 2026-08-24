@@ -195,7 +195,9 @@ where
                 pipeline.memory.update("", &result.glossary_updates);
                 pipeline.commit_terminology_updates(&result.terminology_updates);
             }
-            pipeline.translation_memory_hits = stage.memory_hits();
+            pipeline
+                .accounting
+                .set_translation_memory_hits(stage.memory_hits());
             if let Some(store) = pipeline.store.as_ref() {
                 pipeline.cancellation.check()?;
                 store.save_glossary(

@@ -1,15 +1,22 @@
 use std::path::PathBuf;
 
+mod transcription;
+mod translation;
+
+#[cfg(test)]
+use subbake_adapters::TranscriptionFormat;
 use subbake_adapters::{
     ApiFormat, BackendConfig, ConfigurationResolver, MemoryAction, ResolveRequest, RuntimeAction,
-    SettingsOverrides, TranscriptionFormat, TranscriptionSettings, TranslationSettings,
-    WhisperAction, WhisperBuildVariant, apply_whisper_configuration,
-    default_whisper_binary_path_for, default_whisper_models_dir_for,
+    SettingsOverrides, TranscriptionSettings, TranslationSettings, WhisperAction,
+    WhisperBuildVariant, apply_whisper_configuration, default_whisper_binary_path_for,
+    default_whisper_models_dir_for,
 };
 #[cfg(feature = "agent")]
 use subbake_agent::{AgentAction, AgentActionKind};
 
 use crate::{CliError, CliResult};
+use transcription::{TranscriptionOptionGroup, TranscriptionOptionSurface};
+use translation::TranslationOptionGroup;
 
 #[cfg(feature = "agent")]
 #[derive(Debug, Clone)]
@@ -21,11 +28,34 @@ pub struct AgentArgs {
 pub struct TranslateArgs {
     pub input_path: PathBuf,
     pub output: Option<PathBuf>,
+    pub overwrite: bool,
+    pub config_path: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub settings: TranslationSettings,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineArgs {
+    pub input_path: PathBuf,
+    pub output: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub settings: TranslationSettings,
     pub transcription_settings: TranscriptionSettings,
     pub json: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedFileTranslationArgs {
+    input_path: PathBuf,
+    output: Option<PathBuf>,
+    overwrite: bool,
+    config_path: Option<PathBuf>,
+    profile: Option<String>,
+    settings: TranslationSettings,
+    transcription_settings: TranscriptionSettings,
+    json: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +79,7 @@ pub struct BatchArgs {
 pub struct TranscribeArgs {
     pub media_path: PathBuf,
     pub output: Option<PathBuf>,
+    pub overwrite: bool,
     pub settings: TranscriptionSettings,
 }
 
@@ -120,11 +151,50 @@ impl TranslateArgs {
         Self {
             input_path: input_path.into(),
             output: None,
+            overwrite: false,
+            config_path: None,
+            profile: None,
+            settings: TranslationSettings::default(),
+            json: false,
+        }
+    }
+}
+
+impl ParsedFileTranslationArgs {
+    fn default_for(input_path: impl Into<PathBuf>) -> Self {
+        Self {
+            input_path: input_path.into(),
+            output: None,
+            overwrite: false,
             config_path: None,
             profile: None,
             settings: TranslationSettings::default(),
             transcription_settings: TranscriptionSettings::default(),
             json: false,
+        }
+    }
+
+    fn into_translate(self) -> TranslateArgs {
+        TranslateArgs {
+            input_path: self.input_path,
+            output: self.output,
+            overwrite: self.overwrite,
+            config_path: self.config_path,
+            profile: self.profile,
+            settings: self.settings,
+            json: self.json,
+        }
+    }
+
+    fn into_pipeline(self) -> PipelineArgs {
+        PipelineArgs {
+            input_path: self.input_path,
+            output: self.output,
+            config_path: self.config_path,
+            profile: self.profile,
+            settings: self.settings,
+            transcription_settings: self.transcription_settings,
+            json: self.json,
         }
     }
 }
@@ -160,10 +230,12 @@ pub fn parse_resume_args(args: &[String]) -> CliResult<AgentArgs> {
 
 pub fn parse_translate_args(args: &[String]) -> CliResult<TranslateArgs> {
     parse_file_translation_args(args, "translate requires a subtitle path", "translate")
+        .map(ParsedFileTranslationArgs::into_translate)
 }
 
-pub fn parse_pipeline_args(args: &[String]) -> CliResult<TranslateArgs> {
+pub fn parse_pipeline_args(args: &[String]) -> CliResult<PipelineArgs> {
     parse_file_translation_args(args, "pipeline requires an input path", "pipeline")
+        .map(ParsedFileTranslationArgs::into_pipeline)
 }
 
 pub fn parse_overnight_args(args: &[String]) -> CliResult<OvernightArgs> {
@@ -173,18 +245,24 @@ pub fn parse_overnight_args(args: &[String]) -> CliResult<OvernightArgs> {
         .ok_or_else(|| CliError::usage("overnight requires `submit`, `status`, or `collect`"))?;
     match action {
         "submit" => Ok(OvernightArgs {
-            action: OvernightAction::Submit(parse_file_translation_args(
-                &args[1..],
-                "overnight submit requires a subtitle path",
-                "overnight submit",
-            )?),
+            action: OvernightAction::Submit(
+                parse_file_translation_args(
+                    &args[1..],
+                    "overnight submit requires a subtitle path",
+                    "overnight submit",
+                )?
+                .into_translate(),
+            ),
         }),
         "status" => Ok(OvernightArgs {
-            action: OvernightAction::Status(parse_file_translation_args(
-                &args[1..],
-                "overnight status requires a manifest path",
-                "overnight status",
-            )?),
+            action: OvernightAction::Status(
+                parse_file_translation_args(
+                    &args[1..],
+                    "overnight status requires a manifest path",
+                    "overnight status",
+                )?
+                .into_translate(),
+            ),
         }),
         "collect" => {
             let mut filtered = Vec::new();
@@ -202,7 +280,8 @@ pub fn parse_overnight_args(args: &[String]) -> CliResult<OvernightArgs> {
                         &filtered,
                         "overnight collect requires a manifest path",
                         "overnight collect",
-                    )?,
+                    )?
+                    .into_translate(),
                     overwrite,
                 },
             })
@@ -321,22 +400,24 @@ fn parse_file_translation_args(
     args: &[String],
     missing_input_message: &str,
     command_name: &str,
-) -> CliResult<TranslateArgs> {
+) -> CliResult<ParsedFileTranslationArgs> {
     let input_path = args
         .first()
         .ok_or_else(|| CliError::usage(missing_input_message))?;
-    let mut parsed = TranslateArgs::default_for(input_path);
+    let mut parsed = ParsedFileTranslationArgs::default_for(input_path);
 
     // First pass: extract --config and --profile (store their values).
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
 
-    let mut overrides = SettingsOverrides::default();
+    let mut translation_options = TranslationOptionGroup::default();
+    let mut transcription_options = TranscriptionOptionGroup::default();
 
     // Second pass: all remaining CLI flags override.
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
+            "--overwrite" if command_name == "translate" => parsed.overwrite = true,
             "--config" | "--profile" => {
                 // Skip flag + value (already consumed in first pass).
                 skip_two(args, &mut index)?;
@@ -349,14 +430,13 @@ fn parse_file_translation_args(
             }
             value
                 if command_name == "pipeline"
-                    && parse_pipeline_transcription_option(
+                    && transcription_options.parse(
+                        TranscriptionOptionSurface::Pipeline,
                         value,
                         args,
                         &mut index,
-                        &mut parsed.transcription_settings,
                     )? => {}
-            value if parse_translation_setting_option(value, args, &mut index, &mut overrides)? => {
-            }
+            value if translation_options.parse(value, args, &mut index)? => {}
             other => {
                 return Err(CliError::usage(format!(
                     "unknown {command_name} option `{other}`"
@@ -365,10 +445,15 @@ fn parse_file_translation_args(
         }
         index += 1;
     }
-    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    let resolved = resolve_settings(
+        explicit_config,
+        explicit_profile,
+        translation_options.into_overrides(),
+    )?;
     if command_name == "pipeline" {
-        apply_whisper_configuration(&mut parsed.transcription_settings, &resolved.settings);
+        apply_whisper_configuration(transcription_options.settings_mut(), &resolved.settings);
     }
+    parsed.transcription_settings = transcription_options.into_settings();
     parsed.settings = resolved.settings;
     parsed.config_path = resolved.config_path;
     parsed.profile = resolved.profile;
@@ -434,7 +519,7 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
     };
 
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
-    let mut overrides = SettingsOverrides::default();
+    let mut translation_options = TranslationOptionGroup::default();
 
     let mut index = 1usize;
     while index < args.len() {
@@ -453,13 +538,16 @@ pub fn parse_batch_args(args: &[String]) -> CliResult<BatchArgs> {
                     "{value} is only valid with `sbake pipeline`"
                 )));
             }
-            value if parse_translation_setting_option(value, args, &mut index, &mut overrides)? => {
-            }
+            value if translation_options.parse(value, args, &mut index)? => {}
             other => return Err(CliError::usage(format!("unknown batch option `{other}`"))),
         }
         index += 1;
     }
-    let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
+    let resolved = resolve_settings(
+        explicit_config,
+        explicit_profile,
+        translation_options.into_overrides(),
+    )?;
     parsed.translate.settings = resolved.settings;
     parsed.config_path = resolved.config_path;
     parsed.profile = resolved.profile;
@@ -489,15 +577,18 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
     let mut parsed = TranscribeArgs {
         media_path: PathBuf::from(media_path),
         output: None,
+        overwrite: false,
         settings: TranscriptionSettings::default(),
     };
     let (explicit_config, explicit_profile) = extract_config_and_profile(args);
     let mut overrides = SettingsOverrides::default();
+    let mut transcription_options = TranscriptionOptionGroup::default();
 
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
+            "--overwrite" => parsed.overwrite = true,
             "--config" | "--profile" => skip_two(args, &mut index)?,
             "--runtime-dir" => {
                 overrides.storage.runtime_dir =
@@ -511,50 +602,13 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
                 overrides.storage.whisper_models_dir =
                     Some(required_path(args, &mut index, "--whisper-models-dir")?)
             }
-            "--language" => {
-                parsed.settings.language = Some(required_value(args, &mut index, "--language")?)
-            }
-            "--model" => parsed.settings.model = Some(required_value(args, &mut index, "--model")?),
-            "--sidecar" => {
-                parsed.settings.sidecar_path = Some(required_path(args, &mut index, "--sidecar")?)
-            }
-            "--format" => {
-                let value = required_value(args, &mut index, "--format")?;
-                parsed.settings.output_format = TranscriptionFormat::parse(&value)
-                    .ok_or_else(|| CliError::usage("--format must be one of: srt, vtt, txt"))?;
-            }
-            "--filter-hallucinations" => parsed.settings.filter_hallucinations = true,
-            "--no-filter-hallucinations" => parsed.settings.filter_hallucinations = false,
-            "--vad" => parsed.settings.vad_enabled = Some(true),
-            "--no-vad" => parsed.settings.vad_enabled = Some(false),
-            "--vad-model" => {
-                parsed.settings.vad_model = Some(required_value(args, &mut index, "--vad-model")?)
-            }
-            "--vad-threshold" => {
-                parsed.settings.vad_threshold =
-                    Some(parse_unit_f32(args, &mut index, "--vad-threshold")?)
-            }
-            "--vad-min-speech-duration-ms" => {
-                parsed.settings.vad_min_speech_duration_ms = Some(parse_positive_u64(
+            value
+                if transcription_options.parse(
+                    TranscriptionOptionSurface::Direct,
+                    value,
                     args,
                     &mut index,
-                    "--vad-min-speech-duration-ms",
-                )?)
-            }
-            "--vad-min-silence-duration-ms" => {
-                parsed.settings.vad_min_silence_duration_ms = Some(parse_positive_u64(
-                    args,
-                    &mut index,
-                    "--vad-min-silence-duration-ms",
-                )?)
-            }
-            "--vad-speech-pad-ms" => {
-                parsed.settings.vad_speech_pad_ms = Some(parse_nonnegative_u64(
-                    args,
-                    &mut index,
-                    "--vad-speech-pad-ms",
-                )?)
-            }
+                )? => {}
             other => {
                 return Err(CliError::usage(format!(
                     "unknown transcribe option `{other}`"
@@ -565,53 +619,9 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
     }
 
     let resolved = resolve_settings(explicit_config, explicit_profile, overrides)?;
-    apply_whisper_configuration(&mut parsed.settings, &resolved.settings);
+    apply_whisper_configuration(transcription_options.settings_mut(), &resolved.settings);
+    parsed.settings = transcription_options.into_settings();
     Ok(parsed)
-}
-
-fn parse_pipeline_transcription_option(
-    option: &str,
-    args: &[String],
-    index: &mut usize,
-    settings: &mut TranscriptionSettings,
-) -> CliResult<bool> {
-    match option {
-        "--transcribe-language" | "--language" => {
-            settings.language = Some(required_value(args, index, option)?)
-        }
-        "--transcribe-model" | "--transcriber-model" => {
-            settings.model = Some(required_value(args, index, option)?)
-        }
-        "--sidecar" => settings.sidecar_path = Some(required_path(args, index, option)?),
-        "--transcribe-format" => {
-            let value = required_value(args, index, option)?;
-            settings.output_format = TranscriptionFormat::parse(&value).ok_or_else(|| {
-                CliError::usage("--transcribe-format must be one of: srt, vtt, txt")
-            })?;
-        }
-        "--filter-hallucinations" => settings.filter_hallucinations = true,
-        "--no-filter-hallucinations" => settings.filter_hallucinations = false,
-        "--vad" | "--transcribe-vad" => settings.vad_enabled = Some(true),
-        "--no-vad" | "--no-transcribe-vad" => settings.vad_enabled = Some(false),
-        "--vad-model" | "--transcribe-vad-model" => {
-            settings.vad_model = Some(required_value(args, index, option)?)
-        }
-        "--vad-threshold" | "--transcribe-vad-threshold" => {
-            settings.vad_threshold = Some(parse_unit_f32(args, index, option)?)
-        }
-        "--vad-min-speech-duration-ms" => {
-            settings.vad_min_speech_duration_ms = Some(parse_positive_u64(args, index, option)?)
-        }
-        "--vad-min-silence-duration-ms" => {
-            settings.vad_min_silence_duration_ms = Some(parse_positive_u64(args, index, option)?)
-        }
-        "--vad-speech-pad-ms" => {
-            settings.vad_speech_pad_ms = Some(parse_nonnegative_u64(args, index, option)?)
-        }
-        _ => return Ok(false),
-    }
-
-    Ok(true)
 }
 
 pub fn parse_provider_args(args: &[String]) -> CliResult<ProviderArgs> {
@@ -835,150 +845,6 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
     Ok(parsed)
 }
 
-fn parse_translation_setting_option(
-    option: &str,
-    args: &[String],
-    index: &mut usize,
-    overrides: &mut SettingsOverrides,
-) -> CliResult<bool> {
-    match option {
-        "--output-format" => overrides.output.format = Some(required_value(args, index, option)?),
-        "--bilingual-font-scale" => {
-            overrides.output.bilingual_font_scale =
-                Some(parse_bilingual_font_scale(args, index, option)?)
-        }
-        "--provider" => overrides.backend.id = Some(required_value(args, index, option)?),
-        "--model" => overrides.backend.model = Some(required_value(args, index, option)?),
-        "--api-key" => overrides.backend.api_key = Some(required_value(args, index, option)?),
-        "--base-url" => overrides.backend.base_url = Some(required_value(args, index, option)?),
-        "--api-format" => {
-            overrides.backend.api_format = Some(
-                ApiFormat::parse(&required_value(args, index, option)?)
-                    .map_err(|error| CliError::usage(error.to_string()))?,
-            )
-        }
-        "--endpoint-url" => {
-            overrides.backend.endpoint_url = Some(required_value(args, index, option)?)
-        }
-        "--api-key-env" => {
-            overrides.backend.api_key_env = Some(required_value(args, index, option)?)
-        }
-        "--auth-header" => {
-            overrides.backend.auth_header = Some(required_value(args, index, option)?)
-        }
-        "--auth-prefix" => {
-            overrides.backend.auth_prefix = Some(required_value(args, index, option)?)
-        }
-        "--timeout-seconds" => {
-            overrides.backend.timeout_seconds = Some(parse_timeout_seconds(args, index, option)?)
-        }
-        "--source-lang" => {
-            overrides.translation.source_language = Some(required_value(args, index, option)?)
-        }
-        "--target-lang" => {
-            overrides.translation.target_language = Some(required_value(args, index, option)?)
-        }
-        "--subtitle-stream" => {
-            overrides.translation.subtitle_stream_index =
-                Some(parse_nonnegative_usize(args, index, option)?)
-        }
-        "--batch-size" => {
-            overrides.translation.batch_size = Some(parse_batch_size(args, index, option)?)
-        }
-        "--batch-token-budget" => {
-            overrides.translation.batch_token_budget = Some(parse_batch_size(args, index, option)?)
-        }
-        "--request-token-budget" => {
-            overrides.translation.request_token_budget =
-                Some(parse_batch_size(args, index, option)?)
-        }
-        "--confirmed-context-lines" => {
-            overrides.translation.confirmed_context_lines =
-                Some(parse_nonnegative_usize(args, index, option)?)
-        }
-        "--confirmed-context-token-budget" => {
-            overrides.translation.confirmed_context_token_budget =
-                Some(parse_nonnegative_usize(args, index, option)?)
-        }
-        "--translation-concurrency" => {
-            overrides.translation.translation_concurrency =
-                Some(parse_batch_size(args, index, option)?)
-        }
-        "--review-concurrency" => {
-            overrides.translation.review_concurrency = Some(parse_batch_size(args, index, option)?)
-        }
-        "--max-characters-per-second" => {
-            overrides.translation.max_characters_per_second =
-                Some(parse_positive_f64(args, index, option)?)
-        }
-        "--max-characters-per-line" => {
-            overrides.translation.max_characters_per_line =
-                Some(parse_batch_size(args, index, option)?)
-        }
-        "--max-lines" => {
-            overrides.translation.max_lines = Some(parse_batch_size(args, index, option)?)
-        }
-        "--runtime-dir" => {
-            overrides.storage.runtime_dir = Some(required_path(args, index, option)?)
-        }
-        "--whisper-bin" => {
-            overrides.storage.whisper_binary_path = Some(required_path(args, index, option)?)
-        }
-        "--whisper-models-dir" => {
-            overrides.storage.whisper_models_dir = Some(required_path(args, index, option)?)
-        }
-        "--glossary" => overrides.storage.glossary_path = Some(required_path(args, index, option)?),
-        "--bilingual" => overrides.output.bilingual = Some(true),
-        "--online-terminology" => overrides.translation.online_terminology = Some(true),
-        "--no-online-terminology" => overrides.translation.online_terminology = Some(false),
-        "--allow-degraded-preflight" => overrides.translation.allow_degraded_preflight = Some(true),
-        "--strict-preflight" => overrides.translation.allow_degraded_preflight = Some(false),
-        "--preserve-names" => overrides.translation.preserve_names = Some(true),
-        "--transliterate-names" => overrides.translation.preserve_names = Some(false),
-        "--preserve-source-container" => overrides.output.preserve_source_container = Some(true),
-        "--in-place-container" => overrides.output.preserve_source_container = Some(false),
-        "--mode" => {
-            overrides.translation.mode = Some(
-                subbake_core::TranslationMode::parse(&required_value(args, index, option)?)
-                    .map_err(|error| CliError::usage(error.to_string()))?,
-            )
-        }
-        "--fast" => overrides.translation.fast_mode = Some(true),
-        "--no-review" => {
-            overrides.translation.review_policy = Some(subbake_core::ReviewPolicy::Off)
-        }
-        "--review" => {
-            overrides.translation.review_policy = Some(
-                subbake_core::ReviewPolicy::parse(&required_value(args, index, option)?)
-                    .map_err(|error| CliError::usage(error.to_string()))?,
-            )
-        }
-        "--dry-run" => overrides.translation.dry_run = Some(true),
-        "--resume" => overrides.translation.resume = Some(true),
-        "--no-resume" => overrides.translation.resume = Some(false),
-        "--cache" => overrides.translation.use_cache = Some(true),
-        "--no-cache" => overrides.translation.use_cache = Some(false),
-        "--retries" => {
-            overrides.translation.retries = Some(parse_nonnegative_usize(args, index, option)?)
-        }
-        "--agent" => overrides.translation.agent = Some(true),
-        "--no-agent" => overrides.translation.agent = Some(false),
-        "--agent-repair-attempts" => {
-            overrides.translation.agent_repair_attempts =
-                Some(parse_nonnegative_usize(args, index, option)?)
-        }
-        "--max-requests" => {
-            overrides.translation.max_requests = Some(parse_batch_size(args, index, option)?)
-        }
-        "--max-tokens" => {
-            overrides.translation.max_tokens = Some(parse_batch_size(args, index, option)?)
-        }
-        _ => return Ok(false),
-    }
-
-    Ok(true)
-}
-
 pub(crate) fn required_value(args: &[String], index: &mut usize, flag: &str) -> CliResult<String> {
     *index += 1;
     args.get(*index)
@@ -1095,6 +961,17 @@ mod tests {
         ];
         let error = parse_translate_args(&args).expect_err("zero batch size should fail");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn translate_overwrite_requires_an_explicit_flag() {
+        let default =
+            parse_translate_args(&["clip.srt".to_owned()]).expect("parse default overwrite policy");
+        let enabled = parse_translate_args(&["clip.srt".to_owned(), "--overwrite".to_owned()])
+            .expect("parse explicit overwrite policy");
+
+        assert!(!default.overwrite);
+        assert!(enabled.overwrite);
     }
 
     #[test]
@@ -1524,6 +1401,17 @@ mod tests {
             parsed.settings.sidecar_path,
             Some(PathBuf::from("movie.srt"))
         );
+    }
+
+    #[test]
+    fn transcribe_overwrite_requires_an_explicit_flag() {
+        let default = parse_transcribe_args(&["movie.mp4".to_owned()])
+            .expect("parse default overwrite policy");
+        let enabled = parse_transcribe_args(&["movie.mp4".to_owned(), "--overwrite".to_owned()])
+            .expect("parse explicit overwrite policy");
+
+        assert!(!default.overwrite);
+        assert!(enabled.overwrite);
     }
 
     #[test]

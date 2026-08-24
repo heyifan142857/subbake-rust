@@ -14,7 +14,13 @@ use subbake_core::{
 use tokio::runtime::Runtime;
 
 use crate::error::{AdapterError, AdapterResult};
-use crate::process::run_command_cancellable;
+use crate::process::ProcessSupervisor;
+
+mod release;
+
+#[cfg(test)]
+use release::{PlatformAssets, ReleasePlatform};
+use release::{detect_platform, pinned_release_asset};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhisperRequest {
@@ -303,41 +309,6 @@ struct InstallManifest {
     files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReleasePlatform {
-    Linux,
-    Windows,
-}
-
-struct PlatformAssets {
-    release_platform: ReleasePlatform,
-    arch_terms: &'static [&'static str],
-    executable_names: &'static [&'static str],
-}
-
-fn detect_platform() -> Option<PlatformAssets> {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    match (os, arch) {
-        ("linux", "x86_64") => Some(PlatformAssets {
-            release_platform: ReleasePlatform::Linux,
-            arch_terms: &["x64", "x86_64", "amd64"],
-            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
-        }),
-        ("linux", "aarch64") => Some(PlatformAssets {
-            release_platform: ReleasePlatform::Linux,
-            arch_terms: &["arm64", "aarch64"],
-            executable_names: &["whisper-whisper-cli", "whisper-cli", "main"],
-        }),
-        ("windows", "x86_64") => Some(PlatformAssets {
-            release_platform: ReleasePlatform::Windows,
-            arch_terms: &["x64", "x86_64", "amd64"],
-            executable_names: &["whisper-whisper-cli.exe", "whisper-cli.exe", "main.exe"],
-        }),
-        _ => None,
-    }
-}
-
 fn install_binary(
     request: &WhisperRequest,
     cancellation: &CancellationGuard,
@@ -425,51 +396,6 @@ fn install_binary(
         cancellation,
         progress,
     )
-}
-
-struct ReleaseAsset {
-    name: String,
-    url: String,
-    tag: String,
-    sha256: String,
-}
-
-fn pinned_release_asset(
-    platform: &PlatformAssets,
-    variant: WhisperBuildVariant,
-) -> Option<ReleaseAsset> {
-    let is_x64 = platform.arch_terms.contains(&"x64");
-    let (name, sha256) = match (platform.release_platform, is_x64, variant) {
-        (ReleasePlatform::Linux, true, WhisperBuildVariant::Cpu) => (
-            "whisper-bin-ubuntu-x64.tar.gz",
-            "f3bf3b4369a99b54665b0f19b88483b30de27f25963b0414235dea03198515c5",
-        ),
-        (ReleasePlatform::Linux, false, WhisperBuildVariant::Cpu) => (
-            "whisper-bin-ubuntu-arm64.tar.gz",
-            "e0b66cd551ff6f2a28fabe3c6e89691eea037bb76833493abb9a71ca788994b3",
-        ),
-        (ReleasePlatform::Windows, true, WhisperBuildVariant::Cpu) => (
-            "whisper-bin-x64.zip",
-            "7d8be46ecd31828e1eb7a2ecdd0d6b314feafd82163038ab6092594b0a063539",
-        ),
-        (ReleasePlatform::Windows, true, WhisperBuildVariant::OpenBlas) => (
-            "whisper-blas-bin-x64.zip",
-            "3c319eab3e87f85883e1ff3d14426c0a1986c661c5eb5985e8af431ed9c4f71f",
-        ),
-        (ReleasePlatform::Windows, true, WhisperBuildVariant::Cuda) => (
-            "whisper-cublas-12.4.0-bin-x64.zip",
-            "106a2030eff8998e4ef320fe72e263a78449e9040386ee27c41ea80b001b601b",
-        ),
-        _ => return None,
-    };
-    Some(ReleaseAsset {
-        name: name.to_owned(),
-        url: format!(
-            "https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/download/{WHISPER_VERSION_TAG}/{name}"
-        ),
-        tag: WHISPER_VERSION_TAG.to_owned(),
-        sha256: sha256.to_owned(),
-    })
 }
 
 async fn download_file(
@@ -760,7 +686,7 @@ fn extract_tar_gz(
 ) -> AdapterResult<()> {
     std::fs::create_dir_all(target)
         .map_err(|e| io::Error::other(format!("create extract target: {e}")))?;
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new("tar").args([
             "-xzf",
             &archive.to_string_lossy(),
@@ -809,7 +735,7 @@ fn extract_zip_system(
         ]);
         command
     };
-    let output = run_command_cancellable(&mut command, cancellation, "extract whisper.cpp zip")?;
+    let output = ProcessSupervisor::run(&mut command, cancellation, "extract whisper.cpp zip")?;
     if !output.status.success() {
         return Err(AdapterError::ChildProcess {
             program: "archive extractor",
@@ -1073,7 +999,7 @@ fn build_from_source(
     // Extract with tar.
     emit_install_stage(progress, "EXTRACT_SOURCE");
     std::fs::create_dir_all(&src_dir).map_err(|e| io::Error::other(format!("create src: {e}")))?;
-    let status = run_command_cancellable(
+    let status = ProcessSupervisor::run(
         Command::new("tar").args([
             "-xzf",
             &tarball_path.to_string_lossy(),
@@ -1135,7 +1061,7 @@ fn build_from_source(
             configure.args(["-DGGML_BLAS=ON", "-DGGML_BLAS_VENDOR=OpenBLAS"]);
         }
     }
-    let cmake = run_command_cancellable(&mut configure, cancellation, "configure whisper.cpp")?;
+    let cmake = ProcessSupervisor::run(&mut configure, cancellation, "configure whisper.cpp")?;
     if !cmake.status.success() {
         let stderr = String::from_utf8_lossy(&cmake.stderr);
         return Err(AdapterError::ChildProcess {
@@ -1146,7 +1072,7 @@ fn build_from_source(
     }
 
     emit_install_stage(progress, "BUILD");
-    let make = run_command_cancellable(
+    let make = ProcessSupervisor::run(
         Command::new("cmake")
             .args([
                 "--build",
@@ -1164,7 +1090,7 @@ fn build_from_source(
     if !make.status.success() {
         let stderr = String::from_utf8_lossy(&make.stderr);
         // Retry with target "main" (older whisper.cpp releases).
-        let make2 = run_command_cancellable(
+        let make2 = ProcessSupervisor::run(
             Command::new("cmake")
                 .args([
                     "--build",
@@ -1696,7 +1622,7 @@ pub(crate) fn verify_whisper_cli(
     binary_path: &Path,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<String> {
-    let version_output = run_command_cancellable(
+    let version_output = ProcessSupervisor::run(
         Command::new(binary_path).arg("--version"),
         cancellation,
         "inspect whisper.cpp version",
@@ -1709,7 +1635,7 @@ pub(crate) fn verify_whisper_cli(
         });
     }
     let version = process_diagnostics(&version_output, "unknown whisper.cpp version");
-    let help_output = run_command_cancellable(
+    let help_output = ProcessSupervisor::run(
         Command::new(binary_path).arg("--help"),
         cancellation,
         "inspect whisper.cpp capabilities",

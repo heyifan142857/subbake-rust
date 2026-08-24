@@ -19,7 +19,7 @@ use subbake_core::{
 };
 
 use crate::error::{AdapterError, AdapterResult};
-use crate::process::run_command_cancellable;
+use crate::process::ProcessSupervisor;
 use crate::translation::{
     TranslationInputIdentity, TranslationOutcome, TranslationRequest,
     normalize_translation_languages, translate_subtitle_cancellable_with_progress_and_identity,
@@ -600,7 +600,7 @@ fn probe_subtitle_streams(
     input_path: &Path,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<Vec<SubtitleStream>> {
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new(ffprobe).args([
             OsStr::new("-v"),
             OsStr::new("error"),
@@ -785,7 +785,7 @@ fn extract_subtitle(
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
     let map = format!("0:{stream_index}");
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new(ffmpeg).args([
             OsStr::new("-nostdin"),
             OsStr::new("-hide_banner"),
@@ -849,7 +849,7 @@ fn embed_subtitle(
     let mut args = embed_subtitle_args(request, subtitle_ordinal, &title, &replaced_streams);
     let mut command = Command::new(ffmpeg);
     command.args(args.drain(..));
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         &mut command,
         cancellation,
         "ffmpeg translated subtitle embedding",
@@ -942,7 +942,7 @@ fn remux_without_streams(
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
     let args = remux_without_streams_args(input_path, output_path, removed_streams, container_kind);
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new(ffmpeg).args(args),
         cancellation,
         "ffmpeg embedded subtitle undo",

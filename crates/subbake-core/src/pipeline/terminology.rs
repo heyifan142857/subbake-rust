@@ -16,6 +16,8 @@ use crate::ports::{
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::term_matcher::TermMatcher;
 
+use super::accounting::PipelineAccounting;
+
 pub(super) struct TerminologyStage<'a, B, D> {
     pub backend: &'a mut B,
     pub dashboard: &'a mut D,
@@ -25,9 +27,7 @@ pub(super) struct TerminologyStage<'a, B, D> {
     pub store: Option<&'a dyn RuntimeStore>,
     pub cancellation: &'a CancellationGuard,
     pub progress: Option<&'a dyn ProgressSink>,
-    pub cache_hits: &'a mut usize,
-    pub provider_requests: &'a mut usize,
-    pub provider_tokens: &'a mut usize,
+    pub accounting: &'a mut PipelineAccounting,
 }
 
 impl<B, D> TerminologyStage<'_, B, D>
@@ -87,7 +87,7 @@ where
         };
         let result = if let Some(response) = cached {
             stats.cache_hits = 1;
-            *self.cache_hits += 1;
+            self.accounting.record_cache_hit();
             Ok(response)
         } else {
             self.generate(&messages, &candidates, &document.segments)
@@ -164,7 +164,11 @@ where
         let mut last_error = None;
         for _ in 0..=self.options.retries {
             self.cancellation.check()?;
-            reserve_provider_request(self.options, self.provider_requests, *self.provider_tokens)?;
+            self.accounting.reserve_requests(
+                1,
+                self.options.max_requests,
+                self.options.max_tokens,
+            )?;
             let response = self
                 .backend
                 .execute(
@@ -183,9 +187,7 @@ where
                 });
             match response {
                 Ok(value) => {
-                    *self.provider_tokens = self
-                        .provider_tokens
-                        .saturating_add(value.usage.total_tokens);
+                    self.accounting.record_tokens(value.usage.total_tokens);
                     return Ok(value);
                 }
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -802,29 +804,6 @@ fn source_span_in_document(source: &str, segments: &[SubtitleSegment]) -> Option
             .contains(&segment.text, source)
             .then(|| source.to_owned())
     })
-}
-
-fn reserve_provider_request(
-    options: &PipelineOptions,
-    provider_requests: &mut usize,
-    provider_tokens: usize,
-) -> CoreResult<()> {
-    if let Some(limit) = options.max_requests
-        && provider_requests.saturating_add(1) > limit
-    {
-        return Err(CoreError::ResourceBudgetExceeded(format!(
-            "request limit is {limit}; {provider_requests} request(s) already used and 1 more required"
-        )));
-    }
-    if let Some(limit) = options.max_tokens
-        && provider_tokens >= limit
-    {
-        return Err(CoreError::ResourceBudgetExceeded(format!(
-            "token limit is {limit}; {provider_tokens} token(s) already used"
-        )));
-    }
-    *provider_requests = provider_requests.saturating_add(1);
-    Ok(())
 }
 
 fn accept_document_guide(

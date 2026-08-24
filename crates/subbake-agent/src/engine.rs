@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use subbake_core::ports::{ModelToolResult, ToolContinuation};
 use subbake_core::{AgentToolOutcome, CancellationGuard, CancellationToken, SharedProgress};
@@ -14,13 +15,14 @@ use subbake_core::{AgentToolOutcome, CancellationGuard, CancellationToken, Share
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, ToolCallDraft};
 use crate::guard::FileGuard;
+use crate::outcome_render::render_tool_outcome;
 use crate::plan_coordinator::PlanCoordinator;
 use crate::presentation::ConversationPresenter;
 pub use crate::presentation::{ProfileChoice, SessionChoice};
 use crate::profile_coordinator::ProfileCoordinator;
+use crate::services::{AgentServices, DefaultAgentServices};
 use crate::session::{AgentSessionStore, SessionMode};
 use crate::session_controller::SessionController;
-use crate::tool_execution::render_tool_outcome;
 use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
 use crate::undo::UndoService;
 use crate::{ConfigChange, ConfigEditorSnapshot};
@@ -277,6 +279,7 @@ pub struct AgentEngine {
     pub(crate) progress: Option<SharedProgress>,
     pub(crate) pending_native_continuation: Option<PendingNativeContinuation>,
     pub(crate) runtime_policy: AgentRuntimePolicy,
+    pub(crate) services: Arc<dyn AgentServices>,
 }
 
 pub(crate) struct PendingNativeContinuation {
@@ -323,6 +326,13 @@ impl Default for AgentRuntimePolicy {
 
 impl AgentEngine {
     pub fn new(project_root: PathBuf) -> Self {
+        Self::new_with_services(project_root, Arc::new(DefaultAgentServices))
+    }
+
+    pub(crate) fn new_with_services(
+        project_root: PathBuf,
+        services: Arc<dyn AgentServices>,
+    ) -> Self {
         let session_store = AgentSessionStore::new(project_root.clone());
         let guard = FileGuard::new(project_root.clone());
         Self {
@@ -336,6 +346,7 @@ impl AgentEngine {
             progress: None,
             pending_native_continuation: None,
             runtime_policy: AgentRuntimePolicy::default(),
+            services,
         }
     }
 

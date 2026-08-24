@@ -217,6 +217,7 @@ Usage: sbake translate <SUBTITLE> [OPTIONS]
 
 Options:
   -o, --output <PATH>              Output file path
+      --overwrite                  Replace an existing output
       --config <PATH>              Configuration file
       --profile <NAME>             Named provider profile
       --source-lang <LANGUAGE>     Source language
@@ -308,6 +309,7 @@ Usage: sbake transcribe <MEDIA> [OPTIONS]
 
 Options:
   -o, --output <PATH>          Output file path
+      --overwrite              Replace an existing output
       --language <LANGUAGE>    Spoken language
       --model <NAME>           Transcription model
       --format <FORMAT>        Output format: srt, vtt, or txt
@@ -330,7 +332,7 @@ const PIPELINE_HELP: &str = r#"Transcribe media when needed, then translate it
 
 Usage: sbake pipeline <MEDIA_OR_SUBTITLE> [OPTIONS]
 
-Accepts all `translate` options plus:
+Accepts the translation settings from `translate` plus:
       --subtitle-stream <INDEX>       Explicit embedded text subtitle stream index
       --preserve-source-container     Write a separate translated media file
       --in-place-container            Atomically replace the source media (default)

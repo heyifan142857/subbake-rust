@@ -1,9 +1,9 @@
 use crate::CliResult;
-use crate::args::TranslateArgs;
+use crate::args::PipelineArgs;
 use crate::output::print_pipeline_outcome;
 use subbake_adapters::{PipelineRequest, run_pipeline_cancellable_with_progress};
 
-pub fn run(args: TranslateArgs) -> CliResult<()> {
+pub fn run(args: PipelineArgs) -> CliResult<()> {
     let cancellation = crate::cancellation::CliCancellation::new()?;
     let outcome = run_pipeline_cancellable_with_progress(
         PipelineRequest {

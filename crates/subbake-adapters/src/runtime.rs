@@ -5,6 +5,7 @@ use subbake_core::storage::{RuntimePaths, build_runtime_paths};
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::stable_runtime_input_path;
+use crate::platform::PlatformPaths;
 use crate::runtime_store::{RUNTIME_MARKER_CONTENT, RUNTIME_MARKER_NAME};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +164,7 @@ fn validate_managed_runtime_root(root: &Path, stable_target_path: &Path) -> Adap
     let marker = canonical_root.join(RUNTIME_MARKER_NAME);
     let marked = fs::read_to_string(marker).is_ok_and(|content| content == RUNTIME_MARKER_CONTENT);
     let critical = canonical_root.parent().is_none()
-        || canonical_home().as_deref() == Some(canonical_root.as_path())
+        || PlatformPaths::canonical_home_dir().as_deref() == Some(canonical_root.as_path())
         || stable_target_path.starts_with(&canonical_root);
     if (named_default || marked) && !critical {
         return Ok(canonical_root);
@@ -172,12 +173,6 @@ fn validate_managed_runtime_root(root: &Path, stable_target_path: &Path) -> Adap
         "refusing to clean unsafe or unmarked runtime directory `{}`; use a dedicated SubBake-created runtime directory or the default `.subbake` directory",
         root.display()
     )))
-}
-
-fn canonical_home() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .and_then(|home| home.canonicalize().ok())
 }
 
 fn rebase_runtime_path(

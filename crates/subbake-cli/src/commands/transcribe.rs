@@ -9,7 +9,7 @@ pub fn run(args: TranscribeArgs) -> CliResult<()> {
         TranscriptionRequest {
             media_path: args.media_path,
             output_path: args.output,
-            overwrite: true,
+            overwrite: args.overwrite,
             settings: args.settings,
         },
         cancellation.guard(),

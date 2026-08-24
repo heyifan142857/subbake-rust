@@ -8,9 +8,10 @@ use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, FileOpEventData};
 use crate::guard::{FileOpAction, FileOpResult};
 use crate::profile_coordinator::ProfileCoordinator;
+use crate::services::AgentServices;
 use crate::tool_execution::{
-    execute_adapter_tool, execute_command_tool, execute_local_tool, execute_session_tool,
-    execute_translation_tool,
+    execute_adapter_tool_with_services, execute_command_tool_with_services, execute_local_tool,
+    execute_session_tool, execute_translation_tool_with_services,
 };
 use crate::tools::{ToolExecutor, ValidatedToolCall};
 
@@ -22,6 +23,16 @@ impl ToolRunner {
         name: &str,
         args: &JsonValue,
     ) -> AgentResult<AgentToolOutcome> {
+        let services = std::sync::Arc::clone(&engine.services);
+        Self::run_with_services(engine, name, args, services.as_ref())
+    }
+
+    pub(crate) fn run_with_services(
+        engine: &mut AgentEngine,
+        name: &str,
+        args: &JsonValue,
+        services: &dyn AgentServices,
+    ) -> AgentResult<AgentToolOutcome> {
         engine.check_cancelled()?;
         let call =
             ValidatedToolCall::parse(name, args).map_err(|error| AgentError::ToolArguments {
@@ -31,7 +42,12 @@ impl ToolRunner {
         let executor = call.executor();
 
         if executor == ToolExecutor::RunCommand {
-            let outcome = execute_command_tool(args, &engine.guard, &engine.operation_guard)?;
+            let outcome = execute_command_tool_with_services(
+                args,
+                &engine.guard,
+                &engine.operation_guard,
+                services,
+            )?;
             let group_id = (outcome.file_operations.len() > 1)
                 .then(|| format!("run-command-{}", crate::session::iso_now()));
             for operation in &outcome.file_operations {
@@ -88,13 +104,14 @@ impl ToolRunner {
         } else {
             None
         };
-        if let Some(outcome) = execute_adapter_tool(
+        if let Some(outcome) = execute_adapter_tool_with_services(
             executor,
             args,
             &engine.guard,
             &engine.operation_guard,
             engine.progress.clone(),
             adapter_settings.as_ref(),
+            services,
         )? {
             if let Some(operation) = outcome.file_operation {
                 Self::record_file_operation(engine, &operation, None)?;
@@ -109,13 +126,14 @@ impl ToolRunner {
         ) {
             let settings = ProfileCoordinator::new(&engine.project_root, engine.session.as_ref())
                 .active_settings()?;
-            let outcome = execute_translation_tool(
+            let outcome = execute_translation_tool_with_services(
                 executor,
                 args,
                 &engine.guard,
                 &engine.operation_guard,
                 engine.progress.clone(),
                 settings,
+                services,
             )?
             .ok_or_else(|| AgentError::InvalidState {
                 message: "translation tool executor rejected its tool".to_owned(),

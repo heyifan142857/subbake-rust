@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use subbake_adapters::PlatformPaths;
 use thiserror::Error;
 
 pub type FileGuardResult<T> = Result<T, FileGuardError>;
@@ -246,18 +247,13 @@ impl ExternalPathGuard {
                 path: path.to_path_buf(),
             });
         }
-        if path.parent().is_none() || canonical_home().as_deref() == Some(path) {
+        if path.parent().is_none() || PlatformPaths::canonical_home_dir().as_deref() == Some(path) {
             return Err(FileGuardError::CriticalExternalPath {
                 path: path.to_path_buf(),
             });
         }
         Ok(())
     }
-}
-
-fn canonical_home() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.canonicalize().unwrap_or_else(|_| normalize_path(home)))
 }
 
 impl FileGuard {
@@ -303,18 +299,22 @@ impl FileGuard {
 
     pub fn append_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
-        let backup = self.backup(&safe)?;
-        let mut existing = if safe.exists() {
-            std::fs::read_to_string(&safe)?
+        let (mut existing, backup) = if safe.exists() {
+            let backup = self.backup(&safe)?;
+            (std::fs::read_to_string(&safe)?, Some(backup))
         } else {
-            String::new()
+            (String::new(), None)
         };
         existing.push_str(content);
         self.write_atomically(&safe, &existing)?;
         Ok(FileOpResult {
-            action: FileOpAction::Append,
+            action: if backup.is_some() {
+                FileOpAction::Append
+            } else {
+                FileOpAction::Create
+            },
             path: safe,
-            backup_path: Some(backup),
+            backup_path: backup,
             new_path: None,
             semantic_undo: None,
         })
@@ -1128,6 +1128,19 @@ mod tests {
         assert_eq!(result.action, FileOpAction::Append);
         assert!(result.backup_path.is_some());
         assert_eq!(guard.read_file(path).expect("read"), "line1\nline2\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_creates_a_missing_file_without_a_fake_backup() {
+        let (root, guard) = setup();
+        let path = Path::new("new-log.txt");
+
+        let result = guard.append_file(path, "first line\n").expect("append");
+
+        assert_eq!(result.action, FileOpAction::Create);
+        assert!(result.backup_path.is_none());
+        assert_eq!(guard.read_file(path).expect("read"), "first line\n");
         let _ = std::fs::remove_dir_all(&root);
     }
 

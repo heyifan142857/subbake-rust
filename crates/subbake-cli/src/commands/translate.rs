@@ -15,7 +15,7 @@ pub fn translate_file(args: TranslateArgs) -> CliResult<Option<PathBuf>> {
             input_path: args.input_path.clone(),
             output_path: args.output.clone(),
             output_language_tag: None,
-            overwrite: true,
+            overwrite: args.overwrite,
             settings: args.settings.clone(),
         },
         cancellation.guard(),

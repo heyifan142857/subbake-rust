@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AdapterError, AdapterResult, ConfigError};
 use crate::fs::write_file_atomically;
+use crate::platform::PlatformPaths;
 use crate::settings::{BackendOverrides, ResolvedSettings, SettingsOverrides};
 
 pub const CONFIG_VERSION: u64 = 2;
@@ -199,10 +200,8 @@ impl ConfigurationResolver {
 
 pub fn discover_config_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(path).join("subbake/config.toml"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".config/subbake/config.toml"));
+    if let Some(path) = PlatformPaths::config_dir() {
+        candidates.push(path.join("subbake/config.toml"));
     }
     candidates.push(PathBuf::from("subbake.toml"));
     candidates.push(PathBuf::from(".subbake.toml"));

@@ -81,7 +81,7 @@ where
             completed_batches: resume.review_batches_completed,
             reviewed_segments: &resume.reviewed_segments,
             report: restored_report.as_ref(),
-            cache_hits_before: pipeline.cache_hits,
+            cache_hits_before: pipeline.accounting.cache_hits(),
         },
     )?;
     pipeline
@@ -142,7 +142,7 @@ where
                         *review_position,
                         &reviewed_segments,
                     )?;
-                    let (review, changes) = stage.snapshot(pipeline.cache_hits);
+                    let (review, changes) = stage.snapshot(pipeline.accounting.cache_hits());
                     store.save_review_report(&ReviewReport {
                         version: REVIEW_REPORT_VERSION,
                         terminology: terminology.clone(),
@@ -177,7 +177,7 @@ where
     }
 
     let review_batches = stage.len();
-    let outcome = stage.finish(pipeline.cache_hits);
+    let outcome = stage.finish(pipeline.accounting.cache_hits());
     if let Some(store) = pipeline.store.as_ref() {
         store.save_review_report(&ReviewReport {
             version: REVIEW_REPORT_VERSION,

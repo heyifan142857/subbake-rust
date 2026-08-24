@@ -17,18 +17,19 @@ pub use subbake_core::{TranscriberBackend, TranscriptionFormat};
 
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{read_document, render_and_write_document};
-use crate::process::{
-    run_command_cancellable, run_command_cancellable_with_stderr_lines,
-    run_command_cancellable_with_stdout_lines,
-};
+use crate::process::ProcessSupervisor;
 use crate::settings::{
     DEFAULT_VAD_MIN_SILENCE_DURATION_MS, DEFAULT_VAD_MIN_SPEECH_DURATION_MS,
     DEFAULT_VAD_SPEECH_PAD_MS, DEFAULT_VAD_THRESHOLD, ResolvedSettings, StorageSettings,
 };
 use crate::whisper::{
     DEFAULT_WHISPER_VAD_MODEL, default_whisper_binary_path_for, default_whisper_models_dir_for,
-    installed_models_in, vad_model_path, verify_whisper_cli,
+    vad_model_path, verify_whisper_cli,
 };
+
+mod model_resolution;
+
+use model_resolution::{ResolvedWhisperModel, locate_whisper_binary, resolve_whisper_model};
 
 const LONG_AUDIO_THRESHOLD_MS: u64 = 12 * 60 * 1_000;
 const TRANSCRIPTION_CHUNK_MS: u64 = 10 * 60 * 1_000;
@@ -285,7 +286,7 @@ impl TranscriberBackend for WhisperCppTranscriber {
         cmd.args(["--print-progress", "--no-prints"]);
 
         let mut last_progress = 0_u64;
-        let out = run_command_cancellable_with_stderr_lines(
+        let out = ProcessSupervisor::run_with_stderr_lines(
             &mut cmd,
             cancellation,
             "whisper.cpp execution",
@@ -1140,7 +1141,7 @@ fn extract_audio_chunk(
 ) -> AdapterResult<()> {
     let start = format_seconds(chunk.input_start_ms);
     let duration = format_seconds(chunk.input_end_ms - chunk.input_start_ms);
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new("ffmpeg").args([
             "-nostdin",
             "-hide_banner",
@@ -1481,7 +1482,7 @@ fn prepare_audio_with_programs(
         &output.to_string_lossy(),
     ]);
     let mut processed_ms = 0_u64;
-    let out = run_command_cancellable_with_stdout_lines(
+    let out = ProcessSupervisor::run_with_stdout_lines(
         &mut command,
         cancellation,
         "ffmpeg audio preparation",
@@ -1543,7 +1544,7 @@ fn probe_audio_info(
     media_path: &Path,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<MediaAudioInfo> {
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new(ffprobe).args([
             "-v",
             "error",
@@ -1609,7 +1610,7 @@ fn validate_audio_decodable(
     codec: &str,
     cancellation: &CancellationGuard,
 ) -> AdapterResult<()> {
-    let output = run_command_cancellable(
+    let output = ProcessSupervisor::run(
         Command::new(ffmpeg).args([
             "-nostdin",
             "-hide_banner",
@@ -1733,134 +1734,6 @@ fn wav_duration_ms(path: &Path) -> Option<u64> {
             file.seek(SeekFrom::Current(1)).ok()?;
         }
     }
-}
-
-fn locate_whisper_binary(settings: &TranscriptionSettings) -> AdapterResult<PathBuf> {
-    let p = settings
-        .whisper_binary_path
-        .clone()
-        .unwrap_or_else(|| default_whisper_binary_path_for(None));
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(AdapterError::invalid_input(format!(
-            "whisper-cli not found at `{}`; set `storage.whisper_binary_path` to an existing executable or run `sbake whisper install`",
-            p.display()
-        )))
-    }
-}
-
-#[derive(Debug)]
-struct ResolvedWhisperModel {
-    name: String,
-    path: PathBuf,
-    auto_selected: bool,
-}
-
-fn resolve_whisper_model(settings: &TranscriptionSettings) -> AdapterResult<ResolvedWhisperModel> {
-    let models_dir = settings
-        .whisper_models_dir
-        .clone()
-        .unwrap_or_else(|| default_whisper_models_dir_for(None));
-    let mut installed = if models_dir.is_dir() {
-        installed_models_in(&models_dir).map_err(|source| {
-            AdapterError::external_io(
-                "list installed whisper models",
-                Some(models_dir.clone()),
-                source,
-            )
-        })?
-    } else {
-        Vec::new()
-    };
-    installed.sort_by(|left, right| model_rank(&left.name).cmp(&model_rank(&right.name)));
-    let installed_names = installed
-        .iter()
-        .map(|model| model.name.clone())
-        .collect::<Vec<_>>();
-
-    if let Some(requested) = settings.model.as_deref() {
-        return installed
-            .into_iter()
-            .find(|model| model.name == requested)
-            .map(|model| ResolvedWhisperModel {
-                name: model.name,
-                path: model.path,
-                auto_selected: false,
-            })
-            .ok_or_else(|| {
-                AdapterError::invalid_input(format!(
-                    "model `{requested}` was not found in `{}`; available models: {}. Set `storage.whisper_models_dir` to your existing model directory or run `sbake whisper model {requested}`.",
-                    models_dir.display(), display_model_names(&installed_names)
-                ))
-            });
-    }
-
-    let selected = match installed.as_slice() {
-        [] => {
-            return Err(AdapterError::invalid_input(format!(
-                "no Whisper models were found in `{}`; set `storage.whisper_models_dir` to a directory containing ggml-*.bin or ggml-*.gguf files, or run `sbake whisper model list` followed by `sbake whisper model <NAME>`",
-                models_dir.display()
-            )));
-        }
-        [only] => only,
-        many => {
-            if let Some(small) = many.iter().find(|model| model.name == "small") {
-                small
-            } else if settings.multiple_model_policy == MultipleModelPolicy::PreferRanked {
-                &many[0]
-            } else {
-                return Err(AdapterError::invalid_input(format!(
-                    "multiple whisper.cpp models are installed; specify `--model <NAME>`. Available: {}",
-                    display_model_names(&installed_names)
-                )));
-            }
-        }
-    };
-    Ok(ResolvedWhisperModel {
-        name: selected.name.clone(),
-        path: selected.path.clone(),
-        auto_selected: true,
-    })
-}
-
-fn display_model_names(names: &[String]) -> String {
-    if names.is_empty() {
-        "none".to_owned()
-    } else {
-        names.join(", ")
-    }
-}
-
-fn model_rank(name: &str) -> (usize, usize, usize, &str) {
-    const FAMILIES: &[&str] = &[
-        "small",
-        "base",
-        "medium",
-        "large-v3-turbo",
-        "large-v3",
-        "large-v2",
-        "large-v1",
-        "tiny",
-    ];
-    let family = FAMILIES
-        .iter()
-        .position(|family| {
-            name == *family
-                || name
-                    .strip_prefix(*family)
-                    .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('.'))
-        })
-        .unwrap_or(FAMILIES.len());
-    let english_only = usize::from(name.contains(".en"));
-    let quantization = if name.contains("q8_") {
-        1
-    } else if name.contains("q5_") {
-        2
-    } else {
-        0
-    };
-    (family, english_only, quantization, name)
 }
 
 pub fn apply_whisper_storage(transcription: &mut TranscriptionSettings, storage: &StorageSettings) {

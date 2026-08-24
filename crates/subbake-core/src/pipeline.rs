@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, ConcurrencyStrategy,
-    FailureLog, GlossaryEntry, PipelineOptions, PipelineResult, ReviewAnnotation, ReviewPolicy,
-    ReviewStats, SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment,
-    TerminologyEntity, TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
+    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry,
+    PipelineOptions, PipelineResult, ReviewAnnotation, ReviewPolicy, ReviewStats, SplitRetryLog,
+    StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment, TerminologyEntity,
+    TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::restore_batch_formatting;
@@ -30,6 +30,7 @@ use crate::validation::{
     validate_unique_segment_ids,
 };
 
+mod accounting;
 mod name_alignment;
 mod online_terminology;
 mod persistence;
@@ -41,6 +42,7 @@ mod terminology;
 mod translation_runner;
 mod translation_stage;
 
+use accounting::PipelineAccounting;
 use persistence::PipelinePersistence;
 use planning::{BatchPlanner, DeduplicationPlan};
 use review_runner::{ReviewBatchInput, ReviewRun};
@@ -81,17 +83,10 @@ pub struct SubtitlePipeline<B, D> {
     input_signature: Option<InputSignature>,
     /// Normalised-key → translation text cache loaded from the runtime store.
     translation_memory: HashMap<String, String>,
-    translation_memory_hits: usize,
-    cache_hits: usize,
+    accounting: PipelineAccounting,
     agent_repairs: Vec<AgentRepairRecord>,
     cancellation: CancellationGuard,
     progress: Option<Box<dyn ProgressSink>>,
-    /// Turbo starts conservatively and uses additive increase / multiplicative
-    /// decrease when the provider signals pressure.
-    adaptive_translation_concurrency: usize,
-    translation_window_was_rate_limited: bool,
-    provider_requests: usize,
-    provider_tokens: usize,
 }
 
 impl<B, D> SubtitlePipeline<B, D>
@@ -104,7 +99,7 @@ where
         options.target_language = normalize_language_name(&options.target_language, false);
         let language_rules =
             LanguageRuleRegistry::resolve(&options.source_language, &options.target_language);
-        let adaptive_translation_concurrency = options.translation_concurrency.clamp(1, 2);
+        let accounting = PipelineAccounting::new(options.translation_concurrency);
         Self {
             backend,
             reviewer: None,
@@ -116,15 +111,10 @@ where
             store: None,
             input_signature: None,
             translation_memory: HashMap::new(),
-            translation_memory_hits: 0,
-            cache_hits: 0,
+            accounting,
             agent_repairs: Vec::new(),
             cancellation: CancellationGuard::never(),
             progress: None,
-            adaptive_translation_concurrency,
-            translation_window_was_rate_limited: false,
-            provider_requests: 0,
-            provider_tokens: 0,
         }
     }
 
@@ -149,7 +139,7 @@ where
             .map_err(CoreError::from)?
             .into_json()
             .map_err(CoreError::from)?;
-        self.provider_tokens = self.provider_tokens.saturating_add(result.1.total_tokens);
+        self.accounting.record_tokens(result.1.total_tokens);
         Ok(result)
     }
 
@@ -169,7 +159,7 @@ where
             .map_err(CoreError::from)?
             .into_json()
             .map_err(CoreError::from)?;
-        self.provider_tokens = self.provider_tokens.saturating_add(result.1.total_tokens);
+        self.accounting.record_tokens(result.1.total_tokens);
         Ok(result)
     }
 
@@ -181,41 +171,18 @@ where
     }
 
     fn reserve_requests(&mut self, additional: usize) -> CoreResult<()> {
-        if additional == 0 {
-            return Ok(());
-        }
-        if let Some(limit) = self.options.max_requests
-            && self.provider_requests.saturating_add(additional) > limit
-        {
-            return Err(CoreError::ResourceBudgetExceeded(format!(
-                "request limit is {limit}; {} request(s) already used and {additional} more required",
-                self.provider_requests
-            )));
-        }
-        if let Some(limit) = self.options.max_tokens
-            && self.provider_tokens >= limit
-        {
-            return Err(CoreError::ResourceBudgetExceeded(format!(
-                "token limit is {limit}; {} token(s) already used",
-                self.provider_tokens
-            )));
-        }
-        self.provider_requests = self.provider_requests.saturating_add(additional);
-        Ok(())
+        self.accounting.reserve_requests(
+            additional,
+            self.options.max_requests,
+            self.options.max_tokens,
+        )
     }
 
     fn record_response_tokens(
         &mut self,
         responses: &[Result<crate::ports::GenerationResponse, crate::LlmCallError>],
     ) {
-        for response in responses
-            .iter()
-            .filter_map(|response| response.as_ref().ok())
-        {
-            self.provider_tokens = self
-                .provider_tokens
-                .saturating_add(response.usage.total_tokens);
-        }
+        self.accounting.record_response_tokens(responses);
     }
 
     fn report(
@@ -269,8 +236,8 @@ where
             batches_committed: committed as u64,
             batches_total: batches.len() as u64,
             requests_in_flight: in_flight as u64,
-            cache_hits: self.cache_hits as u64,
-            translation_memory_hits: self.translation_memory_hits as u64,
+            cache_hits: self.accounting.cache_hits() as u64,
+            translation_memory_hits: self.accounting.translation_memory_hits() as u64,
             window_index: committed.div_ceil(self.options.translation_concurrency.max(1)) as u64
                 + 1,
             ..crate::progress::TranslationProgress::default()
@@ -284,42 +251,22 @@ where
     }
 
     pub(super) fn effective_translation_concurrency(&self) -> usize {
-        if matches!(
+        self.accounting.effective_translation_concurrency(
             self.options.policy().concurrency_strategy,
-            ConcurrencyStrategy::AdaptiveQueued { .. }
-        ) {
-            self.adaptive_translation_concurrency
-        } else {
-            self.options.translation_concurrency.max(1)
-        }
+            self.options.translation_concurrency,
+        )
     }
 
     pub(super) fn note_translation_window_success(&mut self) {
-        if matches!(
+        self.accounting.note_translation_window_success(
             self.options.policy().concurrency_strategy,
-            ConcurrencyStrategy::AdaptiveQueued { .. }
-        ) {
-            if std::mem::take(&mut self.translation_window_was_rate_limited) {
-                return;
-            }
-            self.adaptive_translation_concurrency = self
-                .adaptive_translation_concurrency
-                .saturating_add(1)
-                .min(self.options.translation_concurrency.max(1));
-        }
+            self.options.translation_concurrency,
+        );
     }
 
     fn note_translation_rate_limit(&mut self) {
-        if matches!(
-            self.options.policy().concurrency_strategy,
-            ConcurrencyStrategy::AdaptiveQueued { .. }
-        ) {
-            self.translation_window_was_rate_limited = true;
-            self.adaptive_translation_concurrency = self
-                .adaptive_translation_concurrency
-                .saturating_div(2)
-                .max(1);
-        }
+        self.accounting
+            .note_translation_rate_limit(self.options.policy().concurrency_strategy);
     }
 
     /// Attach a runtime store for glossary/TM persistence.
@@ -560,10 +507,10 @@ where
                     && self.reviewer.is_none(),
                 dry_run: false,
                 planned_batches,
-                cache_hits: self.cache_hits,
+                cache_hits: self.accounting.cache_hits(),
                 resumed_translation_batches: resume.translation_batches_completed,
                 resumed_review_batches,
-                translation_memory_hits: self.translation_memory_hits,
+                translation_memory_hits: self.accounting.translation_memory_hits(),
                 state_path,
                 glossary_path,
                 agent_repairs: self.agent_repairs.clone(),
@@ -588,9 +535,7 @@ where
             store: self.store.as_deref(),
             cancellation: &self.cancellation,
             progress: self.progress.as_deref(),
-            cache_hits: &mut self.cache_hits,
-            provider_requests: &mut self.provider_requests,
-            provider_tokens: &mut self.provider_tokens,
+            accounting: &mut self.accounting,
         }
         .run(document)
     }
@@ -826,7 +771,7 @@ where
                     true,
                 )?;
                 validate_translation_batch(batch, &payload.lines)?;
-                self.cache_hits += 1;
+                self.accounting.record_cache_hit();
                 results.insert(
                     *batch_index,
                     BatchWithUsage {
@@ -1111,7 +1056,7 @@ where
         let cached = cached_response.is_some();
         let mut backend_result = match cached_response {
             Some(response) => {
-                self.cache_hits += 1;
+                self.accounting.record_cache_hit();
                 response
             }
             None => {
@@ -1303,7 +1248,7 @@ where
                 };
                 restore_batch_formatting(&batch.source, &mut result.lines);
                 validate_translation_batch(&batch.source, &result.lines)?;
-                self.cache_hits += 1;
+                self.accounting.record_cache_hit();
                 output.insert(
                     *index,
                     ReviewWithUsage {
@@ -1404,7 +1349,7 @@ where
         let cached = cached_response.is_some();
         let mut backend_result = match cached_response {
             Some(response) => {
-                self.cache_hits += 1;
+                self.accounting.record_cache_hit();
                 response
             }
             None => {
@@ -1669,7 +1614,7 @@ where
             let cached = cached_response.is_some();
             let response_result = match cached_response {
                 Some(response) => {
-                    self.cache_hits += 1;
+                    self.accounting.record_cache_hit();
                     Ok(response)
                 }
                 None => (if stage == "translate" {

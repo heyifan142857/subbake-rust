@@ -5,11 +5,8 @@ use subbake_adapters::{
     BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, SettingsOverrides,
     SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest, TranscriptionSettings,
     TranslationRequest, TranslationSettings, WhisperAction, WhisperBuildVariant, WhisperOutcome,
-    WhisperRequest, batch_translation_output_path, default_translation_output_path,
-    default_whisper_binary_path_for, default_whisper_models_dir_for, diagnose_failure_path,
-    edit_subtitle_cancellable, format_diagnostic_report, is_supported_subtitle_container_path,
-    is_supported_subtitle_path, load_diagnostic_reports, transcribe_media_cancellable,
-    translate_input_cancellable,
+    WhisperRequest, default_whisper_binary_path_for, default_whisper_models_dir_for,
+    format_diagnostic_report, is_supported_subtitle_container_path, is_supported_subtitle_path,
 };
 use subbake_core::diagnostics::diagnose_text;
 use subbake_core::formats::{normalize_format, supported_format_from_path};
@@ -24,6 +21,9 @@ use subbake_core::{
 use crate::discovery::rank_subtitle_candidates;
 use crate::error::{AgentError, AgentResult};
 use crate::guard::{ExternalPathGuard, FileGuard, FileOpAction, FileOpResult, SemanticUndo};
+use crate::services::AgentServices;
+#[cfg(test)]
+use crate::services::DefaultAgentServices;
 use crate::session::AgentEvent;
 use crate::session::EventTag;
 use crate::tools::ToolExecutor;
@@ -53,10 +53,20 @@ pub(crate) struct CommandExecutionOutcome {
     pub file_operations: Vec<FileOpResult>,
 }
 
+#[cfg(test)]
 pub(crate) fn execute_command_tool(
     args: &JsonValue,
     guard: &FileGuard,
     cancellation: &CancellationGuard,
+) -> AgentResult<CommandExecutionOutcome> {
+    execute_command_tool_with_services(args, guard, cancellation, &DefaultAgentServices)
+}
+
+pub(crate) fn execute_command_tool_with_services(
+    args: &JsonValue,
+    guard: &FileGuard,
+    cancellation: &CancellationGuard,
+    services: &dyn AgentServices,
 ) -> AgentResult<CommandExecutionOutcome> {
     if let crate::command_policy::CommandApproval::Deny(message) =
         crate::command_policy::classify(args)
@@ -120,7 +130,7 @@ pub(crate) fn execute_command_tool(
         network: optional_bool(args, "network", false),
         timeout: std::time::Duration::from_secs(timeout_seconds),
     };
-    let executed = subbake_adapters::run_sandboxed_command(&request, cancellation)?;
+    let executed = services.run_command(&request, cancellation)?;
     let file_operations = if executed.exit_code == 0 {
         let staged = outputs
             .iter()
@@ -253,6 +263,7 @@ pub(crate) fn execute_local_tool(
     Ok(Some(outcome))
 }
 
+#[cfg(test)]
 pub(crate) fn execute_adapter_tool(
     executor: ToolExecutor,
     args: &JsonValue,
@@ -260,6 +271,26 @@ pub(crate) fn execute_adapter_tool(
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
     resolved_settings: Option<&ResolvedSettings>,
+) -> AgentResult<Option<AdapterToolOutcome>> {
+    execute_adapter_tool_with_services(
+        executor,
+        args,
+        guard,
+        cancellation,
+        progress,
+        resolved_settings,
+        &DefaultAgentServices,
+    )
+}
+
+pub(crate) fn execute_adapter_tool_with_services(
+    executor: ToolExecutor,
+    args: &JsonValue,
+    guard: &FileGuard,
+    cancellation: &CancellationGuard,
+    progress: Option<SharedProgress>,
+    resolved_settings: Option<&ResolvedSettings>,
+    services: &dyn AgentServices,
 ) -> AgentResult<Option<AdapterToolOutcome>> {
     let outcome = match executor {
         ToolExecutor::TranscribeAudio => {
@@ -311,15 +342,7 @@ pub(crate) fn execute_adapter_tool(
                 overwrite,
                 settings,
             };
-            let transcribed = if let Some(progress) = progress {
-                subbake_adapters::transcribe_media_cancellable_with_progress(
-                    request,
-                    cancellation,
-                    progress,
-                )
-            } else {
-                transcribe_media_cancellable(request, cancellation)
-            };
+            let transcribed = services.transcribe(request, cancellation, progress);
             match transcribed {
                 Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(outcome) => AdapterToolOutcome {
@@ -372,15 +395,7 @@ pub(crate) fn execute_adapter_tool(
                 }),
                 build_variant,
             };
-            let managed = if let Some(progress) = progress {
-                subbake_adapters::run_whisper_cancellable_with_progress(
-                    request,
-                    cancellation,
-                    progress,
-                )
-            } else {
-                subbake_adapters::run_whisper_cancellable(request, cancellation)
-            };
+            let managed = services.manage_whisper(request, cancellation, progress);
             match managed {
                 Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(managed) => {
@@ -469,20 +484,7 @@ pub(crate) fn execute_adapter_tool(
         }
         ToolExecutor::DiagnosePath => {
             let full = guard.resolve_path(&required_path(args, "path")?)?;
-            let reports = if full.is_file() {
-                vec![diagnose_failure_path(&full)?]
-            } else {
-                load_diagnostic_reports(&full)?
-            };
-            let text = if reports.is_empty() {
-                "No failure logs found.".to_owned()
-            } else {
-                reports
-                    .iter()
-                    .map(format_diagnostic_report)
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n")
-            };
+            let text = services.diagnose_path(&full)?;
             AdapterToolOutcome {
                 outcome: observation("diagnose_path", text),
                 file_operation: None,
@@ -503,13 +505,34 @@ pub(crate) fn execute_adapter_tool(
     Ok(Some(outcome))
 }
 
+#[cfg(test)]
 pub(crate) fn execute_translation_tool(
     executor: ToolExecutor,
     args: &JsonValue,
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
+    settings: TranslationSettings,
+) -> AgentResult<Option<TranslationExecutionOutcome>> {
+    execute_translation_tool_with_services(
+        executor,
+        args,
+        guard,
+        cancellation,
+        progress,
+        settings,
+        &DefaultAgentServices,
+    )
+}
+
+pub(crate) fn execute_translation_tool_with_services(
+    executor: ToolExecutor,
+    args: &JsonValue,
+    guard: &FileGuard,
+    cancellation: &CancellationGuard,
+    progress: Option<SharedProgress>,
     mut settings: TranslationSettings,
+    services: &dyn AgentServices,
 ) -> AgentResult<Option<TranslationExecutionOutcome>> {
     let explicit_target_language = optional_argument(args, "target_language").is_some();
     settings.translation.source_language = normalize_language(
@@ -586,7 +609,7 @@ pub(crate) fn execute_translation_tool(
             let output_path = if let Some(path) = optional_argument(args, "output_path") {
                 guard.resolve_path(Path::new(path))?
             } else {
-                default_translation_output_path(
+                services.default_translation_output_path(
                     &input,
                     settings.output_format(),
                     settings.output.bilingual,
@@ -620,15 +643,7 @@ pub(crate) fn execute_translation_tool(
                 overwrite,
                 settings: settings.clone(),
             };
-            let translated = if let Some(progress) = progress {
-                subbake_adapters::translate_input_cancellable_with_progress(
-                    request,
-                    cancellation,
-                    progress,
-                )?
-            } else {
-                translate_input_cancellable(request, cancellation)?
-            };
+            let translated = services.translate(request, cancellation, progress)?;
             let file_operations = if let Some(change) = &translated.container_change
                 && change.in_place
                 && !translated.result.dry_run
@@ -730,20 +745,12 @@ pub(crate) fn execute_translation_tool(
                 .filter(|path| path.is_file() && is_supported_subtitle_path(path))
                 .filter(|path| !is_generated_subtitle(path))
             {
-                let output = batch_translation_output_path(&request, &source)?;
+                let output = services.batch_translation_output_path(&request, &source)?;
                 if !settings.translation.dry_run && (overwrite || !output.exists()) {
                     undo_snapshots.push((output.clone(), guard.snapshot_write(&output)?));
                 }
             }
-            let translated = if let Some(progress) = progress {
-                subbake_adapters::translate_subtitle_batch_with_progress(
-                    request,
-                    cancellation,
-                    progress,
-                )?
-            } else {
-                subbake_adapters::translate_subtitle_batch_cancellable(request, cancellation)?
-            };
+            let translated = services.translate_batch(request, cancellation, progress)?;
             let file_operations = translated
                 .outputs
                 .iter()
@@ -804,7 +811,7 @@ pub(crate) fn execute_translation_tool(
         ToolExecutor::EditSubtitle => {
             let target_path = guard.resolve_path(&required_path(args, "path")?)?;
             let snapshot = guard.snapshot_write(&target_path)?;
-            let edited = edit_subtitle_cancellable(
+            let edited = services.edit_subtitle(
                 SubtitleEditRequest {
                     target_path: target_path.clone(),
                     instruction: required_string(args, "instruction")?,
@@ -1179,217 +1186,6 @@ fn format_file_list(files: &[PathBuf]) -> String {
         .join("\n")
 }
 
-pub(crate) fn render_tool_outcome(outcome: &AgentToolOutcome) -> String {
-    match outcome {
-        AgentToolOutcome::Translation(facts) => {
-            let mode = if facts.bilingual {
-                format!("bilingual ({})", facts.bilingual_order.as_str())
-            } else {
-                "translated".to_owned()
-            };
-            let mut lines = vec![format!(
-                "Translation {}: {} file(s), {} subtitle entries, {} → {}, {}, {mode}, provider {}/{}.",
-                status_label(facts.status),
-                facts.processed_files,
-                facts.subtitle_entries,
-                facts.source_language,
-                facts.target_language,
-                facts.output_format,
-                facts.provider,
-                facts.model
-            )];
-            if facts.outputs.is_empty() {
-                if facts.dry_run {
-                    lines.push(
-                        "Dry run: no output file was written and no undo event was recorded."
-                            .to_owned(),
-                    );
-                }
-            } else {
-                lines.push(format!(
-                    "Output: {}",
-                    facts
-                        .outputs
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if !facts.skipped.is_empty() {
-                lines.push(format!(
-                    "Skipped: {}",
-                    facts
-                        .skipped
-                        .iter()
-                        .map(|item| format!("{} ({})", item.path.display(), item.reason))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if facts.cache_hits > 0
-                || facts.resumed_translation_batches > 0
-                || facts.resumed_review_batches > 0
-                || facts.translation_memory_hits > 0
-            {
-                lines.push(format!(
-                    "Reuse: cache={}, resumed_translation={}, resumed_review={}, translation_memory={}.",
-                    facts.cache_hits,
-                    facts.resumed_translation_batches,
-                    facts.resumed_review_batches,
-                    facts.translation_memory_hits
-                ));
-            }
-            if facts.fresh_runtime
-                && let Some(runtime_dir) = &facts.runtime_dir
-            {
-                lines.push(format!(
-                    "Fresh runtime: {} (Resume, request cache, translation memory, and accumulated glossary reuse disabled).",
-                    runtime_dir.display()
-                ));
-            }
-            lines.join("\n")
-        }
-        AgentToolOutcome::Transcription(facts) => format!(
-            "Transcription written: {}, language {}, format {}, provider {}/{}, {} subtitle entries.\nOutput: {}",
-            facts.input.display(),
-            facts.language,
-            facts.output_format,
-            facts.provider,
-            facts.model,
-            facts.subtitle_entries,
-            facts.output.display()
-        ),
-        AgentToolOutcome::SubtitleEdit(facts) => {
-            let mut text = format!(
-                "Subtitle edited: {}, target language {}, {} entries modified.",
-                facts.target_path.display(),
-                facts.target_language,
-                facts.modified_entries
-            );
-            if !facts.edit_notes.trim().is_empty() {
-                text.push_str(&format!("\n{}", facts.edit_notes));
-            }
-            text
-        }
-        AgentToolOutcome::Whisper(facts) => {
-            let mut lines = vec![format!(
-                "Whisper {} {}.",
-                facts.action,
-                status_label(facts.status)
-            )];
-            if let Some(path) = &facts.binary_path {
-                lines.push(format!(
-                    "Binary: {} ({})",
-                    path.display(),
-                    existence_label(facts.binary_exists)
-                ));
-            }
-            if let Some(path) = &facts.models_dir {
-                lines.push(format!(
-                    "Models directory: {} ({})",
-                    path.display(),
-                    existence_label(facts.models_dir_exists)
-                ));
-            }
-            if !facts.models.is_empty() {
-                lines.push(format!(
-                    "Models: {}",
-                    facts
-                        .models
-                        .iter()
-                        .map(|model| format!("{} ({})", model.name, model.path.display()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            lines.join("\n")
-        }
-        AgentToolOutcome::File(facts) => {
-            let paths = facts
-                .paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if facts.destination_paths.is_empty() {
-                format!("File {}: {paths}", facts.action)
-            } else {
-                format!(
-                    "File {}: {paths} → {}",
-                    facts.action,
-                    facts
-                        .destination_paths
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        }
-        AgentToolOutcome::Profile(facts)
-            if facts.action == "switch"
-                && facts.status == ToolExecutionStatus::Completed
-                && facts.provider.is_some()
-                && facts.model.is_some() =>
-        {
-            format!(
-                "{} ({}/{})",
-                facts.message,
-                facts.provider.as_deref().unwrap_or_default(),
-                facts.model.as_deref().unwrap_or_default()
-            )
-        }
-        AgentToolOutcome::Profile(facts) => facts.message.clone(),
-        AgentToolOutcome::Observation(facts) => facts.content.clone(),
-        AgentToolOutcome::Command(facts) => {
-            let mut lines = vec![format!(
-                "Command exited with code {} in {} ms (cwd {}).",
-                facts.exit_code,
-                facts.duration_ms,
-                facts.cwd.display()
-            )];
-            if !facts.stdout.is_empty() {
-                lines.push(format!("stdout:\n{}", facts.stdout));
-            }
-            if !facts.stderr.is_empty() {
-                lines.push(format!("stderr:\n{}", facts.stderr));
-            }
-            if !facts.outputs.is_empty() {
-                lines.push(format!(
-                    "Outputs: {}",
-                    facts
-                        .outputs
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            lines.join("\n")
-        }
-    }
-}
-
-fn status_label(status: ToolExecutionStatus) -> &'static str {
-    match status {
-        ToolExecutionStatus::Written => "written",
-        ToolExecutionStatus::DryRun => "dry run",
-        ToolExecutionStatus::Skipped => "skipped",
-        ToolExecutionStatus::Unchanged => "unchanged",
-        ToolExecutionStatus::Observed => "observed",
-        ToolExecutionStatus::Completed => "completed",
-    }
-}
-
-fn existence_label(value: Option<bool>) -> &'static str {
-    match value {
-        Some(true) => "found",
-        Some(false) => "missing",
-        None => "not inspected",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1400,6 +1196,7 @@ mod tests {
     use subbake_core::{ProgressEvent, ProgressSink, TaskKind};
 
     use super::*;
+    use crate::outcome_render::render_tool_outcome;
 
     #[derive(Default)]
     struct RecordingProgress {
