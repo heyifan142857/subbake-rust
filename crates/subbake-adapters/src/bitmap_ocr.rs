@@ -448,7 +448,7 @@ fn frame_to_ocr_image(frame: &SubtitleFrame) -> Option<(u32, u32, Vec<u8>)> {
     let mut visible = false;
     for composition in &frame.compositions {
         let width = usize::from(composition.width);
-        for (pixel_index, pixel) in composition.rgba.chunks_exact(4).enumerate() {
+        for (pixel_index, pixel) in composition.rgba.as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] <= MIN_VISIBLE_ALPHA {
                 continue;
             }
@@ -478,7 +478,7 @@ fn frame_to_ocr_image(frame: &SubtitleFrame) -> Option<(u32, u32, Vec<u8>)> {
 
     for composition in &frame.compositions {
         let composition_width = usize::from(composition.width);
-        for (pixel_index, pixel) in composition.rgba.chunks_exact(4).enumerate() {
+        for (pixel_index, pixel) in composition.rgba.as_chunks::<4>().0.iter().enumerate() {
             if pixel[3] <= MIN_VISIBLE_ALPHA {
                 continue;
             }

@@ -1333,7 +1333,7 @@ fn decode_ffprobe_hex_data(value: &str) -> AdapterResult<Vec<u8>> {
                 "ffprobe returned malformed DVB subtitle packet hex data",
             ));
         }
-        for pair in digits.as_bytes().chunks_exact(2) {
+        for pair in digits.as_bytes().as_chunks::<2>().0 {
             let pair = std::str::from_utf8(pair).map_err(|source| {
                 AdapterError::invalid_input(format!("invalid ffprobe packet encoding: {source}"))
             })?;
