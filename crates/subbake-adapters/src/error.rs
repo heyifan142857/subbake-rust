@@ -109,7 +109,7 @@ pub enum AdapterError {
         operation: &'static str,
         path: Option<PathBuf>,
         #[source]
-        source: CoreError,
+        source: Box<CoreError>,
     },
 }
 
@@ -137,14 +137,12 @@ impl AdapterError {
     }
 
     pub fn is_resource_budget_exceeded(&self) -> bool {
-        matches!(
-            self,
-            Self::Core(CoreError::ResourceBudgetExceeded(_))
-                | Self::CoreContext {
-                    source: CoreError::ResourceBudgetExceeded(_),
-                    ..
-                }
-        )
+        matches!(self, Self::Core(CoreError::ResourceBudgetExceeded(_)))
+            || matches!(
+                self,
+                Self::CoreContext { source, .. }
+                    if matches!(source.as_ref(), CoreError::ResourceBudgetExceeded(_))
+            )
     }
 
     pub fn is_not_found(&self) -> bool {

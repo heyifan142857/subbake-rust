@@ -40,7 +40,7 @@ pub fn read_document(path: &Path) -> AdapterResult<SubtitleDocument> {
     parse_document_text(path, &text, None).map_err(|source| AdapterError::CoreContext {
         operation: "parse subtitle",
         path: Some(path.to_path_buf()),
-        source,
+        source: Box::new(source),
     })
 }
 
@@ -161,7 +161,8 @@ impl AtomicWriteLock {
             .and_then(|value| value.to_str())
             .unwrap_or("file");
         let path = target.with_file_name(format!(".{file_name}.subbake-write-lock"));
-        for attempt in 0..100 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -185,7 +186,7 @@ impl AtomicWriteLock {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    if attempt < 99 {
+                    if std::time::Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -207,7 +208,6 @@ impl AtomicWriteLock {
                 }
             }
         }
-        unreachable!("atomic write lock loop always returns")
     }
 }
 
@@ -510,6 +510,29 @@ mod tests {
                 .count(),
             1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_writer_waits_for_a_slow_concurrent_writer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("subbake-atomic-slow-writer-{nonce}"));
+        fs::create_dir_all(&root).expect("create root");
+        let output = root.join("state.json");
+        fs::write(&output, b"initial").expect("write initial file");
+        let lock = AtomicWriteLock::acquire(&output).expect("acquire competing lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_200));
+            drop(lock);
+        });
+
+        write_file_atomically(&output, b"replacement").expect("wait for competing writer");
+        releaser.join().expect("release competing lock");
+
+        assert_eq!(fs::read(&output).expect("read replacement"), b"replacement");
         let _ = fs::remove_dir_all(root);
     }
 

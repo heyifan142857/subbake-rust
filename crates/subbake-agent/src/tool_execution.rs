@@ -53,7 +53,7 @@ pub(crate) struct CommandExecutionOutcome {
     pub file_operations: Vec<FileOpResult>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn execute_command_tool(
     args: &JsonValue,
     guard: &FileGuard,
