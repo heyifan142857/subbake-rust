@@ -1,16 +1,17 @@
 use subbake_core::ports::ChatMessage;
 
 use super::model::AgentTaskLoop;
-use crate::tools::model_visible_tool_specs;
+use crate::tools::ToolRegistry;
 
 pub(super) fn build_native_messages(
     input: &str,
     loop_state: &AgentTaskLoop,
     dialogue: Option<&str>,
     effective_defaults: &str,
+    registry: ToolRegistry,
 ) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::system(system_contract(false, false, effective_defaults)),
+        ChatMessage::system(system_contract(false, false, effective_defaults, registry)),
         ChatMessage::user(user_context(input, dialogue, Some((loop_state, None)))),
     ]
 }
@@ -22,9 +23,15 @@ pub(super) fn build_json_messages(
     tools_enabled: bool,
     repair_error: Option<&str>,
     effective_defaults: &str,
+    registry: ToolRegistry,
 ) -> Vec<ChatMessage> {
     vec![
-        ChatMessage::system(system_contract(true, !tools_enabled, effective_defaults)),
+        ChatMessage::system(system_contract(
+            true,
+            !tools_enabled,
+            effective_defaults,
+            registry,
+        )),
         ChatMessage::user(user_context(
             input,
             dialogue,
@@ -33,11 +40,16 @@ pub(super) fn build_json_messages(
     ]
 }
 
-fn system_contract(json_fallback: bool, tools_disabled: bool, effective_defaults: &str) -> String {
+fn system_contract(
+    json_fallback: bool,
+    tools_disabled: bool,
+    effective_defaults: &str,
+    registry: ToolRegistry,
+) -> String {
     let mut system = String::from(
         "You are SubBake, a subtitle workflow assistant. The registered tool list supplied in this turn is the complete list: never invent tools such as `list_tools`, shell, or unregistered aliases. Use project-reading tools to ground uncertain paths, then continue with the appropriate execution tool. Descend into directories returned by list_files until you find the actual requested media; a status or list-models check is only an intermediate observation and never completes a transcription request. For a media-to-bilingual-subtitle request that requires speech recognition, call transcribe_audio on the media, then call translate_file with bilingual=true on the exact subtitle path returned by transcription. When the user asks to translate a specific MKV, MP4, M4V, MOV, or WebM containing text subtitles, call translate_file directly: it adds a translated subtitle track without transcription and replaces the source container by default. For a request to translate all subtitles in a directory, prefer `translate_series` with `{\"path\":\".\"}` immediately; use `candidate_subtitles` only when the target is genuinely ambiguous. Keep other media translation explicit through `transcribe_audio`. Preserve subtitle IDs and ordering. Use `edit_subtitle` for an existing translated or bilingual subtitle. Reuse exact paths returned by tools. Use `apply_patch` for project text-file edits; its patch format is `*** Begin Patch`, Add/Update/Delete File sections, and `*** End Patch`. Do not produce a plan action: call a mutating tool normally and the runtime will handle any approval. After every successful mutation, use its result to produce a concise natural-language final response instead of echoing raw tool output. Responses are rendered in a terminal: use plain text only, without Markdown headings, tables, bold, code fences, or decorative status icons. For successful translation or transcription, normally respond in one to three short lines with the completed action, output path when available, and processed/skipped counts for a batch. Do not reproduce or summarize individual subtitle entries unless the user explicitly asks for their contents.",
     );
-    if subbake_adapters::platform::CapabilitySet::current().supports_command_sandbox() {
+    if registry.model_visible_names().contains(&"run_command") {
         system.push_str(
             "\nYou are also a small project-local coding agent. Use `run_command` for inspection, builds, tests, and general non-text artifact generation. The command sandbox cannot write project files directly: use `apply_patch` for source edits. To retain an artifact, declare an alias and final path in `outputs`, then make the command write to `$SUBBAKE_OUTPUT_<ALIAS>`. Never place credentials in a command string.",
         );
@@ -59,7 +71,7 @@ fn system_contract(json_fallback: bool, tools_disabled: bool, effective_defaults
         );
     } else {
         system.push_str("\nThe stable registered tools for this entire task are:\n");
-        for spec in model_visible_tool_specs() {
+        for spec in registry.model_visible_specs() {
             system.push_str(&spec.prompt_line());
             if spec.mutating {
                 system.push_str(" (mutating)");
@@ -119,6 +131,9 @@ mod tests {
             true,
             None,
             "translation: source=Auto, target=zh-Hans, provider=mock, model=mock-zh, format=source, bilingual=false, bilingual_order=target_first, dry_run=false\ntranscription: provider=whisper_cpp, model=small, language=Auto, format=srt",
+            ToolRegistry::new(subbake_adapters::CapabilitySet::from_target(
+                "linux", "x86_64",
+            )),
         );
         let system = &messages[0].content;
         assert!(system.contains("complete list"));

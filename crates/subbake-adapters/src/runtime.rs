@@ -151,27 +151,17 @@ fn clean_runtime(
 }
 
 fn validate_managed_runtime_root(root: &Path, stable_target_path: &Path) -> AdapterResult<PathBuf> {
-    let canonical_root = root.canonicalize().map_err(|source| {
-        AdapterError::external_io(
-            "resolve runtime directory",
-            Some(root.to_path_buf()),
-            source,
-        )
-    })?;
+    let root_identity = PlatformPaths::identify_existing(root)?;
+    let target_identity = PlatformPaths::identify_with_missing_tail(stable_target_path)?;
+    let canonical_root = root_identity.resolved().to_path_buf();
     let named_default = canonical_root
         .file_name()
         .is_some_and(|name| name == std::ffi::OsStr::new(".subbake"));
     let marker = canonical_root.join(RUNTIME_MARKER_NAME);
     let marked = fs::read_to_string(marker).is_ok_and(|content| content == RUNTIME_MARKER_CONTENT);
-    // A missing target cannot itself be canonicalized. On macOS, the temp
-    // directory commonly changes from `/var` to `/private/var` when the root
-    // is canonicalized; Windows may similarly add a verbatim path prefix.
-    // Compare against both spellings so a runtime root that contains the
-    // target is always treated as critical.
     let critical = canonical_root.parent().is_none()
         || PlatformPaths::canonical_home_dir().as_deref() == Some(canonical_root.as_path())
-        || stable_target_path.starts_with(root)
-        || stable_target_path.starts_with(&canonical_root);
+        || target_identity.resolved().starts_with(&canonical_root);
     if (named_default || marked) && !critical {
         return Ok(canonical_root);
     }

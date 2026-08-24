@@ -1214,7 +1214,7 @@ mod tests {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("note.txt"), "hello").expect("write source");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let outcome = execute_local_tool(
             ToolExecutor::RenamePath,
             &json!({"from": "note.txt", "to": "renamed.txt"}),
@@ -1238,7 +1238,7 @@ mod tests {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("source.txt"), b"original").expect("source");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
 
         let outcome = match execute_command_tool(
             &json!({
@@ -1305,7 +1305,8 @@ mod tests {
     #[test]
     fn non_local_tool_is_left_for_the_service_executor() {
         let root = temp_root();
-        let guard = FileGuard::new(root.clone());
+        fs::create_dir_all(&root).expect("create root");
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let outcome = execute_local_tool(ToolExecutor::TranslateFile, &json!({}), &guard, &root)
             .expect("execute");
         assert!(outcome.is_none());
@@ -1314,7 +1315,8 @@ mod tests {
     #[test]
     fn diagnostic_text_is_executed_without_engine_state() {
         let root = temp_root();
-        let guard = FileGuard::new(root);
+        fs::create_dir_all(&root).expect("create root");
+        let guard = FileGuard::new(root).expect("create file guard");
         let outcome = execute_adapter_tool(
             ToolExecutor::DiagnoseText,
             &json!({"text": "HTTP status=429"}),
@@ -1331,7 +1333,8 @@ mod tests {
     #[test]
     fn invalid_whisper_action_is_an_error_not_success_text() {
         let root = temp_root();
-        let guard = FileGuard::new(root.clone());
+        fs::create_dir_all(&root).expect("create root");
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let error = execute_adapter_tool(
             ToolExecutor::ManageWhisper,
             &json!({"action": "not-a-command"}),
@@ -1362,7 +1365,7 @@ mod tests {
             "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
         )
         .expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let progress = Arc::new(RecordingProgress::default());
 
         let outcome = execute_translation_tool(
@@ -1401,7 +1404,7 @@ mod tests {
             "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
         )
         .expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let settings = TranslationSettings::default();
 
         let japanese = execute_translation_tool(
@@ -1454,7 +1457,7 @@ mod tests {
             "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
         )
         .expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let mut settings = TranslationSettings::default();
         settings.storage.runtime_dir = Some(root.join("runtime"));
         settings.storage.glossary_path = Some(root.join("shared-glossary.json"));
@@ -1508,7 +1511,7 @@ mod tests {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("sample.txt"), "Hello\n").expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         let mut settings = TranslationSettings::default();
         settings.translation.dry_run = true;
 
@@ -1538,7 +1541,7 @@ mod tests {
         let root = temp_root();
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("sample.txt"), "Hello\n").expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
 
         let error = execute_translation_tool(
             ToolExecutor::TranslateFile,
@@ -1564,7 +1567,7 @@ mod tests {
             "1\n00:00:00,000 --> 00:00:01,000\nHello\n",
         )
         .expect("write subtitle");
-        let guard = FileGuard::new(root.clone());
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
 
         let outcome = execute_translation_tool(
             ToolExecutor::TranslateSeries,

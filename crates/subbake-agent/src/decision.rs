@@ -24,10 +24,7 @@ use crate::event::{
 };
 use crate::guard::ExternalPathGuard;
 use crate::profile_coordinator::ProfileCoordinator;
-use crate::tools::{
-    ToolValidationError, find_tool_spec, model_visible_tool_names, model_visible_tool_specs,
-    validate_tool_call,
-};
+use crate::tools::{ToolValidationError, find_tool_spec, validate_tool_call};
 
 mod model;
 mod prompts;
@@ -268,7 +265,8 @@ impl AgentEngine {
         if !*legacy_mode {
             let was_continuation = native_turn.is_some();
             let definitions = if tools_enabled {
-                model_visible_tool_specs()
+                self.tool_registry
+                    .model_visible_specs()
                     .into_iter()
                     .map(|spec| spec.native_definition())
                     .collect()
@@ -294,6 +292,7 @@ impl AgentEngine {
                     task,
                     dialogue,
                     effective_defaults,
+                    self.tool_registry,
                 ))
                 .with_tools(definitions, choice)
             };
@@ -325,6 +324,7 @@ impl AgentEngine {
             tools_enabled,
             None,
             effective_defaults,
+            self.tool_registry,
         );
         match execute_json(backend, messages, &self.operation_guard) {
             Ok((value, _)) => match parse_json_decision(&value) {
@@ -395,7 +395,9 @@ impl AgentEngine {
             return Ok(ProcessedCalls::Planned);
         }
 
-        let available_tools = model_visible_tool_names()
+        let available_tools = self
+            .tool_registry
+            .model_visible_names()
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -650,7 +652,9 @@ impl AgentEngine {
         };
 
         let mut state = AgentTurnState::from_pending(persisted_turn);
-        let available_tools = model_visible_tool_names()
+        let available_tools = self
+            .tool_registry
+            .model_visible_names()
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -1380,6 +1384,7 @@ fn canonical_json(value: &JsonValue) -> JsonValue {
 mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use subbake_core::ports::{ModelToolCall, ToolContinuation};
@@ -1891,7 +1896,7 @@ mod tests {
             .expect("request approval");
         let session_id = engine.session.as_ref().expect("session").id.clone();
 
-        let mut resumed = AgentEngine::new(root.clone());
+        let mut resumed = test_engine(root.clone());
         resumed
             .resume_session(Some(&session_id))
             .expect("resume session");
@@ -2060,7 +2065,7 @@ mod tests {
             .expect("request approval");
         let session_id = engine.session.as_ref().expect("session").id.clone();
 
-        let mut resumed = AgentEngine::new(root.clone());
+        let mut resumed = test_engine(root.clone());
         resumed
             .resume_session(Some(&session_id))
             .expect("resume session");
@@ -2387,7 +2392,7 @@ mod tests {
             .expect("store plan");
         let session_id = engine.session.as_ref().expect("session").id.clone();
 
-        let mut resumed = AgentEngine::new(root.clone());
+        let mut resumed = test_engine(root.clone());
         resumed
             .resume_session(Some(&session_id))
             .expect("resume session");
@@ -2420,9 +2425,18 @@ mod tests {
     }
 
     fn active_engine(root: PathBuf) -> AgentEngine {
-        let mut engine = AgentEngine::new(root);
+        let mut engine = test_engine(root);
         engine.start_session().expect("session");
         engine
+    }
+
+    fn test_engine(root: PathBuf) -> AgentEngine {
+        AgentEngine::new_with_runtime(
+            root,
+            subbake_adapters::CapabilitySet::from_target("linux", "x86_64"),
+            Arc::new(crate::services::TestAgentServices),
+        )
+        .expect("test engine")
     }
 
     fn temp_root(label: &str) -> PathBuf {

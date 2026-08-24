@@ -23,7 +23,7 @@ use crate::profile_coordinator::ProfileCoordinator;
 use crate::services::{AgentServices, DefaultAgentServices};
 use crate::session::{AgentSessionStore, SessionMode};
 use crate::session_controller::SessionController;
-use crate::tools::{ALL_TOOL_SPECS, ToolKind, find_tool_spec};
+use crate::tools::{ToolKind, ToolRegistry, find_tool_spec};
 use crate::undo::UndoService;
 use crate::{ConfigChange, ConfigEditorSnapshot};
 
@@ -280,6 +280,7 @@ pub struct AgentEngine {
     pub(crate) pending_native_continuation: Option<PendingNativeContinuation>,
     pub(crate) runtime_policy: AgentRuntimePolicy,
     pub(crate) services: Arc<dyn AgentServices>,
+    pub(crate) tool_registry: ToolRegistry,
 }
 
 pub(crate) struct PendingNativeContinuation {
@@ -325,17 +326,23 @@ impl Default for AgentRuntimePolicy {
 }
 
 impl AgentEngine {
-    pub fn new(project_root: PathBuf) -> Self {
-        Self::new_with_services(project_root, Arc::new(DefaultAgentServices))
+    pub fn new(project_root: PathBuf) -> AgentResult<Self> {
+        Self::new_with_runtime(
+            project_root,
+            subbake_adapters::CapabilitySet::current(),
+            Arc::new(DefaultAgentServices),
+        )
     }
 
-    pub(crate) fn new_with_services(
+    pub(crate) fn new_with_runtime(
         project_root: PathBuf,
+        capabilities: subbake_adapters::CapabilitySet,
         services: Arc<dyn AgentServices>,
-    ) -> Self {
+    ) -> AgentResult<Self> {
+        let guard = FileGuard::new(project_root)?;
+        let project_root = guard.project_root().to_path_buf();
         let session_store = AgentSessionStore::new(project_root.clone());
-        let guard = FileGuard::new(project_root.clone());
-        Self {
+        Ok(Self {
             project_root,
             session_store,
             guard,
@@ -347,7 +354,8 @@ impl AgentEngine {
             pending_native_continuation: None,
             runtime_policy: AgentRuntimePolicy::default(),
             services,
-        }
+            tool_registry: ToolRegistry::new(capabilities),
+        })
     }
 
     pub fn set_runtime_policy(&mut self, policy: AgentRuntimePolicy) {
@@ -818,7 +826,7 @@ impl AgentEngine {
 
     /// List tool specs filtered by category for the LLM context.
     pub fn tool_specs_for_llm(&self, categories: &[ToolKind]) -> Vec<&crate::tools::ToolSpec> {
-        crate::tools::tool_specs_for_categories(ALL_TOOL_SPECS, categories)
+        self.tool_registry.specs_for_categories(categories)
     }
 }
 
@@ -847,7 +855,8 @@ mod error_persistence_tests {
             "subbake-agent-command-approval-{}",
             crate::session::iso_now().replace([':', '.'], "-")
         ));
-        let mut engine = AgentEngine::new(root.clone());
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");
         engine
             .session
@@ -885,7 +894,8 @@ mod error_persistence_tests {
             "subbake-agent-error-{}",
             crate::session::iso_now().replace([':', '.'], "-")
         ));
-        let mut engine = AgentEngine::new(root.clone());
+        std::fs::create_dir_all(&root).expect("create root");
+        let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");
 
         let path = engine

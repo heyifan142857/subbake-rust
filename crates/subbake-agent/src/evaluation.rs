@@ -489,7 +489,13 @@ pub fn run_scripted_case(
 
     let recorder = AgentEvalRecorder::default();
     let observer = recorder.clone();
-    let mut engine = AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
+    let mut engine = AgentEngine::new(project_root.to_path_buf())
+        .map_err(|source| AgentEvalError::AgentStep {
+            case_id: case.id.clone(),
+            step: 0,
+            source,
+        })?
+        .with_observer(Box::new(observer));
     engine
         .start_session()
         .map_err(|source| AgentEvalError::AgentStep {
@@ -528,13 +534,14 @@ pub fn run_scripted_case(
             }
             AgentEvalStep::Restart => {
                 let observer = recorder.clone();
-                let mut replacement =
-                    AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
-                match engine
-                    .save()
-                    .and_then(|()| replacement.resume_session(None))
-                {
-                    Ok(()) => {
+                match AgentEngine::new(project_root.to_path_buf())
+                    .map(|replacement| replacement.with_observer(Box::new(observer)))
+                    .and_then(|mut replacement| {
+                        engine.save()?;
+                        replacement.resume_session(None)?;
+                        Ok(replacement)
+                    }) {
+                    Ok(replacement) => {
                         engine = replacement;
                         Ok(String::new())
                     }
@@ -600,7 +607,13 @@ pub fn run_live_case(
 
     let recorder = AgentEvalRecorder::default();
     let observer = recorder.clone();
-    let mut engine = AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
+    let mut engine = AgentEngine::new(project_root.to_path_buf())
+        .map_err(|source| AgentEvalError::AgentStep {
+            case_id: case.id.clone(),
+            step: 0,
+            source,
+        })?
+        .with_observer(Box::new(observer));
     engine
         .start_session()
         .map_err(|source| AgentEvalError::AgentStep {
@@ -630,13 +643,14 @@ pub fn run_live_case(
             ),
             AgentEvalStep::Restart => {
                 let observer = recorder.clone();
-                let mut replacement =
-                    AgentEngine::new(project_root.to_path_buf()).with_observer(Box::new(observer));
-                match engine
-                    .save()
-                    .and_then(|()| replacement.resume_session(None))
-                {
-                    Ok(()) => {
+                match AgentEngine::new(project_root.to_path_buf())
+                    .map(|replacement| replacement.with_observer(Box::new(observer)))
+                    .and_then(|mut replacement| {
+                        engine.save()?;
+                        replacement.resume_session(None)?;
+                        Ok(replacement)
+                    }) {
+                    Ok(replacement) => {
                         engine = replacement;
                         Ok(String::new())
                     }

@@ -169,10 +169,16 @@ exit "$status"
     wait_for_output(&transcript, b"\x1b[?1049l", STEP_TIMEOUT);
     wait_for_output(&transcript, b"profile created", STEP_TIMEOUT);
 
+    let config_checkpoint = transcript_len(&transcript);
     send_text(&writer, "/config");
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:/config", &transcript);
-    wait_for_output_count(&transcript, b"\x1b[?1049h", 2, STEP_TIMEOUT);
+    wait_for_output_after(
+        &transcript,
+        config_checkpoint,
+        b"SubBake configuration",
+        STEP_TIMEOUT,
+    );
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -190,8 +196,14 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("widen PTY configuration editor");
+    let config_close_checkpoint = transcript_len(&transcript);
     send(&writer, b"q");
-    wait_for_output_count(&transcript, b"\x1b[?1049l", 2, STEP_TIMEOUT);
+    wait_for_output_after(
+        &transcript,
+        config_close_checkpoint,
+        b"\x1b[?1049l",
+        STEP_TIMEOUT,
+    );
 
     send_text(&writer, "make a plan");
     send(&writer, ENTER_KEY);
@@ -561,19 +573,26 @@ fn wait_for_output(transcript: &Transcript, needle: &[u8], timeout: Duration) {
     }
 }
 
-fn wait_for_output_count(
+fn transcript_len(transcript: &Transcript) -> usize {
+    transcript.bytes.lock().expect("lock PTY transcript").len()
+}
+
+fn wait_for_output_after(
     transcript: &Transcript,
+    checkpoint: usize,
     needle: &[u8],
-    expected_count: usize,
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
     let mut bytes = transcript.bytes.lock().expect("lock PTY transcript");
-    while count_subslice(&bytes, needle) < expected_count {
+    while !bytes
+        .get(checkpoint..)
+        .is_some_and(|tail| contains_subslice(tail, needle))
+    {
         let now = Instant::now();
         if now >= deadline {
             panic!(
-                "timed out waiting for {expected_count} occurrences of {:?}; transcript: {}",
+                "timed out waiting for new output {:?}; transcript: {}",
                 String::from_utf8_lossy(needle),
                 escape_bytes(&bytes)
             );
@@ -584,9 +603,13 @@ fn wait_for_output_count(
             .wait_timeout(bytes, remaining)
             .expect("wait for PTY output");
         bytes = next;
-        if result.timed_out() && count_subslice(&bytes, needle) < expected_count {
+        if result.timed_out()
+            && !bytes
+                .get(checkpoint..)
+                .is_some_and(|tail| contains_subslice(tail, needle))
+        {
             panic!(
-                "timed out waiting for {expected_count} occurrences of {:?}; transcript: {}",
+                "timed out waiting for new output {:?}; transcript: {}",
                 String::from_utf8_lossy(needle),
                 escape_bytes(&bytes)
             );

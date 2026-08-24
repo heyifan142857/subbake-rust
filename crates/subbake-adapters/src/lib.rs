@@ -56,7 +56,7 @@ pub use overnight::{
 pub use pipeline::{
     PipelineOutcome, PipelineRequest, run_pipeline, run_pipeline_cancellable_with_progress,
 };
-pub use platform::{Architecture, CapabilitySet, OperatingSystem, PlatformPaths};
+pub use platform::{Architecture, CapabilitySet, OperatingSystem, PathIdentity, PlatformPaths};
 pub use providers::{
     ApiFormat, BackendConfig, ProviderCheckOutcome, ProviderCheckRequest, build_backend,
     check_provider, check_provider_cancellable, default_api_key_env, resolve_env_var,

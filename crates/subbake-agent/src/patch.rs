@@ -440,6 +440,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("subbake-patch-{nanos}"));
         std::fs::create_dir_all(&root).expect("root");
-        (root.clone(), FileGuard::new(root))
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
+        (root, guard)
     }
 }

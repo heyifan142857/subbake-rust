@@ -193,3 +193,117 @@ impl AgentServices for DefaultAgentServices {
         subbake_adapters::edit_subtitle_cancellable(request, cancellation)
     }
 }
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TestAgentServices;
+
+#[cfg(test)]
+impl AgentServices for TestAgentServices {
+    fn run_command(
+        &self,
+        request: &SandboxedCommandRequest,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<SandboxedCommandOutput> {
+        cancellation
+            .check()
+            .map_err(subbake_adapters::AdapterError::from)?;
+        std::fs::create_dir_all(&request.staging_root)?;
+        for alias in &request.output_aliases {
+            std::fs::write(request.staging_root.join(alias), b"test artifact")?;
+        }
+        let stdout = request
+            .command
+            .split_once("printf ")
+            .map(|(_, value)| {
+                value
+                    .split([';', '>'])
+                    .next()
+                    .unwrap_or_default()
+                    .trim_matches([' ', '\'', '"'])
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        Ok(SandboxedCommandOutput {
+            exit_code: 0,
+            stdout,
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: std::time::Duration::ZERO,
+        })
+    }
+
+    fn transcribe(
+        &self,
+        request: TranscriptionRequest,
+        cancellation: &CancellationGuard,
+        progress: Option<SharedProgress>,
+    ) -> AdapterResult<TranscriptionOutcome> {
+        DefaultAgentServices.transcribe(request, cancellation, progress)
+    }
+
+    fn manage_whisper(
+        &self,
+        request: WhisperRequest,
+        cancellation: &CancellationGuard,
+        progress: Option<SharedProgress>,
+    ) -> AdapterResult<WhisperOutcome> {
+        DefaultAgentServices.manage_whisper(request, cancellation, progress)
+    }
+
+    fn diagnose_path(&self, path: &Path) -> AdapterResult<String> {
+        DefaultAgentServices.diagnose_path(path)
+    }
+
+    fn default_translation_output_path(
+        &self,
+        input_path: &Path,
+        output_format: Option<&str>,
+        bilingual: bool,
+        language_tag: Option<&str>,
+        preserve_source_container: bool,
+    ) -> AdapterResult<PathBuf> {
+        DefaultAgentServices.default_translation_output_path(
+            input_path,
+            output_format,
+            bilingual,
+            language_tag,
+            preserve_source_container,
+        )
+    }
+
+    fn batch_translation_output_path(
+        &self,
+        request: &BatchTranslationRequest,
+        input_path: &Path,
+    ) -> AdapterResult<PathBuf> {
+        DefaultAgentServices.batch_translation_output_path(request, input_path)
+    }
+
+    fn translate(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationGuard,
+        progress: Option<SharedProgress>,
+    ) -> AdapterResult<TranslationOutcome> {
+        DefaultAgentServices.translate(request, cancellation, progress)
+    }
+
+    fn translate_batch(
+        &self,
+        request: BatchTranslationRequest,
+        cancellation: &CancellationGuard,
+        progress: Option<SharedProgress>,
+    ) -> AdapterResult<BatchTranslationOutcome> {
+        DefaultAgentServices.translate_batch(request, cancellation, progress)
+    }
+
+    fn edit_subtitle(
+        &self,
+        request: SubtitleEditRequest,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<SubtitleEditOutcome> {
+        DefaultAgentServices.edit_subtitle(request, cancellation)
+    }
+}

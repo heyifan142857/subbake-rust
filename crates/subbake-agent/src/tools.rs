@@ -19,6 +19,11 @@ pub enum ToolKind {
     Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCapability {
+    CommandSandbox,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -27,6 +32,7 @@ pub struct ToolSpec {
     pub requires_approval: bool,
     pub discovery: bool,
     pub model_visible: bool,
+    pub required_capability: Option<ToolCapability>,
     pub description: &'static str,
     pub arguments: &'static [ToolArgSpec],
     pub(crate) executor: ToolExecutor,
@@ -545,6 +551,21 @@ macro_rules! tool {
             requires_approval: $approval,
             discovery: $discovery,
             model_visible: $visible,
+            required_capability: None,
+            description: $description,
+            arguments: $arguments,
+            executor: ToolExecutor::$executor,
+        }
+    };
+    ($name:literal, $category:ident, $mutating:literal, $approval:literal, $discovery:literal, $visible:literal, $description:literal, $arguments:expr, $executor:ident, requires $capability:ident) => {
+        ToolSpec {
+            name: $name,
+            category: ToolKind::$category,
+            mutating: $mutating,
+            requires_approval: $approval,
+            discovery: $discovery,
+            model_visible: $visible,
+            required_capability: Some(ToolCapability::$capability),
             description: $description,
             arguments: $arguments,
             executor: ToolExecutor::$executor,
@@ -562,7 +583,8 @@ pub const ALL_TOOL_SPECS: &[ToolSpec] = &[
         true,
         "Run a sandboxed Linux command. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits.",
         RUN_COMMAND_ARGS,
-        RunCommand
+        RunCommand,
+        requires CommandSandbox
     ),
     tool!(
         "translate_file",
@@ -779,41 +801,52 @@ pub fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     ALL_TOOL_SPECS.iter().find(|spec| spec.name == name)
 }
 
-fn tool_is_available(spec: &ToolSpec) -> bool {
-    tool_is_available_for(spec, subbake_adapters::platform::CapabilitySet::current())
-}
-
 fn tool_is_available_for(
     spec: &ToolSpec,
     capabilities: subbake_adapters::platform::CapabilitySet,
 ) -> bool {
-    spec.executor != ToolExecutor::RunCommand || capabilities.supports_command_sandbox()
+    match spec.required_capability {
+        None => true,
+        Some(ToolCapability::CommandSandbox) => capabilities.supports_command_sandbox(),
+    }
 }
 
-pub(crate) fn model_visible_tool_specs() -> Vec<&'static ToolSpec> {
-    ALL_TOOL_SPECS
-        .iter()
-        .filter(|spec| spec.model_visible && tool_is_available(spec))
-        .collect()
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolRegistry {
+    capabilities: subbake_adapters::platform::CapabilitySet,
 }
 
-pub(crate) fn model_visible_tool_names() -> Vec<&'static str> {
-    model_visible_tool_specs()
-        .into_iter()
-        .map(|spec| spec.name)
-        .collect()
-}
+impl ToolRegistry {
+    pub(crate) const fn new(capabilities: subbake_adapters::platform::CapabilitySet) -> Self {
+        Self { capabilities }
+    }
 
-pub fn tool_specs_for_categories<'a>(
-    specs: &'a [ToolSpec],
-    categories: &[ToolKind],
-) -> Vec<&'a ToolSpec> {
-    let mut result = specs
-        .iter()
-        .filter(|spec| categories.contains(&spec.category) && tool_is_available(spec))
-        .collect::<Vec<_>>();
-    result.sort_by_key(|spec| spec.name);
-    result
+    pub(crate) fn is_available(self, spec: &ToolSpec) -> bool {
+        tool_is_available_for(spec, self.capabilities)
+    }
+
+    pub(crate) fn model_visible_specs(self) -> Vec<&'static ToolSpec> {
+        ALL_TOOL_SPECS
+            .iter()
+            .filter(|spec| spec.model_visible && self.is_available(spec))
+            .collect()
+    }
+
+    pub(crate) fn model_visible_names(self) -> Vec<&'static str> {
+        self.model_visible_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect()
+    }
+
+    pub(crate) fn specs_for_categories(self, categories: &[ToolKind]) -> Vec<&'static ToolSpec> {
+        let mut result = ALL_TOOL_SPECS
+            .iter()
+            .filter(|spec| categories.contains(&spec.category) && self.is_available(spec))
+            .collect::<Vec<_>>();
+        result.sort_by_key(|spec| spec.name);
+        result
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -980,13 +1013,14 @@ mod tests {
 
     #[test]
     fn model_sees_one_complete_stable_registry() {
-        let names = model_visible_tool_names();
+        let capabilities = subbake_adapters::platform::CapabilitySet::current();
+        let names = ToolRegistry::new(capabilities).model_visible_names();
         assert!(names.contains(&"translate_series"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
         assert_eq!(
             names.contains(&"run_command"),
-            subbake_adapters::platform::CapabilitySet::current().supports_command_sandbox()
+            capabilities.supports_command_sandbox()
         );
         assert!(names.contains(&"delete_external_path"));
     }
@@ -1037,7 +1071,8 @@ mod tests {
         #[test]
         fn path_traversal_arguments_do_not_bypass_the_file_guard(name in "[A-Za-z0-9_-]{1,32}") {
             let root = std::env::temp_dir().join(format!("subbake-proptest-{}", std::process::id()));
-            let guard = crate::guard::FileGuard::new(root);
+            std::fs::create_dir_all(&root).expect("create property-test root");
+            let guard = crate::guard::FileGuard::new(root).expect("create file guard");
             let traversal = format!("../{name}");
             prop_assert!(guard.resolve_path(std::path::Path::new(&traversal)).is_err());
         }

@@ -1,5 +1,7 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::error::{AdapterError, AdapterResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatingSystem {
@@ -75,6 +77,33 @@ impl CapabilitySet {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlatformPaths;
 
+/// The two filesystem identities of one path.
+///
+/// `logical` is an absolute, lexically-normalized spelling suitable for
+/// presentation and stable application state. `resolved` is the operating
+/// system identity used only for containment and filesystem operations. The
+/// latter may contain platform-specific spellings such as `/private/var` or a
+/// Windows verbatim prefix and must not leak into user-facing paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathIdentity {
+    logical: PathBuf,
+    resolved: PathBuf,
+}
+
+impl PathIdentity {
+    pub fn logical(&self) -> &Path {
+        &self.logical
+    }
+
+    pub fn resolved(&self) -> &Path {
+        &self.resolved
+    }
+
+    pub fn resolved_relative_to(&self, root: &Self) -> Option<&Path> {
+        self.resolved.strip_prefix(&root.resolved).ok()
+    }
+}
+
 impl PlatformPaths {
     pub fn home_dir() -> Option<PathBuf> {
         home_dir_with(CapabilitySet::current().operating_system(), |key| {
@@ -92,6 +121,97 @@ impl PlatformPaths {
             std::env::var_os(key)
         })
     }
+
+    /// Identify an existing path. Callers can compare `resolved` identities
+    /// while retaining `logical` for stable output.
+    pub fn identify_existing(path: &Path) -> AdapterResult<PathIdentity> {
+        let logical = absolute_lexical(path)?;
+        let resolved = logical.canonicalize().map_err(|source| {
+            AdapterError::external_io("resolve existing path", Some(logical.clone()), source)
+        })?;
+        Ok(PathIdentity { logical, resolved })
+    }
+
+    /// Identify a path whose final components may not exist yet.
+    ///
+    /// The deepest filesystem entry is resolved first, including symlinks and
+    /// junctions, and the missing suffix is then appended. A dangling symlink
+    /// counts as an entry and therefore fails canonicalization safely.
+    pub fn identify_with_missing_tail(path: &Path) -> AdapterResult<PathIdentity> {
+        let logical = absolute_lexical(path)?;
+        let mut ancestor = logical.as_path();
+        loop {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        AdapterError::external_io(
+                            "locate existing path ancestor",
+                            Some(logical.clone()),
+                            source,
+                        )
+                    })?;
+                }
+                Err(source) => {
+                    return Err(AdapterError::external_io(
+                        "inspect path ancestor",
+                        Some(ancestor.to_path_buf()),
+                        source,
+                    ));
+                }
+            }
+        }
+        let resolved_ancestor = ancestor.canonicalize().map_err(|source| {
+            AdapterError::external_io(
+                "resolve existing path ancestor",
+                Some(ancestor.to_path_buf()),
+                source,
+            )
+        })?;
+        let suffix = logical
+            .strip_prefix(ancestor)
+            .map(Path::to_path_buf)
+            .map_err(|source| {
+                AdapterError::external_io(
+                    "derive missing path suffix",
+                    Some(logical.clone()),
+                    std::io::Error::other(source),
+                )
+            })?;
+        let resolved = if suffix.as_os_str().is_empty() {
+            resolved_ancestor
+        } else {
+            resolved_ancestor.join(suffix)
+        };
+        Ok(PathIdentity { logical, resolved })
+    }
+}
+
+fn absolute_lexical(path: &Path) -> AdapterResult<PathBuf> {
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| AdapterError::external_io("resolve current directory", None, source))?
+            .join(path)
+    };
+    Ok(normalize_absolute(anchored))
+}
+
+fn normalize_absolute(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn home_dir_with(
@@ -167,6 +287,53 @@ mod tests {
         assert!(!mac.supports_command_sandbox());
         assert!(!mac.has_prebuilt_whisper());
         assert!(windows.has_prebuilt_whisper());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_separates_logical_spelling_from_filesystem_identity() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!("subbake-path-identity-{nonce}"));
+        let actual = container.join("actual");
+        let alias = container.join("alias");
+        std::fs::create_dir_all(&actual).expect("create actual directory");
+        symlink(&actual, &alias).expect("create alias");
+
+        let identity = PlatformPaths::identify_with_missing_tail(&alias.join("new/file.srt"))
+            .expect("identify missing child");
+
+        assert_eq!(identity.logical(), alias.join("new/file.srt"));
+        assert_eq!(
+            identity.resolved(),
+            actual
+                .canonicalize()
+                .expect("canonical actual directory")
+                .join("new/file.srt")
+        );
+        let _ = std::fs::remove_dir_all(container);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_identity_rejects_a_dangling_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!("subbake-path-dangling-{nonce}"));
+        std::fs::create_dir_all(&container).expect("create container");
+        symlink(container.join("missing"), container.join("link")).expect("create dangling link");
+
+        PlatformPaths::identify_with_missing_tail(&container.join("link/file.srt"))
+            .expect_err("dangling symlink must not be treated as a missing directory");
+        let _ = std::fs::remove_dir_all(container);
     }
 
     #[cfg(windows)]

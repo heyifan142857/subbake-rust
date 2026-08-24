@@ -29,7 +29,7 @@ pub fn run(args: AgentArgs) -> CliResult<()> {
 
 fn start_interactive() -> CliResult<()> {
     let project_root = std::env::current_dir()?;
-    let mut engine = AgentEngine::new(project_root);
+    let mut engine = AgentEngine::new(project_root)?;
     engine.start_session()?;
 
     run_tui_with_engine(engine, false)
@@ -37,7 +37,7 @@ fn start_interactive() -> CliResult<()> {
 
 fn start_interactive_resume(session_id: Option<&str>) -> CliResult<()> {
     let project_root = std::env::current_dir()?;
-    let mut engine = AgentEngine::new(project_root);
+    let mut engine = AgentEngine::new(project_root)?;
     engine.resume_session(session_id)?;
 
     run_tui_with_engine(engine, session_id.is_none())
@@ -507,7 +507,7 @@ mod tests {
              model = \"none\"\n",
         )
         .expect("write config");
-        let mut engine = AgentEngine::new(root.clone());
+        let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");
         engine.set_config_path(Some(&path)).expect("pin config");
 
@@ -532,7 +532,7 @@ mod tests {
         let pinned = root.join("original.toml");
         std::fs::create_dir_all(&root).expect("create root");
 
-        let mut engine = AgentEngine::new(root.clone());
+        let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");
         engine.set_config_path(Some(&pinned)).expect("pin config");
 
@@ -551,7 +551,7 @@ mod tests {
         let path = root.join("subbake.toml");
         let original = "version = 2\n# retained\n";
         std::fs::write(&path, original).expect("write config");
-        let mut engine = AgentEngine::new(root.clone());
+        let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");
         engine.set_config_path(Some(&path)).expect("pin config");
 

@@ -38,6 +38,13 @@ impl ToolRunner {
             ValidatedToolCall::parse(name, args).map_err(|error| AgentError::ToolArguments {
                 message: error.to_string(),
             })?;
+        if crate::tools::find_tool_spec(name)
+            .is_some_and(|spec| !engine.tool_registry.is_available(spec))
+        {
+            return Err(AgentError::ToolArguments {
+                message: format!("tool `{name}` is unavailable on this platform"),
+            });
+        }
         let args = call.arguments();
         let executor = call.executor();
 
@@ -225,9 +232,7 @@ fn action_label(action: FileOpAction) -> &'static str {
 }
 
 fn event_path(root: &Path, path: &Path) -> String {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    path.strip_prefix(&canonical_root)
-        .or_else(|_| path.strip_prefix(root))
+    path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()

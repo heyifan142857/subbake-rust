@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use subbake_adapters::PlatformPaths;
+use subbake_adapters::{PathIdentity, PlatformPaths};
 use thiserror::Error;
 
 pub type FileGuardResult<T> = Result<T, FileGuardError>;
@@ -120,7 +120,15 @@ pub enum FileOpAction {
 #[derive(Debug, Clone)]
 pub struct FileGuard {
     project_root: PathBuf,
+    project_identity: PathIdentity,
     backup_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardedProjectPath {
+    relative: PathBuf,
+    logical: PathBuf,
+    io: PathBuf,
 }
 
 /// Guard for the deliberately exceptional operation that deletes paths outside
@@ -257,12 +265,25 @@ impl ExternalPathGuard {
 }
 
 impl FileGuard {
-    pub fn new(project_root: PathBuf) -> Self {
-        let backup_root = project_root.join(".subbake/agent/backups");
-        Self {
-            project_root,
-            backup_root,
+    pub fn new(project_root: PathBuf) -> FileGuardResult<Self> {
+        let project_identity = identify_existing(&project_root, "resolve project root")?;
+        if !project_identity.resolved().is_dir() {
+            return Err(FileGuardError::Io {
+                operation: "validate project root",
+                path: Some(project_identity.logical().to_path_buf()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "project root must be an existing directory",
+                ),
+            });
         }
+        let project_root = project_identity.logical().to_path_buf();
+        let backup_root = project_root.join(".subbake/agent/backups");
+        Ok(Self {
+            project_root,
+            project_identity,
+            backup_root,
+        })
     }
 
     pub(crate) fn project_root(&self) -> &Path {
@@ -275,22 +296,22 @@ impl FileGuard {
 
     pub fn read_file(&self, path: &Path) -> FileGuardResult<String> {
         let safe = self.resolve(path)?;
-        std::fs::read_to_string(&safe).map_err(|source| FileGuardError::Io {
+        std::fs::read_to_string(&safe.io).map_err(|source| FileGuardError::Io {
             operation: "read file",
-            path: Some(safe),
+            path: Some(safe.logical),
             source,
         })
     }
 
     pub fn create_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
-        if safe.exists() {
-            return Err(FileGuardError::AlreadyExists { path: safe });
+        if safe.io.exists() {
+            return Err(FileGuardError::AlreadyExists { path: safe.logical });
         }
-        self.write_atomically(&safe, content)?;
+        self.write_atomically(&safe.io, content)?;
         Ok(FileOpResult {
             action: FileOpAction::Create,
-            path: safe,
+            path: safe.logical,
             backup_path: None,
             new_path: None,
             semantic_undo: None,
@@ -299,21 +320,21 @@ impl FileGuard {
 
     pub fn append_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
-        let (mut existing, backup) = if safe.exists() {
+        let (mut existing, backup) = if safe.io.exists() {
             let backup = self.backup(&safe)?;
-            (std::fs::read_to_string(&safe)?, Some(backup))
+            (std::fs::read_to_string(&safe.io)?, Some(backup))
         } else {
             (String::new(), None)
         };
         existing.push_str(content);
-        self.write_atomically(&safe, &existing)?;
+        self.write_atomically(&safe.io, &existing)?;
         Ok(FileOpResult {
             action: if backup.is_some() {
                 FileOpAction::Append
             } else {
                 FileOpAction::Create
             },
-            path: safe,
+            path: safe.logical,
             backup_path: backup,
             new_path: None,
             semantic_undo: None,
@@ -328,12 +349,12 @@ impl FileGuard {
     ) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
-        let content = std::fs::read_to_string(&safe)?;
+        let content = std::fs::read_to_string(&safe.io)?;
         let updated = content.replace(old, new);
-        self.write_atomically(&safe, &updated)?;
+        self.write_atomically(&safe.io, &updated)?;
         Ok(FileOpResult {
             action: FileOpAction::Modified,
-            path: safe,
+            path: safe.logical,
             backup_path: Some(backup),
             new_path: None,
             semantic_undo: None,
@@ -344,10 +365,10 @@ impl FileGuard {
     pub fn replace_file(&self, path: &Path, content: &str) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
-        self.write_atomically(&safe, content)?;
+        self.write_atomically(&safe.io, content)?;
         Ok(FileOpResult {
             action: FileOpAction::Modified,
-            path: safe,
+            path: safe.logical,
             backup_path: Some(backup),
             new_path: None,
             semantic_undo: None,
@@ -359,18 +380,18 @@ impl FileGuard {
         let safe_to = self.resolve(to)?;
         // Backup both: the source (will be gone) and the destination (will be overwritten).
         let backup = self.backup(&safe_from)?;
-        if safe_to.exists() {
+        if safe_to.io.exists() {
             let _ = self.backup(&safe_to)?;
         }
-        if let Some(parent) = safe_to.parent() {
+        if let Some(parent) = safe_to.io.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::rename(&safe_from, &safe_to)?;
+        std::fs::rename(&safe_from.io, &safe_to.io)?;
         Ok(FileOpResult {
             action: FileOpAction::Renamed,
-            path: safe_from,
+            path: safe_from.logical,
             backup_path: Some(backup),
-            new_path: Some(safe_to),
+            new_path: Some(safe_to.logical),
             semantic_undo: None,
         })
     }
@@ -378,14 +399,14 @@ impl FileGuard {
     pub fn delete_file(&self, path: &Path) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
         let backup = self.backup(&safe)?;
-        if safe.is_dir() {
-            std::fs::remove_dir_all(&safe)?;
+        if safe.io.is_dir() {
+            std::fs::remove_dir_all(&safe.io)?;
         } else {
-            std::fs::remove_file(&safe)?;
+            std::fs::remove_file(&safe.io)?;
         }
         Ok(FileOpResult {
             action: FileOpAction::Deleted,
-            path: safe,
+            path: safe.logical,
             backup_path: Some(backup),
             new_path: None,
             semantic_undo: None,
@@ -396,10 +417,10 @@ impl FileGuard {
     /// write can participate in the same undo log as direct file operations.
     pub fn snapshot_write(&self, path: &Path) -> FileGuardResult<FileOpResult> {
         let safe = self.resolve(path)?;
-        if safe.exists() {
+        if safe.io.exists() {
             Ok(FileOpResult {
                 action: FileOpAction::Modified,
-                path: safe.clone(),
+                path: safe.logical.clone(),
                 backup_path: Some(self.backup(&safe)?),
                 new_path: None,
                 semantic_undo: None,
@@ -407,7 +428,7 @@ impl FileGuard {
         } else {
             Ok(FileOpResult {
                 action: FileOpAction::Create,
-                path: safe,
+                path: safe.logical,
                 backup_path: None,
                 new_path: None,
                 semantic_undo: None,
@@ -454,23 +475,23 @@ impl FileGuard {
                 });
             }
             let safe = self.resolve(destination)?;
-            if !destinations.insert(safe.clone()) {
+            if !destinations.insert(safe.io.clone()) {
                 return Err(FileGuardError::Io {
                     operation: "commit staged command outputs",
-                    path: Some(safe),
+                    path: Some(safe.logical),
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "duplicate output destination",
                     ),
                 });
             }
-            if safe.exists() && !overwrite {
-                return Err(FileGuardError::AlreadyExists { path: safe });
+            if safe.io.exists() && !overwrite {
+                return Err(FileGuardError::AlreadyExists { path: safe.logical });
             }
-            if safe.exists() && !safe.is_file() {
+            if safe.io.exists() && !safe.io.is_file() {
                 return Err(FileGuardError::Io {
                     operation: "replace command output",
-                    path: Some(safe),
+                    path: Some(safe.logical),
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "output destination is not a regular file",
@@ -486,16 +507,13 @@ impl FileGuard {
         let backups = prepared
             .iter()
             .map(|(staged, destination)| {
-                if let Some(parent) = destination.parent() {
+                if let Some(parent) = destination.io.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                if destination.exists() {
-                    let permissions = std::fs::metadata(destination)?.permissions();
+                if destination.io.exists() {
+                    let permissions = std::fs::metadata(&destination.io)?.permissions();
                     std::fs::set_permissions(staged, permissions)?;
-                    let relative = destination
-                        .strip_prefix(&self.project_root)
-                        .unwrap_or(destination);
-                    let backup = transaction_root.join(relative);
+                    let backup = transaction_root.join(&destination.relative);
                     if let Some(parent) = backup.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -506,45 +524,43 @@ impl FileGuard {
             })
             .collect::<FileGuardResult<Vec<_>>>()?;
         let mut committed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let mut operations = Vec::with_capacity(prepared.len());
         for (index, ((staged, destination), backup)) in prepared.iter().zip(backups).enumerate() {
             if let Some(backup) = &backup
-                && let Err(source) = std::fs::rename(destination, backup)
+                && let Err(source) = std::fs::rename(&destination.io, backup)
             {
                 rollback_committed_files(&committed);
                 return Err(FileGuardError::Io {
                     operation: "back up command output destination",
-                    path: Some(destination.clone()),
+                    path: Some(destination.logical.clone()),
                     source,
                 });
             }
-            if let Err(source) = std::fs::rename(staged, destination) {
+            if let Err(source) = std::fs::rename(staged, &destination.io) {
                 if let Some(backup) = &backup {
-                    let _ = std::fs::rename(backup, destination);
+                    let _ = std::fs::rename(backup, &destination.io);
                 }
                 rollback_committed_files(&committed);
                 return Err(FileGuardError::Io {
                     operation: "commit staged command output",
-                    path: Some(prepared[index].1.clone()),
+                    path: Some(prepared[index].1.logical.clone()),
                     source,
                 });
             }
-            committed.push((destination.clone(), backup));
-        }
-
-        Ok(committed
-            .into_iter()
-            .map(|(path, backup_path)| FileOpResult {
-                action: if backup_path.is_some() {
+            committed.push((destination.io.clone(), backup.clone()));
+            operations.push(FileOpResult {
+                action: if backup.is_some() {
                     FileOpAction::Modified
                 } else {
                     FileOpAction::Create
                 },
-                path,
-                backup_path,
+                path: destination.logical.clone(),
+                backup_path: backup,
                 new_path: None,
                 semantic_undo: None,
-            })
-            .collect())
+            });
+        }
+        Ok(operations)
     }
 
     /// Persist only the previous text subtitle when an in-place media remux
@@ -557,11 +573,10 @@ impl FileGuard {
         subtitle_format: &str,
     ) -> FileGuardResult<PathBuf> {
         let safe = self.resolve(container_path)?;
-        let relative = safe.strip_prefix(&self.project_root).unwrap_or(&safe);
         let mut payload_path = self
             .backup_root
             .join(format!("{}", nanos_since_epoch()))
-            .join(relative);
+            .join(&safe.relative);
         let name = payload_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -577,9 +592,16 @@ impl FileGuard {
     pub fn list_files(&self, dir: &Path) -> FileGuardResult<Vec<PathBuf>> {
         let safe = self.resolve(dir)?;
         let mut files = Vec::new();
-        for entry in std::fs::read_dir(&safe)? {
+        for entry in std::fs::read_dir(&safe.io)? {
             let entry = entry?;
-            files.push(entry.path());
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_protected_component)
+            {
+                continue;
+            }
+            files.push(self.path_from_io(&entry.path())?.logical);
         }
         files.sort();
         Ok(files)
@@ -589,13 +611,17 @@ impl FileGuard {
     pub fn search_files(&self, dir: &Path, pattern: &str) -> FileGuardResult<Vec<PathBuf>> {
         let safe = self.resolve(dir)?;
         let mut results = Vec::new();
-        self.search_recursive(&safe, pattern, &mut results)?;
+        self.search_recursive(&safe.io, pattern, &mut results)?;
+        let mut results = results
+            .into_iter()
+            .map(|path| self.path_from_io(&path).map(|safe| safe.logical))
+            .collect::<FileGuardResult<Vec<_>>>()?;
         results.sort();
         Ok(results)
     }
 
     pub fn resolve_path(&self, path: &Path) -> FileGuardResult<PathBuf> {
-        self.resolve(path)
+        Ok(self.resolve(path)?.logical)
     }
 
     /// Resolve a persisted undo target through the same project boundary as
@@ -619,7 +645,7 @@ impl FileGuard {
                 ),
             });
         }
-        self.resolve(path)
+        Ok(self.resolve(path)?.io)
     }
 
     /// Validate a persisted backup path without applying the protected-path
@@ -717,51 +743,46 @@ impl FileGuard {
 
     /// Resolve a user-supplied path to an absolute path under the project root,
     /// rejecting paths that escape the project root or contain protected components.
-    fn resolve(&self, user_path: &Path) -> FileGuardResult<PathBuf> {
-        let project_root = self.anchored_project_root()?;
-
-        // Normalise `..` components so `root/../etc/passwd` is caught below.
+    fn resolve(&self, user_path: &Path) -> FileGuardResult<GuardedProjectPath> {
         let anchored = normalize_path(if user_path.is_absolute() {
             user_path.to_path_buf()
         } else {
-            project_root.join(user_path)
+            self.project_root.join(user_path)
         });
-
-        self.reject_protected_components(&anchored)?;
-
-        // Resolve both sides through their nearest existing ancestors before
-        // comparing them. macOS can canonicalize `/var` as `/private/var`,
-        // while Windows can expand an 8.3 path and add a verbatim prefix. A
-        // lexical comparison between those equivalent spellings would reject
-        // every missing child path as an escape.
-        let root_canon = canonicalize_with_missing_tail(&project_root, "resolve project root")?;
-        let safe = canonicalize_with_missing_tail(&anchored, "resolve project path")?;
-
-        if !safe.starts_with(&root_canon) {
-            return Err(FileGuardError::PathEscape {
-                root: root_canon,
-                path: safe,
-            });
+        if let Ok(requested_relative) = anchored.strip_prefix(&self.project_root) {
+            self.reject_protected_components(requested_relative)?;
         }
-
-        self.reject_protected_components(&safe)?;
-
-        Ok(safe)
+        let identity = identify_with_missing_tail(&anchored, "resolve project path")?;
+        let Some(relative) = identity.resolved_relative_to(&self.project_identity) else {
+            return Err(FileGuardError::PathEscape {
+                root: self.project_root.clone(),
+                path: identity.logical().to_path_buf(),
+            });
+        };
+        let relative = relative.to_path_buf();
+        self.reject_protected_components(&relative)?;
+        Ok(GuardedProjectPath {
+            logical: self.project_root.join(&relative),
+            io: identity.resolved().to_path_buf(),
+            relative,
+        })
     }
 
-    fn anchored_project_root(&self) -> FileGuardResult<PathBuf> {
-        let root = if self.project_root.is_absolute() {
-            self.project_root.clone()
-        } else {
-            std::env::current_dir()
-                .map_err(|source| FileGuardError::Io {
-                    operation: "resolve project root",
-                    path: Some(self.project_root.clone()),
-                    source,
-                })?
-                .join(&self.project_root)
+    fn path_from_io(&self, path: &Path) -> FileGuardResult<GuardedProjectPath> {
+        let identity = identify_existing(path, "resolve discovered project path")?;
+        let Some(relative) = identity.resolved_relative_to(&self.project_identity) else {
+            return Err(FileGuardError::PathEscape {
+                root: self.project_root.clone(),
+                path: identity.logical().to_path_buf(),
+            });
         };
-        Ok(normalize_path(root))
+        let relative = relative.to_path_buf();
+        self.reject_protected_components(&relative)?;
+        Ok(GuardedProjectPath {
+            logical: self.project_root.join(&relative),
+            io: identity.resolved().to_path_buf(),
+            relative,
+        })
     }
 
     fn reject_protected_components(&self, path: &Path) -> FileGuardResult<()> {
@@ -788,6 +809,13 @@ impl FileGuard {
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_protected_component)
+            {
+                continue;
+            }
             // Recursive discovery must not follow links after the initial
             // directory has passed `resolve`. Following a directory symlink
             // here could escape the project root or recurse through a cycle.
@@ -819,30 +847,19 @@ impl FileGuard {
     // ------------------------------------------------------------------
 
     /// Create a timestamped backup of a file before mutating it.
-    fn backup(&self, path: &Path) -> FileGuardResult<PathBuf> {
-        if !path.exists() {
+    fn backup(&self, path: &GuardedProjectPath) -> FileGuardResult<PathBuf> {
+        if !path.io.exists() {
             return Err(FileGuardError::MissingBackupSource {
-                path: path.to_path_buf(),
+                path: path.logical.clone(),
             });
         }
-
-        let project_root = canonicalize_with_missing_tail(
-            &self.anchored_project_root()?,
-            "resolve project root for backup",
-        )?;
-        let rel = path
-            .strip_prefix(&project_root)
-            .map_err(|_| FileGuardError::PathEscape {
-                root: project_root,
-                path: path.to_path_buf(),
-            })?;
         let ts = nanos_since_epoch();
-        let backup_path = self.backup_root.join(format!("{ts}")).join(rel);
+        let backup_path = self.backup_root.join(format!("{ts}")).join(&path.relative);
 
         if let Some(parent) = backup_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(path, &backup_path)?;
+        std::fs::copy(&path.io, &backup_path)?;
         Ok(backup_path)
     }
 
@@ -917,69 +934,40 @@ fn nanos_since_epoch() -> u128 {
 /// Remove `..` and `.` components from a path without touching the filesystem.
 /// Mirrors `std::fs::canonicalize` but works for non-existent paths.
 fn normalize_path(path: PathBuf) -> PathBuf {
-    let mut components = Vec::new();
+    let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
-                components.pop();
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
             }
             std::path::Component::CurDir => {
                 // skip
             }
-            other => components.push(other),
+            other => normalized.push(other.as_os_str()),
         }
     }
-    components.iter().collect()
+    normalized
 }
 
-/// Canonicalize the deepest existing path prefix and append any missing tail.
-///
-/// `symlink_metadata` deliberately identifies dangling symlinks as existing;
-/// canonicalizing such an ancestor then fails safely instead of allowing a
-/// later directory creation to follow an unchecked link.
-fn canonicalize_with_missing_tail(
+fn identify_existing(path: &Path, operation: &'static str) -> FileGuardResult<PathIdentity> {
+    PlatformPaths::identify_existing(path).map_err(|source| FileGuardError::Io {
+        operation,
+        path: Some(path.to_path_buf()),
+        source: std::io::Error::other(source),
+    })
+}
+
+fn identify_with_missing_tail(
     path: &Path,
     operation: &'static str,
-) -> FileGuardResult<PathBuf> {
-    let mut ancestor = path;
-    loop {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(_) => break,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                ancestor = ancestor.parent().ok_or_else(|| FileGuardError::Io {
-                    operation,
-                    path: Some(path.to_path_buf()),
-                    source,
-                })?;
-            }
-            Err(source) => {
-                return Err(FileGuardError::Io {
-                    operation,
-                    path: Some(ancestor.to_path_buf()),
-                    source,
-                });
-            }
-        }
-    }
-    let canonical_ancestor = ancestor
-        .canonicalize()
-        .map_err(|source| FileGuardError::Io {
-            operation,
-            path: Some(ancestor.to_path_buf()),
-            source,
-        })?;
-    let suffix = path
-        .strip_prefix(ancestor)
-        .map_err(|source| FileGuardError::Io {
-            operation,
-            path: Some(path.to_path_buf()),
-            source: std::io::Error::other(source),
-        })?;
-    if suffix.as_os_str().is_empty() {
-        Ok(canonical_ancestor)
-    } else {
-        Ok(canonical_ancestor.join(suffix))
-    }
+) -> FileGuardResult<PathIdentity> {
+    PlatformPaths::identify_with_missing_tail(path).map_err(|source| FileGuardError::Io {
+        operation,
+        path: Some(path.to_path_buf()),
+        source: std::io::Error::other(source),
+    })
 }
 
 #[cfg(test)]
@@ -989,7 +977,8 @@ mod tests {
     fn setup() -> (PathBuf, FileGuard) {
         let ts = nanos_since_epoch();
         let root = std::env::temp_dir().join(format!("subbake-guard-{ts}"));
-        let guard = FileGuard::new(root.clone());
+        std::fs::create_dir_all(&root).expect("create project root");
+        let guard = FileGuard::new(root.clone()).expect("create file guard");
         (root, guard)
     }
 
@@ -1003,8 +992,12 @@ mod tests {
         let project_error = guard
             .prepare(&root.join("inside.txt"))
             .expect_err("project path must use FileGuard");
+        let filesystem_root = root
+            .ancestors()
+            .last()
+            .expect("temporary path has a filesystem root");
         let root_error = guard
-            .prepare(Path::new("/"))
+            .prepare(filesystem_root)
             .expect_err("filesystem root must be protected");
 
         assert!(matches!(
@@ -1044,7 +1037,7 @@ mod tests {
         let deleted = guard
             .delete(&approved.path, true)
             .expect("recursive external deletion");
-        assert_eq!(deleted.path, outside);
+        assert_eq!(deleted.path, approved.path);
         assert!(!outside.exists());
         let _ = std::fs::remove_dir_all(project_root);
     }
@@ -1137,7 +1130,7 @@ mod tests {
         let alias_root = alias_parent.join("project");
         std::fs::create_dir_all(&actual_root).expect("create actual project root");
         symlink(&actual_parent, &alias_parent).expect("create project-root alias");
-        let guard = FileGuard::new(alias_root.clone());
+        let guard = FileGuard::new(alias_root.clone()).expect("create aliased file guard");
 
         let result = guard
             .create_file(&alias_root.join("nested/new.txt"), "safe")
@@ -1147,11 +1140,7 @@ mod tests {
             std::fs::read_to_string(actual_root.join("nested/new.txt")).expect("read created file"),
             "safe"
         );
-        assert!(
-            result
-                .path
-                .starts_with(actual_root.canonicalize().expect("canonical root"))
-        );
+        assert_eq!(result.path, alias_root.join("nested/new.txt"));
         let _ = std::fs::remove_dir_all(container);
     }
 

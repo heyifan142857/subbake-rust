@@ -46,7 +46,7 @@ impl UndoService {
             vec![target_index]
         };
 
-        let guard = FileGuard::new(project_root.to_path_buf());
+        let guard = FileGuard::new(project_root.to_path_buf())?;
         for index in indices.iter().rev().copied() {
             let data = file_operation(&session.events[index])?;
             restore_event(&guard, &data, cancellation)?;
