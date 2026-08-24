@@ -509,9 +509,9 @@ mod tests {
 
     #[test]
     fn targeted_review_derives_auditable_deterministic_reason() {
-        let source = vec![segment("1", "Version 12")];
+        let source = vec![segment("1", "<i>Version</i>")];
         let mut translated = source.clone();
-        translated[0].text = "版本十三".to_owned();
+        translated[0].text = "版本".to_owned();
         let batches = vec![source];
         let mut options = PipelineOptions::new("review.txt".into());
         options.execution.review_policy = ReviewPolicy::Targeted;
@@ -535,7 +535,7 @@ mod tests {
                 1,
                 &[TranslationLine {
                     id: "1".to_owned(),
-                    translation: "版本12".to_owned(),
+                    translation: "<i>版本</i>".to_owned(),
                 }],
                 &[],
                 Usage::default(),
@@ -551,7 +551,7 @@ mod tests {
             changes[0]
                 .rationale
                 .as_deref()
-                .is_some_and(|value| value.contains("number mismatch"))
+                .is_some_and(|value| value.contains("formatting mismatch"))
         );
     }
 
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn review_rejects_a_new_factual_token_violation() {
+    fn review_leaves_number_changes_to_model_judgment() {
         let source = vec![segment("1", "Wait 2 minutes")];
         let mut translated = source.clone();
         translated[0].text = "等2分钟".to_owned();
@@ -640,8 +640,8 @@ mod tests {
             )
             .expect("apply safe review filter");
 
-        assert_eq!(reviewed[0].text, "等2分钟");
-        assert!(stage.snapshot(0).1.is_empty());
+        assert_eq!(reviewed[0].text, "等3分钟");
+        assert_eq!(stage.snapshot(0).1.len(), 1);
     }
 
     #[test]

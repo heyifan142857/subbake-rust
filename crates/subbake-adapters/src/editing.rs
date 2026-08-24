@@ -320,25 +320,24 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_validation_rejects_changed_number_before_writing() {
+    fn editing_leaves_number_changes_to_the_requested_model_edit() {
         let root = temp_root("edit-facts");
         fs::create_dir_all(&root).expect("create root");
         let path = root.join("clip.translated.txt");
         fs::write(&path, "It costs 10 dollars.\n").expect("write target");
 
-        let error = edit_subtitle(SubtitleEditRequest {
+        edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "change number".to_owned(),
             settings: TranslationSettings::default(),
             allow_non_generated: false,
             dry_run: false,
         })
-        .expect_err("changed fact must fail");
+        .expect("requested numeric edit should be written");
 
-        assert!(error.to_string().contains("changes numbers"));
         assert_eq!(
-            fs::read_to_string(&path).expect("preserved target"),
-            "It costs 10 dollars.\n"
+            fs::read_to_string(&path).expect("edited target"),
+            "It costs 11 dollars.\n"
         );
         let _ = fs::remove_dir_all(&root);
     }

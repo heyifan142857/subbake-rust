@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashSet};
 use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::formatting_tokens;
-use crate::number_facts::{NumberFactComparison, compare_number_facts};
 use crate::term_matcher::TermMatcher;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -216,21 +215,6 @@ fn validate_final_segment(
         issues.push(format!("line {} has a formatting mismatch", source.id));
     }
 
-    if let NumberFactComparison::HardMismatch {
-        left: source_facts,
-        right: translated_facts,
-    } = compare_number_facts(&source.text, &translated.text)
-    {
-        issues.push(format!(
-            "subtitle id `{}` changes numbers, dates, amounts, or percentages (expected {}, got {}; source {:?}; translation {:?})",
-            source.id,
-            display_tokens(&source_facts),
-            display_tokens(&translated_facts),
-            diagnostic_excerpt(&source.text),
-            diagnostic_excerpt(&translated.text),
-        ));
-    }
-
     for (term, target) in TermMatcher::case_insensitive().missing_required(
         &source.text,
         &translated.text,
@@ -275,26 +259,6 @@ fn validate_final_segment(
                 source.id
             ));
         }
-    }
-}
-
-fn display_tokens(tokens: &[String]) -> String {
-    if tokens.is_empty() {
-        "none".to_owned()
-    } else {
-        format!("[{}]", tokens.join(", "))
-    }
-}
-
-fn diagnostic_excerpt(text: &str) -> String {
-    const LIMIT: usize = 120;
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut characters = normalized.chars();
-    let excerpt = characters.by_ref().take(LIMIT).collect::<String>();
-    if characters.next().is_some() {
-        format!("{excerpt}…")
-    } else {
-        excerpt
     }
 }
 
@@ -403,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_normalizes_english_and_chinese_number_expressions() {
+    fn final_validation_accepts_english_and_chinese_number_expressions() {
         let pairs = [
             ("it's nearly 20,000 years old.", "将近有两万年的历史了。"),
             (
@@ -444,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_normalizes_clock_hours_cjk_percentages_and_numeric_idioms() {
+    fn final_validation_accepts_clock_hours_cjk_percentages_and_numeric_idioms() {
         let pairs = [
             ("Some of y'all ain't gonna see 3:00.", "有些人活不到三点。"),
             (
@@ -477,29 +441,6 @@ mod tests {
             FinalValidationPolicy::default(),
         )
         .expect("equivalent time, percentage, and idiom expressions should pass");
-
-        let error = validate_final_output(
-            &[segment("1", "Meet me at 3:30.", None)],
-            &[segment("1", "三点见。", None)],
-            &BTreeMap::new(),
-            "English",
-            "Chinese",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("dropping non-zero clock minutes must still fail");
-        assert!(error.to_string().contains("expected [3, 30]"));
-
-        let error = validate_final_output(
-            &[segment("1", "Ten people arrived.", None)],
-            &[segment("1", "一百个人来了。", None)],
-            &BTreeMap::new(),
-            "English",
-            "Chinese",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("a real ten-to-one-hundred change must still fail");
-        assert!(error.to_string().contains("expected [10]"));
-        assert!(error.to_string().contains("got [100]"));
     }
 
     #[test]
@@ -566,50 +507,31 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_still_blocks_explicit_cjk_quantity_changes() {
-        let error = validate_final_output(
-            &[segment("1", "十二岁", None)],
-            &[segment("1", "13 years old", None)],
-            &BTreeMap::new(),
-            "Chinese",
-            "English",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("an explicit age change must remain a hard mismatch");
-
-        assert!(error.to_string().contains("expected [12]"));
-        assert!(error.to_string().contains("got [13]"));
-    }
-
-    #[test]
-    fn final_validation_treats_article_plus_scale_as_a_strong_number() {
-        let source = vec![segment("1", "the DNA of a billion people", None)];
-        let translated = vec![segment("1", "一亿人的DNA", None)];
-
-        let error = validate_final_output(
-            &source,
-            &translated,
-            &BTreeMap::new(),
-            "English",
-            "Chinese",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("one billion must not equal one hundred million");
-
-        assert!(error.to_string().contains("expected [1000000000]"));
-        assert!(error.to_string().contains("got [100000000]"));
-    }
-
-    #[test]
-    fn final_validation_normalizes_call_signs_but_rejects_dropped_components() {
-        let source = vec![
-            segment("1", "Under-1-2 calling Guardian.", None),
-            segment("2", "Tally-3 target.", None),
+    fn final_validation_leaves_number_consistency_to_cinema_review() {
+        let pairs = [
+            ("Two. One.", "二。一。"),
+            ("Oh. Oh.", "哦。哦。"),
+            (
+                "2400 hours and 2 minutes. Subject declining rapidly.",
+                "24时零2分。对象状态急剧恶化。",
+            ),
+            ("ANNOUNCER 1: 58 fo nothing.", "播音员1：58比0，毫无收获。"),
+            (
+                "The repair costs 12 million dollars.",
+                "维修费用为一千三百万美元。",
+            ),
         ];
-        let translated = vec![
-            segment("1", "水下一二呼叫守护者。", None),
-            segment("2", "发现三个目标。", None),
-        ];
+        let source = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (source, _))| segment(&(index + 1).to_string(), source, None))
+            .collect::<Vec<_>>();
+        let translated = pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, translated))| segment(&(index + 1).to_string(), translated, None))
+            .collect::<Vec<_>>();
+
         validate_final_output(
             &source,
             &translated,
@@ -618,41 +540,11 @@ mod tests {
             "Chinese",
             FinalValidationPolicy::default(),
         )
-        .expect("equivalent call signs and explicit small quantities should pass");
-
-        let error = validate_final_output(
-            &[segment("1", "Copy, 1-1.", None)],
-            &[segment("1", "收到，一号机。", None)],
-            &BTreeMap::new(),
-            "English",
-            "Chinese",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("dropping half of a call sign must still fail");
-        assert!(error.to_string().contains("expected [11]"));
+        .expect("number differences are advisory cinema-review candidates, not hard failures");
     }
 
     #[test]
-    fn final_validation_still_rejects_a_real_number_change_after_normalization() {
-        let source = vec![segment("1", "The repair costs 12 million dollars.", None)];
-        let translated = vec![segment("1", "维修费用为一千三百万美元。", None)];
-
-        let error = validate_final_output(
-            &source,
-            &translated,
-            &BTreeMap::new(),
-            "English",
-            "Chinese",
-            FinalValidationPolicy::default(),
-        )
-        .expect_err("12 million must not equal 13 million");
-
-        assert!(error.to_string().contains("expected [12000000]"));
-        assert!(error.to_string().contains("got [13000000]"));
-    }
-
-    #[test]
-    fn final_validation_rejects_glossary_facts_formatting_and_omissions() {
+    fn final_validation_rejects_glossary_formatting_and_omissions() {
         let source = vec![
             segment("1", "<i>The Lord paid $20 (50%).</i>", None),
             segment("2", "Translate this sentence.", None),
@@ -676,7 +568,6 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains("formatting mismatch"));
-        assert!(message.contains("numbers, dates, amounts, or percentages"));
         assert!(message.contains("`Lord` -> `勋爵`"));
         assert!(message.contains("appears untranslated"));
         assert!(message.contains("line 3 is empty"));

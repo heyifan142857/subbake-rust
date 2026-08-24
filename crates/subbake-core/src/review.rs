@@ -83,6 +83,7 @@ pub(crate) fn build_review_plan(
                     memory,
                     &translations_by_source,
                     !source_language.eq_ignore_ascii_case(target_language),
+                    false,
                 );
                 (!reasons.is_empty()).then(|| (source.id.clone(), reasons))
             })
@@ -163,6 +164,7 @@ pub(crate) fn build_full_review_plan_with_rules(
                 memory,
                 &translations_by_source,
                 language_rules.is_cross_language(),
+                true,
             );
             reasons.extend(document_guide_review_reasons(
                 source,
@@ -480,7 +482,7 @@ pub(crate) fn build_review_messages_with_rules(
             format!(
                 "You are SubBake's targeted deterministic subtitle repair reviewer.\n\
                  Return valid JSON only.\n\
-                 Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording. Ambiguous number-expression candidates require verification, not automatic rewriting; preserve idioms and lexicalized expressions when they do not state a numeric fact.",
+                 Repair only the stated issues in {} subtitles without changing entry structure or unrelated wording.",
                 options.validation.target_language
             ),
             "{\"changes\":[{\"id\":\"<id>\",\"translation\":\"<replacement>\"}]}",
@@ -648,6 +650,7 @@ fn line_review_reasons(
     memory: &ContextMemory,
     translations_by_source: &BTreeMap<String, BTreeSet<String>>,
     cross_language: bool,
+    include_number_facts: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     if !TermMatcher::case_insensitive()
@@ -659,12 +662,14 @@ fn line_review_reasons(
     if formatting_tokens(&source.text) != formatting_tokens(&translated.text) {
         reasons.push("formatting mismatch".to_owned());
     }
-    match compare_number_facts(&source.text, &translated.text) {
-        NumberFactComparison::HardMismatch { .. } => reasons.push("number mismatch".to_owned()),
-        NumberFactComparison::Uncertain => reasons.push(
-            "ambiguous number expression; verify the fact without rewriting idioms".to_owned(),
-        ),
-        NumberFactComparison::Match => {}
+    if include_number_facts {
+        match compare_number_facts(&source.text, &translated.text) {
+            NumberFactComparison::HardMismatch { .. } => reasons.push("number mismatch".to_owned()),
+            NumberFactComparison::Uncertain => reasons.push(
+                "ambiguous number expression; verify the fact without rewriting idioms".to_owned(),
+            ),
+            NumberFactComparison::Match => {}
+        }
     }
     if has_readability_risk(translated) {
         reasons.push("subtitle readability risk".to_owned());
@@ -1003,15 +1008,11 @@ mod tests {
         );
         assert!(targeted_messages[1].content.contains("smallest change"));
         assert!(!targeted_messages[1].content.contains("\"category\""));
-        assert!(
-            targeted_messages[0]
-                .content
-                .contains("preserve idioms and lexicalized expressions")
-        );
+        assert!(!targeted_messages[0].content.contains("number-expression"));
     }
 
     #[test]
-    fn targeted_review_distinguishes_hard_and_ambiguous_number_candidates() {
+    fn targeted_review_ignores_number_candidates() {
         let source = vec![
             segment(
                 "1",
@@ -1032,6 +1033,38 @@ mod tests {
         ];
 
         let plan = build_review_plan(
+            &[source],
+            &translated,
+            &ContextMemory::default(),
+            "English",
+            "Chinese",
+        );
+
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn full_review_distinguishes_hard_and_ambiguous_number_candidates() {
+        let source = vec![
+            segment(
+                "1",
+                "Look at all this mess.",
+                "00:00:00,000",
+                "00:00:01,000",
+            ),
+            segment("2", "She is 12 years old.", "00:00:01,000", "00:00:02,000"),
+        ];
+        let translated = vec![
+            segment(
+                "1",
+                "看看这些乱七八糟的东西。",
+                "00:00:00,000",
+                "00:00:01,000",
+            ),
+            segment("2", "她十三岁。", "00:00:01,000", "00:00:02,000"),
+        ];
+
+        let plan = build_full_review_plan(
             &[source],
             &translated,
             &ContextMemory::default(),

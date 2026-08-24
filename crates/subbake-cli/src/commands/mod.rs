@@ -296,7 +296,7 @@ Options:
   -h, --help                    Print help
 
 The edit is rejected before publication if it changes IDs, formatting markers,
-numbers, dates, amounts, required terminology, or configured readability limits.
+required terminology, or configured readability limits.
 "#;
 const BATCH_HELP: &str = r#"Translate subtitle files in a directory
 

@@ -2864,17 +2864,17 @@ mod tests {
         return_unchanged: bool,
     }
 
-    struct AmbiguousCjkOutputBackend {
+    struct NumberMismatchOutputBackend {
         repair_calls: Arc<AtomicUsize>,
     }
 
-    impl LlmBackend for AmbiguousCjkOutputBackend {
+    impl LlmBackend for NumberMismatchOutputBackend {
         fn provider_name(&self) -> &str {
             "test"
         }
 
         fn model_name(&self) -> &str {
-            "ambiguous-cjk-output"
+            "number-mismatch-output"
         }
 
         fn execute(
@@ -2892,7 +2892,7 @@ mod tests {
             if prompt.contains("AGENT_REPAIR_JSON_START") {
                 self.repair_calls.fetch_add(1, Ordering::SeqCst);
                 return Err(LlmCallError::InvalidResponse(
-                    "ambiguous CJK output must not request final repair".to_owned(),
+                    "number mismatch must not request final repair".to_owned(),
                 ));
             }
             let body = prompt
@@ -2909,7 +2909,7 @@ mod tests {
                 .map(|line| {
                     serde_json::json!({
                         "id": line["id"],
-                        "translation": "看看这些乱七八糟的东西。",
+                        "translation": "24时零2分。对象状态急剧恶化。",
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2980,13 +2980,13 @@ mod tests {
                                 .and_then(|line| line["translation"].as_str())
                                 .unwrap_or_default()
                         } else {
-                            "费用是12美元。"
+                            "短句。"
                         };
                         serde_json::json!({"id": id, "translation": translation})
                     })
                     .collect::<Vec<_>>();
                 return Ok(GenerationResponse::json(
-                    serde_json::json!({"lines": lines, "review_notes": "fixed numeric fact"}),
+                    serde_json::json!({"lines": lines, "review_notes": "fixed final validation issue"}),
                     Usage {
                         input_tokens: 3,
                         output_tokens: 2,
@@ -3014,7 +3014,7 @@ mod tests {
                     let id = line["id"].as_str().unwrap_or_default();
                     serde_json::json!({
                         "id": id,
-                        "translation": if id == "1" { "费用是13美元。" } else { "这里没有数字。" },
+                        "translation": if id == "1" { "这是一条过长字幕。" } else { "好。" },
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3849,13 +3849,14 @@ mod tests {
     fn final_validation_repairs_only_failing_segments() {
         let document = document(
             "final-repair.srt",
-            &["The repair costs 12 dollars.", "There is no number here."],
+            &["A concise subtitle.", "Another subtitle."],
         );
         let mut options = PipelineOptions::new("final-repair.srt".into());
         options.execution.batch_size = 8;
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.terminology_preflight = false;
         options.execution.online_terminology = false;
+        options.validation.max_characters_per_line = Some(4);
         let signature = input_signature_from_bytes(b"final repair\n", Some(7));
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let paths = build_runtime_paths(
@@ -3889,8 +3890,8 @@ mod tests {
             *repair_ids.lock().expect("repair ids"),
             vec![vec!["1".to_owned()]]
         );
-        assert_eq!(run.translated_segments[0].text, "费用是12美元。");
-        assert_eq!(run.translated_segments[1].text, "这里没有数字。");
+        assert_eq!(run.translated_segments[0].text, "短句。");
+        assert_eq!(run.translated_segments[1].text, "好。");
         assert_eq!(run.result.agent_repairs.len(), 1);
         assert_eq!(run.result.agent_repairs[0].stage, "final_validation");
         assert!(run.result.agent_repairs[0].success);
@@ -3929,15 +3930,13 @@ mod tests {
 
     #[test]
     fn unchanged_final_validation_repair_stops_after_one_attempt() {
-        let document = document(
-            "unchanged-final-repair.srt",
-            &["The repair costs 12 dollars."],
-        );
+        let document = document("unchanged-final-repair.srt", &["A concise subtitle."]);
         let mut options = PipelineOptions::new("unchanged-final-repair.srt".into());
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.terminology_preflight = false;
         options.execution.online_terminology = false;
         options.execution.agent_repair_attempts = 3;
+        options.validation.max_characters_per_line = Some(4);
         let repair_ids = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             FinalValidationRepairBackend {
@@ -3962,15 +3961,18 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_cjk_number_glyphs_publish_without_final_validation_repair() {
-        let document = document("ambiguous-cjk.srt", &["Look at all this crazy stuff."]);
-        let mut options = PipelineOptions::new("ambiguous-cjk.srt".into());
+    fn number_mismatches_publish_without_final_validation_repair() {
+        let document = document(
+            "number-mismatch.srt",
+            &["2400 hours and 2 minutes. Subject declining rapidly."],
+        );
+        let mut options = PipelineOptions::new("number-mismatch.srt".into());
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.terminology_preflight = false;
         options.execution.online_terminology = false;
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
-            AmbiguousCjkOutputBackend {
+            NumberMismatchOutputBackend {
                 repair_calls: Arc::clone(&repair_calls),
             },
             options,
@@ -3978,10 +3980,13 @@ mod tests {
 
         let run = pipeline
             .run_document(&document)
-            .expect("ambiguous expression should publish directly");
+            .expect("number mismatch should publish directly outside cinema review");
 
         assert_eq!(repair_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(run.translated_segments[0].text, "看看这些乱七八糟的东西。");
+        assert_eq!(
+            run.translated_segments[0].text,
+            "24时零2分。对象状态急剧恶化。"
+        );
         assert!(run.result.agent_repairs.is_empty());
     }
 
@@ -4150,15 +4155,9 @@ mod tests {
             "zh-Hans",
         );
 
-        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].source[0].id, "2");
         assert_eq!(plan[0].reasons, vec!["formatting mismatch"]);
-        assert_eq!(plan[1].source[0].id, "3");
-        assert!(
-            plan[1].reasons[0].contains("ambiguous number expression"),
-            "{:?}",
-            plan[1].reasons
-        );
     }
 
     #[test]
