@@ -168,12 +168,12 @@ exit "$status"
             .windows(b"\x1b[2J".len())
             .position(|window| window == b"\x1b[2J")
             .expect("resize clears the visible screen");
-        let cursor_query = resize_output
-            .windows(DSR_QUERY.len())
-            .position(|window| window == DSR_QUERY)
-            .expect("replacement inline terminal queries the cursor");
+        let history_replay = resize_output
+            .windows(b"/pty-test".len())
+            .position(|window| window == b"/pty-test")
+            .expect("resize replays stable startup history");
         assert!(
-            screen_clear < cursor_query,
+            screen_clear < history_replay,
             "screen and scrollback must be cleared before transcript replay"
         );
     }
