@@ -27,7 +27,6 @@ const KEYBOARD_RESPONSE: &[u8] = b"\x1b[?1u\x1b[?1;2c";
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
-const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 const ENHANCED_ENTER_KEY: &[u8] = b"\x1b[13u";
 const ENHANCED_ESCAPE_KEY: &[u8] = b"\x1b[27u";
@@ -319,7 +318,7 @@ exit "$status"
     wait_for_output_after(
         &transcript,
         config_narrow_clear + b"\x1b[2J".len(),
-        CURSOR_HIDE,
+        b"Tab focus",
         STEP_TIMEOUT,
     );
     let config_navigation_checkpoint = transcript_len(&transcript);
@@ -327,7 +326,7 @@ exit "$status"
     wait_for_output_after(
         &transcript,
         config_navigation_checkpoint,
-        CURSOR_HIDE,
+        b"Active",
         STEP_TIMEOUT,
     );
     let config_resize_checkpoint = transcript_len(&transcript);
@@ -348,7 +347,7 @@ exit "$status"
     wait_for_output_after(
         &transcript,
         config_wide_clear + b"\x1b[2J".len(),
-        CURSOR_HIDE,
+        b"Tab focus",
         STEP_TIMEOUT,
     );
     let config_close_checkpoint = transcript_len(&transcript);
