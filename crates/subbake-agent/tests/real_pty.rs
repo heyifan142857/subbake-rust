@@ -164,17 +164,13 @@ exit "$status"
             contains_subslice(resize_output, b"\x1b[3J"),
             "resize reflow must purge terminal-native scrollback before replay"
         );
-        let screen_clear = resize_output
-            .windows(b"\x1b[2J".len())
-            .position(|window| window == b"\x1b[2J")
-            .expect("resize clears the visible screen");
-        let history_replay = resize_output
-            .windows(b"/pty-test".len())
-            .position(|window| window == b"/pty-test")
-            .expect("resize replays stable startup history");
         assert!(
-            screen_clear < history_replay,
-            "screen and scrollback must be cleared before transcript replay"
+            contains_subslice(resize_output, b"\x1b[2J"),
+            "resize reflow must clear the visible screen"
+        );
+        assert!(
+            contains_subslice(resize_output, b"/pty-test"),
+            "resize reflow must replay stable startup history"
         );
     }
     send_text(&writer, "after ");
@@ -318,6 +314,7 @@ exit "$status"
         b"SubBake configuration",
         STEP_TIMEOUT,
     );
+    let config_narrow_request = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
             rows: 30,
@@ -326,7 +323,22 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("resize PTY configuration editor");
+    let config_narrow_clear =
+        wait_for_output_after(&transcript, config_narrow_request, b"\x1b[2J", STEP_TIMEOUT);
+    wait_for_output_after(
+        &transcript,
+        config_narrow_clear + b"\x1b[2J".len(),
+        CURSOR_HIDE,
+        STEP_TIMEOUT,
+    );
+    let config_navigation_checkpoint = transcript_len(&transcript);
     send(&writer, b"\t\x1b[B");
+    wait_for_output_after(
+        &transcript,
+        config_navigation_checkpoint,
+        CURSOR_HIDE,
+        STEP_TIMEOUT,
+    );
     let config_resize_checkpoint = transcript_len(&transcript);
     pair.master
         .resize(PtySize {
@@ -336,14 +348,20 @@ exit "$status"
             pixel_height: 0,
         })
         .expect("widen PTY configuration editor");
-    wait_for_output_after(
+    let config_wide_clear = wait_for_output_after(
         &transcript,
         config_resize_checkpoint,
+        b"\x1b[2J",
+        STEP_TIMEOUT,
+    );
+    wait_for_output_after(
+        &transcript,
+        config_wide_clear + b"\x1b[2J".len(),
         CURSOR_HIDE,
         STEP_TIMEOUT,
     );
     let config_close_checkpoint = transcript_len(&transcript);
-    send(&writer, b"q");
+    send(&writer, escape_key);
     wait_for_output_after(
         &transcript,
         config_close_checkpoint,

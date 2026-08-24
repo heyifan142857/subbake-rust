@@ -79,7 +79,8 @@ impl ResizeReflowState {
     fn observe(&mut self, size: (u16, u16), now: Instant) {
         if size != self.last_observed {
             self.last_observed = size;
-            self.pending = Some((size, now + RESIZE_REFLOW_DEBOUNCE));
+            self.pending =
+                (size != self.last_rebuilt).then_some((size, now + RESIZE_REFLOW_DEBOUNCE));
         }
     }
 
@@ -993,6 +994,20 @@ mod tests {
             state.due_size(due + std::time::Duration::from_secs(1)),
             Some((40, 24))
         );
+    }
+
+    #[test]
+    fn resize_reflow_cancels_when_overlay_returns_to_the_rebuilt_size() {
+        let start = std::time::Instant::now();
+        let mut state = ResizeReflowState::new((120, 30));
+        state.observe((40, 30), start);
+        state.observe((120, 30), start + std::time::Duration::from_millis(50));
+
+        assert_eq!(
+            state.due_size(start + std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(state.pending, None);
     }
 
     #[test]
