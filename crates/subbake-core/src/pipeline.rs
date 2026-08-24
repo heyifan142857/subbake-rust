@@ -1624,6 +1624,7 @@ where
                 None
             };
             let cached = cached_response.is_some();
+            let mut unchanged_final_repair = false;
             let response_result = match cached_response {
                 Some(response) => {
                     self.accounting.record_cache_hit();
@@ -1670,6 +1671,13 @@ where
                 };
                 validate_translation_batch(source, lines)?;
                 if stage == "final_validation" {
+                    if translated.is_some_and(|current| repair_lines_unchanged(current, lines)) {
+                        unchanged_final_repair = true;
+                        return Err(CoreError::InvalidTranslation(
+                            "targeted final-validation repair returned unchanged translations"
+                                .to_owned(),
+                        ));
+                    }
                     let repaired = source
                         .iter()
                         .map(|segment| {
@@ -1742,7 +1750,8 @@ where
                     }));
                 }
                 Err(error) => {
-                    let stop_after_attempt = is_operational_llm_failure(&error);
+                    let stop_after_attempt =
+                        unchanged_final_repair || is_operational_llm_failure(&error);
                     repair_error = error;
                     attempts.push(AttemptLog {
                         attempt,
@@ -1851,6 +1860,16 @@ where
             shards,
         )
     }
+}
+
+fn repair_lines_unchanged(current: &[SubtitleSegment], lines: &[TranslationLine]) -> bool {
+    current.len() == lines.len()
+        && current.iter().all(|segment| {
+            lines
+                .iter()
+                .find(|line| line.id == segment.id)
+                .is_some_and(|line| line.translation == segment.text)
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2842,6 +2861,7 @@ mod tests {
 
     struct FinalValidationRepairBackend {
         repair_ids: Arc<Mutex<Vec<Vec<String>>>>,
+        return_unchanged: bool,
     }
 
     struct AmbiguousCjkOutputBackend {
@@ -2950,7 +2970,20 @@ mod tests {
                     .push(ids.clone());
                 let lines = ids
                     .into_iter()
-                    .map(|id| serde_json::json!({"id": id, "translation": "费用是12美元。"}))
+                    .map(|id| {
+                        let translation = if self.return_unchanged {
+                            payload["current_translations"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .find(|line| line["id"].as_str() == Some(id.as_str()))
+                                .and_then(|line| line["translation"].as_str())
+                                .unwrap_or_default()
+                        } else {
+                            "费用是12美元。"
+                        };
+                        serde_json::json!({"id": id, "translation": translation})
+                    })
                     .collect::<Vec<_>>();
                 return Ok(GenerationResponse::json(
                     serde_json::json!({"lines": lines, "review_notes": "fixed numeric fact"}),
@@ -3838,6 +3871,7 @@ mod tests {
         let mut pipeline = SubtitlePipeline::new(
             FinalValidationRepairBackend {
                 repair_ids: Arc::clone(&repair_ids),
+                return_unchanged: false,
             },
             options.clone(),
         )
@@ -3876,6 +3910,7 @@ mod tests {
         let mut resumed = SubtitlePipeline::new(
             FinalValidationRepairBackend {
                 repair_ids: Arc::clone(&resumed_repair_ids),
+                return_unchanged: false,
             },
             options,
         )
@@ -3890,6 +3925,40 @@ mod tests {
 
         assert!(resumed_repair_ids.lock().expect("repair ids").is_empty());
         assert_eq!(resumed_run.translated_segments, run.translated_segments);
+    }
+
+    #[test]
+    fn unchanged_final_validation_repair_stops_after_one_attempt() {
+        let document = document(
+            "unchanged-final-repair.srt",
+            &["The repair costs 12 dollars."],
+        );
+        let mut options = PipelineOptions::new("unchanged-final-repair.srt".into());
+        options.execution.review_policy = ReviewPolicy::Off;
+        options.execution.terminology_preflight = false;
+        options.execution.online_terminology = false;
+        options.execution.agent_repair_attempts = 3;
+        let repair_ids = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = SubtitlePipeline::new(
+            FinalValidationRepairBackend {
+                repair_ids: Arc::clone(&repair_ids),
+                return_unchanged: true,
+            },
+            options,
+        );
+
+        let error = pipeline
+            .run_document(&document)
+            .expect_err("unchanged invalid translation must not be retried");
+
+        assert!(
+            error
+                .to_string()
+                .contains("repair returned unchanged translations")
+        );
+        assert_eq!(repair_ids.lock().expect("repair ids").len(), 1);
+        assert_eq!(pipeline.agent_repairs.len(), 1);
+        assert_eq!(pipeline.agent_repairs[0].attempts, 1);
     }
 
     #[test]

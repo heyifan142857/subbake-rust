@@ -192,6 +192,16 @@ fn number_facts(text: &str) -> NumberFacts {
                 index += 1;
             }
             if start > 0 && characters[start - 1] == '第' {
+                let raw = characters[start..index].iter().collect::<String>();
+                if let Some(value) = parse_cjk_cardinal(&characters[start..index]) {
+                    facts
+                        .ambiguous
+                        .push(AmbiguousFact::numeric(value.to_string()));
+                } else {
+                    facts
+                        .ambiguous
+                        .push(AmbiguousFact::raw(format!("cjk-ordinal:{raw}")));
+                }
                 continue;
             }
             classify_cjk_span(&characters, start, index, &mut facts);
@@ -462,8 +472,32 @@ fn english_number_facts(text: &str) -> NumberFacts {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
     let mut facts = NumberFacts::default();
+    facts.definite.extend(
+        words
+            .iter()
+            .filter(|word| {
+                matches!(
+                    word.as_str(),
+                    "percent" | "percents" | "percentage" | "percentages"
+                )
+            })
+            .map(|_| "%".to_owned()),
+    );
     let mut index = 0;
     while index < words.len() {
+        if let Some(value) = EnglishRules::ordinal(&words[index]) {
+            let fact = AmbiguousFact::numeric(value.to_string());
+            if words
+                .get(index + 1)
+                .is_some_and(|word| is_ordinal_quantity_context(word))
+            {
+                facts.definite.push(value.to_string());
+            } else {
+                facts.ambiguous.push(fact);
+            }
+            index += 1;
+            continue;
+        }
         let Some(_) = english_number_value(&words[index]) else {
             index += 1;
             continue;
@@ -473,6 +507,15 @@ fn english_number_facts(text: &str) -> NumberFacts {
             index += 1;
         }
         let phrase = &words[start..index];
+        if is_contextual_countdown(phrase, words.get(start.wrapping_sub(1)), words.get(index)) {
+            facts.definite.extend(
+                phrase
+                    .iter()
+                    .filter_map(|word| EnglishRules::digit(word))
+                    .map(|value| value.to_string()),
+            );
+            continue;
+        }
         if phrase.len() == 1 {
             if let Some(scale) = EnglishRules::scale(&phrase[0]) {
                 if start > 0 && matches!(words[start - 1].as_str(), "a" | "an") {
@@ -494,6 +537,59 @@ fn english_number_facts(text: &str) -> NumberFacts {
         }
     }
     facts
+}
+
+fn is_ordinal_quantity_context(word: &str) -> bool {
+    matches!(
+        word,
+        "chapter"
+            | "chapters"
+            | "day"
+            | "days"
+            | "episode"
+            | "episodes"
+            | "floor"
+            | "floors"
+            | "level"
+            | "levels"
+            | "place"
+            | "places"
+            | "round"
+            | "rounds"
+            | "time"
+            | "times"
+            | "week"
+            | "weeks"
+            | "year"
+            | "years"
+    )
+}
+
+fn is_contextual_countdown(
+    phrase: &[String],
+    previous: Option<&String>,
+    next: Option<&String>,
+) -> bool {
+    if phrase.len() < 3
+        || !phrase
+            .iter()
+            .all(|word| EnglishRules::digit(word).is_some())
+    {
+        return false;
+    }
+    let descending = phrase.windows(2).all(|pair| {
+        EnglishRules::digit(&pair[0])
+            .zip(EnglishRules::digit(&pair[1]))
+            .is_some_and(|(left, right)| left == right + 1)
+    });
+    descending
+        && (previous.is_some_and(|word| matches!(word.as_str(), "count" | "countdown" | "in"))
+            || next.is_some_and(|word| {
+                matches!(
+                    word.as_str(),
+                    "blastoff" | "fire" | "go" | "impact" | "launch" | "liftoff"
+                )
+            }))
 }
 
 fn parse_english_number(words: &[String]) -> Option<u128> {
@@ -591,6 +687,52 @@ mod tests {
                 compare_number_facts("nothing", value),
                 NumberFactComparison::Uncertain,
                 "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_whisper_style_ordinals_percentages_dozens_and_countdowns() {
+        for (left, right) in [
+            ("But you're the ten.", "但你是那第十个。"),
+            (
+                "there's even a one percent chance",
+                "哪怕只有百分之一的机会。",
+            ),
+            (
+                "two dozen hostiles on the third floor",
+                "三楼有二十四个敌人。",
+            ),
+            (
+                "fire at will three two one impact",
+                "开火，三、二、一，命中。",
+            ),
+        ] {
+            assert_eq!(
+                compare_number_facts(left, right),
+                NumberFactComparison::Match,
+                "{left} / {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_rejects_real_changes_in_normalized_whisper_style_numbers() {
+        for (left, right) in [
+            ("But you're the ten.", "但你是那第十一个。"),
+            ("there's even a one percent chance", "有百分之二的机会。"),
+            (
+                "two dozen hostiles on the third floor",
+                "四楼有二十三个敌人。",
+            ),
+            ("fire at will three two one impact", "开火，三、二，命中。"),
+        ] {
+            assert!(
+                matches!(
+                    compare_number_facts(left, right),
+                    NumberFactComparison::HardMismatch { .. }
+                ),
+                "{left} / {right}"
             );
         }
     }

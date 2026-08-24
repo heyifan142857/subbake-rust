@@ -294,8 +294,42 @@ impl EnglishRules {
         }
     }
 
+    pub(crate) fn ordinal(word: &str) -> Option<u128> {
+        match word {
+            "first" => Some(1),
+            "second" => Some(2),
+            "third" => Some(3),
+            "fourth" => Some(4),
+            "fifth" => Some(5),
+            "sixth" => Some(6),
+            "seventh" => Some(7),
+            "eighth" => Some(8),
+            "ninth" => Some(9),
+            "tenth" => Some(10),
+            "eleventh" => Some(11),
+            "twelfth" => Some(12),
+            "thirteenth" => Some(13),
+            "fourteenth" => Some(14),
+            "fifteenth" => Some(15),
+            "sixteenth" => Some(16),
+            "seventeenth" => Some(17),
+            "eighteenth" => Some(18),
+            "nineteenth" => Some(19),
+            "twentieth" => Some(20),
+            "thirtieth" => Some(30),
+            "fortieth" => Some(40),
+            "fiftieth" => Some(50),
+            "sixtieth" => Some(60),
+            "seventieth" => Some(70),
+            "eightieth" => Some(80),
+            "ninetieth" => Some(90),
+            _ => None,
+        }
+    }
+
     pub(crate) fn scale(word: &str) -> Option<u128> {
         match word {
+            "dozen" => Some(12),
             "hundred" => Some(100),
             "thousand" => Some(1_000),
             "million" => Some(1_000_000),

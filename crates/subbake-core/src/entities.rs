@@ -866,6 +866,22 @@ mod tests {
     }
 
     #[test]
+    fn only_cinema_enables_review_by_default() {
+        assert_eq!(
+            TranslationPolicy::for_mode(TranslationMode::Economy).review_policy,
+            ReviewPolicy::Off
+        );
+        assert_eq!(
+            TranslationPolicy::for_mode(TranslationMode::Turbo).review_policy,
+            ReviewPolicy::Off
+        );
+        assert_eq!(
+            TranslationPolicy::for_mode(TranslationMode::Cinema).review_policy,
+            ReviewPolicy::Full
+        );
+    }
+
+    #[test]
     fn mode_strategies_are_fully_expanded_in_one_policy() {
         let economy = TranslationPolicy::for_mode(TranslationMode::Economy);
         assert_eq!(economy.context_strategy, ContextStrategy::SelfContained);

@@ -19,7 +19,7 @@ pub const PROMPT_CONTRACT_VERSION: u64 = 12;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 5;
 /// Bump when deterministic final-output validation semantics change.
-pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 7;
+pub const FINAL_VALIDATION_POLICY_VERSION: u64 = 8;
 /// Bump when the ordering, buffering, or publication contract of an
 /// incremental pipeline changes.
 pub const PIPELINE_EXECUTION_POLICY_VERSION: u64 = 1;
@@ -769,7 +769,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "31b2d074a3b1e0e84e6ef35005aaad3860a6da83"
+            "d7d9bd62cc431bcff8083e9710c25eeae506c61f"
         );
     }
 

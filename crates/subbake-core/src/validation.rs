@@ -222,10 +222,12 @@ fn validate_final_segment(
     } = compare_number_facts(&source.text, &translated.text)
     {
         issues.push(format!(
-            "line {} changes numbers, dates, amounts, or percentages (expected {}, got {})",
+            "subtitle id `{}` changes numbers, dates, amounts, or percentages (expected {}, got {}; source {:?}; translation {:?})",
             source.id,
             display_tokens(&source_facts),
             display_tokens(&translated_facts),
+            diagnostic_excerpt(&source.text),
+            diagnostic_excerpt(&translated.text),
         ));
     }
 
@@ -281,6 +283,18 @@ fn display_tokens(tokens: &[String]) -> String {
         "none".to_owned()
     } else {
         format!("[{}]", tokens.join(", "))
+    }
+}
+
+fn diagnostic_excerpt(text: &str) -> String {
+    const LIMIT: usize = 120;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let excerpt = characters.by_ref().take(LIMIT).collect::<String>();
+    if characters.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
     }
 }
 
