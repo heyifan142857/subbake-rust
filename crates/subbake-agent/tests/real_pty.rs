@@ -18,8 +18,10 @@ const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
 const ACTION_LOG_ENV: &str = "SUBBAKE_REAL_PTY_ACTION_LOG";
 #[cfg(unix)]
 const TEST_BIN_ENV: &str = "SUBBAKE_REAL_PTY_TEST_BIN";
-const TEST_TIMEOUT: Duration = Duration::from_secs(15);
-const STEP_TIMEOUT: Duration = Duration::from_secs(4);
+// Hosted runners can take several seconds to drain a full-screen Ratatui
+// redraw. These are failure ceilings; successful local runs remain fast.
+const TEST_TIMEOUT: Duration = Duration::from_secs(45);
+const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const KEYBOARD_QUERY: &[u8] = b"\x1b[?u\x1b[c";
 const KEYBOARD_RESPONSE: &[u8] = b"\x1b[?1u\x1b[?1;2c";
 const DSR_QUERY: &[u8] = b"\x1b[6n";
@@ -132,6 +134,7 @@ exit "$status"
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "SubmitText:/profile", &transcript);
     wait_for_output(&transcript, b"\x1b[?1049h", STEP_TIMEOUT);
+    wait_for_output(&transcript, b"Choose a model profile", STEP_TIMEOUT);
 
     pair.master
         .resize(PtySize {
@@ -151,6 +154,15 @@ exit "$status"
         })
         .expect("widen PTY profile picker");
     send(&writer, ENTER_KEY);
+    // Ratatui updates the picker header by terminal diff, so the full title is
+    // not guaranteed to occur contiguously in the raw PTY stream. This form-
+    // specific line is newly rendered and is therefore a stable readiness
+    // marker before typing into the profile-name field.
+    wait_for_output(
+        &transcript,
+        b"Allowed: letters, numbers, - and _",
+        STEP_TIMEOUT,
+    );
     send_text(&writer, "pty_profile");
     send(&writer, ENTER_KEY);
     wait_for_action(&action_log, "CreateProfile:pty_profile", &transcript);

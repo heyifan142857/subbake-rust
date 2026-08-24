@@ -85,6 +85,7 @@ pub(crate) fn write_file_atomically_with_permissions(
         )
     })?;
     let write_lock = AtomicWriteLock::acquire(output_path)?;
+    reject_directory_target(output_path)?;
     let file_name = output_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -224,6 +225,26 @@ fn lock_is_stale(path: &Path) -> bool {
         .is_ok_and(|elapsed| elapsed > Duration::from_secs(300))
 }
 
+fn reject_directory_target(path: &Path) -> AdapterResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(AdapterError::external_io(
+            "inspect atomic write target",
+            Some(path.to_path_buf()),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "atomic file output cannot replace a directory",
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(AdapterError::external_io(
+            "inspect atomic write target",
+            Some(path.to_path_buf()),
+            source,
+        )),
+    }
+}
+
 #[cfg(not(windows))]
 fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()> {
     fs::rename(temporary, output_path).map_err(|source| {
@@ -238,6 +259,10 @@ fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()
 
 #[cfg(windows)]
 fn publish_staged_file(temporary: &Path, output_path: &Path) -> AdapterResult<()> {
+    if let Err(error) = reject_directory_target(output_path) {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
     if !output_path.exists() {
         return fs::rename(temporary, output_path).map_err(|source| {
             let _ = fs::remove_file(temporary);
