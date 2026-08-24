@@ -4,10 +4,10 @@ use crate::entities::{
     BilingualOrder, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
 };
 use crate::error::CoreResult;
-use crate::formats::bilingual_text;
+use crate::formats::{bilingual_text, normalize_line_endings};
 
 pub fn parse(path: &Path, text: &str) -> SubtitleDocument {
-    let text = text.trim_start_matches('\u{feff}');
+    let text = normalize_line_endings(text.trim_start_matches('\u{feff}'));
     let segments = text
         .lines()
         .enumerate()

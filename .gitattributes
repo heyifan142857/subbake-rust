@@ -1,0 +1,2 @@
+# Keep compile-time test fixtures byte-stable across Git checkout configurations.
+crates/subbake-core/tests/fixtures/** text eol=lf

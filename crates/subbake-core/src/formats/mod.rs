@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::entities::{BilingualOrder, SubtitleDocument, SubtitleSegment};
@@ -131,6 +132,18 @@ pub(crate) fn bilingual_text(source: &str, target: &str, order: BilingualOrder) 
     }
 }
 
+/// Normalizes text-file line endings at the format boundary.
+///
+/// Parsers accept Unix, Windows, and legacy carriage-return separators, while
+/// renderers emit the workspace's canonical `\n` representation.
+pub(crate) fn normalize_line_endings(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 pub fn normalize_format(value: &str) -> CoreResult<String> {
     let normalized = value.trim().trim_start_matches('.').to_lowercase();
     match normalized.as_str() {
@@ -183,6 +196,24 @@ mod tests {
         let rendered = render_document(&doc, &doc.segments, &RenderOptions::new(false, None))
             .expect("render srt");
         assert!(rendered.contains("00:00:00,000 --> 00:00:01,000 position:10%"));
+    }
+
+    #[test]
+    fn srt_accepts_platform_line_endings_and_renders_canonical_lf() {
+        let canonical = "1\n00:00:00,000 --> 00:00:01,000\nhello\n";
+
+        for text in [
+            canonical.to_owned(),
+            canonical.replace('\n', "\r\n"),
+            canonical.replace('\n', "\r"),
+        ] {
+            let doc = parse_document_text(&PathBuf::from("clip.srt"), &text, None)
+                .expect("parse platform line endings");
+            let rendered = render_document(&doc, &doc.segments, &RenderOptions::new(false, None))
+                .expect("render canonical SRT");
+
+            assert_eq!(rendered, canonical);
+        }
     }
 
     #[test]

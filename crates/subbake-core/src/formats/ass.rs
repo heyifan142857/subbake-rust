@@ -5,17 +5,14 @@ use crate::entities::{
     SubtitleDocumentMetadata, SubtitleSegment, SubtitleSemanticContext,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::formats::bilingual_text;
+use crate::formats::{bilingual_text, normalize_line_endings};
 
 const EVENTS_SECTION: &str = "[events]";
 
 pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
     let had_bom = text.starts_with('\u{feff}');
-    let normalized = text
-        .trim_start_matches('\u{feff}')
-        .replace('\0', "")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let without_nul = text.trim_start_matches('\u{feff}').replace('\0', "");
+    let normalized = normalize_line_endings(&without_nul);
     if normalized.trim().is_empty() {
         return Err(CoreError::MalformedSubtitle(
             "Malformed ASS file: empty input.".to_owned(),

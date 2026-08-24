@@ -4,15 +4,12 @@ use crate::entities::{
     BilingualOrder, PassthroughBlock, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
 };
 use crate::error::{CoreError, CoreResult};
-use crate::formats::{bilingual_text, split_blocks};
+use crate::formats::{bilingual_text, normalize_line_endings, split_blocks};
 
 const TIMESTAMP_SEPARATOR: &str = "-->";
 
 pub fn parse(path: &Path, text: &str) -> CoreResult<SubtitleDocument> {
-    let normalized = text
-        .trim_start_matches('\u{feff}')
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let normalized = normalize_line_endings(text.trim_start_matches('\u{feff}'));
     if normalized.trim().is_empty() {
         return Err(CoreError::MalformedSubtitle(
             "Malformed VTT file: missing WEBVTT header.".to_owned(),
