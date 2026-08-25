@@ -153,12 +153,15 @@ struct AtomicWriteLock {
 
 impl AtomicWriteLock {
     fn acquire(target: &Path) -> AdapterResult<Self> {
+        const MAX_TRANSIENT_WINDOWS_PERMISSION_RETRIES: u8 = 50;
+
         let file_name = target
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("file");
         let path = target.with_file_name(format!(".{file_name}.subbake-write-lock"));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut transient_windows_permission_retries = 0_u8;
         loop {
             match fs::OpenOptions::new()
                 .write(true)
@@ -195,6 +198,19 @@ impl AtomicWriteLock {
                             "another process is writing the same file",
                         ),
                     ));
+                }
+                Err(source)
+                    if cfg!(windows)
+                        && source.kind() == std::io::ErrorKind::PermissionDenied
+                        && transient_windows_permission_retries
+                            < MAX_TRANSIENT_WINDOWS_PERMISSION_RETRIES =>
+                {
+                    // NTFS can briefly report access denied while another
+                    // writer removes the lock file. Retry that bounded race,
+                    // but preserve persistent permission errors below.
+                    transient_windows_permission_retries += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
                 }
                 Err(source) => {
                     return Err(AdapterError::external_io(
