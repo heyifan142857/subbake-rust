@@ -70,8 +70,9 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap ffmpeg tesseract-ocr
+          sudo apt-get install --yes --no-install-recommends bubblewrap espeak-ng ffmpeg tesseract-ocr
           bwrap --version
+          espeak-ng --version
           ffmpeg -version
           ffprobe -version
 

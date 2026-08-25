@@ -48,6 +48,10 @@ def generate_speech(destination: Path) -> None:
         run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
     elif sys.platform == "darwin":
         run("say", "-o", destination, "Hello from SubBake cross platform testing.")
+    elif sys.platform.startswith("linux"):
+        if shutil.which("espeak-ng") is None:
+            raise RuntimeError("espeak-ng is not available on PATH")
+        run("espeak-ng", "-w", destination, "Hello from SubBake cross platform testing.")
     else:
         raise RuntimeError(f"unsupported smoke-test platform: {sys.platform}")
 
@@ -62,7 +66,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="subbake-platform-smoke-") as temporary:
         work = Path(temporary)
         runtime = work / "runtime"
-        source_audio = work / ("speech.wav" if sys.platform == "win32" else "speech.aiff")
+        source_audio = work / (
+            "speech.aiff" if sys.platform == "darwin" else "speech.wav"
+        )
         compressed_audio = work / "speech.mp3"
         output = work / "speech.srt"
 
