@@ -162,7 +162,7 @@ jobs:
 
     steps:
       - name: Download verified assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: subbake-*-linux-x64
           path: dist
