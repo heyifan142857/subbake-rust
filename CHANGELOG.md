@@ -6,6 +6,12 @@ breaking changes when they are called out in advance.
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve non-zero embedded subtitle timestamps while extracting text or PGS
+  tracks, embedding translated tracks, and remuxing container undo output, so a
+  subtitle-only container no longer rebases its first cue to `00:00:00`.
+
 ## [0.2.0-alpha.1]
 
 ### Added

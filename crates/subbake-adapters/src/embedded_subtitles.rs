@@ -1063,6 +1063,7 @@ fn extract_subtitle(
             OsStr::new("-v"),
             OsStr::new("error"),
             OsStr::new("-y"),
+            OsStr::new("-copyts"),
             OsStr::new("-i"),
             input_path.as_os_str(),
             OsStr::new("-map"),
@@ -1109,6 +1110,7 @@ fn extract_pgs_subtitle(
             OsStr::new("-v"),
             OsStr::new("error"),
             OsStr::new("-y"),
+            OsStr::new("-copyts"),
             OsStr::new("-i"),
             input_path.as_os_str(),
             OsStr::new("-map"),
@@ -1443,6 +1445,9 @@ fn embed_subtitle_args(
         "-v".into(),
         "error".into(),
         "-y".into(),
+        // Subtitle-only containers may begin at the first cue rather than zero.
+        // Keep that absolute offset when the translated track is appended.
+        "-copyts".into(),
         "-fflags".into(),
         "+genpts".into(),
         "-i".into(),
@@ -1533,6 +1538,8 @@ fn remux_without_streams_args(
         "-v".into(),
         "error".into(),
         "-y".into(),
+        // Undo must not rebase a non-zero container timeline either.
+        "-copyts".into(),
         "-fflags".into(),
         "+genpts".into(),
         "-i".into(),
@@ -1943,6 +1950,7 @@ mod tests {
             .iter()
             .position(|arg| arg == "-i")
             .expect("input option");
+        assert!(rendered[..input_index].iter().any(|arg| arg == "-copyts"));
         assert_eq!(
             rendered
                 .get(input_index - 2)
@@ -1993,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_removal_generates_missing_timestamps_before_input() {
+    fn subtitle_removal_preserves_and_generates_timestamps_before_input() {
         let rendered = remux_without_streams_args(
             Path::new("input.mkv"),
             Path::new("output.mkv"),
@@ -2008,6 +2016,7 @@ mod tests {
             .position(|argument| argument == "-i")
             .expect("input option");
 
+        assert!(rendered[..input_index].iter().any(|arg| arg == "-copyts"));
         assert_eq!(
             &rendered[input_index - 2..input_index],
             ["-fflags", "+genpts"]
