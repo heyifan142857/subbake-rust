@@ -21,8 +21,29 @@ speech-to-text only, or `pipeline` for transcription followed by translation.
 
 ## Installation
 
-Install a recent Rust toolchain. FFmpeg and ffprobe are required for media
-inspection, transcription preparation, and embedded subtitle operations.
+### Precompiled Linux x64 archive
+
+Preview releases provide an x86-64 GNU/Linux archive for glibc 2.35 or newer.
+Download both release assets, verify the checksum, and then install the binary:
+
+```bash
+release_version="0.2.0-alpha.1"
+archive="subbake-v${release_version}-x86_64-unknown-linux-gnu.tar.gz"
+curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/${archive}"
+curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$archive"
+install -Dm755 "subbake-v${release_version}-x86_64-unknown-linux-gnu/sbake" "$HOME/.local/bin/sbake"
+```
+
+The archive does not bundle FFmpeg, bubblewrap, Tesseract, whisper.cpp, or
+Whisper models.
+
+### Install from source
+
+Install Rust 1.88 or newer. Official CI and release builds pin Rust 1.97.0.
+FFmpeg and ffprobe are required for media inspection, transcription preparation,
+and embedded subtitle operations.
 
 ```bash
 git clone https://github.com/heyifan142857/subbake-rust.git

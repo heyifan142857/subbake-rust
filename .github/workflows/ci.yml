@@ -15,8 +15,27 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  MSRV: "1.88.0"
+  RUST_TOOLCHAIN: "1.97.0"
 
 jobs:
+  msrv:
+    name: Linux / MSRV check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install the minimum supported Rust version
+        run: |
+          rustup toolchain install "${{ env.MSRV }}" --profile minimal
+          rustc "+${{ env.MSRV }}" --version --verbose
+
+      - name: Check every target with the locked dependency graph
+        run: cargo "+${{ env.MSRV }}" check --workspace --all-targets --locked
+
   linux-quality:
     name: Linux / format, lint, and test
     runs-on: ubuntu-24.04
@@ -26,10 +45,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Select stable Rust with lint and format components
+      - name: Select pinned Rust with lint and format components
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          rustup toolchain install "${{ env.RUST_TOOLCHAIN }}" --profile minimal --component clippy,rustfmt
+          rustup default "${{ env.RUST_TOOLCHAIN }}"
           rustc --version
           cargo --version
 
@@ -69,10 +88,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Select stable Rust with Clippy
+      - name: Select pinned Rust with Clippy
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install "${{ env.RUST_TOOLCHAIN }}" --profile minimal --component clippy
+          rustup default "${{ env.RUST_TOOLCHAIN }}"
           rustc --version --verbose
           cargo --version
 

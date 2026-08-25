@@ -10,9 +10,11 @@ resolver = "3"
 [workspace.package]
 version = "0.2.0-alpha.1"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-only"
 authors = ["azote <azote.h2@gmail.com>"]
 repository = "https://github.com/heyifan142857/subbake-rust"
+publish = false
 
 [workspace.dependencies]
 tempfile = "3.27"

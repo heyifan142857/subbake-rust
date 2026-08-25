@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.97.0"
+
+jobs:
+  build:
+    name: Linux x64 / build and verify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        id: metadata
+        shell: bash
+        run: |
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$package_version" ]]; then
+            printf '%s\n' "workspace package version is missing" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${package_version}" ]]; then
+            printf '%s\n' "tag ${GITHUB_REF_NAME} does not match Cargo version ${package_version}" >&2
+            exit 1
+          fi
+          release_notes="docs/release-notes/v${package_version}.md"
+          if [[ ! -f "$release_notes" ]]; then
+            printf '%s\n' "missing ${release_notes}" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$package_version" >> "$GITHUB_OUTPUT"
+          printf 'archive_dir=subbake-v%s-x86_64-unknown-linux-gnu\n' "$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Select pinned Rust
+        run: |
+          rustup toolchain install "${{ env.RUST_TOOLCHAIN }}" --profile minimal --component clippy,rustfmt
+          rustup default "${{ env.RUST_TOOLCHAIN }}"
+          rustc --version --verbose
+          cargo --version
+
+      - name: Install Linux smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap ffmpeg tesseract-ocr
+          if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Run release quality gates
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --no-fail-fast
+
+      - name: Build locked release binary
+        run: cargo build --locked --release -p subbake-cli
+
+      - name: Enforce the glibc 2.35 baseline
+        shell: bash
+        run: |
+          max_glibc="$(objdump -T target/release/sbake | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1 | cut -d_ -f2)"
+          if [[ -z "$max_glibc" ]]; then
+            printf '%s\n' "could not determine the binary's glibc requirement" >&2
+            exit 1
+          fi
+          printf 'maximum referenced glibc symbol: %s\n' "$max_glibc"
+          if dpkg --compare-versions "$max_glibc" gt "2.35"; then
+            printf '%s\n' "binary requires glibc ${max_glibc}, above the documented 2.35 baseline" >&2
+            exit 1
+          fi
+
+      - name: Stage reproducible release archive
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          ARCHIVE_DIR: ${{ steps.metadata.outputs.archive_dir }}
+        shell: bash
+        run: |
+          package_root="dist/${ARCHIVE_DIR}"
+          install -D -m 0755 target/release/sbake "${package_root}/sbake"
+          install -D -m 0644 LICENSE "${package_root}/LICENSE"
+          install -D -m 0644 README.md "${package_root}/README.md"
+          install -D -m 0644 docs/usage.md "${package_root}/docs/usage.md"
+          mkdir -p "${package_root}/completions"
+          target/release/sbake completion bash > "${package_root}/completions/sbake.bash"
+          target/release/sbake completion zsh > "${package_root}/completions/_sbake"
+          target/release/sbake completion fish > "${package_root}/completions/sbake.fish"
+          source_date_epoch="$(git log -1 --format=%ct)"
+          tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 --numeric-owner \
+            -C dist -czf "dist/${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+          rm -rf "$package_root"
+          cp "docs/release-notes/v${RELEASE_VERSION}.md" dist/RELEASE_NOTES.md
+          cd dist
+          sha256sum "${ARCHIVE_DIR}.tar.gz" > SHA256SUMS
+
+      - name: Smoke-test the packaged binary
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          ARCHIVE_DIR: ${{ steps.metadata.outputs.archive_dir }}
+        shell: bash
+        run: |
+          candidate_root="$(mktemp -d)"
+          tar -C "$candidate_root" -xzf "dist/${ARCHIVE_DIR}.tar.gz"
+          candidate="${candidate_root}/${ARCHIVE_DIR}/sbake"
+          version_output="$($candidate --version)"
+          printf '%s\n' "$version_output"
+          if [[ "$version_output" != *"${RELEASE_VERSION}"* || "$version_output" == *"dirty"* ]]; then
+            printf '%s\n' "release identity is missing the version or reports a dirty build" >&2
+            exit 1
+          fi
+          "$candidate" --help >/dev/null
+          "$candidate" completion bash >/dev/null
+          "$candidate" whisper status --runtime-dir "${candidate_root}/runtime" --json >/dev/null
+          printf '1\n00:00:00,000 --> 00:00:01,000\nhello\n' > "${candidate_root}/smoke.srt"
+          "$candidate" qa "${candidate_root}/smoke.srt" --json >/dev/null
+          bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user -- true
+          ffmpeg -version >/dev/null
+          ffprobe -version >/dev/null
+          tesseract --version >/dev/null
+          cd dist
+          sha256sum --check SHA256SUMS
+
+      - name: Upload candidate assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: subbake-${{ steps.metadata.outputs.version }}-linux-x64
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    name: Create draft pre-release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download verified assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: subbake-*-linux-x64
+          path: dist
+          merge-multiple: true
+
+      - name: Attest the release archive
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create GitHub draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --latest=false \
+            --title "$GITHUB_REF_NAME (preview)" \
+            --notes-file dist/RELEASE_NOTES.md

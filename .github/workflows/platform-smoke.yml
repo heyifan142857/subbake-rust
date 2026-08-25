@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.97.0"
 
 jobs:
   whisper:
@@ -23,6 +24,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: Linux x64
+            os: ubuntu-22.04
           - name: Windows x64
             os: windows-latest
           - name: macOS arm64
@@ -36,10 +39,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Select stable Rust
+      - name: Select pinned Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "${{ env.RUST_TOOLCHAIN }}" --profile minimal
+          rustup default "${{ env.RUST_TOOLCHAIN }}"
           rustc --version --verbose
 
       - name: Select Python for the smoke harness
@@ -61,6 +64,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install ffmpeg --yes --no-progress
+
+      - name: Install Linux media and sandbox dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap ffmpeg tesseract-ocr
+          bwrap --version
+          ffmpeg -version
+          ffprobe -version
 
       - name: Install macOS build and media dependencies
         if: runner.os == 'macOS'

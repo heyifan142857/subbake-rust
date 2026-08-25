@@ -36,7 +36,30 @@ FFmpeg codec 都可用。
 
 ## 安装
 
-需要较新的 Rust 工具链；处理音视频时还需安装 FFmpeg。
+### Linux x64 预编译包
+
+预览版提供面向 x86-64 GNU/Linux 的预编译包，要求 glibc 2.35 或更新版本。
+下载压缩包与校验文件后先验证 SHA-256，再安装二进制：
+
+```bash
+release_version="0.2.0-alpha.1"
+archive="subbake-v${release_version}-x86_64-unknown-linux-gnu.tar.gz"
+curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/${archive}"
+curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "$archive"
+install -Dm755 "subbake-v${release_version}-x86_64-unknown-linux-gnu/sbake" "$HOME/.local/bin/sbake"
+sbake --version
+```
+
+预编译包只包含 SubBake。处理音视频仍需安装 FFmpeg；Agent 的 `run_command`
+需要 bubblewrap；位图字幕 OCR 需要 Tesseract。whisper.cpp 与模型可以在安装
+SubBake 后通过内置命令管理。
+
+### 从源码安装
+
+源码构建需要 Rust 1.88 或更新版本；官方 CI 和发布构建固定使用 Rust 1.97.0。
+处理音视频时还需安装 FFmpeg。
 
 ```bash
 git clone https://github.com/heyifan142857/subbake-rust.git
@@ -179,6 +202,12 @@ profile、provider、模型、路径与环境变量占位符，不包含本地�
 
 - [`docs/agent-evaluation.md`](docs/agent-evaluation.md)
 - [`docs/subtitle-evaluation.md`](docs/subtitle-evaluation.md)
+
+兼容性与维护者发布流程见：
+
+- [`docs/compatibility.md`](docs/compatibility.md)
+- [`docs/releasing.md`](docs/releasing.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
 
 ## 开发
 

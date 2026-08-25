@@ -2,9 +2,11 @@
 name = "subbake-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "sbake"
@@ -21,9 +23,9 @@ agent = ["dep:subbake-agent"]
 [dependencies]
 ctrlc = { version = "3.5", features = ["termination"] }
 serde_json = "1"
-subbake-adapters = { path = "../subbake-adapters" }
-subbake-agent = { path = "../subbake-agent", optional = true }
-subbake-core = { path = "../subbake-core" }
+subbake-adapters = { version = "=0.2.0-alpha.1", path = "../subbake-adapters" }
+subbake-agent = { version = "=0.2.0-alpha.1", path = "../subbake-agent", optional = true }
+subbake-core = { version = "=0.2.0-alpha.1", path = "../subbake-core" }
 thiserror = "2"
 
 [dev-dependencies]
