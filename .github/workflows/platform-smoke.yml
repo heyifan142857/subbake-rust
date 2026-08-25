@@ -46,7 +46,7 @@ jobs:
           rustc --version --verbose
 
       - name: Select Python for the smoke harness
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.x"
 
