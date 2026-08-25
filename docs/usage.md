@@ -21,23 +21,27 @@ speech-to-text only, or `pipeline` for transcription followed by translation.
 
 ## Installation
 
-### Precompiled Linux x64 archive
+### Precompiled Linux x64 archives
 
-Preview releases provide an x86-64 GNU/Linux archive for glibc 2.35 or newer.
-Download both release assets, verify the checksum, and then install the binary:
+Preview releases provide two Linux x64 archives. The musl archive has no glibc
+runtime dependency. The GNU archive requires glibc 2.35 or newer. Set
+`release_target` to the archive appropriate for the host, download it together
+with the checksum file, and then install the binary:
 
 ```bash
 release_version="0.2.0-alpha.1"
-archive="subbake-v${release_version}-x86_64-unknown-linux-gnu.tar.gz"
+release_target="x86_64-unknown-linux-musl" # or x86_64-unknown-linux-gnu
+archive="subbake-v${release_version}-${release_target}.tar.gz"
 curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/${archive}"
 curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf "$archive"
-install -Dm755 "subbake-v${release_version}-x86_64-unknown-linux-gnu/sbake" "$HOME/.local/bin/sbake"
+install -Dm755 "subbake-v${release_version}-${release_target}/sbake" "$HOME/.local/bin/sbake"
 ```
 
-The archive does not bundle FFmpeg, bubblewrap, Tesseract, whisper.cpp, or
-Whisper models.
+Neither archive bundles FFmpeg, bubblewrap, Tesseract, whisper.cpp, or Whisper
+models. The musl build removes the glibc runtime dependency from `sbake`; it
+does not make these external programs part of the binary.
 
 ### Install from source
 

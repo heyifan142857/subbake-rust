@@ -30,13 +30,15 @@ come from GitHub Actions, never from a developer workstation.
 ## 2. Build a candidate without publishing
 
 Run the `Release` workflow manually from the target commit. The manual run builds
-the same Linux archive as a tag build, verifies its glibc baseline, runs smoke
-checks, and uploads a workflow artifact without creating a GitHub Release.
+the same GNU and musl Linux x64 archives as a tag build, verifies the GNU glibc
+baseline and musl static-link contract, runs smoke checks, and uploads a workflow
+artifact without creating a GitHub Release.
 
-Download the workflow artifact and verify it on clean Ubuntu 22.04 and Ubuntu
-24.04 installations. At minimum, test `--version`, `--help`, completion
-generation, provider configuration failure, FFmpeg discovery, bubblewrap
-discovery, and managed whisper.cpp status/install behavior.
+Download the workflow artifact and verify the GNU archive on clean Ubuntu 22.04
+and Ubuntu 24.04 installations, and the musl archive on a clean Alpine system.
+At minimum, test `--version`, `--help`, completion generation, provider
+configuration failure, FFmpeg discovery, bubblewrap discovery, and managed
+whisper.cpp status/install behavior.
 
 ## 3. Create the tag
 
@@ -61,6 +63,8 @@ pre-release. Download the draft assets and verify:
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf subbake-v0.2.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz
 ./subbake-v0.2.0-alpha.1-x86_64-unknown-linux-gnu/sbake --version
+tar -xzf subbake-v0.2.0-alpha.1-x86_64-unknown-linux-musl.tar.gz
+./subbake-v0.2.0-alpha.1-x86_64-unknown-linux-musl/sbake --version
 ```
 
 Confirm that the reported version and Git revision match the release tag, the

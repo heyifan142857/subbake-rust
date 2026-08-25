@@ -10,7 +10,8 @@ distinguishes user data from command-line conveniences.
 - Translation modes are `economy`, `turbo`, and `cinema` and are selected with
   `--mode` or the profile's `translation.mode` setting.
 - Interactive plan approval is a typed approve/reject/revise picker.
-- The precompiled release target is x86-64 GNU/Linux with glibc 2.35 or newer.
+- Precompiled releases include x86-64 GNU/Linux for glibc 2.35 or newer and a
+  statically linked x86-64 musl/Linux build without a glibc runtime dependency.
 - Windows x64 and macOS arm64/Intel remain experimental source-build and CI
   targets; no precompiled assets are published for them in this preview.
 

@@ -17,12 +17,14 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   RUST_TOOLCHAIN: "1.97.0"
+  MUSL_TARGET: "x86_64-unknown-linux-musl"
+  ALPINE_SMOKE_IMAGE: "docker.io/library/alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
 
 jobs:
   build:
     name: Linux x64 / build and verify
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out the exact source revision
@@ -49,19 +51,32 @@ jobs:
             exit 1
           fi
           printf 'version=%s\n' "$package_version" >> "$GITHUB_OUTPUT"
-          printf 'archive_dir=subbake-v%s-x86_64-unknown-linux-gnu\n' "$package_version" >> "$GITHUB_OUTPUT"
+          printf 'gnu_archive_dir=subbake-v%s-x86_64-unknown-linux-gnu\n' "$package_version" >> "$GITHUB_OUTPUT"
+          printf 'musl_archive_dir=subbake-v%s-x86_64-unknown-linux-musl\n' "$package_version" >> "$GITHUB_OUTPUT"
 
       - name: Select pinned Rust
         run: |
           rustup toolchain install "${{ env.RUST_TOOLCHAIN }}" --profile minimal --component clippy,rustfmt
           rustup default "${{ env.RUST_TOOLCHAIN }}"
+          rustup target add "${{ env.MUSL_TARGET }}"
           rustc --version --verbose
           cargo --version
+          host_triple="$(rustc --version --verbose | sed -n 's/^host: //p')"
+          musl_linker="$(rustc --print sysroot)/lib/rustlib/${host_triple}/bin/rust-lld"
+          if [[ ! -x "$musl_linker" ]]; then
+            printf '%s\n' "Rust self-contained linker is missing: ${musl_linker}" >&2
+            exit 1
+          fi
+          printf 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=%s\n' "$musl_linker" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C link-self-contained=yes\n' >> "$GITHUB_ENV"
+          printf 'CC_x86_64_unknown_linux_musl=musl-gcc\n' >> "$GITHUB_ENV"
 
-      - name: Install Linux smoke dependencies
+      - name: Install Linux build and smoke dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap ffmpeg tesseract-ocr
+          sudo apt-get install --yes --no-install-recommends \
+            binutils bubblewrap build-essential ca-certificates cmake ffmpeg file \
+            musl-tools perl pkg-config tesseract-ocr
           if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
@@ -70,10 +85,14 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --no-fail-fast
+          cargo test --workspace --locked --no-fail-fast
+          CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 \
+            cargo test --workspace --target "${MUSL_TARGET}" --locked --no-fail-fast
 
-      - name: Build locked release binary
-        run: cargo build --locked --release -p subbake-cli
+      - name: Build locked release binaries
+        run: |
+          cargo build --locked --release -p subbake-cli
+          cargo build --locked --release -p subbake-cli --target "${MUSL_TARGET}"
 
       - name: Enforce the glibc 2.35 baseline
         shell: bash
@@ -89,49 +108,99 @@ jobs:
             exit 1
           fi
 
-      - name: Stage reproducible release archive
-        env:
-          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
-          ARCHIVE_DIR: ${{ steps.metadata.outputs.archive_dir }}
+      - name: Verify the musl static binary
         shell: bash
         run: |
-          package_root="dist/${ARCHIVE_DIR}"
-          install -D -m 0755 target/release/sbake "${package_root}/sbake"
-          install -D -m 0644 LICENSE "${package_root}/LICENSE"
-          install -D -m 0644 README.md "${package_root}/README.md"
-          install -D -m 0644 docs/usage.md "${package_root}/docs/usage.md"
-          mkdir -p "${package_root}/completions"
-          target/release/sbake completion bash > "${package_root}/completions/sbake.bash"
-          target/release/sbake completion zsh > "${package_root}/completions/_sbake"
-          target/release/sbake completion fish > "${package_root}/completions/sbake.fish"
-          source_date_epoch="$(git log -1 --format=%ct)"
-          tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 --numeric-owner \
-            -C dist -czf "dist/${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
-          rm -rf "$package_root"
-          cp "docs/release-notes/v${RELEASE_VERSION}.md" dist/RELEASE_NOTES.md
-          cd dist
-          sha256sum "${ARCHIVE_DIR}.tar.gz" > SHA256SUMS
+          candidate="target/${MUSL_TARGET}/release/sbake"
+          file_output="$(file "$candidate")"
+          printf '%s\n' "$file_output"
+          if [[ "$file_output" != *"ELF 64-bit"* || "$file_output" != *"x86-64"* ]]; then
+            printf '%s\n' "musl binary has an unexpected file format" >&2
+            exit 1
+          fi
+          if ! readelf -h "$candidate" | grep -E 'Type:[[:space:]]+DYN' >/dev/null; then
+            printf '%s\n' "musl binary is not position-independent" >&2
+            exit 1
+          fi
+          if readelf -l "$candidate" | grep 'INTERP' >/dev/null; then
+            printf '%s\n' "musl binary unexpectedly contains an ELF interpreter" >&2
+            exit 1
+          fi
+          if readelf -d "$candidate" 2>/dev/null | grep '(NEEDED)' >/dev/null; then
+            printf '%s\n' "musl binary unexpectedly depends on a shared library" >&2
+            exit 1
+          fi
+          "$candidate" --version
 
-      - name: Smoke-test the packaged binary
+      - name: Stage reproducible release archives
         env:
           RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
-          ARCHIVE_DIR: ${{ steps.metadata.outputs.archive_dir }}
+          GNU_ARCHIVE_DIR: ${{ steps.metadata.outputs.gnu_archive_dir }}
+          MUSL_ARCHIVE_DIR: ${{ steps.metadata.outputs.musl_archive_dir }}
+        shell: bash
+        run: |
+          source_date_epoch="$(git log -1 --format=%ct)"
+
+          stage_archive() {
+            local archive_dir="$1"
+            local binary="$2"
+            local package_root="dist/${archive_dir}"
+            install -D -m 0755 "$binary" "${package_root}/sbake"
+            install -D -m 0644 LICENSE "${package_root}/LICENSE"
+            install -D -m 0644 README.md "${package_root}/README.md"
+            install -D -m 0644 docs/usage.md "${package_root}/docs/usage.md"
+            mkdir -p "${package_root}/completions"
+            "$binary" completion bash > "${package_root}/completions/sbake.bash"
+            "$binary" completion zsh > "${package_root}/completions/_sbake"
+            "$binary" completion fish > "${package_root}/completions/sbake.fish"
+            tar --sort=name --mtime="@${source_date_epoch}" --owner=0 --group=0 --numeric-owner \
+              -C dist -czf "dist/${archive_dir}.tar.gz" "${archive_dir}"
+            rm -rf "$package_root"
+          }
+
+          stage_archive "$GNU_ARCHIVE_DIR" target/release/sbake
+          stage_archive "$MUSL_ARCHIVE_DIR" "target/${MUSL_TARGET}/release/sbake"
+          cp "docs/release-notes/v${RELEASE_VERSION}.md" dist/RELEASE_NOTES.md
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Smoke-test the packaged binaries
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          GNU_ARCHIVE_DIR: ${{ steps.metadata.outputs.gnu_archive_dir }}
+          MUSL_ARCHIVE_DIR: ${{ steps.metadata.outputs.musl_archive_dir }}
         shell: bash
         run: |
           candidate_root="$(mktemp -d)"
-          tar -C "$candidate_root" -xzf "dist/${ARCHIVE_DIR}.tar.gz"
-          candidate="${candidate_root}/${ARCHIVE_DIR}/sbake"
-          version_output="$($candidate --version)"
-          printf '%s\n' "$version_output"
-          if [[ "$version_output" != *"${RELEASE_VERSION}"* || "$version_output" == *"dirty"* ]]; then
-            printf '%s\n' "release identity is missing the version or reports a dirty build" >&2
-            exit 1
-          fi
-          "$candidate" --help >/dev/null
-          "$candidate" completion bash >/dev/null
-          "$candidate" whisper status --runtime-dir "${candidate_root}/runtime" --json >/dev/null
           printf '1\n00:00:00,000 --> 00:00:01,000\nhello\n' > "${candidate_root}/smoke.srt"
-          "$candidate" qa "${candidate_root}/smoke.srt" --json >/dev/null
+
+          smoke_archive() {
+            local archive_dir="$1"
+            local runtime_dir="${candidate_root}/runtime-${archive_dir}"
+            tar -C "$candidate_root" -xzf "dist/${archive_dir}.tar.gz"
+            local candidate="${candidate_root}/${archive_dir}/sbake"
+            local version_output
+            version_output="$($candidate --version)"
+            printf '%s\n' "$version_output"
+            if [[ "$version_output" != *"${RELEASE_VERSION}"* || "$version_output" == *"dirty"* ]]; then
+              printf '%s\n' "release identity is missing the version or reports a dirty build" >&2
+              exit 1
+            fi
+            "$candidate" --help >/dev/null
+            "$candidate" completion bash >/dev/null
+            "$candidate" whisper status --runtime-dir "$runtime_dir" --json >/dev/null
+            "$candidate" qa "${candidate_root}/smoke.srt" --json >/dev/null
+          }
+
+          smoke_archive "$GNU_ARCHIVE_DIR"
+          smoke_archive "$MUSL_ARCHIVE_DIR"
+
+          docker run --rm --network none --read-only --tmpfs /tmp \
+            -v "${candidate_root}/${MUSL_ARCHIVE_DIR}/sbake:/usr/local/bin/sbake:ro" \
+            -v "${candidate_root}/smoke.srt:/tmp/smoke.srt:ro" \
+            "$ALPINE_SMOKE_IMAGE" \
+            sh -ec 'sbake --version; sbake --help >/dev/null; sbake whisper status --runtime-dir /tmp/runtime --json >/dev/null; sbake qa /tmp/smoke.srt --json >/dev/null'
+
           bwrap --ro-bind / / --proc /proc --dev /dev --unshare-user -- true
           ffmpeg -version >/dev/null
           ffprobe -version >/dev/null
@@ -168,7 +237,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Attest the release archive
+      - name: Attest the release archives
         uses: actions/attest@v4
         with:
           subject-path: dist/*.tar.gz

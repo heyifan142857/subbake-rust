@@ -16,7 +16,7 @@ breaking changes when they are called out in advance.
 - Local whisper.cpp installation, model management, and transcription.
 - Economy, Turbo, and Cinema translation policies.
 - Translation memory, glossary, resumable runtime state, quality checks, and safe editing.
-- Linux x64 release archive with SHA-256 checksums and build provenance.
+- GNU and musl Linux x64 release archives with SHA-256 checksums and build provenance.
 
 ### Changed
 
