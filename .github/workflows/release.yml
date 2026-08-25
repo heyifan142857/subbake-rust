@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Check out the exact source revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -140,7 +140,7 @@ jobs:
           sha256sum --check SHA256SUMS
 
       - name: Upload candidate assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: subbake-${{ steps.metadata.outputs.version }}-linux-x64
           path: |
@@ -162,7 +162,7 @@ jobs:
 
     steps:
       - name: Download verified assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: subbake-*-linux-x64
           path: dist
