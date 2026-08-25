@@ -1,65 +1,36 @@
 # SubBake
 
-SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写 CLI，也提供交互式终端 Agent。
+SubBake 是一个使用 Rust 编写的字幕翻译与音视频转写命令行工具，同时提供交互式终端代理。它面向需要批量处理、断点续跑和稳定输出校验的字幕工作流。
 
-本项目从原有的 Python 项目 [heyifan142857/subbake](https://github.com/heyifan142857/subbake) 迁移而来。它重新设计了部分核心逻辑与命令，利用并发翻译提升处理速度，并在类型安全、资源占用、错误处理和单文件部署方面做了改进。
+> 项目目前处于预览阶段，命令和配置仍可能调整。建议在重要任务中保留原始文件，并先用少量内容验证配置。
 
-> 当前版本仍处于早期开发阶段，命令和配置格式可能继续调整。
+## 主要功能
 
-## 平台兼容性
-
-本项目目前主要在 Linux 上开发和维护。Windows 与 macOS 会通过真实 GitHub
-Actions runner 做编译、测试和定期 Whisper/FFmpeg 冒烟验证，但仍属于实验性支持。
-
-| 平台 | 支持级别 | 当前边界 |
-| --- | --- | --- |
-| Linux x64 | 主要支持 | 完整 CLI、TUI、转写及基于 bubblewrap 的 Agent `run_command` |
-| Windows x64 | 实验性 | 翻译、转写、Whisper 预编译安装和 TUI；不提供 `run_command` 沙箱 |
-| macOS arm64/Intel | 实验性 | 翻译、转写、Whisper 源码构建和 TUI；不提供 `run_command` 沙箱 |
-
-当前不承诺 Windows ARM、所有 GPU/CUDA/Metal 组合、所有终端模拟器或任意系统
-FFmpeg codec 都可用。
-
-## 功能
-
-- 翻译 SRT、VTT、ASS/SSA、TTML/DFXP 与 TXT 字幕/文本文件
-- 直接翻译 MKV、MP4/M4V/MOV 和 WebM 中的文本字幕轨
-- 并发分批翻译、审校、缓存、失败重试与断点续跑
-- 批量处理目录中的字幕文件
-- 通过本地 whisper.cpp 转写音视频
-- 将转写与翻译组合成完整流水线
-- 支持 OpenAI、Anthropic、Gemini 及兼容接口
-- 提供带计划确认、会话恢复、历史记录和撤销功能的终端 Agent
-- 支持术语表与翻译记忆，并兼容部分旧版运行数据
-- 提供无参考译文的字幕 QA、可恢复批处理清单和资源预算
-- 安全润色已翻译字幕，支持 dry-run 差异预览和确定性发布前校验
+- 翻译 SRT、VTT、ASS/SSA、TTML/DFXP 和 TXT 文件
+- 处理媒体容器中的文本字幕轨，并通过 whisper.cpp 转写音视频
+- 支持批量翻译、缓存、失败重试、断点续跑、术语表和翻译记忆
+- 提供 `economy`、`turbo` 和 `cinema` 三种翻译策略
+- 提供字幕质量检查、离线对照评估和带差异预览的字幕润色
+- 提供带计划确认、会话恢复和撤销功能的终端代理
 
 ## 安装
 
 ### Linux x64 预编译包
 
-预览版提供面向 x86-64 GNU/Linux 的预编译包，要求 glibc 2.35 或更新版本。
-下载压缩包与校验文件后先验证 SHA-256，再安装二进制：
+[Releases](https://github.com/heyifan142857/subbake-rust/releases) 提供两种 Linux x64 预编译包：musl 包不依赖 glibc，GNU 包适用于 glibc 2.35 或更新版本。选择其中一种，并下载对应压缩包和 `SHA256SUMS`。以下以 musl 包为例：
 
 ```bash
-release_version="0.2.0-alpha.1"
-archive="subbake-v${release_version}-x86_64-unknown-linux-gnu.tar.gz"
-curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/${archive}"
-curl -LO "https://github.com/heyifan142857/subbake-rust/releases/download/v${release_version}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf "$archive"
-install -Dm755 "subbake-v${release_version}-x86_64-unknown-linux-gnu/sbake" "$HOME/.local/bin/sbake"
+tar -xzf subbake-*-x86_64-unknown-linux-musl.tar.gz
+install -Dm755 subbake-*-x86_64-unknown-linux-musl/sbake "$HOME/.local/bin/sbake"
 sbake --version
 ```
 
-预编译包只包含 SubBake。处理音视频仍需安装 FFmpeg；Agent 的 `run_command`
-需要 bubblewrap；位图字幕 OCR 需要 Tesseract。whisper.cpp 与模型可以在安装
-SubBake 后通过内置命令管理。
+预编译包只包含 `sbake`。媒体处理需要系统提供 FFmpeg；终端代理的命令沙箱需要 bubblewrap；位图字幕 OCR 需要 Tesseract。whisper.cpp 及其模型可以由 SubBake 管理。
 
 ### 从源码安装
 
-源码构建需要 Rust 1.88 或更新版本；官方 CI 和发布构建固定使用 Rust 1.97.0。
-处理音视频时还需安装 FFmpeg。
+源码构建需要 Rust 1.88 或更新版本：
 
 ```bash
 git clone https://github.com/heyifan142857/subbake-rust.git
@@ -67,33 +38,41 @@ cd subbake-rust
 cargo install --path crates/subbake-cli
 ```
 
-默认安装包含交互式 Agent 和全部 CLI 命令。如只需要非交互式 CLI（包括翻译、
-批处理、转写、流水线和运行时管理），可以关闭默认的 `agent` feature：
+如果不需要交互式终端代理，可以只安装非交互式 CLI：
 
 ```bash
 cargo install --path crates/subbake-cli --no-default-features
 ```
 
-如需本地转写，可以让 SubBake 安装 whisper.cpp 和模型：
+## 快速开始
 
 ```bash
+# 启动交互式终端代理
+sbake
+
+# 翻译单个字幕
+sbake translate episode.srt --target-lang Chinese
+
+# 批量翻译目录中的字幕
+sbake batch ./subtitles --target-lang Chinese
+
+# 安装 whisper.cpp 和基础模型
 sbake whisper install
 sbake whisper model base
+
+# 转写音视频，或在转写后继续翻译
+sbake transcribe interview.mp4 --model base
+sbake pipeline interview.mp4 --transcribe-model base --target-lang Chinese
+
+# 检查字幕时间轴与可读性
+sbake qa episode.srt
 ```
 
-默认安装 CPU 版本，也可用 `--variant cuda|metal|vulkan|openblas` 选择加速构建。安装后即可运行：
-
-```bash
-sbake transcribe movie.mp4 --model base --language Auto
-sbake pipeline movie.mp4 --transcribe-model base --target-language zh-Hans
-```
-
-安装器不是必需的。如果机器上已有 `whisper-cli` 和 GGML/GGUF 模型，可在配置中
-直接指定可执行文件和模型目录，SubBake 不会再要求使用内置安装流程。
+`translate` 只处理字幕、文本文件或媒体中的文本字幕轨，不会隐式转写音视频。需要语音识别时请使用 `transcribe` 或 `pipeline`。完整参数可通过 `sbake --help` 和 `sbake <COMMAND> --help` 查看。
 
 ## 配置
 
-SubBake 会读取 `~/.config/subbake/config.toml` 或项目目录下的 `.subbake.toml`。建议通过环境变量保存 API Key：
+SubBake 默认读取 `~/.config/subbake/config.toml`，也会识别当前目录中的 `subbake.toml` 或 `.subbake.toml`。下面是一份最小配置示例：
 
 ```toml
 version = 2
@@ -105,122 +84,51 @@ model = "translation-model"
 api_format = "openai_chat"
 base_url = "https://api.example.com/v1"
 api_key_env = "SUBBAKE_PROVIDER_API_KEY"
-timeout_seconds = 120
 
 [profiles.default]
 translator = "primary"
 
 [profiles.default.translation]
+source_language = "Auto"
+target_language = "Chinese"
 mode = "turbo"
-source_language = "English"
-target_language = "Simplified Chinese"
-
-[profiles.default.transcription]
-model = "large-v3-turbo"
-vad_enabled = true
-vad_model = "silero-v6.2.0"
-
-[profiles.default.storage]
-whisper_binary_path = "/opt/whisper.cpp/build/bin/whisper-cli"
-whisper_models_dir = "/opt/whisper.cpp/models"
 ```
+
+API 密钥建议通过环境变量提供，不要写入仓库：
 
 ```bash
 export SUBBAKE_PROVIDER_API_KEY="your-api-key"
 sbake provider check --profile default
 ```
 
-使用 `--config` 指定其他配置文件，使用 `--profile` 切换 profile。翻译模式可选
-`economy`、`turbo` 或 `cinema`。翻译模型由 `[backends.<名称>].model` 指定；如需只为
-某个 profile 覆盖模型，可写入 `[profiles.<名称>.backend].model`。交互式界面中输入
-`/config` 也可以编辑翻译模型、Whisper 模型、Silero VAD 参数、`whisper-cli`
-路径和模型目录。首次转写前可运行 `sbake whisper vad-model` 下载默认 VAD 模型。
+支持的接口格式包括 OpenAI Chat、OpenAI Responses、Anthropic Messages 和 Gemini Generate Content。具体字段、profile、审校模型及本地转写配置见[使用文档](docs/usage.md)。
 
 ## 翻译模式
 
-三种模式是不同的处理策略，不只是速度档位：
+| 模式 | 适用场景 |
+| --- | --- |
+| `economy` | 优先减少请求和成本，适合大批量处理 |
+| `turbo` | 平衡速度与一致性，也是默认模式 |
+| `cinema` | 使用更多上下文、术语预检和审校，适合质量优先的任务 |
 
-| 模式 | 主要目标 | 翻译策略 | 媒体流水线 |
-| --- | --- | --- | --- |
-| Economy | 降低请求数和成本 | 使用较大的自包含 batch 和严格语义去重；结构失败先纠正一次再拆分；默认关闭全文术语预检、在线术语和模型审校 | 缓存转录块，达到配置的 batch 或 token 阈值后再翻译 |
-| Turbo | 平衡延迟、吞吐与一致性 | 自适应并发翻译，使用严格语义去重、相邻原文、受行数/token 限制的已确认译文和轻量人名/术语对齐 | 每个稳定的 10 分钟核心块完成后立即开始翻译 |
-| Cinema | 优先保证全片质量与一致性 | 场景感知调度、严格语义去重、跨场景同源文本一致性审校、严格全文术语预检、在线术语、时间轴感知完整审校和语言感知可读性限制 | 等待完整转录后再翻译，以便使用全文上下文 |
+显式的配置项和命令行参数会覆盖模式默认值。三种模式都保留输出对齐、格式标记保护、术语约束、缓存隔离和最终校验。
 
-显式启用全文术语预检时，Turbo 和 Economy 也会自动回退到完整转录后再翻译。
-所有模式的去重都要求规范化原文、相邻原文和可用的说话人、ASS 样式/层级及 cue
-设置等语义元数据一致。Cinema 还会把相同原文的其他出现位置作为只读审校上下文：
-语义条件相同时统一译法，角色、用途或场景含义不同时允许保留差异。
-所有模式都会在 provider 调用前检查完整 prompt 加预估响应是否超过
-`request_token_budget`。Cinema 默认在术语预检失败时终止；可显式启用
-`allow_degraded_preflight` 继续降级运行。
-命令行可通过 `--mode economy|turbo|cinema` 选择模式；配置文件使用
-`[profiles.<名称>.translation]` 下的 `mode`。显式配置项和 CLI 参数会覆盖模式默认值。
+## 平台
 
-## 转写与流水线
+| 平台 | 状态 |
+| --- | --- |
+| Linux x64 | 主要支持平台，提供 GNU 和 musl 预编译包及完整功能 |
+| Windows x64 | 实验性支持，不提供终端代理的命令沙箱 |
+| macOS arm64 / Intel | 实验性支持，不提供终端代理的命令沙箱 |
 
-超过 12 分钟的音频会自动按 10 分钟核心窗口转录；相邻窗口各保留 30 秒重叠，
-避免边界切断对白。合并后若有效字幕明显未覆盖媒体尾部，任务会失败且不会写入残缺结果。
+目前不提供 Windows 或 macOS 预编译包。更具体的平台边界见[兼容性说明](docs/compatibility.md)。
 
-增量流水线分别保存转录 chunk 和翻译 group，恢复时可独立跳过已完成工作。术语与人名
-始终按字幕顺序提交，避免并发导致译名漂移。只有全片覆盖和源文/译文 ID 完整性校验
-都通过后，最终字幕才会原子发布。
+## 文档
 
-## 使用
+- [使用文档](docs/usage.md)：安装、配置、命令和常见问题
+- [更新记录](CHANGELOG.md)
+- [兼容性说明](docs/compatibility.md)
 
-```bash
-# 交互式 Agent
-sbake
+## 许可证
 
-# 翻译字幕、文本文件或媒体中的文本字幕轨
-sbake translate episode.srt --target-lang Chinese
-sbake translate movie.mkv --subtitle-stream 7 --target-lang Chinese
-
-# 批量翻译
-sbake batch ./subtitles
-
-# 预览并校验字幕润色，不写入文件
-sbake edit episode.translated.srt --instruction "让对白更口语化" --dry-run
-
-# 转写，或转写后翻译
-sbake transcribe episode.mp4
-sbake pipeline episode.mp4
-
-# 恢复最近的 Agent 会话
-sbake resume
-```
-
-`translate` 不会自动转写音视频；没有文本字幕轨时请使用 `pipeline`。完整选项请运行
-`sbake --help` 或 `sbake <COMMAND> --help`。
-
-## 详细文档
-
-完整的英文安装、通用配置、命令、交互式 Agent、翻译模式、媒体字幕、转写、流水线、
-质量检查、内存与运行时管理说明见 [`docs/usage.md`](docs/usage.md)。示例均使用通用
-profile、provider、模型、路径与环境变量占位符，不包含本地配置或凭据。
-
-评测设计与运行方式另见：
-
-- [`docs/agent-evaluation.md`](docs/agent-evaluation.md)
-- [`docs/subtitle-evaluation.md`](docs/subtitle-evaluation.md)
-
-兼容性与维护者发布流程见：
-
-- [`docs/compatibility.md`](docs/compatibility.md)
-- [`docs/releasing.md`](docs/releasing.md)
-- [`CHANGELOG.md`](CHANGELOG.md)
-
-## 开发
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-交互式 Agent 另有数据驱动的确定性场景、可选真实模型回归、属性测试和 fuzz
-入口。评测用例格式、运行方法及质量门槛见
-[`docs/agent-evaluation.md`](docs/agent-evaluation.md)。
-
-## License
-
-GNU General Public License v3.0（GPL-3.0-only）
+[GNU General Public License v3.0](LICENSE)（GPL-3.0-only）
