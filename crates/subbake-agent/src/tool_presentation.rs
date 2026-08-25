@@ -390,10 +390,22 @@ fn outcome_detail(outcome: &AgentToolOutcome, elapsed: Duration) -> String {
             facts.subtitle_entries,
             facts.language
         ),
-        AgentToolOutcome::SubtitleEdit(facts) => format!(
-            "{} entries modified · {} · {elapsed}",
-            facts.modified_entries, facts.target_language
-        ),
+        AgentToolOutcome::SubtitleEdit(facts) => {
+            if facts.partial_preview {
+                format!(
+                    "sampled {}/{} · {} modified · {} · {elapsed}",
+                    facts.processed_entries,
+                    facts.total_entries,
+                    facts.modified_entries,
+                    facts.target_language
+                )
+            } else {
+                format!(
+                    "{} entries modified · {} · {elapsed}",
+                    facts.modified_entries, facts.target_language
+                )
+            }
+        }
         AgentToolOutcome::Whisper(facts) => {
             let count = facts
                 .models

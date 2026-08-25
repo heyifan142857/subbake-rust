@@ -1,10 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::CancellationGuard;
-use subbake_core::editing::{build_subtitle_edit_messages, parse_subtitle_edit_payload};
-use subbake_core::entities::SubtitleSegment;
+use subbake_core::editing::{
+    SUBTITLE_EDIT_MAX_BATCH_ENTRIES, SUBTITLE_EDIT_RESPONSE_TOKEN_BUDGET,
+    SubtitleEditTokenEstimate, build_subtitle_edit_messages, distributed_subtitle_edit_indices,
+    estimate_subtitle_edit_tokens, parse_subtitle_edit_payload,
+};
+use subbake_core::entities::{SubtitleSegment, TranslationLine};
+use subbake_core::error::CoreError;
 use subbake_core::formats::RenderOptions;
 use subbake_core::languages::{is_language_tag, normalize_language};
 use subbake_core::ports::{GenerationRequest, LlmBackend, RuntimeMemoryStore};
@@ -42,6 +48,12 @@ pub struct SubtitleEditOutcome {
     pub modified_entries: usize,
     pub edit_notes: String,
     pub dry_run: bool,
+    #[serde(default)]
+    pub processed_entries: usize,
+    #[serde(default)]
+    pub total_entries: usize,
+    #[serde(default)]
+    pub partial_preview: bool,
     pub changes: Vec<SubtitleEditChange>,
 }
 
@@ -77,30 +89,72 @@ pub fn edit_subtitle_cancellable(
 
     let document = read_document(&request.target_path)?;
     let source_document = infer_source_document(&request.target_path, document.segments.len())?;
-    let messages = build_subtitle_edit_messages(
+    let source_segments = source_document
+        .as_ref()
+        .map(|document| document.segments.as_slice());
+    let full_messages = build_subtitle_edit_messages(
         &document.segments,
-        source_document.as_ref().map(|doc| doc.segments.as_slice()),
+        source_segments,
         &request.instruction,
         &request.settings.translation.target_language,
     )
     .map_err(AdapterError::from)?;
+    let full_estimate = estimate_subtitle_edit_tokens(&full_messages, &document.segments);
+    let partial_preview = request.dry_run
+        && !edit_request_fits(
+            full_estimate,
+            request.settings.translation.request_token_budget,
+        );
+    let selected_indices = if partial_preview {
+        preview_indices(
+            &document.segments,
+            source_segments,
+            &request.instruction,
+            &request.settings.translation.target_language,
+            request.settings.translation.request_token_budget,
+        )?
+    } else {
+        (0..document.segments.len()).collect()
+    };
+    let target_segments = select_segments(&document.segments, &selected_indices);
+    let selected_source = source_segments.map(|source| select_segments(source, &selected_indices));
 
     let mut backend = build_backend(&request.settings.backend_config())?;
-    let (payload, _) = backend
-        .execute(
-            GenerationRequest::json(messages).without_reasoning(),
+    let batches = if partial_preview {
+        std::iter::once(0..target_segments.len()).collect()
+    } else {
+        plan_edit_batches(
+            &target_segments,
+            selected_source.as_deref(),
+            &request.instruction,
+            &request.settings.translation.target_language,
+            request.settings.translation.request_token_budget,
+        )?
+    };
+    let mut edited_lines = Vec::with_capacity(target_segments.len());
+    let mut edit_notes = BTreeSet::new();
+    for range in &batches {
+        cancellation.check().map_err(AdapterError::from)?;
+        let source_batch = selected_source
+            .as_deref()
+            .map(|source| &source[range.clone()]);
+        let payload = execute_edit_batch(
+            backend.as_mut(),
+            &target_segments[range.clone()],
+            source_batch,
+            &request.instruction,
+            &request.settings.translation.target_language,
             cancellation,
-        )
-        .map_err(AdapterError::from)?
-        .into_json()
-        .map_err(AdapterError::from)?;
-    let payload =
-        parse_subtitle_edit_payload(payload, &document.segments).map_err(AdapterError::from)?;
+        )?;
+        edited_lines.extend(payload.lines);
+        if !payload.edit_notes.trim().is_empty() {
+            edit_notes.insert(payload.edit_notes.trim().to_owned());
+        }
+    }
 
-    let changes = document
-        .segments
+    let changes = target_segments
         .iter()
-        .zip(&payload.lines)
+        .zip(&edited_lines)
         .filter(|(segment, line)| segment.text != line.translation)
         .map(|(segment, line)| SubtitleEditChange {
             id: segment.id.clone(),
@@ -109,18 +163,18 @@ pub fn edit_subtitle_cancellable(
         })
         .collect::<Vec<_>>();
     let modified_entries = changes.len();
-    let translations = merge_segments(&document.segments, &payload.lines);
+    let translations = merge_segments(&target_segments, &edited_lines);
     let required_glossary = load_required_glossary(&request)?;
-    let (validation_source, validation_source_language) = source_document
-        .as_ref()
+    let (validation_source, validation_source_language) = selected_source
+        .as_deref()
         .map(|source| {
             (
-                source.segments.as_slice(),
+                source,
                 request.settings.translation.source_language.as_str(),
             )
         })
         .unwrap_or((
-            document.segments.as_slice(),
+            target_segments.as_slice(),
             request.settings.translation.target_language.as_str(),
         ));
     validate_final_output(
@@ -138,6 +192,7 @@ pub fn edit_subtitle_cancellable(
     .map_err(AdapterError::from)?;
     cancellation.check().map_err(AdapterError::from)?;
     if !request.dry_run {
+        debug_assert!(!partial_preview);
         render_and_write_document(
             &document,
             &translations,
@@ -150,10 +205,123 @@ pub fn edit_subtitle_cancellable(
         target_path: request.target_path,
         target_language: request.settings.translation.target_language,
         modified_entries,
-        edit_notes: payload.edit_notes,
+        edit_notes: edit_notes.into_iter().collect::<Vec<_>>().join(" "),
         dry_run: request.dry_run,
+        processed_entries: target_segments.len(),
+        total_entries: document.segments.len(),
+        partial_preview,
         changes,
     })
+}
+
+fn execute_edit_batch(
+    backend: &mut dyn LlmBackend,
+    target_segments: &[SubtitleSegment],
+    source_segments: Option<&[SubtitleSegment]>,
+    instruction: &str,
+    target_language: &str,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<subbake_core::SubtitleEditPayload> {
+    let messages = build_subtitle_edit_messages(
+        target_segments,
+        source_segments,
+        instruction,
+        target_language,
+    )
+    .map_err(AdapterError::from)?;
+    let (payload, _) = backend
+        .execute(
+            GenerationRequest::json(messages).without_reasoning(),
+            cancellation,
+        )
+        .map_err(AdapterError::from)?
+        .into_json()
+        .map_err(AdapterError::from)?;
+    parse_subtitle_edit_payload(payload, target_segments).map_err(AdapterError::from)
+}
+
+fn plan_edit_batches(
+    target_segments: &[SubtitleSegment],
+    source_segments: Option<&[SubtitleSegment]>,
+    instruction: &str,
+    target_language: &str,
+    request_token_budget: usize,
+) -> AdapterResult<Vec<Range<usize>>> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < target_segments.len() {
+        let limit = target_segments
+            .len()
+            .min(start.saturating_add(SUBTITLE_EDIT_MAX_BATCH_ENTRIES));
+        let mut accepted_end = start;
+        for end in start + 1..=limit {
+            let source = source_segments.map(|segments| &segments[start..end]);
+            let messages = build_subtitle_edit_messages(
+                &target_segments[start..end],
+                source,
+                instruction,
+                target_language,
+            )
+            .map_err(AdapterError::from)?;
+            let estimate = estimate_subtitle_edit_tokens(&messages, &target_segments[start..end]);
+            if !edit_request_fits(estimate, request_token_budget) {
+                break;
+            }
+            accepted_end = end;
+        }
+        if accepted_end == start {
+            return Err(AdapterError::from(CoreError::ResourceBudgetExceeded(
+                format!(
+                    "subtitle edit entry `{}` cannot fit within the configured request/output token budget",
+                    target_segments[start].id
+                ),
+            )));
+        }
+        batches.push(start..accepted_end);
+        start = accepted_end;
+    }
+    Ok(batches)
+}
+
+fn preview_indices(
+    target_segments: &[SubtitleSegment],
+    source_segments: Option<&[SubtitleSegment]>,
+    instruction: &str,
+    target_language: &str,
+    request_token_budget: usize,
+) -> AdapterResult<Vec<usize>> {
+    let maximum = target_segments.len().min(SUBTITLE_EDIT_MAX_BATCH_ENTRIES);
+    for count in (1..=maximum).rev() {
+        let indices = distributed_subtitle_edit_indices(target_segments.len(), count);
+        let target = select_segments(target_segments, &indices);
+        let source = source_segments.map(|segments| select_segments(segments, &indices));
+        let messages =
+            build_subtitle_edit_messages(&target, source.as_deref(), instruction, target_language)
+                .map_err(AdapterError::from)?;
+        if edit_request_fits(
+            estimate_subtitle_edit_tokens(&messages, &target),
+            request_token_budget,
+        ) {
+            return Ok(indices);
+        }
+    }
+    Err(AdapterError::from(CoreError::ResourceBudgetExceeded(
+        "even one sampled subtitle edit entry cannot fit within the configured request/output token budget"
+            .to_owned(),
+    )))
+}
+
+fn select_segments(segments: &[SubtitleSegment], indices: &[usize]) -> Vec<SubtitleSegment> {
+    indices
+        .iter()
+        .filter_map(|index| segments.get(*index).cloned())
+        .collect()
+}
+
+fn edit_request_fits(estimate: SubtitleEditTokenEstimate, request_token_budget: usize) -> bool {
+    estimate.response <= SUBTITLE_EDIT_RESPONSE_TOKEN_BUDGET
+        && (request_token_budget == 0
+            || estimate.request.saturating_add(estimate.response) <= request_token_budget)
 }
 
 fn load_required_glossary(
@@ -180,7 +348,7 @@ fn load_required_glossary(
 
 fn merge_segments(
     target_segments: &[SubtitleSegment],
-    edited_lines: &[subbake_core::entities::TranslationLine],
+    edited_lines: &[TranslationLine],
 ) -> Vec<SubtitleSegment> {
     target_segments
         .iter()
@@ -270,6 +438,9 @@ mod tests {
         assert!(content.contains("HELLO"));
         assert!(!outcome.edit_notes.is_empty());
         assert_eq!(outcome.modified_entries, 1);
+        assert_eq!(outcome.processed_entries, 1);
+        assert_eq!(outcome.total_entries, 1);
+        assert!(!outcome.partial_preview);
     }
 
     #[test]
@@ -309,6 +480,7 @@ mod tests {
         .expect("preview subtitle edit");
 
         assert!(outcome.dry_run);
+        assert!(!outcome.partial_preview);
         assert_eq!(outcome.changes.len(), 1);
         assert_eq!(outcome.changes[0].before, "hello");
         assert_eq!(outcome.changes[0].after, "HELLO");
@@ -316,6 +488,104 @@ mod tests {
             fs::read_to_string(&path).expect("unchanged target"),
             "hello\n"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn long_dry_run_edits_a_distributed_sample_without_writing() {
+        let root = temp_root("edit-long-preview");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("movie.translated.srt");
+        let content = subtitle_with_entries(500);
+        fs::write(&path, &content).expect("write target");
+
+        let outcome = edit_subtitle(SubtitleEditRequest {
+            target_path: path.clone(),
+            instruction: "make it uppercase".to_owned(),
+            settings: TranslationSettings::default(),
+            allow_non_generated: false,
+            dry_run: true,
+        })
+        .expect("preview long subtitle edit");
+
+        assert!(outcome.partial_preview);
+        assert_eq!(outcome.total_entries, 500);
+        assert!(outcome.processed_entries <= SUBTITLE_EDIT_MAX_BATCH_ENTRIES);
+        assert!(outcome.processed_entries < outcome.total_entries);
+        assert_eq!(
+            outcome.changes.first().map(|change| change.id.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            outcome.changes.last().map(|change| change.id.as_str()),
+            Some("500")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("unchanged target"),
+            content
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_edit_planner_splits_large_documents_into_bounded_batches() {
+        let segments = (1..=120)
+            .map(|index| SubtitleSegment {
+                id: index.to_string(),
+                text: format!("line {index}"),
+                start: None,
+                end: None,
+                identifier: None,
+                settings: None,
+                semantic: Default::default(),
+            })
+            .collect::<Vec<_>>();
+
+        let batches = plan_edit_batches(
+            &segments,
+            None,
+            "rewrite",
+            "Chinese",
+            TranslationSettings::default()
+                .translation
+                .request_token_budget,
+        )
+        .expect("plan edit batches");
+
+        assert!(batches.len() >= 3);
+        assert_eq!(batches.first(), Some(&(0..SUBTITLE_EDIT_MAX_BATCH_ENTRIES)));
+        assert_eq!(batches.last().map(|range| range.end), Some(120));
+        assert!(
+            batches
+                .iter()
+                .all(|range| range.len() <= SUBTITLE_EDIT_MAX_BATCH_ENTRIES)
+        );
+    }
+
+    #[test]
+    fn long_real_edit_writes_every_bounded_batch_only_after_completion() {
+        let root = temp_root("edit-long-full");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("movie.translated.srt");
+        fs::write(&path, subtitle_with_entries(60)).expect("write target");
+
+        let outcome = edit_subtitle(SubtitleEditRequest {
+            target_path: path.clone(),
+            instruction: "make it uppercase".to_owned(),
+            settings: TranslationSettings::default(),
+            allow_non_generated: false,
+            dry_run: false,
+        })
+        .expect("edit all subtitle batches");
+        let edited = fs::read_to_string(&path).expect("read edited target");
+
+        assert!(!outcome.partial_preview);
+        assert_eq!(outcome.processed_entries, 60);
+        assert_eq!(outcome.total_entries, 60);
+        assert_eq!(outcome.modified_entries, 60);
+        assert!(edited.contains("LINE NUMBER 1"));
+        assert!(edited.contains("LINE NUMBER 60"));
+        assert!(!edited.contains("line number"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -363,5 +633,12 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("subbake-{label}-{nanos}"))
+    }
+
+    fn subtitle_with_entries(count: usize) -> String {
+        (1..=count)
+            .map(|index| format!("{index}\n00:00:00,000 --> 00:00:01,000\nline number {index}\n"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

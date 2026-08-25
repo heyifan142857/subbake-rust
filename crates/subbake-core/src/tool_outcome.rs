@@ -79,6 +79,12 @@ pub struct SubtitleEditToolOutcome {
     pub target_path: PathBuf,
     pub target_language: String,
     pub modified_entries: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub processed_entries: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_entries: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial_preview: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub edit_notes: String,
 }

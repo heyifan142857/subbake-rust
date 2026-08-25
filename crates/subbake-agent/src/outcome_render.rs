@@ -82,12 +82,23 @@ pub(crate) fn render_tool_outcome(outcome: &AgentToolOutcome) -> String {
             facts.output.display()
         ),
         AgentToolOutcome::SubtitleEdit(facts) => {
-            let mut text = format!(
-                "Subtitle edited: {}, target language {}, {} entries modified.",
-                facts.target_path.display(),
-                facts.target_language,
-                facts.modified_entries
-            );
+            let mut text = if facts.partial_preview {
+                format!(
+                    "Subtitle edit preview sampled {} of {} entries in {}, target language {}; {} sampled entries modified. Run the edit without dry-run to process the complete file in bounded batches.",
+                    facts.processed_entries,
+                    facts.total_entries,
+                    facts.target_path.display(),
+                    facts.target_language,
+                    facts.modified_entries
+                )
+            } else {
+                format!(
+                    "Subtitle edited: {}, target language {}, {} entries modified.",
+                    facts.target_path.display(),
+                    facts.target_language,
+                    facts.modified_entries
+                )
+            };
             if !facts.edit_notes.trim().is_empty() {
                 text.push_str(&format!("\n{}", facts.edit_notes));
             }

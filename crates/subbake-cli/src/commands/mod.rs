@@ -283,7 +283,7 @@ Usage: sbake edit <SUBTITLE> --instruction <TEXT> [OPTIONS]
 
 Options:
       --instruction <TEXT>      Requested subtitle edit
-      --dry-run                 Validate and show the proposed diff without writing
+      --dry-run                 Preview the proposed diff without writing; long files use a distributed sample
       --allow-non-generated     Allow editing a file without a translated/bilingual name
       --config <PATH>           Configuration file
       --profile <NAME>          Named provider profile
@@ -297,6 +297,7 @@ Options:
 
 The edit is rejected before publication if it changes IDs, formatting markers,
 required terminology, or configured readability limits.
+Long edits are processed in bounded batches and written only after every batch passes validation.
 "#;
 const BATCH_HELP: &str = r#"Translate subtitle files in a directory
 

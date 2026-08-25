@@ -4,6 +4,18 @@ use crate::entities::{SubtitleSegment, TranslationLine};
 use crate::error::{CoreError, CoreResult};
 use crate::ports::ChatMessage;
 
+/// Keep edit responses below common structured-output limits. The estimate is
+/// deliberately conservative because a rewritten line can be longer than its
+/// input and JSON adds per-line overhead.
+pub const SUBTITLE_EDIT_RESPONSE_TOKEN_BUDGET: usize = 3_000;
+pub const SUBTITLE_EDIT_MAX_BATCH_ENTRIES: usize = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubtitleEditTokenEstimate {
+    pub request: usize,
+    pub response: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleEditPayload {
     pub lines: Vec<TranslationLine>,
@@ -92,6 +104,54 @@ pub fn parse_subtitle_edit_payload(
     Ok(payload)
 }
 
+pub fn estimate_subtitle_edit_tokens(
+    messages: &[ChatMessage],
+    target_segments: &[SubtitleSegment],
+) -> SubtitleEditTokenEstimate {
+    let request = messages
+        .iter()
+        .map(|message| estimated_text_tokens(&message.content).saturating_add(6))
+        .sum();
+    let response = target_segments
+        .iter()
+        .map(|segment| {
+            estimated_text_tokens(&segment.text)
+                .saturating_mul(3)
+                .div_ceil(2)
+                .saturating_add(12)
+        })
+        .sum::<usize>()
+        .saturating_add(64);
+    SubtitleEditTokenEstimate { request, response }
+}
+
+pub fn distributed_subtitle_edit_indices(total: usize, count: usize) -> Vec<usize> {
+    let count = total.min(count);
+    if count == 0 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|sample| {
+            if count == 1 {
+                0
+            } else {
+                sample.saturating_mul(total.saturating_sub(1)) / (count - 1)
+            }
+        })
+        .collect()
+}
+
+fn estimated_text_tokens(text: &str) -> usize {
+    let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |(ascii, other), ch| {
+        if ch.is_ascii() {
+            (ascii + 1, other)
+        } else {
+            (ascii, other + 1)
+        }
+    });
+    ascii.div_ceil(4).saturating_add(non_ascii)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +194,26 @@ mod tests {
         )
         .expect_err("reordered ids must fail");
         assert!(error.to_string().contains("id mismatch"));
+    }
+
+    #[test]
+    fn distributed_preview_covers_the_document() {
+        assert_eq!(
+            distributed_subtitle_edit_indices(101, 5),
+            vec![0, 25, 50, 75, 100]
+        );
+        assert_eq!(distributed_subtitle_edit_indices(2, 8), vec![0, 1]);
+        assert!(distributed_subtitle_edit_indices(0, 8).is_empty());
+    }
+
+    #[test]
+    fn edit_token_estimate_accounts_for_non_ascii_text_and_response() {
+        let segments = vec![segment("1", "hello"), segment("2", "你好")];
+        let messages =
+            build_subtitle_edit_messages(&segments, None, "rewrite", "Chinese").expect("messages");
+        let estimate = estimate_subtitle_edit_tokens(&messages, &segments);
+
+        assert!(estimate.request > 20);
+        assert!(estimate.response > 64);
     }
 }

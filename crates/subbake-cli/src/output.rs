@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -31,25 +32,70 @@ pub fn print_subtitle_edit_outcome(outcome: &SubtitleEditOutcome, json: bool) ->
         print_json_value("subtitle_edit_result", result);
         return Ok(());
     }
-    println!(
-        "{}: {} proposed change(s) for {}",
-        if outcome.dry_run { "Dry run" } else { "Edited" },
-        outcome.modified_entries,
-        outcome.target_path.display()
-    );
-    for change in &outcome.changes {
-        println!("@@ {} @@", change.id);
+    print!("{}", subtitle_edit_text(outcome));
+    Ok(())
+}
+
+const MAX_DISPLAYED_EDIT_CHANGES: usize = 40;
+
+fn subtitle_edit_text(outcome: &SubtitleEditOutcome) -> String {
+    let mut output = String::new();
+    if outcome.partial_preview {
+        let _ = writeln!(
+            output,
+            "Dry-run sample: {} of {} entries for {}",
+            outcome.processed_entries,
+            outcome.total_entries,
+            outcome.target_path.display()
+        );
+        let _ = writeln!(
+            output,
+            "Proposed changes in sample: {}",
+            outcome.modified_entries
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "{}: {} proposed change(s) for {}",
+            if outcome.dry_run { "Dry run" } else { "Edited" },
+            outcome.modified_entries,
+            outcome.target_path.display()
+        );
+    }
+    for change in outcome.changes.iter().take(MAX_DISPLAYED_EDIT_CHANGES) {
+        let _ = writeln!(output, "@@ {} @@", change.id);
         for line in change.before.lines() {
-            println!("- {line}");
+            let _ = writeln!(output, "- {line}");
         }
         for line in change.after.lines() {
-            println!("+ {line}");
+            let _ = writeln!(output, "+ {line}");
         }
     }
-    if !outcome.edit_notes.trim().is_empty() {
-        println!("Notes: {}", outcome.edit_notes.trim());
+    let omitted = outcome
+        .changes
+        .len()
+        .saturating_sub(MAX_DISPLAYED_EDIT_CHANGES);
+    if omitted > 0 {
+        let _ = writeln!(
+            output,
+            "... {omitted} additional change(s) omitted from terminal output; use --json for the complete result."
+        );
     }
-    Ok(())
+    if outcome.partial_preview {
+        let _ = writeln!(
+            output,
+            "Preview only: this file is too large for a full dry run. The sample is distributed across the document, and its change count and validation result do not represent the complete file."
+        );
+        let _ = writeln!(
+            output,
+            "Run without --dry-run to process all {} entries in bounded batches.",
+            outcome.total_entries
+        );
+    }
+    if !outcome.edit_notes.trim().is_empty() {
+        let _ = writeln!(output, "Notes: {}", outcome.edit_notes.trim());
+    }
+    output
 }
 
 pub fn print_pipeline_outcome(
@@ -680,6 +726,36 @@ mod tests {
 
         assert!(output.contains("Planned batches: 1"));
         assert!(output.contains("batch 1: 3 line(s), 1 -> 3"));
+    }
+
+    #[test]
+    fn partial_edit_preview_is_explicit_and_bounds_terminal_diff() {
+        let changes = (1..=45)
+            .map(|index| subbake_adapters::SubtitleEditChange {
+                id: index.to_string(),
+                before: format!("before {index}"),
+                after: format!("after {index}"),
+            })
+            .collect::<Vec<_>>();
+        let outcome = SubtitleEditOutcome {
+            target_path: "movie.translated.srt".into(),
+            target_language: "Chinese".to_owned(),
+            modified_entries: changes.len(),
+            edit_notes: String::new(),
+            dry_run: true,
+            processed_entries: 45,
+            total_entries: 1_915,
+            partial_preview: true,
+            changes,
+        };
+
+        let output = subtitle_edit_text(&outcome);
+
+        assert!(output.contains("Dry-run sample: 45 of 1915 entries"));
+        assert!(output.contains("Proposed changes in sample: 45"));
+        assert!(output.contains("5 additional change(s) omitted"));
+        assert!(output.contains("Run without --dry-run to process all 1915 entries"));
+        assert!(!output.contains("@@ 41 @@"));
     }
 
     #[test]
