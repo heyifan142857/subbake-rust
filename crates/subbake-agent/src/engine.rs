@@ -182,18 +182,6 @@ pub(crate) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         description: "exit SubBake",
         suggest: true,
     },
-    // Approval is presented as a typed picker. These legacy spellings remain
-    // recognized for persisted/headless compatibility but are not suggested.
-    SlashCommandSpec {
-        command: "/approve",
-        description: "approve pending plan",
-        suggest: false,
-    },
-    SlashCommandSpec {
-        command: "/reject",
-        description: "reject pending plan",
-        suggest: false,
-    },
 ];
 
 /// Returns whether `input` is a complete built-in slash command.
@@ -842,8 +830,6 @@ impl AgentEngine {
             "/plan" => return self.handle_toggle_plan(),
             "/plan on" => return self.set_plan_mode(true),
             "/plan off" => return self.set_plan_mode(false),
-            "/approve" => return self.handle_plan_decision(PlanDecision::Approve),
-            "/reject" => return self.handle_plan_decision(PlanDecision::Reject),
             "/undo" => self.undo_last(),
             "/sessions" => self.sessions_summary(20),
             "/clear" => self.clear_session(),
@@ -962,6 +948,8 @@ mod error_persistence_tests {
         assert!(is_known_slash_command("/config"));
         assert!(is_known_slash_command("/model"));
         assert!(is_known_slash_command("/history 50"));
+        assert!(!is_known_slash_command("/approve"));
+        assert!(!is_known_slash_command("/reject"));
         assert!(!is_known_slash_command(
             "/home/azote/Downloads/Braveheart.fixed.translated.srt改为中英双语"
         ));

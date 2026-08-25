@@ -28,7 +28,7 @@ use crate::fs::{
 };
 use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
-use crate::settings::TranslationSettings;
+use crate::settings::ResolvedSettings;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeReusePolicy {
@@ -44,7 +44,7 @@ pub struct TranslationRequest {
     pub output_language_tag: Option<String>,
     pub overwrite: bool,
     pub runtime_reuse: RuntimeReusePolicy,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,7 +98,7 @@ pub struct BatchTranslationRequest {
     pub output_dir: Option<PathBuf>,
     pub output_language_tag: Option<String>,
     pub runtime_reuse: RuntimeReusePolicy,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,7 +463,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     })
 }
 
-fn quality_policy(settings: &TranslationSettings) -> QualityPolicy {
+fn quality_policy(settings: &ResolvedSettings) -> QualityPolicy {
     let defaults = QualityPolicy::default();
     QualityPolicy {
         max_characters_per_second: settings
@@ -765,8 +765,8 @@ trait RuntimeRequest {
     fn runtime_input(&self) -> &Path;
     fn runtime_reuse(&self) -> RuntimeReusePolicy;
     fn set_runtime_reuse(&mut self, policy: RuntimeReusePolicy);
-    fn settings(&self) -> &TranslationSettings;
-    fn settings_mut(&mut self) -> &mut TranslationSettings;
+    fn settings(&self) -> &ResolvedSettings;
+    fn settings_mut(&mut self) -> &mut ResolvedSettings;
 }
 
 impl RuntimeRequest for TranslationRequest {
@@ -782,11 +782,11 @@ impl RuntimeRequest for TranslationRequest {
         self.runtime_reuse = policy;
     }
 
-    fn settings(&self) -> &TranslationSettings {
+    fn settings(&self) -> &ResolvedSettings {
         &self.settings
     }
 
-    fn settings_mut(&mut self) -> &mut TranslationSettings {
+    fn settings_mut(&mut self) -> &mut ResolvedSettings {
         &mut self.settings
     }
 }
@@ -804,11 +804,11 @@ impl RuntimeRequest for BatchTranslationRequest {
         self.runtime_reuse = policy;
     }
 
-    fn settings(&self) -> &TranslationSettings {
+    fn settings(&self) -> &ResolvedSettings {
         &self.settings
     }
 
-    fn settings_mut(&mut self) -> &mut TranslationSettings {
+    fn settings_mut(&mut self) -> &mut ResolvedSettings {
         &mut self.settings
     }
 }
@@ -933,7 +933,7 @@ pub fn batch_translation_output_path(
 }
 
 pub(crate) fn normalize_translation_languages(
-    settings: &mut TranslationSettings,
+    settings: &mut ResolvedSettings,
 ) -> AdapterResult<()> {
     settings.translation.source_language =
         normalize_language(&settings.translation.source_language, true)
@@ -993,7 +993,7 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
 
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.target_language = "en".to_owned();
         settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         let outcome = translate_subtitle(TranslationRequest {
@@ -1024,7 +1024,7 @@ mod tests {
             "[Script Info]\nPlayResY: 1040\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,sans-serif,71\n\n[Events]\nFormat: Start, End, Style, Text\nDialogue: 0:00:00.00,0:00:01.00,Default,{\\i1}hello{\\i0}\n",
         )
         .expect("write ASS input");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.target_language = "zh-Hans".to_owned();
         settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         settings.output.bilingual = true;
@@ -1059,7 +1059,7 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
 
-        let mut translated_settings = TranslationSettings::default();
+        let mut translated_settings = ResolvedSettings::default();
         translated_settings.translation.target_language = "en".to_owned();
         translated_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         let translated = translate_subtitle(TranslationRequest {
@@ -1072,7 +1072,7 @@ mod tests {
         })
         .expect("translate source subtitle");
 
-        let mut bilingual_settings = TranslationSettings::default();
+        let mut bilingual_settings = ResolvedSettings::default();
         bilingual_settings.translation.target_language = "en".to_owned();
         bilingual_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         bilingual_settings.output.bilingual = true;
@@ -1108,7 +1108,7 @@ mod tests {
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
         let output_path = root.join("custom.txt");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.dry_run = true;
 
         let outcome = translate_subtitle(TranslationRequest {
@@ -1139,7 +1139,7 @@ mod tests {
         )
         .expect("write input");
         let output_path = root.join("custom.txt");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.target_language = "en".to_owned();
         settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
 
@@ -1170,7 +1170,7 @@ mod tests {
             output_language_tag: None,
             overwrite: true,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect_err("unsupported media translation must require the explicit pipeline");
 
@@ -1185,7 +1185,7 @@ mod tests {
             output_language_tag: None,
             overwrite: true,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect_err("subtitle-only service must reject a container");
 
@@ -1212,7 +1212,7 @@ mod tests {
             output_dir: None,
             output_language_tag: None,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect("batch translate");
         let output = fs::read_to_string(&output_path).expect("read output");
@@ -1244,7 +1244,7 @@ mod tests {
             output_dir: None,
             output_language_tag: None,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect_err("malformed subtitle should stop the batch");
         let message = error.to_string();
@@ -1273,7 +1273,7 @@ mod tests {
             output_dir: None,
             output_language_tag: None,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect("ordinary file failure should not stop the batch");
         let manifest: serde_json::Value =
@@ -1291,7 +1291,7 @@ mod tests {
             output_dir: None,
             output_language_tag: None,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect("retry failed inputs only");
         let _ = fs::remove_dir_all(&root);
@@ -1323,7 +1323,7 @@ mod tests {
             output_language_tag: None,
             overwrite: false,
             runtime_reuse: RuntimeReusePolicy::Configured,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
         })
         .expect_err("existing output must fail");
         let content = fs::read_to_string(&output).expect("read output");
@@ -1341,7 +1341,7 @@ mod tests {
         fs::write(&input, "hello\n").expect("write input");
 
         let shared_runtime = root.join("shared-runtime");
-        let mut seeded_settings = TranslationSettings::default();
+        let mut seeded_settings = ResolvedSettings::default();
         seeded_settings.translation.target_language = "en".to_owned();
         seeded_settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
         seeded_settings.storage.runtime_dir = Some(shared_runtime.clone());
@@ -1421,7 +1421,7 @@ mod tests {
                 let output = root.join(format!("translated-{index}.txt"));
                 let runtime_root = runtime_root.clone();
                 std::thread::spawn(move || {
-                    let mut settings = TranslationSettings::default();
+                    let mut settings = ResolvedSettings::default();
                     settings.translation.target_language = "en".to_owned();
                     settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
                     settings.storage.runtime_dir = Some(runtime_root);

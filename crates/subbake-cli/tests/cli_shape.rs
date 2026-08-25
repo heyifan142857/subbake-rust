@@ -78,7 +78,7 @@ fn edit_dry_run_validates_and_preserves_the_target() {
     let target = root.join("clip.translated.txt");
     std::fs::write(&target, "hello\n").expect("write target");
     let config = root.join("config.toml");
-    std::fs::write(&config, "version = 1\n").expect("write config");
+    std::fs::write(&config, "version = 2\n").expect("write config");
 
     subbake_cli::run(vec![
         "edit".to_owned(),
@@ -139,7 +139,7 @@ fn translate_preserves_existing_output_without_overwrite() {
     let config = root.join("config.toml");
     std::fs::write(&input, "hello\n").expect("write input");
     std::fs::write(&output, "keep me\n").expect("write existing output");
-    std::fs::write(&config, "version = 1\n").expect("write config");
+    std::fs::write(&config, "version = 2\n").expect("write config");
 
     let error = subbake_cli::run(vec![
         "translate".to_owned(),
@@ -306,7 +306,7 @@ fn empty_config(label: &str) -> std::path::PathBuf {
         "subbake-cli-shape-{}-{label}.toml",
         std::process::id()
     ));
-    std::fs::write(&path, "version = 1\n").expect("write empty config");
+    std::fs::write(&path, "version = 2\n").expect("write empty config");
     path
 }
 

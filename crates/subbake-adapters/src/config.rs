@@ -62,9 +62,9 @@ impl ConfigFile {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !matches!(self.version, 1 | CONFIG_VERSION) {
+        if self.version != CONFIG_VERSION {
             return Err(ConfigError::invalid(format!(
-                "unsupported configuration version `{}`; expected 1 or `{CONFIG_VERSION}`",
+                "unsupported configuration version `{}`; expected `{CONFIG_VERSION}`",
                 self.version
             )));
         }
@@ -316,7 +316,7 @@ mod tests {
     fn resolves_builtin_defaults_then_defaults_profile_and_cli() {
         let config = ConfigFile::parse(
             r#"
-            version = 1
+            version = 2
             default_profile = "quality"
 
             [defaults.translation]
@@ -408,7 +408,7 @@ mod tests {
     fn rejects_old_flat_configuration() {
         let error = ConfigFile::parse(
             r#"
-            version = 1
+            version = 2
             [profiles.openai]
             provider = "openai"
             model = "gpt"
@@ -422,13 +422,7 @@ mod tests {
     fn rejects_missing_or_invalid_versions_and_profiles() {
         assert!(ConfigFile::parse("[defaults.output]\nbilingual = true").is_err());
         assert!(ConfigFile::parse("version = 3").is_err());
-        assert!(ConfigFile::parse("version = 1\ndefault_profile = \"missing\"").is_err());
-        let config = ConfigFile::parse("version = 1").expect("empty v1 config");
-        assert!(
-            config
-                .resolve(Some("missing"), SettingsOverrides::default())
-                .is_err()
-        );
+        assert!(ConfigFile::parse("version = 1").is_err());
     }
 
     #[test]
@@ -525,11 +519,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_snapshot_uses_grouped_v1_shape_without_inline_secrets() {
+    fn profile_snapshot_uses_v2_shape_without_inline_secrets() {
         let path = temporary_config("profile-snapshot");
         fs::write(
             &path,
-            "# preserve this comment\nversion = 1\n\n[defaults.output]\nbilingual = true\n",
+            "# preserve this comment\nversion = 2\n\n[defaults.output]\nbilingual = true\n",
         )
         .expect("write config");
         let settings = ResolvedSettings::default()

@@ -77,7 +77,7 @@ pub use settings::{
     AgentDomainSettings, AgentOverrides, BackendOverrides, BackendSettings, OutputOverrides,
     OutputSettings, ResolvedSettings, SettingsOverrides, StorageOverrides, StorageSettings,
     TranscriptionDomainSettings, TranscriptionOverrides, TranslationDomainSettings,
-    TranslationOverrides, TranslationSettings,
+    TranslationOverrides,
 };
 pub use subbake_core::ports::BatchShardKind;
 pub use transcription::{

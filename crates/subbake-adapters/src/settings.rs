@@ -46,10 +46,6 @@ pub struct TranscriptionDomainSettings {
     pub vad_speech_pad_ms: u64,
 }
 
-/// Compatibility alias for service request types. New configuration code
-/// should name the complete resolved value `ResolvedSettings`.
-pub type TranslationSettings = ResolvedSettings;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputSettings {
     pub format: Option<String>,
@@ -164,8 +160,6 @@ pub struct TranslationOverrides {
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
     pub mode: Option<TranslationMode>,
-    /// Legacy v1 input. `true` maps to turbo; `false` keeps the selected mode.
-    pub fast_mode: Option<bool>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
     pub online_terminology: Option<bool>,
@@ -275,7 +269,6 @@ impl SettingsOverrides {
                 translation_concurrency: Some(settings.translation.translation_concurrency),
                 review_concurrency: Some(settings.translation.review_concurrency),
                 mode: Some(settings.translation.mode),
-                fast_mode: None,
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
                 online_terminology: Some(settings.translation.online_terminology),
@@ -368,7 +361,6 @@ impl TranslationOverrides {
             translation_concurrency,
             review_concurrency,
             mode,
-            fast_mode,
             review_policy,
             terminology_preflight,
             online_terminology,
@@ -604,7 +596,6 @@ impl ResolvedSettings {
             translation_concurrency,
             review_concurrency,
             mode,
-            fast_mode,
             review_policy,
             terminology_preflight,
             online_terminology,
@@ -662,9 +653,6 @@ impl ResolvedSettings {
         let selected_mode = mode;
         if let Some(value) = selected_mode {
             self.apply_mode_defaults(value);
-        }
-        if fast_mode == Some(true) {
-            self.apply_mode_defaults(TranslationMode::Turbo);
         }
         if let Some(value) = source_language {
             self.translation.source_language = value;

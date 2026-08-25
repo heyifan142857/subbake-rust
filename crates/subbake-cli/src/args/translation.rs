@@ -133,7 +133,6 @@ impl TranslationOptionGroup {
                         .map_err(|error| CliError::usage(error.to_string()))?,
                 )
             }
-            "--fast" => overrides.translation.fast_mode = Some(true),
             "--no-review" => {
                 overrides.translation.review_policy = Some(subbake_core::ReviewPolicy::Off)
             }

@@ -263,7 +263,6 @@ Options:
                                    Reject subtitle lines longer than N characters
       --max-lines <N>              Reject subtitle entries with more than N lines
       --qa-fail-on <LEVEL>         Block publication on QA error or warning
-      --fast                       Deprecated alias for --mode turbo
       --dry-run                    Prepare work without provider calls
       --max-requests <N>           Stop before exceeding N provider requests
       --max-tokens <N>             Stop before the next call after N used tokens

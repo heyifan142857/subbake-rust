@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    CONFIG_VERSION, ConfigEditTarget, ConfigFile, PreparedConfigUpdate, SettingsOverrides,
-    TranslationSettings, append_profile_snapshot, prepare_config_update,
+    CONFIG_VERSION, ConfigEditTarget, ConfigFile, PreparedConfigUpdate, ResolvedSettings,
+    SettingsOverrides, append_profile_snapshot, prepare_config_update,
 };
 
 use crate::config_editor::{ConfigChange, ConfigEditorSnapshot, build_snapshot};
@@ -42,9 +42,9 @@ impl<'a> ProfileCoordinator<'a> {
         Ok(None)
     }
 
-    pub(crate) fn active_settings(&self) -> AgentResult<TranslationSettings> {
+    pub(crate) fn active_settings(&self) -> AgentResult<ResolvedSettings> {
         let Some((_, config)) = self.load_config()? else {
-            return Ok(TranslationSettings::default());
+            return Ok(ResolvedSettings::default());
         };
         self.settings_for_profile(
             &config,
@@ -56,7 +56,7 @@ impl<'a> ProfileCoordinator<'a> {
         &self,
         config: &ConfigFile,
         profile: Option<&str>,
-    ) -> AgentResult<TranslationSettings> {
+    ) -> AgentResult<ResolvedSettings> {
         config
             .resolve(profile, SettingsOverrides::default())
             .map(|(settings, _)| settings)

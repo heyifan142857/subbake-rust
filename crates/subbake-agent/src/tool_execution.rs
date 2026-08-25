@@ -4,10 +4,9 @@ use serde_json::Value as JsonValue;
 use subbake_adapters::{
     BatchTranslationRequest, ConfigFile, MultipleModelPolicy, ResolvedSettings, RuntimeReusePolicy,
     SettingsOverrides, SubtitleEditRequest, TranscriptionFormat, TranscriptionRequest,
-    TranscriptionSettings, TranslationRequest, TranslationSettings, WhisperAction,
-    WhisperBuildVariant, WhisperOutcome, WhisperRequest, default_whisper_binary_path_for,
-    default_whisper_models_dir_for, format_diagnostic_report, is_supported_subtitle_container_path,
-    is_supported_subtitle_path,
+    TranscriptionSettings, TranslationRequest, WhisperAction, WhisperBuildVariant, WhisperOutcome,
+    WhisperRequest, default_whisper_binary_path_for, default_whisper_models_dir_for,
+    format_diagnostic_report, is_supported_subtitle_container_path, is_supported_subtitle_path,
 };
 use subbake_core::diagnostics::diagnose_text;
 use subbake_core::formats::{normalize_format, supported_format_from_path};
@@ -513,7 +512,7 @@ pub(crate) fn execute_translation_tool(
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
-    settings: TranslationSettings,
+    settings: ResolvedSettings,
 ) -> AgentResult<Option<TranslationExecutionOutcome>> {
     execute_translation_tool_with_services(
         executor,
@@ -532,7 +531,7 @@ pub(crate) fn execute_translation_tool_with_services(
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
-    mut settings: TranslationSettings,
+    mut settings: ResolvedSettings,
     services: &dyn AgentServices,
 ) -> AgentResult<Option<TranslationExecutionOutcome>> {
     let explicit_target_language = optional_argument(args, "target_language").is_some();
@@ -1088,10 +1087,7 @@ fn whisper_action_name(action: &WhisperAction) -> &'static str {
     }
 }
 
-fn resolved_translation_format(
-    input: &Path,
-    settings: &TranslationSettings,
-) -> AgentResult<String> {
+fn resolved_translation_format(input: &Path, settings: &ResolvedSettings) -> AgentResult<String> {
     if is_supported_subtitle_container_path(input) {
         return input
             .extension()
@@ -1529,7 +1525,7 @@ mod tests {
             &guard,
             &CancellationGuard::never(),
             Some(progress.clone()),
-            TranslationSettings::default(),
+            ResolvedSettings::default(),
         )
         .expect("translate series")
         .expect("translation outcome");
@@ -1561,7 +1557,7 @@ mod tests {
         )
         .expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
-        let settings = TranslationSettings::default();
+        let settings = ResolvedSettings::default();
         let services = RecordingTranslationServices::default();
 
         let japanese = execute_translation_tool_with_services(
@@ -1630,7 +1626,7 @@ mod tests {
         )
         .expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.storage.runtime_dir = Some(root.join("runtime"));
         settings.storage.glossary_path = Some(root.join("shared-glossary.json"));
         let services = RecordingTranslationServices::default();
@@ -1701,7 +1697,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         fs::write(root.join("sample.txt"), "Hello\n").expect("write subtitle");
         let guard = FileGuard::new(root.clone()).expect("create file guard");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.dry_run = true;
 
         let outcome = execute_translation_tool(
@@ -1739,7 +1735,7 @@ mod tests {
             &guard,
             &CancellationGuard::never(),
             None,
-            TranslationSettings::default(),
+            ResolvedSettings::default(),
         )
         .expect_err("invalid language must fail");
 
@@ -1771,7 +1767,7 @@ mod tests {
             &guard,
             &CancellationGuard::never(),
             None,
-            TranslationSettings::default(),
+            ResolvedSettings::default(),
         )
         .expect("translate series")
         .expect("series outcome");

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    ConfigurationResolver, ResolveRequest, TranslationSettings, build_backend, discover_config_path,
+    ConfigurationResolver, ResolveRequest, ResolvedSettings, build_backend, discover_config_path,
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
@@ -359,7 +359,7 @@ struct PreparedConfigAction {
     path: PathBuf,
     prepared: Option<subbake_adapters::PreparedConfigUpdate>,
     backend: Box<dyn subbake_core::ports::LlmBackend>,
-    settings: TranslationSettings,
+    settings: ResolvedSettings,
     after: ConfigApplyAfter,
 }
 
@@ -392,7 +392,7 @@ fn prepare_config_action(
 }
 
 fn build_backend_for_settings(
-    settings: &TranslationSettings,
+    settings: &ResolvedSettings,
 ) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
     if settings.backend.id == "mock" {
         return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
@@ -407,12 +407,7 @@ fn prepare_profile_backend(
     engine: &AgentEngine,
     config_path: Option<&Path>,
     profile: &str,
-) -> AgentResult<
-    Option<(
-        Box<dyn subbake_core::ports::LlmBackend>,
-        TranslationSettings,
-    )>,
-> {
+) -> AgentResult<Option<(Box<dyn subbake_core::ports::LlmBackend>, ResolvedSettings)>> {
     if !engine.profile_choices()?.iter().any(|name| name == profile) {
         return Ok(None);
     }
@@ -423,7 +418,7 @@ fn prepare_profile_backend(
 
 fn apply_agent_runtime_policy(
     engine: &mut AgentEngine,
-    settings: &TranslationSettings,
+    settings: &ResolvedSettings,
 ) -> AgentResult<()> {
     let policy = AgentRuntimePolicy::new(
         settings.agent.max_steps,
@@ -451,7 +446,7 @@ fn build_agent_decision_backend(
 fn resolved_settings(
     config_path: Option<&Path>,
     profile: Option<&str>,
-) -> AgentResult<TranslationSettings> {
+) -> AgentResult<ResolvedSettings> {
     ConfigurationResolver
         .resolve(ResolveRequest {
             pinned_path: config_path.map(Path::to_path_buf),
@@ -489,7 +484,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("subbake-agent-bad-profile-{nonce}.toml"));
         std::fs::write(
             &path,
-            "version = 1\n\
+            "version = 2\n\
              [profiles.bad.backend]\n\
              id = \"not-a-provider\"\n\
              model = \"none\"\n",
@@ -514,7 +509,7 @@ mod tests {
         let path = root.join("subbake.toml");
         std::fs::write(
             &path,
-            "version = 1\n\
+            "version = 2\n\
              [profiles.bad.backend]\n\
              id = \"not-a-provider\"\n\
              model = \"none\"\n",

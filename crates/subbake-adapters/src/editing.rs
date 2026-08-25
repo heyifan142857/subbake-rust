@@ -23,13 +23,13 @@ use crate::fs::{
 };
 use crate::providers::build_backend;
 use crate::runtime_store::FileRuntimeStore;
-use crate::settings::TranslationSettings;
+use crate::settings::ResolvedSettings;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtitleEditRequest {
     pub target_path: PathBuf,
     pub instruction: String,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub allow_non_generated: bool,
     pub dry_run: bool,
 }
@@ -427,7 +427,7 @@ mod tests {
         let outcome = edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "make it uppercase".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: false,
         })
@@ -453,7 +453,7 @@ mod tests {
         let error = edit_subtitle(SubtitleEditRequest {
             target_path: path,
             instruction: "rewrite".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: false,
         })
@@ -473,7 +473,7 @@ mod tests {
         let outcome = edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "make it uppercase".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: true,
         })
@@ -502,7 +502,7 @@ mod tests {
         let outcome = edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "make it uppercase".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: true,
         })
@@ -546,9 +546,7 @@ mod tests {
             None,
             "rewrite",
             "Chinese",
-            TranslationSettings::default()
-                .translation
-                .request_token_budget,
+            ResolvedSettings::default().translation.request_token_budget,
         )
         .expect("plan edit batches");
 
@@ -572,7 +570,7 @@ mod tests {
         let outcome = edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "make it uppercase".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: false,
         })
@@ -599,7 +597,7 @@ mod tests {
         edit_subtitle(SubtitleEditRequest {
             target_path: path.clone(),
             instruction: "change number".to_owned(),
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             allow_non_generated: false,
             dry_run: false,
         })

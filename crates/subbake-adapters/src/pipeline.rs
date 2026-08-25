@@ -24,7 +24,7 @@ use crate::fs::{
     default_output_path_with_language, is_supported_subtitle_path, read_document,
     render_and_write_document_atomic, stable_runtime_input_path, write_file_atomically,
 };
-use crate::settings::TranslationSettings;
+use crate::settings::ResolvedSettings;
 use crate::transcription::{
     IncrementalTranscriptionOutcome, StableTranscriptionChunk, TranscriptionChunkDescriptor,
     TranscriptionChunkObserver, TranscriptionRequest, TranscriptionSettings,
@@ -42,7 +42,7 @@ const STREAMING_CHANNEL_CAPACITY: usize = 2;
 pub struct PipelineRequest {
     pub input_path: PathBuf,
     pub output_path: Option<PathBuf>,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub transcription_settings: TranscriptionSettings,
 }
 
@@ -412,13 +412,13 @@ pub fn run_pipeline_cancellable_with_progress_and_quality(
 }
 
 fn should_translate_embedded_subtitle(
-    settings: &TranslationSettings,
+    settings: &ResolvedSettings,
     has_translatable_stream: bool,
 ) -> bool {
     settings.translation.subtitle_stream_index.is_some() || has_translatable_stream
 }
 
-fn media_pipeline_strategy(settings: &TranslationSettings) -> MediaPipelineStrategy {
+fn media_pipeline_strategy(settings: &ResolvedSettings) -> MediaPipelineStrategy {
     if settings.translation.mode == TranslationMode::Cinema
         || settings.translation.terminology_preflight
         || settings.translation.dry_run
@@ -1121,7 +1121,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         let input_path = root.join("clip.txt");
         fs::write(&input_path, "hello\n").expect("write input");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.target_language = "en".to_owned();
         settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
 
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn modes_select_expected_media_strategy() {
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.mode = TranslationMode::Turbo;
         assert_eq!(
             media_pipeline_strategy(&settings),
@@ -1164,14 +1164,14 @@ mod tests {
     #[test]
     fn default_settings_select_turbo_immediate_media_strategy() {
         assert_eq!(
-            media_pipeline_strategy(&TranslationSettings::default()),
+            media_pipeline_strategy(&ResolvedSettings::default()),
             MediaPipelineStrategy::TurboImmediate
         );
     }
 
     #[test]
     fn container_pipeline_prefers_text_subtitles_and_falls_back_without_them() {
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         assert!(should_translate_embedded_subtitle(&settings, true));
         assert!(!should_translate_embedded_subtitle(&settings, false));
 
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn terminology_preflight_forces_sequential_pipeline() {
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.mode = TranslationMode::Turbo;
         settings.translation.terminology_preflight = true;
         assert_eq!(
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn economy_waits_for_configured_batch_threshold() {
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.batch_size = 3;
         settings.translation.batch_token_budget = 10_000;
         let request = PipelineRequest {
@@ -1235,7 +1235,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         let input = root.join("movie.mkv");
         fs::write(&input, b"media").expect("write media");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.terminology_preflight = false;
         let request = PipelineRequest {
             input_path: input,
@@ -1257,7 +1257,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         let input = root.join("movie.mkv");
         fs::write(&input, b"media").expect("write media");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.terminology_preflight = false;
         settings.storage.runtime_dir = Some(root.join("runtime"));
         let request = PipelineRequest {
@@ -1284,7 +1284,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create root");
         let input = root.join("movie.mkv");
         fs::write(&input, b"media").expect("write media");
-        let mut settings = TranslationSettings::default();
+        let mut settings = ResolvedSettings::default();
         settings.translation.terminology_preflight = false;
         settings.storage.runtime_dir = Some(root.join("runtime"));
         let output = root.join("final.srt");

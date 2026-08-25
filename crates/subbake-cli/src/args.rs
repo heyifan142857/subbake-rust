@@ -8,8 +8,8 @@ mod translation;
 #[cfg(test)]
 use subbake_adapters::TranscriptionFormat;
 use subbake_adapters::{
-    ApiFormat, BackendConfig, ConfigurationResolver, MemoryAction, ResolveRequest, RuntimeAction,
-    SettingsOverrides, TranscriptionSettings, TranslationSettings, WhisperAction,
+    ApiFormat, BackendConfig, ConfigurationResolver, MemoryAction, ResolveRequest,
+    ResolvedSettings, RuntimeAction, SettingsOverrides, TranscriptionSettings, WhisperAction,
     WhisperBuildVariant, apply_whisper_configuration, default_whisper_binary_path_for,
     default_whisper_models_dir_for,
 };
@@ -33,7 +33,7 @@ pub struct TranslateArgs {
     pub overwrite: bool,
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub json: bool,
     pub qa_fail_on: QualityGate,
 }
@@ -45,7 +45,7 @@ pub struct EditArgs {
     pub allow_non_generated: bool,
     pub dry_run: bool,
     pub json: bool,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct PipelineArgs {
     pub output: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub profile: Option<String>,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub transcription_settings: TranscriptionSettings,
     pub json: bool,
     pub qa_fail_on: QualityGate,
@@ -67,7 +67,7 @@ struct ParsedFileTranslationArgs {
     overwrite: bool,
     config_path: Option<PathBuf>,
     profile: Option<String>,
-    settings: TranslationSettings,
+    settings: ResolvedSettings,
     transcription_settings: TranscriptionSettings,
     json: bool,
     qa_fail_on: QualityGate,
@@ -75,7 +75,7 @@ struct ParsedFileTranslationArgs {
 
 #[derive(Debug, Clone, Default)]
 pub struct BatchTranslateOptions {
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ pub struct ProjectArgs {
 pub struct MemoryArgs {
     pub action: MemoryAction,
     pub target_path: PathBuf,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub json: bool,
 }
 
@@ -181,7 +181,7 @@ impl TranslateArgs {
             overwrite: false,
             config_path: None,
             profile: None,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             json: false,
             qa_fail_on: QualityGate::Never,
         }
@@ -196,7 +196,7 @@ impl ParsedFileTranslationArgs {
             overwrite: false,
             config_path: None,
             profile: None,
-            settings: TranslationSettings::default(),
+            settings: ResolvedSettings::default(),
             transcription_settings: TranscriptionSettings::default(),
             json: false,
             qa_fail_on: QualityGate::Never,
@@ -1093,7 +1093,7 @@ mod tests {
             "subbake-test-{}-{label}-empty.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "version = 1\n").expect("write empty config");
+        std::fs::write(&path, "version = 2\n").expect("write empty config");
         path
     }
 
@@ -1117,6 +1117,18 @@ mod tests {
 
         assert!(!default.overwrite);
         assert!(enabled.overwrite);
+    }
+
+    #[test]
+    fn translate_rejects_removed_fast_alias() {
+        let error = parse_translate_args(&["clip.srt".to_owned(), "--fast".to_owned()])
+            .expect_err("the pre-release CLI must expose semantic modes only");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown translate option `--fast`")
+        );
     }
 
     #[test]
@@ -1354,7 +1366,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 1\n[defaults.translation]\nbatch_size = \"nope\"\n",
+            "version = 2\n[defaults.translation]\nbatch_size = \"nope\"\n",
         )
         .expect("write config");
         let args = vec![
@@ -1378,7 +1390,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 1\n[defaults.translation]\nunknown_setting = true\n",
+            "version = 2\n[defaults.translation]\nunknown_setting = true\n",
         )
         .expect("write config");
         let args = vec![
@@ -1420,7 +1432,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 1
+            version = 2
 
             [defaults.translation]
             target_language = "Japanese"
@@ -1461,7 +1473,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 1
+            version = 2
 
             [defaults.translation]
             target_language = "Japanese"
@@ -1736,7 +1748,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 1
+            version = 2
 
             [profiles.remote.backend]
             id = "openai"

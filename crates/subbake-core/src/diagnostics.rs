@@ -158,7 +158,7 @@ fn classify(errors: &[String], metadata: &[ErrorMetadata]) -> (String, Vec<Strin
             return diagnosis(
                 "Model returned an empty translation for a non-empty subtitle.",
                 &[
-                    "Rerun with a smaller --batch-size or without --fast.",
+                    "Rerun with a smaller --batch-size or a stronger model profile.",
                     "Inspect the saved batch for short fragments or malformed tags.",
                 ],
             );

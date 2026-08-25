@@ -22,7 +22,7 @@ use crate::fs::{
 };
 use crate::llm_backends::{OpenAiBatchClient, OpenAiBatchStatus, build_openai_batch_client};
 use crate::runtime_store::FileRuntimeStore;
-use crate::settings::TranslationSettings;
+use crate::settings::ResolvedSettings;
 
 const MANIFEST_VERSION: u64 = 2;
 
@@ -30,19 +30,19 @@ const MANIFEST_VERSION: u64 = 2;
 pub struct OvernightSubmitRequest {
     pub input_path: PathBuf,
     pub output_path: Option<PathBuf>,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OvernightStatusRequest {
     pub manifest_path: PathBuf,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OvernightCollectRequest {
     pub manifest_path: PathBuf,
-    pub settings: TranslationSettings,
+    pub settings: ResolvedSettings,
     pub overwrite: bool,
 }
 
@@ -383,7 +383,7 @@ fn parse_output_lines(
 }
 
 fn client_for_manifest(
-    settings: &TranslationSettings,
+    settings: &ResolvedSettings,
     manifest: &OvernightManifest,
 ) -> AdapterResult<OpenAiBatchClient> {
     let backend_config = settings.backend_config();
