@@ -208,7 +208,17 @@ fn render_translation_outcome(
     json: bool,
 ) -> io::Result<(String, Option<PathBuf>)> {
     if outcome.result.dry_run {
-        return Ok((dry_run_text(&outcome.result, json), None));
+        if json {
+            return Ok((format!("{}\n", translation_outcome_json(outcome)), None));
+        }
+        let mut rendered = dry_run_text(&outcome.result, false);
+        if let Some(ocr) = &outcome.source_ocr {
+            rendered.push_str(&format!(
+                "Bitmap OCR plan ({}): {} candidate(s), {} model request(s)\n",
+                ocr.codec, ocr.candidates, ocr.planned_model_requests
+            ));
+        }
+        return Ok((rendered, None));
     }
 
     let output_path = outcome
@@ -227,9 +237,18 @@ fn render_translation_outcome(
         }
         if let Some(ocr) = &outcome.source_ocr {
             rendered.push_str(&format!(
-                "Bitmap OCR ({}): {} cue(s), {} low-confidence cue(s)\n",
-                ocr.codec, ocr.cues, ocr.low_confidence_cues
+                "Bitmap OCR ({}): {} cue(s), {} candidate(s), {} deterministic / {} model correction(s), {} unchanged, fallback={}\n",
+                ocr.codec,
+                ocr.cues,
+                ocr.candidates,
+                ocr.deterministic_corrections,
+                ocr.model_corrections,
+                ocr.unchanged,
+                ocr.fallback
             ));
+            if let Some(path) = &ocr.report_path {
+                rendered.push_str(&format!("OCR correction report: {}\n", path.display()));
+            }
         }
         rendered
     };
@@ -508,6 +527,7 @@ fn runtime_json(outcome: &RuntimeOutcome) -> serde_json::Value {
                     "glossary_path": paths.glossary_path,
                     "translation_memory_path": paths.translation_memory_path,
                     "review_report_path": paths.review_report_path,
+                    "ocr_correction_report_path": paths.ocr_correction_report_path,
                 }
             })
         }
@@ -584,6 +604,13 @@ fn translation_outcome_json(outcome: &TranslationOutcome) -> String {
                 "codec": ocr.codec,
                 "cues": ocr.cues,
                 "low_confidence_cues": ocr.low_confidence_cues,
+                "candidates": ocr.candidates,
+                "deterministic_corrections": ocr.deterministic_corrections,
+                "model_corrections": ocr.model_corrections,
+                "unchanged": ocr.unchanged,
+                "planned_model_requests": ocr.planned_model_requests,
+                "fallback": ocr.fallback,
+                "report_path": ocr.report_path,
             }),
         );
     }

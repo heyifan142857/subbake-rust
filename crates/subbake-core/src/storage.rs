@@ -10,12 +10,13 @@ use crate::memory::ContextMemory;
 
 pub const RUN_STATE_VERSION: u64 = 5;
 pub const REVIEW_REPORT_VERSION: u64 = 2;
-pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 18;
+pub const OCR_CORRECTION_REPORT_VERSION: u64 = 1;
+pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 19;
 pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
-pub const CACHE_VERSION: u64 = 5;
+pub const CACHE_VERSION: u64 = 6;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 13;
+pub const PROMPT_CONTRACT_VERSION: u64 = 14;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 5;
 /// Bump when deterministic final-output validation semantics change.
@@ -38,6 +39,7 @@ pub struct RuntimePaths {
     pub translation_memory_path: PathBuf,
     pub agent_logs_dir: PathBuf,
     pub review_report_path: PathBuf,
+    pub ocr_correction_report_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +252,7 @@ pub fn build_runtime_paths(
         )),
         agent_logs_dir: run_dir.join("agent_logs"),
         review_report_path: run_dir.join("review_report.json"),
+        ocr_correction_report_path: run_dir.join("ocr_correction_report.json"),
     }
 }
 
@@ -446,6 +449,29 @@ pub fn build_translation_fingerprint(
         (
             "mode".to_owned(),
             JsonValue::String(options.execution.mode.as_str().to_owned()),
+        ),
+        (
+            "ocr_correction".to_owned(),
+            JsonValue::String(
+                options
+                    .execution
+                    .ocr_correction
+                    .resolve(options.execution.mode)
+                    .as_str()
+                    .to_owned(),
+            ),
+        ),
+        (
+            "ocr_source".to_owned(),
+            options
+                .ocr_source
+                .as_ref()
+                .map_or(JsonValue::Null, |source| {
+                    JsonValue::String(
+                        serde_json::to_string(source)
+                            .unwrap_or_else(|_| "unserializable-ocr-source".to_owned()),
+                    )
+                }),
         ),
         (
             "source_language".to_owned(),
@@ -769,7 +795,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "01a7f7e0804d8f42c11e50456964ea9612629c3d"
+            "eab53adc3f57f5cc8a95269b80bcfe54ffce1a30"
         );
     }
 
@@ -853,6 +879,30 @@ mod tests {
         assert_ne!(
             fingerprint,
             build_translation_fingerprint(&changed_review, &signature)
+        );
+
+        let mut changed_ocr_policy = baseline.clone();
+        changed_ocr_policy.execution.ocr_correction = crate::OcrCorrectionMode::Off;
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_ocr_policy, &signature)
+        );
+
+        let mut changed_ocr_source = baseline.clone();
+        changed_ocr_source.ocr_source = Some(crate::BitmapOcrSource {
+            codec: "hdmv_pgs_subtitle".to_owned(),
+            source_language: "eng".to_owned(),
+            cues: vec![crate::OcrCueMetadata {
+                id: "1".to_owned(),
+                words: vec![crate::OcrWordConfidence {
+                    text: "|".to_owned(),
+                    confidence: Some(42),
+                }],
+            }],
+        });
+        assert_ne!(
+            fingerprint,
+            build_translation_fingerprint(&changed_ocr_source, &signature)
         );
 
         let mut changed_validation = baseline.clone();
@@ -950,7 +1000,7 @@ mod tests {
 
         assert_eq!(
             build_request_hash("OpenAI", "gpt-test", "translate", messages),
-            "4e4686a62417f2a912c8c39f993a416cfb221a12"
+            "4f25d049bfb2daf7923926ef15534fda0ced85e1"
         );
     }
 

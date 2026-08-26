@@ -18,7 +18,8 @@ use libbitsub_core::pgs::{PgsParser, SubtitleComposition, SubtitleFrame};
 use libbitsub_core::vobsub::VobSubParser;
 use sha2::{Digest, Sha256};
 use subbake_core::{
-    CancellationGuard, ProgressEvent, ProgressUnit, SharedProgress, TaskKind, TaskState,
+    CancellationGuard, OcrCueMetadata, OcrWordConfidence, ProgressEvent, ProgressUnit,
+    SharedProgress, TaskKind, TaskState,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -32,6 +33,8 @@ const MIN_VISIBLE_ALPHA: u8 = 8;
 pub(crate) struct BitmapOcrOutcome {
     pub cue_count: usize,
     pub low_confidence_cues: usize,
+    pub source_language: String,
+    pub cues: Vec<OcrCueMetadata>,
 }
 
 #[derive(Debug)]
@@ -54,6 +57,7 @@ struct ActiveCue {
 struct OcrText {
     text: String,
     confidence: Option<u8>,
+    words: Vec<OcrWordConfidence>,
 }
 
 pub(crate) fn convert_sup_to_srt(
@@ -201,6 +205,7 @@ fn convert_decoder_to_srt(
     let cache = recognize_unique_images(tesseract, &cues, &language, cancellation, progress)?;
     let total = u64::try_from(cues.len()).unwrap_or(u64::MAX);
     let mut recognized = Vec::with_capacity(cues.len());
+    let mut metadata = Vec::with_capacity(cues.len());
     let mut low_confidence_cues = 0usize;
     let mut empty_cues = Vec::new();
     for cue in &cues {
@@ -211,10 +216,19 @@ fn convert_decoder_to_srt(
         if text.text.trim().is_empty() {
             empty_cues.push(cue.start_ms);
         } else {
-            if text.confidence.is_some_and(|value| value < 55) {
+            if text
+                .words
+                .iter()
+                .any(|word| word.confidence.is_some_and(|value| value < 70))
+                || text.confidence.is_some_and(|value| value < 55)
+            {
                 low_confidence_cues += 1;
             }
             recognized.push((cue.start_ms, cue.end_ms, text.text.clone()));
+            metadata.push(OcrCueMetadata {
+                id: recognized.len().to_string(),
+                words: text.words.clone(),
+            });
         }
     }
 
@@ -245,13 +259,15 @@ fn convert_decoder_to_srt(
     completed.state = TaskState::Completed;
     if low_confidence_cues > 0 {
         completed.message = Some(format!(
-            "{low_confidence_cues} OCR cue(s) have confidence below 55 and may need review"
+            "{low_confidence_cues} OCR cue(s) contain a word below confidence 70 and may need review"
         ));
     }
     progress.emit(completed);
     Ok(BitmapOcrOutcome {
         cue_count: recognized.len(),
         low_confidence_cues,
+        source_language: language,
+        cues: metadata,
     })
 }
 
@@ -692,6 +708,7 @@ fn recognize_image(
     let mut last = OcrText {
         text: String::new(),
         confidence: None,
+        words: Vec::new(),
     };
     for page_segmentation_mode in [6, 7, 11, 13] {
         let mode = page_segmentation_mode.to_string();
@@ -737,6 +754,7 @@ fn ocr_process_error(output: &Output, fallback: &str) -> AdapterError {
 
 fn parse_tsv(tsv: &str) -> AdapterResult<OcrText> {
     let mut lines = Vec::<((u32, u32, u32), Vec<String>)>::new();
+    let mut word_confidences = Vec::new();
     let mut confidence_sum = 0u64;
     let mut confidence_count = 0u64;
     for row in tsv.lines().skip(1) {
@@ -755,12 +773,19 @@ fn parse_tsv(tsv: &str) -> AdapterResult<OcrText> {
         if let Some((_, words)) = lines.last_mut() {
             words.push(fields[11].trim().to_owned());
         }
-        if let Ok(value) = fields[10].parse::<f64>()
-            && value >= 0.0
-        {
-            confidence_sum = confidence_sum.saturating_add(value.round() as u64);
+        let word_confidence = fields[10]
+            .parse::<f64>()
+            .ok()
+            .filter(|value| *value >= 0.0)
+            .map(|value| u8::try_from((value.round() as u64).min(100)).unwrap_or(100));
+        if let Some(value) = word_confidence {
+            confidence_sum = confidence_sum.saturating_add(u64::from(value));
             confidence_count = confidence_count.saturating_add(1);
         }
+        word_confidences.push(OcrWordConfidence {
+            text: fields[11].trim().to_owned(),
+            confidence: word_confidence,
+        });
     }
     let text = lines
         .into_iter()
@@ -770,7 +795,11 @@ fn parse_tsv(tsv: &str) -> AdapterResult<OcrText> {
         .join("\n");
     let confidence = (confidence_count > 0)
         .then(|| u8::try_from((confidence_sum / confidence_count).min(100)).unwrap_or(100));
-    Ok(OcrText { text, confidence })
+    Ok(OcrText {
+        text,
+        confidence,
+        words: word_confidences,
+    })
 }
 
 fn parse_tsv_number(value: &str) -> AdapterResult<u32> {

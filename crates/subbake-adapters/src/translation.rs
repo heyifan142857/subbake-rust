@@ -13,8 +13,9 @@ use subbake_core::pipeline::SubtitlePipeline;
 use subbake_core::ports::RuntimeLayoutStore;
 use subbake_core::storage::{InputSignature, build_runtime_paths, input_signature_from_bytes};
 use subbake_core::{
-    CancellationGuard, ConfirmedTranslationContext, CoreError, NoopProgress, PipelineResult,
-    QualityGate, QualityPolicy, QualityReport, SharedProgress, inspect_quality,
+    BitmapOcrSource, CancellationGuard, ConfirmedTranslationContext, CoreError, NoopProgress,
+    OcrCorrectionReport, PipelineResult, QualityGate, QualityPolicy, QualityReport, SharedProgress,
+    inspect_quality,
 };
 
 use crate::embedded_subtitles::{
@@ -65,6 +66,13 @@ pub struct BitmapSubtitleOcrSummary {
     pub codec: String,
     pub cues: usize,
     pub low_confidence_cues: usize,
+    pub candidates: usize,
+    pub deterministic_corrections: usize,
+    pub model_corrections: usize,
+    pub unchanged: usize,
+    pub planned_model_requests: usize,
+    pub fallback: bool,
+    pub report_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +93,7 @@ pub(crate) struct TranslationInputIdentity {
     pub output_path: PathBuf,
     pub execution_fingerprint: Option<String>,
     pub initial_confirmed_context: Vec<ConfirmedTranslationContext>,
+    pub ocr_source: Option<BitmapOcrSource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,10 +356,22 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .as_ref()
         .map(|identity| identity.initial_confirmed_context.clone())
         .unwrap_or_default();
+    options.ocr_source = identity
+        .as_ref()
+        .and_then(|identity| identity.ocr_source.clone());
+    let ocr_source = options.ocr_source.clone();
     let backend = build_backend(&request.settings.backend_config())?;
+    let needs_ocr_reviewer = ocr_source.is_some()
+        && request
+            .settings
+            .translation
+            .ocr_correction
+            .resolve(request.settings.translation.mode)
+            == subbake_core::OcrCorrectionMode::Model;
     let needs_reviewer = request.settings.translation.review_policy
         != subbake_core::ReviewPolicy::Off
-        || request.settings.translation.terminology_preflight;
+        || request.settings.translation.terminology_preflight
+        || needs_ocr_reviewer;
     let reviewer = needs_reviewer
         .then(|| request.settings.reviewer_backend_config())
         .flatten()
@@ -399,6 +420,9 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
             return Err(AdapterError::from(error));
         }
     };
+    let source_ocr = ocr_source
+        .as_ref()
+        .map(|source| bitmap_ocr_summary(source, run.ocr_correction.as_ref()));
 
     if request.settings.translation.dry_run {
         let mut event = subbake_core::ProgressEvent::running(
@@ -417,7 +441,7 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
             container_change: None,
             runtime_dir,
             quality: None,
-            source_ocr: None,
+            source_ocr,
         });
     }
 
@@ -432,8 +456,10 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
     let quality = inspect_quality(&quality_document, quality_policy(&request.settings));
     enforce_quality_gate(&quality, quality_gate)?;
     check_cancelled(cancellation)?;
+    let mut source_document = document.clone();
+    source_document.segments = run.source_segments.clone();
     render_and_write_document(
-        &document,
+        &source_document,
         &run.translated_segments,
         &output_path,
         &render_options,
@@ -459,8 +485,37 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         container_change: None,
         runtime_dir,
         quality: Some(quality),
-        source_ocr: None,
+        source_ocr,
     })
+}
+
+fn bitmap_ocr_summary(
+    source: &BitmapOcrSource,
+    report: Option<&OcrCorrectionReport>,
+) -> BitmapSubtitleOcrSummary {
+    let low_confidence_cues = source
+        .cues
+        .iter()
+        .filter(|cue| {
+            cue.words
+                .iter()
+                .any(|word| word.confidence.is_some_and(|confidence| confidence < 70))
+        })
+        .count();
+    let correction = report.map(|report| &report.summary);
+    BitmapSubtitleOcrSummary {
+        codec: source.codec.clone(),
+        cues: source.cues.len(),
+        low_confidence_cues,
+        candidates: correction.map_or(0, |summary| summary.candidates),
+        deterministic_corrections: correction
+            .map_or(0, |summary| summary.deterministic_corrections),
+        model_corrections: correction.map_or(0, |summary| summary.model_corrections),
+        unchanged: correction.map_or(0, |summary| summary.unchanged),
+        planned_model_requests: correction.map_or(0, |summary| summary.planned_model_requests),
+        fallback: correction.is_some_and(|summary| summary.fallback),
+        report_path: correction.and_then(|summary| summary.report_path.clone()),
+    }
 }
 
 fn quality_policy(settings: &ResolvedSettings) -> QualityPolicy {
@@ -1098,6 +1153,73 @@ mod tests {
         assert!(bilingual_path.ends_with("clip.bilingual.txt"));
         assert_eq!(bilingual.result.resumed_translation_batches, 1);
         assert_eq!(bilingual_text, "[MOCK-EN] hello\nhello\n");
+    }
+
+    #[test]
+    fn bitmap_ocr_correction_feeds_bilingual_source_without_changing_timing() {
+        let temporary = temp_root("bitmap-ocr-bilingual");
+        let root = temporary.path().to_path_buf();
+        fs::create_dir_all(&root).expect("create temp root");
+        let input_path = root.join("bitmap.srt");
+        let output_path = root.join("bitmap.bilingual.srt");
+        let input = b"1\n00:00:18,560 --> 00:00:21,230\n| want this\n";
+        fs::write(&input_path, input).expect("write OCR source");
+
+        let mut settings = ResolvedSettings::default();
+        settings.translation.source_language = "English".to_owned();
+        settings.translation.target_language = "Chinese".to_owned();
+        settings.translation.mode = subbake_core::TranslationMode::Economy;
+        settings.translation.ocr_correction = subbake_core::OcrCorrectionMode::Deterministic;
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        settings.output.bilingual = true;
+        settings.storage.runtime_dir = Some(root.join("runtime"));
+        let identity = TranslationInputIdentity {
+            path: input_path.clone(),
+            signature: input_signature_from_bytes(input, None),
+            output_path: output_path.clone(),
+            execution_fingerprint: None,
+            initial_confirmed_context: Vec::new(),
+            ocr_source: Some(subbake_core::BitmapOcrSource {
+                codec: "hdmv_pgs_subtitle".to_owned(),
+                source_language: "eng".to_owned(),
+                cues: vec![subbake_core::OcrCueMetadata {
+                    id: "1".to_owned(),
+                    words: vec![subbake_core::OcrWordConfidence {
+                        text: "|".to_owned(),
+                        confidence: Some(42),
+                    }],
+                }],
+            }),
+        };
+        let outcome = translate_subtitle_cancellable_with_progress_and_identity(
+            TranslationRequest {
+                input_path: input_path.clone(),
+                output_path: Some(output_path.clone()),
+                output_language_tag: None,
+                overwrite: true,
+                runtime_reuse: RuntimeReusePolicy::Configured,
+                settings,
+            },
+            &CancellationGuard::never(),
+            std::sync::Arc::new(NoopProgress),
+            Some(identity),
+            QualityGate::Never,
+        )
+        .expect("translate corrected bitmap OCR source");
+        let rendered = fs::read_to_string(&output_path).expect("read bilingual output");
+        let ocr = outcome.source_ocr.expect("OCR summary");
+        let report_path = ocr.report_path.expect("OCR report path");
+        let report: OcrCorrectionReport =
+            serde_json::from_str(&fs::read_to_string(report_path).expect("read OCR report"))
+                .expect("parse OCR report");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(rendered.contains("00:00:18,560 --> 00:00:21,230"));
+        assert!(rendered.contains("I want this"));
+        assert!(!rendered.contains("\n| want this\n"));
+        assert_eq!(ocr.deterministic_corrections, 1);
+        assert_eq!(report.changes[0].original_source, "| want this");
+        assert_eq!(report.changes[0].corrected_source, "I want this");
     }
 
     #[test]

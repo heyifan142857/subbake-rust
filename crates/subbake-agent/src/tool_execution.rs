@@ -709,6 +709,31 @@ pub(crate) fn execute_translation_tool_with_services(
                         .source_ocr
                         .as_ref()
                         .map_or(0, |ocr| ocr.low_confidence_cues),
+                    source_ocr_candidates: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.candidates),
+                    source_ocr_deterministic_corrections: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.deterministic_corrections),
+                    source_ocr_model_corrections: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.model_corrections),
+                    source_ocr_unchanged: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.unchanged),
+                    source_ocr_planned_model_requests: translated
+                        .source_ocr
+                        .as_ref()
+                        .map_or(0, |ocr| ocr.planned_model_requests),
+                    source_ocr_fallback: translated
+                        .source_ocr
+                        .as_ref()
+                        .is_some_and(|ocr| ocr.fallback),
+                    source_ocr_report_path: translated.source_ocr.and_then(|ocr| ocr.report_path),
                 }),
                 file_operations,
                 group_file_operations: false,
@@ -816,6 +841,13 @@ pub(crate) fn execute_translation_tool_with_services(
                     runtime_dir: translated.runtime_dir,
                     source_ocr_cues: 0,
                     source_ocr_low_confidence_cues: 0,
+                    source_ocr_candidates: 0,
+                    source_ocr_deterministic_corrections: 0,
+                    source_ocr_model_corrections: 0,
+                    source_ocr_unchanged: 0,
+                    source_ocr_planned_model_requests: 0,
+                    source_ocr_fallback: false,
+                    source_ocr_report_path: None,
                 }),
                 file_operations,
                 group_file_operations: true,

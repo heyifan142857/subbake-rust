@@ -92,6 +92,7 @@ translator = "primary"
 source_language = "Auto"
 target_language = "Chinese"
 mode = "turbo"
+ocr_correction = "auto"
 ```
 
 API 密钥建议通过环境变量提供，不要写入仓库：
@@ -112,6 +113,12 @@ sbake provider check --profile default
 | `cinema` | 使用更多上下文、术语预检和审校，适合质量优先的任务 |
 
 显式的配置项和命令行参数会覆盖模式默认值。三种模式都保留输出对齐、格式标记保护、术语约束、缓存隔离和最终校验。
+
+PGS、VobSub 和 DVB 位图字幕在 Tesseract 识别后会先校正可疑 OCR 文本。
+`economy` 默认只做安全的确定性修复，`turbo` 和 `cinema` 默认再用
+reviewer（未配置时为 translator）检查候选 cue。可通过
+`--ocr-correction auto|off|deterministic|model` 覆盖；校正不会改变时间轴，
+原始 OCR 和修改记录保存在运行时 `ocr_correction_report.json`。
 
 ## 平台
 

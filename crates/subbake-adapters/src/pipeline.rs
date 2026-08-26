@@ -714,6 +714,7 @@ fn translate_chunk_group(
                 store.fingerprint
             )),
             initial_confirmed_context: initial_confirmed_context.to_vec(),
+            ocr_source: None,
         }),
         subbake_core::QualityGate::Never,
     )?;

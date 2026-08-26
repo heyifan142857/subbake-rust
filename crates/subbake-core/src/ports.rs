@@ -277,6 +277,7 @@ pub enum BackendPayload {
     Translation(BatchTranslationResult),
     Review(ReviewResult),
     Terminology(TerminologyPreflightResult),
+    OcrCorrection(crate::entities::OcrCorrectionResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +285,7 @@ pub enum CacheStage {
     Translate,
     Review,
     Terminology,
+    OcrCorrection,
     AgentTranslateRepair,
     AgentReviewRepair,
 }
@@ -294,6 +296,7 @@ impl CacheStage {
             Self::Translate => "translate",
             Self::Review => "review",
             Self::Terminology => "terminology",
+            Self::OcrCorrection => "ocr_correction",
             Self::AgentTranslateRepair => "agent_translate_repair",
             Self::AgentReviewRepair => "agent_review_repair",
         }
@@ -469,6 +472,13 @@ pub trait RuntimeMemoryStore {
     fn save_review_report(&self, report: &ReviewReport) -> CoreResult<()>;
     fn load_review_report(&self) -> CoreResult<Option<ReviewReport>> {
         Ok(None)
+    }
+
+    fn save_ocr_correction_report(
+        &self,
+        _report: &crate::entities::OcrCorrectionReport,
+    ) -> CoreResult<()> {
+        Ok(())
     }
 
     fn save_translation_memory(&self, entries: &[(String, String)]) -> CoreResult<()>;

@@ -516,7 +516,7 @@ fn translate_embedded_subtitle_with_programs(
     let extracted_path = temporary
         .path()
         .join(format!("source.{}", payload_format.extension()));
-    let mut source_ocr = None;
+    let mut ocr_source = None;
     emit_stage(&progress, "EXTRACT_SUBTITLE", TaskState::Running);
     match source {
         EmbeddedSubtitleSource::Text(stream) => {
@@ -603,10 +603,10 @@ fn translate_embedded_subtitle_with_programs(
                     message: other.to_string(),
                 },
             })?;
-            source_ocr = Some(crate::translation::BitmapSubtitleOcrSummary {
+            ocr_source = Some(subbake_core::BitmapOcrSource {
                 codec: stream.codec.clone(),
-                cues: ocr.cue_count,
-                low_confidence_cues: ocr.low_confidence_cues,
+                source_language: ocr.source_language,
+                cues: ocr.cues,
             });
         }
     }
@@ -627,6 +627,7 @@ fn translate_embedded_subtitle_with_programs(
         output_path: final_output.clone(),
         execution_fingerprint: None,
         initial_confirmed_context: Vec::new(),
+        ocr_source,
     };
     let translated_path = temporary
         .path()
@@ -642,7 +643,6 @@ fn translate_embedded_subtitle_with_programs(
         Some(identity),
         quality_gate,
     )?;
-    outcome.source_ocr = source_ocr;
 
     if outcome.subtitle_entries == 0 {
         return Err(AdapterError::invalid_input(format!(

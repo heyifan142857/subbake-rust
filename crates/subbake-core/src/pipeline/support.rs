@@ -342,7 +342,10 @@ fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> 
     }
     if matches!(
         stage,
-        CacheStage::Review | CacheStage::Terminology | CacheStage::AgentReviewRepair
+        CacheStage::Review
+            | CacheStage::Terminology
+            | CacheStage::OcrCorrection
+            | CacheStage::AgentReviewRepair
     ) {
         return options
             .identity

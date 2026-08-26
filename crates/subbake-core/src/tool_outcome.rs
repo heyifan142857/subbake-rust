@@ -49,6 +49,20 @@ pub struct TranslationToolOutcome {
     pub source_ocr_cues: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub source_ocr_low_confidence_cues: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_candidates: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_deterministic_corrections: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_model_corrections: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_unchanged: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_ocr_planned_model_requests: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub source_ocr_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ocr_report_path: Option<PathBuf>,
 }
 
 fn is_false(value: &bool) -> bool {

@@ -32,6 +32,7 @@ use crate::validation::{
 
 mod accounting;
 mod name_alignment;
+mod ocr_correction;
 mod online_terminology;
 mod persistence;
 mod planning;
@@ -290,6 +291,10 @@ where
                 "batch size must be greater than zero".to_owned(),
             ));
         }
+        let correction = ocr_correction::run(self, document)?;
+        let mut source_document = document.clone();
+        source_document.segments = correction.source_segments.clone();
+        let document = &source_document;
 
         // Persisted auto terminology is useful prompt context, but only a
         // glossary explicitly supplied by the user is a hard requirement.
@@ -362,6 +367,8 @@ where
                     review: ReviewStats::default(),
                 },
                 translated_segments: Vec::new(),
+                source_segments: correction.source_segments,
+                ocr_correction: correction.report,
             });
         }
 
@@ -393,7 +400,7 @@ where
         let TranslationRun {
             batches,
             segments: translated_segments,
-            usage,
+            mut usage,
         } = translation_runner::run(
             self,
             &translation_document,
@@ -406,6 +413,7 @@ where
                 scene_groups: &translation_scene_groups,
             },
         )?;
+        usage.add(correction.usage);
         let translated_segments = deduplication.expand(&document.segments, &translated_segments)?;
         let ReviewRun {
             mut output,
@@ -528,6 +536,8 @@ where
                 review,
             },
             translated_segments: output,
+            source_segments: correction.source_segments,
+            ocr_correction: correction.report,
         })
     }
 
@@ -1663,9 +1673,9 @@ where
                         restore_batch_formatting(source, &mut result.lines);
                         &result.lines
                     }
-                    BackendPayload::Terminology(_) => {
+                    BackendPayload::Terminology(_) | BackendPayload::OcrCorrection(_) => {
                         return Err(CoreError::DataInvariant(
-                            "repair cache returned a terminology payload".to_owned(),
+                            "repair cache returned an incompatible payload".to_owned(),
                         ));
                     }
                 };
@@ -1875,7 +1885,9 @@ fn repair_lines_unchanged(current: &[SubtitleSegment], lines: &[TranslationLine]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineRun {
     pub result: PipelineResult,
+    pub source_segments: Vec<SubtitleSegment>,
     pub translated_segments: Vec<SubtitleSegment>,
+    pub ocr_correction: Option<crate::entities::OcrCorrectionReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1254,6 +1254,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_translate_accepts_explicit_ocr_correction_mode() {
+        let config = empty_config("ocr-correction-mode");
+        let args = vec![
+            "movie.mkv".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--ocr-correction".to_owned(),
+            "deterministic".to_owned(),
+        ];
+        let parsed = parse_translate_args(&args).expect("OCR correction mode");
+        let _ = std::fs::remove_file(config);
+        assert_eq!(
+            parsed.settings.translation.ocr_correction,
+            subbake_core::OcrCorrectionMode::Deterministic
+        );
+    }
+
     #[cfg(feature = "agent")]
     #[test]
     fn parse_resume_accepts_optional_session() {

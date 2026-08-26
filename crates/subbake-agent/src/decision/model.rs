@@ -207,6 +207,13 @@ mod tests {
                 runtime_dir: None,
                 source_ocr_cues: 0,
                 source_ocr_low_confidence_cues: 0,
+                source_ocr_candidates: 0,
+                source_ocr_deterministic_corrections: 0,
+                source_ocr_model_corrections: 0,
+                source_ocr_unchanged: 0,
+                source_ocr_planned_model_requests: 0,
+                source_ocr_fallback: false,
+                source_ocr_report_path: None,
             }),
         );
         let json = feedback.json();

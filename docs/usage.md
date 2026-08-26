@@ -194,6 +194,7 @@ default_profile = "standard"
 source_language = "Auto"
 target_language = "English"
 mode = "turbo"
+ocr_correction = "auto"
 
 [defaults.output]
 bilingual = false
@@ -468,9 +469,32 @@ sbake translate movie.mkv \
 
 Text subtitles are extracted directly. Bitmap subtitles are rendered and OCRed
 with Tesseract while retaining their timing, then pass through the normal
-translation and validation pipeline. SubBake copies existing streams, verifies
-the output, and atomically replaces the source container by default. Preserve
-the source and write a separate translated container with:
+translation and validation pipeline. Before terminology extraction and
+translation, SubBake corrects only suspicious OCR cues. `auto` resolves to
+deterministic-only correction in Economy and deterministic plus model correction
+in Turbo and Cinema. Override it in configuration with
+`translation.ocr_correction = "off"|"deterministic"|"model"` or on the command
+line:
+
+```bash
+sbake translate movie.mkv --ocr-correction deterministic
+```
+
+The model receives only candidate subtitle text, confidence/reasons, and two
+read-only neighboring cues on each side. It does not receive media, images, or
+paths. Corrected source text is used by terminology, translation, review,
+translation memory, and bilingual rendering; cue IDs, timing, line count,
+formatting, and standalone numbers remain protected. The original OCR text,
+word confidence, reasons, corrections, fallback errors, and route fingerprint
+are recorded in the runtime `ocr_correction_report.json`. Dry runs report the
+candidate and planned request counts without calling a model or writing the
+report.
+
+Turbo falls back to deterministic output with a warning if model correction
+fails. Cinema blocks output. An explicit `model` override follows the same
+failure policy for the selected translation mode. SubBake copies existing
+streams, verifies the output, and atomically replaces the source container by
+default. Preserve the source and write a separate translated container with:
 
 ```bash
 sbake translate movie.mkv \
@@ -724,9 +748,9 @@ arguments may be retained by shell history or process inspection.
 
 ### Media translation reports no subtitle stream
 
-`translate` only accepts supported text subtitle streams. Select the correct
-stream with `--subtitle-stream`, or use `pipeline` when speech transcription is
-required.
+`translate` accepts supported text subtitle streams and PGS/VobSub/DVB bitmap
+streams that Tesseract can OCR. Select the correct stream with
+`--subtitle-stream`; use `pipeline` only when speech transcription is required.
 
 ### Transcription cannot find whisper.cpp or a model
 

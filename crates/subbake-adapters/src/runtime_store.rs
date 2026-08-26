@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleSegment,
-    TerminologyPreflightResult, Usage,
+    AgentLog, BatchTranslationResult, FailureLog, OcrCorrectionReport, OcrCorrectionResult,
+    ReviewReport, ReviewResult, SubtitleSegment, TerminologyPreflightResult, Usage,
 };
 use subbake_core::error::{CoreError, CoreResult, StorageError, StorageIoKind};
 use subbake_core::ports::{
@@ -64,6 +64,13 @@ struct ReviewCacheEntry {
 #[derive(Debug, Serialize, Deserialize)]
 struct TerminologyCacheEntry {
     payload: TerminologyPreflightResult,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OcrCorrectionCacheEntry {
+    payload: OcrCorrectionResult,
     #[serde(default)]
     usage: Usage,
 }
@@ -154,6 +161,13 @@ impl RuntimeMemoryStore for FileRuntimeStore {
         serde_json::from_str(&text).map(Some).map_err(|error| {
             CoreError::DataInvariant(format!("review report parse failed: {error}"))
         })
+    }
+
+    fn save_ocr_correction_report(&self, report: &OcrCorrectionReport) -> CoreResult<()> {
+        let value = serde_json::to_value(report).map_err(|error| {
+            CoreError::DataInvariant(format!("serialize OCR correction report failed: {error}"))
+        })?;
+        write_json_verified(&self.paths.ocr_correction_report_path, &value)
     }
 
     fn load_glossary(&self) -> CoreResult<Vec<(String, String)>> {
@@ -276,6 +290,12 @@ impl RuntimeCacheStore for FileRuntimeStore {
                     usage: response.usage,
                 })
             }
+            (CacheStage::OcrCorrection, BackendPayload::OcrCorrection(payload)) => {
+                serde_json::to_value(OcrCorrectionCacheEntry {
+                    payload: payload.clone(),
+                    usage: response.usage,
+                })
+            }
             _ => {
                 return Err(CoreError::DataInvariant(format!(
                     "cached response payload does not match stage {}",
@@ -327,6 +347,16 @@ impl RuntimeCacheStore for FileRuntimeStore {
                     })?;
                 Ok(Some(BackendJsonResult {
                     payload: BackendPayload::Terminology(entry.payload),
+                    usage: entry.usage,
+                }))
+            }
+            CacheStage::OcrCorrection => {
+                let entry: OcrCorrectionCacheEntry =
+                    serde_json::from_str(&text).map_err(|error| {
+                        CoreError::DataInvariant(format!("request cache parse failed: {error}"))
+                    })?;
+                Ok(Some(BackendJsonResult {
+                    payload: BackendPayload::OcrCorrection(entry.payload),
                     usage: entry.usage,
                 }))
             }
@@ -509,8 +539,10 @@ fn storage_error(operation: &str, path: Option<&Path>, error: io::Error) -> Core
 mod tests {
     use subbake_core::entities::{
         AgentLog, AttemptLog, BatchTranslationResult, DocumentGuide, FailureLog, GlossaryEntry,
-        PipelineOptions, ReviewChange, ReviewReport, ReviewStats, TerminologyEntity,
-        TerminologyKind, TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
+        OcrCorrectionChange, OcrCorrectionMode, OcrCorrectionOrigin, OcrCorrectionReport,
+        OcrCorrectionResult, OcrCorrectionSummary, PipelineOptions, ReviewChange, ReviewReport,
+        ReviewStats, TerminologyEntity, TerminologyKind, TerminologyPreflightResult,
+        TerminologyStats, TranslationLine, Usage,
     };
     use subbake_core::memory::ContextMemory;
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
@@ -1054,6 +1086,83 @@ mod tests {
 
         assert_eq!(saved, report);
         assert_eq!(loaded, report);
+    }
+
+    #[test]
+    fn round_trips_ocr_correction_cache_and_writes_audit_report() {
+        let temporary = temp_root("ocr-correction-cache");
+        let root = temporary.path().to_path_buf();
+        let paths = build_runtime_paths(
+            &root.join("clip.srt"),
+            &root.join("clip.srt"),
+            Some(&root),
+            None,
+            "English",
+            "Chinese",
+            false,
+        );
+        let store = FileRuntimeStore::new(paths);
+        store.ensure_layout().expect("runtime layout");
+        let response = BackendJsonResult {
+            payload: BackendPayload::OcrCorrection(OcrCorrectionResult {
+                lines: vec![subbake_core::OcrCorrectionLine {
+                    id: "1".to_owned(),
+                    corrected_source: "I want".to_owned(),
+                }],
+            }),
+            usage: Usage {
+                input_tokens: 8,
+                output_tokens: 3,
+                total_tokens: 11,
+                requests: 1,
+                ..Usage::default()
+            },
+        };
+        store
+            .save_cached_response(CacheStage::OcrCorrection, "ocr", &response)
+            .expect("save OCR correction cache");
+        assert_eq!(
+            store
+                .load_cached_response(CacheStage::OcrCorrection, "ocr")
+                .expect("load OCR correction cache"),
+            Some(response)
+        );
+
+        let report = OcrCorrectionReport {
+            version: 1,
+            mode: OcrCorrectionMode::Model,
+            codec: "hdmv_pgs_subtitle".to_owned(),
+            summary: OcrCorrectionSummary {
+                candidates: 1,
+                model_corrections: 1,
+                report_path: Some(store.paths().ocr_correction_report_path.clone()),
+                ..OcrCorrectionSummary::default()
+            },
+            changes: vec![OcrCorrectionChange {
+                id: "1".to_owned(),
+                original_source: "| want".to_owned(),
+                corrected_source: "I want".to_owned(),
+                word_confidences: vec![subbake_core::OcrWordConfidence {
+                    text: "|".to_owned(),
+                    confidence: Some(42),
+                }],
+                reasons: vec!["remaining_vertical_bar".to_owned()],
+                origin: OcrCorrectionOrigin::Model,
+            }],
+            backend_fingerprint: Some("test|ocr-model".to_owned()),
+        };
+        store
+            .save_ocr_correction_report(&report)
+            .expect("save OCR correction report");
+        let raw = fs::read_to_string(&store.paths().ocr_correction_report_path)
+            .expect("read OCR correction report");
+        let decoded: OcrCorrectionReport = serde_json::from_str(&raw).expect("valid report");
+        assert_eq!(decoded, report);
+        assert!(
+            store
+                .cache_path(CacheStage::OcrCorrection, "ocr")
+                .ends_with("ocr_correction/ocr.json")
+        );
     }
 
     #[test]

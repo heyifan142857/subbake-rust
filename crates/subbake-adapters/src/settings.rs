@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
     BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_MODEL, DEFAULT_PROVIDER,
-    DEFAULT_RETRIES, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, PipelineOptions,
-    ReviewPolicy, TranslationMode,
+    DEFAULT_RETRIES, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, OcrCorrectionMode,
+    PipelineOptions, ReviewPolicy, TranslationMode,
 };
 
 use crate::error::{AdapterError, AdapterResult};
@@ -83,6 +83,7 @@ pub struct TranslationDomainSettings {
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub mode: TranslationMode,
+    pub ocr_correction: OcrCorrectionMode,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
     pub online_terminology: bool,
@@ -160,6 +161,7 @@ pub struct TranslationOverrides {
     pub translation_concurrency: Option<usize>,
     pub review_concurrency: Option<usize>,
     pub mode: Option<TranslationMode>,
+    pub ocr_correction: Option<OcrCorrectionMode>,
     pub review_policy: Option<ReviewPolicy>,
     pub terminology_preflight: Option<bool>,
     pub online_terminology: Option<bool>,
@@ -269,6 +271,7 @@ impl SettingsOverrides {
                 translation_concurrency: Some(settings.translation.translation_concurrency),
                 review_concurrency: Some(settings.translation.review_concurrency),
                 mode: Some(settings.translation.mode),
+                ocr_correction: Some(settings.translation.ocr_correction),
                 review_policy: Some(settings.translation.review_policy),
                 terminology_preflight: Some(settings.translation.terminology_preflight),
                 online_terminology: Some(settings.translation.online_terminology),
@@ -361,6 +364,7 @@ impl TranslationOverrides {
             translation_concurrency,
             review_concurrency,
             mode,
+            ocr_correction,
             review_policy,
             terminology_preflight,
             online_terminology,
@@ -487,6 +491,7 @@ impl Default for ResolvedSettings {
                 translation_concurrency: policy.translation_concurrency,
                 review_concurrency: policy.review_concurrency,
                 mode: TranslationMode::Turbo,
+                ocr_correction: OcrCorrectionMode::Auto,
                 review_policy: policy.review_policy,
                 terminology_preflight: policy.terminology_strategy.preflight_default(),
                 online_terminology: policy.terminology_strategy.online_default(),
@@ -596,6 +601,7 @@ impl ResolvedSettings {
             translation_concurrency,
             review_concurrency,
             mode,
+            ocr_correction,
             review_policy,
             terminology_preflight,
             online_terminology,
@@ -689,6 +695,9 @@ impl ResolvedSettings {
         }
         if let Some(value) = review_policy {
             self.translation.review_policy = value;
+        }
+        if let Some(value) = ocr_correction {
+            self.translation.ocr_correction = value;
         }
         if let Some(value) = terminology_preflight {
             self.translation.terminology_preflight = value;
@@ -951,6 +960,7 @@ impl ResolvedSettings {
         options.rendering.bilingual_order = self.output.bilingual_order;
         options.rendering.bilingual_font_scale = self.output.bilingual_font_scale;
         options.execution.mode = self.translation.mode;
+        options.execution.ocr_correction = self.translation.ocr_correction;
         options.execution.review_policy = self.translation.review_policy;
         options.execution.terminology_preflight = self.translation.terminology_preflight;
         options.execution.online_terminology = self.translation.online_terminology;
@@ -1156,6 +1166,7 @@ mod tests {
             .with_overrides(SettingsOverrides {
                 translation: TranslationOverrides {
                     mode: Some(TranslationMode::Cinema),
+                    ocr_correction: Some(OcrCorrectionMode::Deterministic),
                     translation_concurrency: Some(7),
                     target_language: Some("zh-Hans".to_owned()),
                     max_characters_per_line: Some(26),
@@ -1168,6 +1179,10 @@ mod tests {
         assert_eq!(settings.translation.batch_size, 48);
         assert_eq!(settings.translation.translation_concurrency, 7);
         assert_eq!(settings.translation.review_policy, ReviewPolicy::Full);
+        assert_eq!(
+            settings.translation.ocr_correction,
+            OcrCorrectionMode::Deterministic
+        );
         assert!(settings.translation.online_terminology);
         assert!(!settings.translation.allow_degraded_preflight);
         assert_eq!(settings.translation.max_characters_per_second, Some(23.0));
@@ -1241,6 +1256,7 @@ mod tests {
         let policy = subbake_core::TranslationPolicy::for_mode(TranslationMode::Turbo);
 
         assert_eq!(settings.translation.mode, TranslationMode::Turbo);
+        assert_eq!(settings.translation.ocr_correction, OcrCorrectionMode::Auto);
         assert_eq!(settings.translation.batch_size, policy.batch_size);
         assert_eq!(
             settings.translation.batch_token_budget,

@@ -250,6 +250,7 @@ Options:
       --preserve-names             Keep names in source spelling; disable Turbo name alignment
       --transliterate-names        Transliterate personal names (default)
       --mode <MODE>               Translation mode: economy, turbo, or cinema
+      --ocr-correction <MODE>     Bitmap OCR correction: auto, off, deterministic, or model
       --request-token-budget <N>  Limit estimated prompt plus response tokens per request
       --confirmed-context-lines <N>
                                    Maximum confirmed lines carried into a later batch
@@ -412,10 +413,10 @@ Accepts the translation settings from `translate` plus:
       --qa-fail-on <LEVEL>              Block publication on QA error or warning
   -h, --help                           Print help
 
-For MKV, MP4/M4V/MOV, and WebM inputs, an existing text subtitle stream is
-translated and added while the other streams are copied. If no translatable
-text subtitle exists, the media is transcribed first. Use --subtitle-stream to
-select a specific embedded stream.
+For MKV, MP4/M4V/MOV, and WebM inputs, an existing text or supported bitmap
+subtitle stream is translated and added while the other streams are copied. If
+no translatable subtitle exists, the media is transcribed first. Use
+--subtitle-stream to select a specific embedded stream.
 "#;
 const OVERNIGHT_HELP: &str = r#"Submit, check, and collect a provider-managed asynchronous translation batch
 
@@ -541,6 +542,7 @@ const COMMON_TRANSLATION_OPTIONS: &[&str] = &[
     "--provider",
     "--model",
     "--mode",
+    "--ocr-correction",
     "--review",
     "--no-review",
     "--dry-run",

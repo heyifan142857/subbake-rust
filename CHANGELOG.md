@@ -6,6 +6,13 @@ breaking changes when they are called out in advance.
 
 ## [Unreleased]
 
+### Added
+
+- Add constrained bitmap-subtitle OCR correction before terminology and
+  translation, with deterministic Economy behavior, targeted model correction
+  in Turbo/Cinema, CLI/config overrides, cache isolation, corrected bilingual
+  source rendering, and a versioned runtime audit report.
+
 ### Fixed
 
 - Preserve non-zero embedded subtitle timestamps while extracting text or PGS

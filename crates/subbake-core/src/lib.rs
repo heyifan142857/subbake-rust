@@ -28,9 +28,11 @@ pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
     AgentLog, AgentRepairRecord, AssDialogueRecord, AssDocumentMetadata, AssRecord, AttemptLog,
-    BatchPlanEntry, BatchTranslationResult, BilingualOrder, ConcurrencyStrategy,
+    BatchPlanEntry, BatchTranslationResult, BilingualOrder, BitmapOcrSource, ConcurrencyStrategy,
     ConfirmedTranslationContext, ContextStrategy, DocumentCharacter, DocumentGuide, FailureLog,
-    GlossaryEntry, PassthroughBlock, PipelineExecutionOptions, PipelineOptions,
+    GlossaryEntry, OcrCorrectionChange, OcrCorrectionLine, OcrCorrectionMode, OcrCorrectionOrigin,
+    OcrCorrectionReport, OcrCorrectionResult, OcrCorrectionSummary, OcrCueMetadata,
+    OcrWordConfidence, PassthroughBlock, PipelineExecutionOptions, PipelineOptions,
     PipelineRenderingOptions, PipelineResult, PipelineRuntimeIdentity, PipelineValidationOptions,
     PreflightFailurePolicy, PromptCacheStrategy, ReviewAnnotation, ReviewChange, ReviewIssueKind,
     ReviewPolicy, ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, ReviewStrategy,

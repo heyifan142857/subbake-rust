@@ -47,6 +47,49 @@ impl TranslationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrCorrectionMode {
+    #[default]
+    Auto,
+    Off,
+    Deterministic,
+    Model,
+}
+
+impl OcrCorrectionMode {
+    pub fn parse(value: &str) -> Result<Self, SettingParseError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
+            "deterministic" => Ok(Self::Deterministic),
+            "model" => Ok(Self::Model),
+            _ => Err(SettingParseError {
+                setting: "OCR correction mode",
+                value: value.to_owned(),
+                expected: "auto, off, deterministic, model",
+            }),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Deterministic => "deterministic",
+            Self::Model => "model",
+        }
+    }
+
+    pub const fn resolve(self, translation_mode: TranslationMode) -> Self {
+        match (self, translation_mode) {
+            (Self::Auto, TranslationMode::Economy) => Self::Deterministic,
+            (Self::Auto, TranslationMode::Turbo | TranslationMode::Cinema) => Self::Model,
+            (mode, _) => mode,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextStrategy {
     SelfContained,
@@ -382,6 +425,87 @@ pub struct SubtitleDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrWordConfidence {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrCueMetadata {
+    pub id: String,
+    #[serde(default)]
+    pub words: Vec<OcrWordConfidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BitmapOcrSource {
+    pub codec: String,
+    pub source_language: String,
+    #[serde(default)]
+    pub cues: Vec<OcrCueMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrCorrectionLine {
+    pub id: String,
+    pub corrected_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrCorrectionResult {
+    pub lines: Vec<OcrCorrectionLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrCorrectionOrigin {
+    Unchanged,
+    Deterministic,
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrCorrectionChange {
+    pub id: String,
+    pub original_source: String,
+    pub corrected_source: String,
+    #[serde(default)]
+    pub word_confidences: Vec<OcrWordConfidence>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub origin: OcrCorrectionOrigin,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OcrCorrectionSummary {
+    pub candidates: usize,
+    pub deterministic_corrections: usize,
+    pub model_corrections: usize,
+    pub unchanged: usize,
+    pub planned_model_requests: usize,
+    pub fallback: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrCorrectionReport {
+    pub version: u64,
+    pub mode: OcrCorrectionMode,
+    pub codec: String,
+    pub summary: OcrCorrectionSummary,
+    pub changes: Vec<OcrCorrectionChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlossaryEntry {
     pub source: String,
     pub target: String,
@@ -670,6 +794,7 @@ pub struct PipelineOptions {
     pub validation: PipelineValidationOptions,
     pub rendering: PipelineRenderingOptions,
     pub identity: PipelineRuntimeIdentity,
+    pub ocr_source: Option<BitmapOcrSource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -682,6 +807,7 @@ pub struct PipelineExecutionOptions {
     pub translation_concurrency: usize,
     pub review_concurrency: usize,
     pub mode: TranslationMode,
+    pub ocr_correction: OcrCorrectionMode,
     pub retries: usize,
     pub review_policy: ReviewPolicy,
     pub terminology_preflight: bool,
@@ -743,6 +869,7 @@ impl PipelineOptions {
                 translation_concurrency: policy.translation_concurrency,
                 review_concurrency: policy.review_concurrency,
                 mode: TranslationMode::Turbo,
+                ocr_correction: OcrCorrectionMode::Auto,
                 retries: DEFAULT_RETRIES,
                 review_policy: policy.review_policy,
                 terminology_preflight: policy.terminology_strategy.preflight_default(),
@@ -784,6 +911,7 @@ impl PipelineOptions {
                 runtime_dir: None,
                 glossary_path: None,
             },
+            ocr_source: None,
         }
     }
 

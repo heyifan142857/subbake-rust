@@ -133,6 +133,12 @@ impl TranslationOptionGroup {
                         .map_err(|error| CliError::usage(error.to_string()))?,
                 )
             }
+            "--ocr-correction" => {
+                overrides.translation.ocr_correction = Some(
+                    subbake_core::OcrCorrectionMode::parse(&required_value(args, index, option)?)
+                        .map_err(|error| CliError::usage(error.to_string()))?,
+                )
+            }
             "--no-review" => {
                 overrides.translation.review_policy = Some(subbake_core::ReviewPolicy::Off)
             }
