@@ -673,7 +673,7 @@ fn translation_result_value(
         "review": result.review,
         "state_path": state_path,
         "glossary_path": glossary_path,
-        "agent_repairs": result.agent_repairs,
+        "model_repairs": result.model_repairs,
         "quality": quality,
     });
     result
@@ -703,7 +703,7 @@ mod tests {
             translation_memory_hits: 0,
             state_path: None,
             glossary_path: None,
-            agent_repairs: Vec::new(),
+            model_repairs: Vec::new(),
             terminology: Default::default(),
             review: Default::default(),
         };
@@ -714,6 +714,8 @@ mod tests {
         assert_eq!(value["version"], 1);
         assert_eq!(value["kind"], "translation_result");
         assert_eq!(value["result"]["output_path"], "quote\"path.txt");
+        assert_eq!(value["result"]["model_repairs"], serde_json::json!([]));
+        assert!(value["result"].get("agent_repairs").is_none());
         assert!(
             value["build"]
                 .as_str()
@@ -744,7 +746,7 @@ mod tests {
             translation_memory_hits: 0,
             state_path: None,
             glossary_path: None,
-            agent_repairs: Vec::new(),
+            model_repairs: Vec::new(),
             terminology: Default::default(),
             review: Default::default(),
         };

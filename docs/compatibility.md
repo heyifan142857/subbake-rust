@@ -5,8 +5,10 @@ distinguishes user data from command-line conveniences.
 
 ## Public preview baseline
 
-- Configuration files use `version = 2`. Older pre-release configuration
+- Configuration files use `version = 3`. Older pre-release configuration
   versions are rejected with an explicit error instead of being reinterpreted.
+- Translation model-output repair uses `translation.model_repair` and
+  `translation.model_repair_attempts`; the former `agent` names are not accepted.
 - Translation modes are `economy`, `turbo`, and `cinema` and are selected with
   `--mode` or the profile's `translation.mode` setting.
 - Interactive plan approval is a typed approve/reject/revise picker.
@@ -23,7 +25,7 @@ Readers therefore retain the already implemented versioned compatibility for:
 - `.subbake` run state and batch shards;
 - request, review, and terminology caches;
 - glossary and translation-memory data;
-- failure and agent logs;
+- failure and model-repair logs;
 - overnight manifests and session metadata.
 
 When a persisted shape changes, SubBake must either retain a backwards-compatible

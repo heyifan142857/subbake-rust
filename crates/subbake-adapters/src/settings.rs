@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
-    BilingualOrder, DEFAULT_AGENT_REPAIR_ATTEMPTS, DEFAULT_MODEL, DEFAULT_PROVIDER,
+    BilingualOrder, DEFAULT_MODEL, DEFAULT_MODEL_REPAIR_ATTEMPTS, DEFAULT_PROVIDER,
     DEFAULT_RETRIES, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, OcrCorrectionMode,
     PipelineOptions, ReviewPolicy, TranslationMode,
 };
@@ -96,8 +96,8 @@ pub struct TranslationDomainSettings {
     pub resume: bool,
     pub use_cache: bool,
     pub retries: usize,
-    pub agent: bool,
-    pub agent_repair_attempts: usize,
+    pub model_repair: bool,
+    pub model_repair_attempts: usize,
     pub max_requests: Option<usize>,
     pub max_tokens: Option<usize>,
 }
@@ -113,7 +113,7 @@ pub struct StorageSettings {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SettingsOverrides {
-    /// Optional v2 references into the configuration's `[backends]` table.
+    /// Optional v3 references into the configuration's `[backends]` table.
     pub translator: Option<String>,
     pub reviewer: Option<String>,
     pub backend: BackendOverrides,
@@ -174,8 +174,8 @@ pub struct TranslationOverrides {
     pub resume: Option<bool>,
     pub use_cache: Option<bool>,
     pub retries: Option<usize>,
-    pub agent: Option<bool>,
-    pub agent_repair_attempts: Option<usize>,
+    pub model_repair: Option<bool>,
+    pub model_repair_attempts: Option<usize>,
     pub max_requests: Option<usize>,
     pub max_tokens: Option<usize>,
 }
@@ -284,8 +284,8 @@ impl SettingsOverrides {
                 resume: Some(settings.translation.resume),
                 use_cache: Some(settings.translation.use_cache),
                 retries: Some(settings.translation.retries),
-                agent: Some(settings.translation.agent),
-                agent_repair_attempts: Some(settings.translation.agent_repair_attempts),
+                model_repair: Some(settings.translation.model_repair),
+                model_repair_attempts: Some(settings.translation.model_repair_attempts),
                 max_requests: settings.translation.max_requests,
                 max_tokens: settings.translation.max_tokens,
             },
@@ -377,8 +377,8 @@ impl TranslationOverrides {
             resume,
             use_cache,
             retries,
-            agent,
-            agent_repair_attempts,
+            model_repair,
+            model_repair_attempts,
             max_requests,
             max_tokens
         );
@@ -504,8 +504,8 @@ impl Default for ResolvedSettings {
                 resume: true,
                 use_cache: true,
                 retries: DEFAULT_RETRIES,
-                agent: true,
-                agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
+                model_repair: true,
+                model_repair_attempts: DEFAULT_MODEL_REPAIR_ATTEMPTS,
                 max_requests: None,
                 max_tokens: None,
             },
@@ -614,8 +614,8 @@ impl ResolvedSettings {
             resume,
             use_cache,
             retries,
-            agent,
-            agent_repair_attempts,
+            model_repair,
+            model_repair_attempts,
             max_requests,
             max_tokens,
         } = overrides.translation;
@@ -732,11 +732,11 @@ impl ResolvedSettings {
         if let Some(value) = retries {
             self.translation.retries = value;
         }
-        if let Some(value) = agent {
-            self.translation.agent = value;
+        if let Some(value) = model_repair {
+            self.translation.model_repair = value;
         }
-        if let Some(value) = agent_repair_attempts {
-            self.translation.agent_repair_attempts = value;
+        if let Some(value) = model_repair_attempts {
+            self.translation.model_repair_attempts = value;
         }
         if let Some(value) = max_requests {
             self.translation.max_requests = Some(value);
@@ -973,8 +973,8 @@ impl ResolvedSettings {
         options.execution.resume = self.translation.resume;
         options.execution.use_cache = self.translation.use_cache;
         options.execution.retries = self.translation.retries;
-        options.execution.agent = self.translation.agent;
-        options.execution.agent_repair_attempts = self.translation.agent_repair_attempts;
+        options.execution.model_repair = self.translation.model_repair;
+        options.execution.model_repair_attempts = self.translation.model_repair_attempts;
         options.execution.max_requests = self.translation.max_requests;
         options.execution.max_tokens = self.translation.max_tokens;
         options.identity.runtime_dir = self.storage.runtime_dir.clone();

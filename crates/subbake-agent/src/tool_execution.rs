@@ -1379,7 +1379,7 @@ mod tests {
             translation_memory_hits: 0,
             state_path: None,
             glossary_path: None,
-            agent_repairs: Vec::new(),
+            model_repairs: Vec::new(),
             terminology: TerminologyStats::default(),
             review: ReviewStats::default(),
         }

@@ -181,13 +181,13 @@ checks the user configuration location and then the current directory:
 - `./subbake.toml`;
 - `./.subbake.toml`.
 
-### Generic version 2 configuration
+### Generic version 3 configuration
 
 Backend names and profile names are local identifiers. They do not select a
 wire protocol; set `api_format` explicitly for every non-mock backend.
 
 ```toml
-version = 2
+version = 3
 default_profile = "standard"
 
 [defaults.translation]
@@ -195,6 +195,8 @@ source_language = "Auto"
 target_language = "English"
 mode = "turbo"
 ocr_correction = "auto"
+model_repair = true
+model_repair_attempts = 2
 
 [defaults.output]
 bilingual = false
@@ -365,8 +367,10 @@ sbake translate episode.srt --no-resume --no-cache
 Useful tuning flags include `--batch-size`, `--batch-token-budget`,
 `--request-token-budget`, `--confirmed-context-lines`,
 `--confirmed-context-token-budget`, `--translation-concurrency`, `--retries`,
-`--glossary`, and `--timeout-seconds`. Run `sbake translate --help` for the
-current flag surface.
+`--model-repair`, `--model-repair-attempts`, `--glossary`, and
+`--timeout-seconds`. Model repair is a constrained retry stage for invalid
+translation or review output; it is unrelated to the interactive terminal
+agent. Run `sbake translate --help` for the current flag surface.
 
 ### Translation modes
 

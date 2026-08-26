@@ -484,7 +484,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("subbake-agent-bad-profile-{nonce}.toml"));
         std::fs::write(
             &path,
-            "version = 2\n\
+            "version = 3\n\
              [profiles.bad.backend]\n\
              id = \"not-a-provider\"\n\
              model = \"none\"\n",
@@ -509,7 +509,7 @@ mod tests {
         let path = root.join("subbake.toml");
         std::fs::write(
             &path,
-            "version = 2\n\
+            "version = 3\n\
              [profiles.bad.backend]\n\
              id = \"not-a-provider\"\n\
              model = \"none\"\n",
@@ -557,7 +557,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("subbake-config-atomic-{nonce}"));
         std::fs::create_dir_all(&root).expect("create root");
         let path = root.join("subbake.toml");
-        let original = "version = 2\n# retained\n";
+        let original = "version = 3\n# retained\n";
         std::fs::write(&path, original).expect("write config");
         let mut engine = AgentEngine::new(root.clone()).expect("engine");
         engine.start_session().expect("start session");

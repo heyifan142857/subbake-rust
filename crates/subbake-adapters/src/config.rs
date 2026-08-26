@@ -9,7 +9,7 @@ use crate::fs::write_file_atomically;
 use crate::platform::PlatformPaths;
 use crate::settings::{BackendOverrides, ResolvedSettings, SettingsOverrides};
 
-pub const CONFIG_VERSION: u64 = 2;
+pub const CONFIG_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,7 +282,7 @@ mod tests {
     fn resolves_agent_defaults_profile_and_cli_overrides() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             default_profile = "automatic"
 
             [defaults.agent]
@@ -313,10 +313,44 @@ mod tests {
     }
 
     #[test]
+    fn v3_uses_model_repair_names_and_rejects_former_agent_names() {
+        let config = ConfigFile::parse(
+            r#"
+            version = 3
+
+            [defaults.translation]
+            model_repair = false
+            model_repair_attempts = 4
+            "#,
+        )
+        .expect("model repair configuration");
+        let (settings, _) = config
+            .resolve(None, SettingsOverrides::default())
+            .expect("resolve model repair configuration");
+        assert!(!settings.translation.model_repair);
+        assert_eq!(settings.translation.model_repair_attempts, 4);
+
+        for former_key in ["agent", "agent_repair_attempts"] {
+            let error = ConfigFile::parse(&format!(
+                "version = 3\n[defaults.translation]\n{former_key} = false\n"
+            ))
+            .expect_err("former repair names must be rejected");
+            assert!(error.to_string().contains("unknown field"));
+        }
+    }
+
+    #[test]
+    fn rejects_configuration_version_two_after_the_breaking_rename() {
+        let error = ConfigFile::parse("version = 2\n")
+            .expect_err("configuration version two must be rejected");
+        assert!(error.to_string().contains("expected `3`"));
+    }
+
+    #[test]
     fn resolves_builtin_defaults_then_defaults_profile_and_cli() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             default_profile = "quality"
 
             [defaults.translation]
@@ -344,7 +378,7 @@ mod tests {
             runtime_dir = "profile-runtime"
             "#,
         )
-        .expect("v1 config");
+        .expect("v3 config");
 
         let (settings, profile) = config
             .resolve(
@@ -381,7 +415,7 @@ mod tests {
     fn resolves_name_and_container_retention_policies() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
 
             [defaults.translation]
             preserve_names = true
@@ -408,7 +442,7 @@ mod tests {
     fn rejects_old_flat_configuration() {
         let error = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             [profiles.openai]
             provider = "openai"
             model = "gpt"
@@ -421,7 +455,7 @@ mod tests {
     #[test]
     fn rejects_missing_or_invalid_versions_and_profiles() {
         assert!(ConfigFile::parse("[defaults.output]\nbilingual = true").is_err());
-        assert!(ConfigFile::parse("version = 3").is_err());
+        assert!(ConfigFile::parse("version = 4").is_err());
         assert!(ConfigFile::parse("version = 1").is_err());
     }
 
@@ -461,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn v2_resolves_reusable_translator_and_reviewer_backends() {
+    fn v3_resolves_reusable_translator_and_reviewer_backends() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             default_profile = "cinema"
 
             [backends.fast]
@@ -487,7 +521,7 @@ mod tests {
             mode = "cinema"
             "#,
         )
-        .expect("v2 config");
+        .expect("v3 config");
         let (settings, profile) = config
             .resolve(None, SettingsOverrides::default())
             .expect("resolve");
@@ -519,11 +553,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_snapshot_uses_v2_shape_without_inline_secrets() {
+    fn profile_snapshot_uses_v3_shape_without_inline_secrets() {
         let path = temporary_config("profile-snapshot");
         fs::write(
             &path,
-            "# preserve this comment\nversion = 2\n\n[defaults.output]\nbilingual = true\n",
+            "# preserve this comment\nversion = 3\n\n[defaults.output]\nbilingual = true\n",
         )
         .expect("write config");
         let settings = ResolvedSettings::default()

@@ -908,13 +908,13 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
             (WhisperAction::ListVadModels, 2usize)
         }
         "vad-model" | "download-vad-model" => {
-            let name = args
-                .get(1)
+            let explicit_name = args.get(1).filter(|value| !value.starts_with('-'));
+            let name = explicit_name
                 .cloned()
                 .unwrap_or_else(|| subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned());
             (
                 WhisperAction::DownloadVadModel { name },
-                usize::from(args.get(1).is_some()) + 1,
+                usize::from(explicit_name.is_some()) + 1,
             )
         }
         other => {
@@ -1093,7 +1093,7 @@ mod tests {
             "subbake-test-{}-{label}-empty.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "version = 2\n").expect("write empty config");
+        std::fs::write(&path, "version = 3\n").expect("write empty config");
         path
     }
 
@@ -1110,10 +1110,22 @@ mod tests {
 
     #[test]
     fn translate_overwrite_requires_an_explicit_flag() {
-        let default =
-            parse_translate_args(&["clip.srt".to_owned()]).expect("parse default overwrite policy");
-        let enabled = parse_translate_args(&["clip.srt".to_owned(), "--overwrite".to_owned()])
-            .expect("parse explicit overwrite policy");
+        let config = empty_config("translate-overwrite");
+        let config_value = config.to_string_lossy().into_owned();
+        let default = parse_translate_args(&[
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            config_value.clone(),
+        ])
+        .expect("parse default overwrite policy");
+        let enabled = parse_translate_args(&[
+            "clip.srt".to_owned(),
+            "--config".to_owned(),
+            config_value,
+            "--overwrite".to_owned(),
+        ])
+        .expect("parse explicit overwrite policy");
+        let _ = std::fs::remove_file(config);
 
         assert!(!default.overwrite);
         assert!(enabled.overwrite);
@@ -1129,6 +1141,18 @@ mod tests {
                 .to_string()
                 .contains("unknown translate option `--fast`")
         );
+    }
+
+    #[test]
+    fn translate_rejects_former_agent_repair_flags() {
+        for flag in ["--agent", "--no-agent", "--agent-repair-attempts"] {
+            let mut args = vec!["clip.srt".to_owned(), flag.to_owned()];
+            if flag == "--agent-repair-attempts" {
+                args.push("2".to_owned());
+            }
+            let error = parse_translate_args(&args).expect_err("former flag must be rejected");
+            assert!(error.to_string().contains("unknown translate option"));
+        }
     }
 
     #[test]
@@ -1161,8 +1185,8 @@ mod tests {
             "--no-cache".to_owned(),
             "--retries".to_owned(),
             "0".to_owned(),
-            "--no-agent".to_owned(),
-            "--agent-repair-attempts".to_owned(),
+            "--no-model-repair".to_owned(),
+            "--model-repair-attempts".to_owned(),
             "3".to_owned(),
         ];
         let parsed = parse_translate_args(&args).expect("translate args should parse");
@@ -1171,8 +1195,8 @@ mod tests {
         assert!(!parsed.settings.translation.resume);
         assert!(!parsed.settings.translation.use_cache);
         assert_eq!(parsed.settings.translation.retries, 0);
-        assert!(!parsed.settings.translation.agent);
-        assert_eq!(parsed.settings.translation.agent_repair_attempts, 3);
+        assert!(!parsed.settings.translation.model_repair);
+        assert_eq!(parsed.settings.translation.model_repair_attempts, 3);
     }
 
     #[test]
@@ -1384,7 +1408,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 2\n[defaults.translation]\nbatch_size = \"nope\"\n",
+            "version = 3\n[defaults.translation]\nbatch_size = \"nope\"\n",
         )
         .expect("write config");
         let args = vec![
@@ -1408,7 +1432,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 2\n[defaults.translation]\nunknown_setting = true\n",
+            "version = 3\n[defaults.translation]\nunknown_setting = true\n",
         )
         .expect("write config");
         let args = vec![
@@ -1450,7 +1474,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 2
+            version = 3
 
             [defaults.translation]
             target_language = "Japanese"
@@ -1491,7 +1515,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 2
+            version = 3
 
             [defaults.translation]
             target_language = "Japanese"
@@ -1567,13 +1591,15 @@ mod tests {
         let batch = parse_batch_args(&[
             ".".to_owned(),
             "--config".to_owned(),
-            config_value,
+            config_value.clone(),
             "--qa-fail-on".to_owned(),
             "error".to_owned(),
         ])
         .expect("batch QA gate");
         let transcribe = parse_transcribe_args(&[
             "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config_value,
             "--qa-fail-on".to_owned(),
             "warning".to_owned(),
         ])
@@ -1587,8 +1613,11 @@ mod tests {
 
     #[test]
     fn parse_transcribe_accepts_local_whisper_options() {
+        let config = empty_config("transcribe-whisper-options");
         let args = vec![
             "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--language".to_owned(),
             "en".to_owned(),
             "--model".to_owned(),
@@ -1600,6 +1629,7 @@ mod tests {
         ];
 
         let parsed = parse_transcribe_args(&args).expect("transcribe args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.media_path, PathBuf::from("movie.mp4"));
         assert_eq!(parsed.settings.language.as_deref(), Some("en"));
@@ -1613,12 +1643,16 @@ mod tests {
 
     #[test]
     fn parse_transcribe_controls_postprocessing_and_speaker_labels() {
+        let config = empty_config("transcribe-postprocessing");
         let parsed = parse_transcribe_args(&[
             "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--no-normalize-transcript".to_owned(),
             "--no-speaker-labels".to_owned(),
         ])
         .expect("transcription post-processing options");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.settings.normalize_text, Some(false));
         assert_eq!(parsed.settings.speaker_labels, Some(false));
@@ -1626,10 +1660,22 @@ mod tests {
 
     #[test]
     fn transcribe_overwrite_requires_an_explicit_flag() {
-        let default = parse_transcribe_args(&["movie.mp4".to_owned()])
-            .expect("parse default overwrite policy");
-        let enabled = parse_transcribe_args(&["movie.mp4".to_owned(), "--overwrite".to_owned()])
-            .expect("parse explicit overwrite policy");
+        let config = empty_config("transcribe-overwrite");
+        let config_value = config.to_string_lossy().into_owned();
+        let default = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config_value.clone(),
+        ])
+        .expect("parse default overwrite policy");
+        let enabled = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config_value,
+            "--overwrite".to_owned(),
+        ])
+        .expect("parse explicit overwrite policy");
+        let _ = std::fs::remove_file(config);
 
         assert!(!default.overwrite);
         assert!(enabled.overwrite);
@@ -1643,7 +1689,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 2\n[defaults.transcription]\nmodel = \"small-q8_0\"\n",
+            "version = 3\n[defaults.transcription]\nmodel = \"small-q8_0\"\n",
         )
         .expect("write config");
         let config = path.to_string_lossy().into_owned();
@@ -1670,10 +1716,22 @@ mod tests {
 
     #[test]
     fn transcription_vad_defaults_to_silero_and_cli_can_disable_it() {
-        let configured =
-            parse_transcribe_args(&["movie.mp4".to_owned()]).expect("parse default VAD settings");
-        let disabled = parse_transcribe_args(&["movie.mp4".to_owned(), "--no-vad".to_owned()])
-            .expect("parse disabled VAD settings");
+        let config = empty_config("transcribe-vad-default");
+        let config_value = config.to_string_lossy().into_owned();
+        let configured = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config_value.clone(),
+        ])
+        .expect("parse default VAD settings");
+        let disabled = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            config_value,
+            "--no-vad".to_owned(),
+        ])
+        .expect("parse disabled VAD settings");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(configured.settings.vad_enabled, Some(true));
         assert_eq!(
@@ -1766,7 +1824,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-            version = 2
+            version = 3
 
             [profiles.remote.backend]
             id = "openai"
@@ -1826,9 +1884,12 @@ mod tests {
 
     #[test]
     fn parse_whisper_model_accepts_paths() {
+        let config = empty_config("whisper-model-paths");
         let args = vec![
             "model".to_owned(),
             "base".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--bin".to_owned(),
             "tools/whisper-cli".to_owned(),
             "--models-dir".to_owned(),
@@ -1836,6 +1897,7 @@ mod tests {
         ];
 
         let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(
             parsed.action,
@@ -1849,14 +1911,18 @@ mod tests {
 
     #[test]
     fn parse_whisper_model_list_accepts_models_dir() {
+        let config = empty_config("whisper-model-list");
         let args = vec![
             "model".to_owned(),
             "list".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
             "--models-dir".to_owned(),
             "models".to_owned(),
         ];
 
         let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.action, WhisperAction::ListModels);
         assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
@@ -1864,8 +1930,14 @@ mod tests {
 
     #[test]
     fn parse_whisper_vad_model_defaults_to_silero() {
-        let parsed = parse_whisper_args(&["vad-model".to_owned()])
-            .expect("whisper VAD model args should parse");
+        let config = empty_config("whisper-vad-model");
+        let parsed = parse_whisper_args(&[
+            "vad-model".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+        ])
+        .expect("whisper VAD model args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(
             parsed.action,
@@ -1877,9 +1949,16 @@ mod tests {
 
     #[test]
     fn parse_whisper_uninstall_accepts_keep_models() {
-        let args = vec!["uninstall".to_owned(), "--keep-models".to_owned()];
+        let config = empty_config("whisper-uninstall");
+        let args = vec![
+            "uninstall".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--keep-models".to_owned(),
+        ];
 
         let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(
             parsed.action,
@@ -1889,17 +1968,29 @@ mod tests {
 
     #[test]
     fn parse_whisper_update_is_supported() {
-        let args = vec!["update".to_owned()];
+        let config = empty_config("whisper-update");
+        let args = vec![
+            "update".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+        ];
 
         let parsed = parse_whisper_args(&args).expect("whisper args should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.action, WhisperAction::Update);
     }
 
     #[test]
     fn parse_whisper_versions_is_supported() {
-        let parsed =
-            parse_whisper_args(&["versions".to_owned()]).expect("whisper versions should parse");
+        let config = empty_config("whisper-versions");
+        let parsed = parse_whisper_args(&[
+            "versions".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+        ])
+        .expect("whisper versions should parse");
+        let _ = std::fs::remove_file(config);
 
         assert_eq!(parsed.action, WhisperAction::ListVersions);
     }
@@ -1912,7 +2003,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "version = 2\n[defaults.storage]\nruntime_dir = \"runtime-data\"\n",
+            "version = 3\n[defaults.storage]\nruntime_dir = \"runtime-data\"\n",
         )
         .expect("write config");
         let config = path.to_string_lossy().into_owned();

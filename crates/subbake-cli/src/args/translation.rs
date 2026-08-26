@@ -156,10 +156,10 @@ impl TranslationOptionGroup {
             "--retries" => {
                 overrides.translation.retries = Some(parse_nonnegative_usize(args, index, option)?)
             }
-            "--agent" => overrides.translation.agent = Some(true),
-            "--no-agent" => overrides.translation.agent = Some(false),
-            "--agent-repair-attempts" => {
-                overrides.translation.agent_repair_attempts =
+            "--model-repair" => overrides.translation.model_repair = Some(true),
+            "--no-model-repair" => overrides.translation.model_repair = Some(false),
+            "--model-repair-attempts" => {
+                overrides.translation.model_repair_attempts =
                     Some(parse_nonnegative_usize(args, index, option)?)
             }
             "--max-requests" => {

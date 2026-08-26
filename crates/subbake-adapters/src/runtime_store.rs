@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, OcrCorrectionReport, OcrCorrectionResult,
+    BatchTranslationResult, FailureLog, ModelRepairLog, OcrCorrectionReport, OcrCorrectionResult,
     ReviewReport, ReviewResult, SubtitleSegment, TerminologyPreflightResult, Usage,
 };
 use subbake_core::error::{CoreError, CoreResult, StorageError, StorageIoKind};
@@ -89,7 +89,7 @@ impl RuntimeLayoutStore for FileRuntimeStore {
             &self.paths.translated_batches_dir,
             &self.paths.reviewed_batches_dir,
             &self.paths.finalized_batches_dir,
-            &self.paths.agent_logs_dir,
+            &self.paths.model_repair_logs_dir,
         ] {
             fs::create_dir_all(directory).map_err(|error| {
                 storage_error("create runtime directory", Some(directory), error)
@@ -271,14 +271,14 @@ impl RuntimeCacheStore for FileRuntimeStore {
     ) -> CoreResult<()> {
         let value = match (stage, &response.payload) {
             (
-                CacheStage::Translate | CacheStage::AgentTranslateRepair,
+                CacheStage::Translate | CacheStage::ModelTranslateRepair,
                 BackendPayload::Translation(payload),
             ) => serde_json::to_value(TranslationCacheEntry {
                 payload: payload.clone(),
                 usage: response.usage,
             }),
             (
-                CacheStage::Review | CacheStage::AgentReviewRepair,
+                CacheStage::Review | CacheStage::ModelReviewRepair,
                 BackendPayload::Review(payload),
             ) => serde_json::to_value(ReviewCacheEntry {
                 payload: payload.clone(),
@@ -321,7 +321,7 @@ impl RuntimeCacheStore for FileRuntimeStore {
         let text = fs::read_to_string(&path)
             .map_err(|error| storage_error("read cached response", Some(&path), error))?;
         match stage {
-            CacheStage::Translate | CacheStage::AgentTranslateRepair => {
+            CacheStage::Translate | CacheStage::ModelTranslateRepair => {
                 let entry: TranslationCacheEntry =
                     serde_json::from_str(&text).map_err(|error| {
                         CoreError::DataInvariant(format!("request cache parse failed: {error}"))
@@ -331,7 +331,7 @@ impl RuntimeCacheStore for FileRuntimeStore {
                     usage: entry.usage,
                 }))
             }
-            CacheStage::Review | CacheStage::AgentReviewRepair => {
+            CacheStage::Review | CacheStage::ModelReviewRepair => {
                 let entry: ReviewCacheEntry = serde_json::from_str(&text).map_err(|error| {
                     CoreError::DataInvariant(format!("request cache parse failed: {error}"))
                 })?;
@@ -377,13 +377,13 @@ impl RuntimeDiagnosticStore for FileRuntimeStore {
         Ok(path)
     }
 
-    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
+    fn save_model_repair_log(&self, log: &ModelRepairLog) -> CoreResult<PathBuf> {
         let path = self
             .paths
-            .agent_logs_dir
+            .model_repair_logs_dir
             .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index));
         let value = serde_json::to_value(log).map_err(|error| {
-            CoreError::DataInvariant(format!("serialize agent log failed: {error}"))
+            CoreError::DataInvariant(format!("serialize model repair log failed: {error}"))
         })?;
         write_json_verified(&path, &value)?;
         Ok(path)
@@ -538,11 +538,11 @@ fn storage_error(operation: &str, path: Option<&Path>, error: io::Error) -> Core
 #[cfg(test)]
 mod tests {
     use subbake_core::entities::{
-        AgentLog, AttemptLog, BatchTranslationResult, DocumentGuide, FailureLog, GlossaryEntry,
-        OcrCorrectionChange, OcrCorrectionMode, OcrCorrectionOrigin, OcrCorrectionReport,
-        OcrCorrectionResult, OcrCorrectionSummary, PipelineOptions, ReviewChange, ReviewReport,
-        ReviewStats, TerminologyEntity, TerminologyKind, TerminologyPreflightResult,
-        TerminologyStats, TranslationLine, Usage,
+        AttemptLog, BatchTranslationResult, DocumentGuide, FailureLog, GlossaryEntry,
+        ModelRepairLog, OcrCorrectionChange, OcrCorrectionMode, OcrCorrectionOrigin,
+        OcrCorrectionReport, OcrCorrectionResult, OcrCorrectionSummary, PipelineOptions,
+        ReviewChange, ReviewReport, ReviewStats, TerminologyEntity, TerminologyKind,
+        TerminologyPreflightResult, TerminologyStats, TranslationLine, Usage,
     };
     use subbake_core::memory::ContextMemory;
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_python_compatible_failure_and_agent_logs() {
+    fn writes_failure_and_model_repair_logs() {
         let temporary = temp_root("recovery-logs");
         let root = temporary.path().to_path_buf();
         let paths = build_runtime_paths(
@@ -1227,31 +1227,35 @@ mod tests {
                 messages: attempt.messages.clone(),
                 translated_segments: Vec::new(),
                 attempts: vec![attempt.clone()],
-                agent_attempts: vec![attempt.clone()],
+                model_repair_attempts: vec![attempt.clone()],
             })
             .expect("save failure");
-        let agent_path = store
-            .save_agent_log(&AgentLog {
+        let model_repair_path = store
+            .save_model_repair_log(&ModelRepairLog {
                 stage: "translate".to_owned(),
                 batch_index: 1,
                 success: false,
                 attempts: vec![attempt],
                 final_error: Some("invalid output".to_owned()),
             })
-            .expect("save agent log");
+            .expect("save model repair log");
         let failure: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&failure_path).expect("read failure"))
                 .expect("failure json");
-        let agent: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&agent_path).expect("read agent"))
-                .expect("agent json");
+        let model_repair: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&model_repair_path).expect("read model repair"),
+        )
+        .expect("model repair json");
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(failure["stage"], "translate");
         assert_eq!(failure["attempts"][0]["messages"][0]["role"], "user");
-        assert_eq!(failure["agent_attempts"].as_array().map(Vec::len), Some(1));
-        assert_eq!(agent["success"], false);
-        assert_eq!(agent["final_error"], "invalid output");
+        assert_eq!(
+            failure["model_repair_attempts"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(model_repair["success"], false);
+        assert_eq!(model_repair["final_error"], "invalid output");
     }
 
     fn temp_root(label: &str) -> tempfile::TempDir {

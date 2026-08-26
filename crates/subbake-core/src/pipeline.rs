@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, AgentRepairRecord, AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry,
-    PipelineOptions, PipelineResult, ReviewAnnotation, ReviewPolicy, ReviewStats, SplitRetryLog,
-    StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment, TerminologyEntity,
-    TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
+    AttemptLog, BatchTranslationResult, FailureLog, GlossaryEntry, ModelRepairLog,
+    ModelRepairRecord, PipelineOptions, PipelineResult, ReviewAnnotation, ReviewPolicy,
+    ReviewStats, SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleSegment,
+    TerminologyEntity, TerminologyStats, TerminologyStrategy, TranslationLine, Usage,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::formatting::restore_batch_formatting;
@@ -19,7 +19,7 @@ use crate::ports::{
 };
 use crate::progress::{ProgressEvent, ProgressSink, ProgressUnit, TaskKind, TaskState};
 use crate::recovery::{
-    backend_payload_json, build_agent_repair_messages, combine_glossary, parse_translation_payload,
+    backend_payload_json, build_model_repair_messages, combine_glossary, parse_translation_payload,
     retry_correction_message, split_index,
 };
 use crate::review::{ReviewBatchPlan, build_review_messages_with_rules, parse_review_payload};
@@ -52,7 +52,7 @@ use support::build_translation_messages;
 pub use support::translation_memory_key;
 use support::{
     build_translation_messages_with_rules, contextual_translation_memory_keys,
-    estimated_request_tokens, is_agent_repairable, is_operational_llm_failure, merge_review_patch,
+    estimated_request_tokens, is_model_repairable, is_operational_llm_failure, merge_review_patch,
     request_hash, translation_memory_scope, update_translation_memory,
     validate_review_candidate_ids,
 };
@@ -84,7 +84,7 @@ pub struct SubtitlePipeline<B> {
     /// Normalised-key → translation text cache loaded from the runtime store.
     translation_memory: HashMap<String, String>,
     accounting: PipelineAccounting,
-    agent_repairs: Vec<AgentRepairRecord>,
+    model_repairs: Vec<ModelRepairRecord>,
     cancellation: CancellationGuard,
     progress: Option<Box<dyn ProgressSink>>,
 }
@@ -114,7 +114,7 @@ where
             input_signature: None,
             translation_memory: HashMap::new(),
             accounting,
-            agent_repairs: Vec::new(),
+            model_repairs: Vec::new(),
             cancellation: CancellationGuard::never(),
             progress: None,
         }
@@ -362,7 +362,7 @@ where
                     translation_memory_hits: 0,
                     state_path,
                     glossary_path,
-                    agent_repairs: self.agent_repairs.clone(),
+                    model_repairs: self.model_repairs.clone(),
                     terminology: TerminologyStats::default(),
                     review: ReviewStats::default(),
                 },
@@ -531,7 +531,7 @@ where
                 translation_memory_hits: self.accounting.translation_memory_hits(),
                 state_path,
                 glossary_path,
-                agent_repairs: self.agent_repairs.clone(),
+                model_repairs: self.model_repairs.clone(),
                 terminology,
                 review,
             },
@@ -1432,7 +1432,7 @@ where
         }
         self.cancellation.check()?;
         let repair =
-            self.run_agent_repair("translate", batch_index, batch, None, &error, &attempts)?;
+            self.run_model_repair("translate", batch_index, batch, None, &error, &attempts)?;
         if let Some(outcome) = repair.as_ref()
             && let Some(BackendPayload::Translation(result)) = outcome.payload.clone()
         {
@@ -1445,7 +1445,7 @@ where
                 cache_key: None,
             });
         }
-        let agent_attempts = repair
+        let model_repair_attempts = repair
             .as_ref()
             .map(|outcome| outcome.attempts.clone())
             .unwrap_or_default();
@@ -1457,7 +1457,7 @@ where
             messages,
             translated_segments: Vec::new(),
             attempts,
-            agent_attempts,
+            model_repair_attempts,
         })?;
         Err(failure_error(
             "Translation",
@@ -1481,7 +1481,7 @@ where
             return Err(error);
         }
         self.cancellation.check()?;
-        let repair = self.run_agent_repair(
+        let repair = self.run_model_repair(
             "review",
             batch_index,
             &batch.source,
@@ -1498,7 +1498,7 @@ where
                 usage: outcome.usage,
             });
         }
-        let agent_attempts = repair
+        let model_repair_attempts = repair
             .as_ref()
             .map(|outcome| outcome.attempts.clone())
             .unwrap_or_default();
@@ -1510,7 +1510,7 @@ where
             messages,
             translated_segments: batch.translated.clone(),
             attempts,
-            agent_attempts,
+            model_repair_attempts,
         })?;
         Err(failure_error(
             "Final review",
@@ -1545,7 +1545,7 @@ where
             .filter(|segment| failing_ids.contains(segment.id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let Some(repair) = self.run_agent_repair(
+        let Some(repair) = self.run_model_repair(
             "final_validation",
             0,
             &source,
@@ -1587,7 +1587,7 @@ where
         )
     }
 
-    fn run_agent_repair(
+    fn run_model_repair(
         &mut self,
         stage: &str,
         batch_index: usize,
@@ -1596,25 +1596,25 @@ where
         initial_error: &CoreError,
         failed_attempts: &[AttemptLog],
     ) -> CoreResult<Option<RepairOutcome>> {
-        if !self.options.execution.agent
-            || self.options.execution.agent_repair_attempts == 0
-            || !is_agent_repairable(initial_error)
+        if !self.options.execution.model_repair
+            || self.options.execution.model_repair_attempts == 0
+            || !is_model_repairable(initial_error)
         {
             return Ok(None);
         }
 
         let cache_stage = if stage == "translate" {
-            CacheStage::AgentTranslateRepair
+            CacheStage::ModelTranslateRepair
         } else {
-            CacheStage::AgentReviewRepair
+            CacheStage::ModelReviewRepair
         };
         let mut repair_error = initial_error.clone();
         let mut attempts = Vec::new();
         let mut total_usage = Usage::default();
         let mut log_path = None;
-        for attempt in 1..=self.options.execution.agent_repair_attempts {
+        for attempt in 1..=self.options.execution.model_repair_attempts {
             self.cancellation.check()?;
-            let messages = build_agent_repair_messages(
+            let messages = build_model_repair_messages(
                 stage,
                 source,
                 translated,
@@ -1736,14 +1736,14 @@ where
                         messages,
                         split_retry: None,
                     });
-                    log_path = self.save_agent_log(AgentLog {
+                    log_path = self.save_model_repair_log(ModelRepairLog {
                         stage: stage.to_owned(),
                         batch_index,
                         success: true,
                         attempts: attempts.clone(),
                         final_error: None,
                     })?;
-                    self.agent_repairs.push(AgentRepairRecord {
+                    self.model_repairs.push(ModelRepairRecord {
                         stage: stage.to_owned(),
                         batch_index,
                         attempts: attempt,
@@ -1771,7 +1771,7 @@ where
                         messages,
                         split_retry: None,
                     });
-                    log_path = self.save_agent_log(AgentLog {
+                    log_path = self.save_model_repair_log(ModelRepairLog {
                         stage: stage.to_owned(),
                         batch_index,
                         success: false,
@@ -1784,7 +1784,7 @@ where
                 }
             }
         }
-        self.agent_repairs.push(AgentRepairRecord {
+        self.model_repairs.push(ModelRepairRecord {
             stage: stage.to_owned(),
             batch_index,
             attempts: attempts.len(),
@@ -1808,10 +1808,10 @@ where
             .transpose()
     }
 
-    fn save_agent_log(&self, log: AgentLog) -> CoreResult<Option<PathBuf>> {
+    fn save_model_repair_log(&self, log: ModelRepairLog) -> CoreResult<Option<PathBuf>> {
         self.store
             .as_ref()
-            .map(|store| store.save_agent_log(&log))
+            .map(|store| store.save_model_repair_log(&log))
             .transpose()
     }
 
@@ -1978,7 +1978,7 @@ fn failure_error(
         && repair.payload.is_none()
     {
         message.push_str(&format!(
-            "\nAgent repair failed after {} attempt(s).",
+            "\nModel repair failed after {} attempt(s).",
             repair.attempts.len()
         ));
         if let Some(log_path) = &repair.log_path {
@@ -2114,7 +2114,7 @@ mod tests {
     fn translation_requests_disable_provider_reasoning() {
         let mut options = PipelineOptions::new(PathBuf::from("reasoning.srt"));
         options.execution.terminology_preflight = false;
-        options.execution.agent = false;
+        options.execution.model_repair = false;
         let mut pipeline = SubtitlePipeline::new(NonThinkingBackend, options);
 
         pipeline
@@ -2126,7 +2126,7 @@ mod tests {
     fn request_budget_stops_before_starting_a_provider_side_effect() {
         let mut options = PipelineOptions::new(PathBuf::from("budget.srt"));
         options.execution.terminology_preflight = false;
-        options.execution.agent = false;
+        options.execution.model_repair = false;
         options.execution.max_requests = Some(0);
         let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
         let error = pipeline
@@ -2786,13 +2786,13 @@ mod tests {
         }
     }
 
-    struct AgentRepairBackend {
+    struct ModelRepairBackend {
         regular_calls: Arc<AtomicUsize>,
         repair_calls: Arc<AtomicUsize>,
         repair_succeeds: bool,
     }
 
-    impl LlmBackend for AgentRepairBackend {
+    impl LlmBackend for ModelRepairBackend {
         fn provider_name(&self) -> &str {
             "test"
         }
@@ -2812,7 +2812,7 @@ mod tests {
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !prompt.contains("AGENT_REPAIR_JSON_START") {
+            if !prompt.contains("MODEL_REPAIR_JSON_START") {
                 self.regular_calls.fetch_add(1, Ordering::SeqCst);
                 let response =
                     EchoBackend.execute(GenerationRequest::json(messages), cancellation)?;
@@ -2827,10 +2827,10 @@ mod tests {
             }
             self.repair_calls.fetch_add(1, Ordering::SeqCst);
             let body = prompt
-                .split("AGENT_REPAIR_JSON_START")
+                .split("MODEL_REPAIR_JSON_START")
                 .nth(1)
-                .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
-                .ok_or_else(|| CoreError::DataInvariant("missing agent repair json".to_owned()))?;
+                .and_then(|value| value.split("MODEL_REPAIR_JSON_END").next())
+                .ok_or_else(|| CoreError::DataInvariant("missing model repair json".to_owned()))?;
             let payload: serde_json::Value = serde_json::from_str(body).map_err(|error| {
                 CoreError::DataInvariant(format!("invalid repair json: {error}"))
             })?;
@@ -2843,7 +2843,7 @@ mod tests {
                     serde_json::json!({
                         "id": line["id"],
                         "translation": if self.repair_succeeds {
-                            format!("[AGENT] {}", line["text"].as_str().unwrap_or_default())
+                            format!("[MODEL_REPAIR] {}", line["text"].as_str().unwrap_or_default())
                         } else {
                             String::new()
                         },
@@ -2853,7 +2853,7 @@ mod tests {
             Ok(GenerationResponse::json(
                 serde_json::json!({
                     "lines": lines,
-                    "summary": "agent repaired",
+                    "summary": "model repaired",
                     "glossary_updates": [],
                 }),
                 Usage {
@@ -2866,7 +2866,7 @@ mod tests {
         }
     }
 
-    struct AgentReviewBackend {
+    struct ModelReviewRepairBackend {
         review_calls: Arc<AtomicUsize>,
         repair_calls: Arc<AtomicUsize>,
     }
@@ -2901,7 +2901,7 @@ mod tests {
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if prompt.contains("AGENT_REPAIR_JSON_START") {
+            if prompt.contains("MODEL_REPAIR_JSON_START") {
                 self.repair_calls.fetch_add(1, Ordering::SeqCst);
                 return Err(LlmCallError::InvalidResponse(
                     "number mismatch must not request final repair".to_owned(),
@@ -2959,11 +2959,11 @@ mod tests {
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if prompt.contains("AGENT_REPAIR_JSON_START") {
+            if prompt.contains("MODEL_REPAIR_JSON_START") {
                 let body = prompt
-                    .split("AGENT_REPAIR_JSON_START")
+                    .split("MODEL_REPAIR_JSON_START")
                     .nth(1)
-                    .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
+                    .and_then(|value| value.split("MODEL_REPAIR_JSON_END").next())
                     .ok_or_else(|| {
                         LlmCallError::InvalidResponse("missing final repair payload".to_owned())
                     })?;
@@ -3043,7 +3043,7 @@ mod tests {
         }
     }
 
-    impl LlmBackend for AgentReviewBackend {
+    impl LlmBackend for ModelReviewRepairBackend {
         fn provider_name(&self) -> &str {
             "test"
         }
@@ -3084,15 +3084,15 @@ mod tests {
                     Usage::default(),
                 ));
             }
-            if !prompt.contains("AGENT_REPAIR_JSON_START") {
+            if !prompt.contains("MODEL_REPAIR_JSON_START") {
                 return EchoBackend.execute(GenerationRequest::json(messages), cancellation);
             }
 
             self.repair_calls.fetch_add(1, Ordering::SeqCst);
             let body = prompt
-                .split("AGENT_REPAIR_JSON_START")
+                .split("MODEL_REPAIR_JSON_START")
                 .nth(1)
-                .and_then(|value| value.split("AGENT_REPAIR_JSON_END").next())
+                .and_then(|value| value.split("MODEL_REPAIR_JSON_END").next())
                 .ok_or_else(|| CoreError::DataInvariant("missing review repair json".to_owned()))?;
             let payload: serde_json::Value = serde_json::from_str(body).map_err(|error| {
                 CoreError::DataInvariant(format!("invalid review repair json: {error}"))
@@ -3110,7 +3110,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             Ok(GenerationResponse::json(
-                serde_json::json!({"lines": lines, "review_notes": "agent repaired"}),
+                serde_json::json!({"lines": lines, "review_notes": "model repaired"}),
                 Usage {
                     input_tokens: 2,
                     output_tokens: 2,
@@ -3434,7 +3434,7 @@ mod tests {
         let mut options = PipelineOptions::new("/shows/one/terms.txt".into());
         options.identity.glossary_path = Some("glossary.json".into());
         options.execution.resume = false;
-        options.execution.agent = false;
+        options.execution.model_repair = false;
         let mut key_memory = ContextMemory::new();
         key_memory
             .glossary
@@ -3707,7 +3707,7 @@ mod tests {
         options.execution.batch_size = 8;
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.retries = 0;
-        options.execution.agent = false;
+        options.execution.model_repair = false;
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             StructuralFailureBackend {
@@ -3738,7 +3738,7 @@ mod tests {
         options.execution.batch_token_budget = 10_000;
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.retries = 1;
-        options.execution.agent = false;
+        options.execution.model_repair = false;
         let call_sizes = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
             StructuralFailureBackend {
@@ -3815,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_repair_continues_pipeline_and_records_log() {
+    fn model_repair_continues_pipeline_and_records_log() {
         let document = document("agent.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent.txt".into());
         options.execution.review_policy = ReviewPolicy::Off;
@@ -3836,7 +3836,7 @@ mod tests {
         let regular_calls = Arc::new(AtomicUsize::new(0));
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
-            AgentRepairBackend {
+            ModelRepairBackend {
                 regular_calls: Arc::clone(&regular_calls),
                 repair_calls: Arc::clone(&repair_calls),
                 repair_succeeds: true,
@@ -3845,15 +3845,22 @@ mod tests {
         )
         .with_store(Box::new(store));
 
-        let run = pipeline.run_document(&document).expect("agent repairs");
+        let run = pipeline
+            .run_document(&document)
+            .expect("model repair succeeds");
 
         assert_eq!(regular_calls.load(Ordering::SeqCst), 1);
         assert_eq!(repair_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(run.translated_segments[0].text, "[AGENT] Alpha.");
-        assert_eq!(run.result.agent_repairs.len(), 1);
-        assert!(run.result.agent_repairs[0].success);
+        assert_eq!(run.translated_segments[0].text, "[MODEL_REPAIR] Alpha.");
+        assert_eq!(run.result.model_repairs.len(), 1);
+        assert!(run.result.model_repairs[0].success);
         let data = captured.lock().expect("capture lock");
-        assert!(data.agent_logs.last().expect("agent log").success);
+        assert!(
+            data.model_repair_logs
+                .last()
+                .expect("model repair log")
+                .success
+        );
         assert!(data.failure_logs.is_empty());
     }
 
@@ -3904,9 +3911,9 @@ mod tests {
         );
         assert_eq!(run.translated_segments[0].text, "短句。");
         assert_eq!(run.translated_segments[1].text, "好。");
-        assert_eq!(run.result.agent_repairs.len(), 1);
-        assert_eq!(run.result.agent_repairs[0].stage, "final_validation");
-        assert!(run.result.agent_repairs[0].success);
+        assert_eq!(run.result.model_repairs.len(), 1);
+        assert_eq!(run.result.model_repairs[0].stage, "final_validation");
+        assert!(run.result.model_repairs[0].success);
         assert_eq!(run.result.usage.total_tokens, 19);
 
         let data = captured.lock().expect("capture lock");
@@ -3947,7 +3954,7 @@ mod tests {
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.terminology_preflight = false;
         options.execution.online_terminology = false;
-        options.execution.agent_repair_attempts = 3;
+        options.execution.model_repair_attempts = 3;
         options.validation.max_characters_per_line = Some(4);
         let repair_ids = Arc::new(Mutex::new(Vec::new()));
         let mut pipeline = SubtitlePipeline::new(
@@ -3968,8 +3975,8 @@ mod tests {
                 .contains("repair returned unchanged translations")
         );
         assert_eq!(repair_ids.lock().expect("repair ids").len(), 1);
-        assert_eq!(pipeline.agent_repairs.len(), 1);
-        assert_eq!(pipeline.agent_repairs[0].attempts, 1);
+        assert_eq!(pipeline.model_repairs.len(), 1);
+        assert_eq!(pipeline.model_repairs[0].attempts, 1);
     }
 
     #[test]
@@ -3999,17 +4006,17 @@ mod tests {
             run.translated_segments[0].text,
             "24时零2分。对象状态急剧恶化。"
         );
-        assert!(run.result.agent_repairs.is_empty());
+        assert!(run.result.model_repairs.is_empty());
     }
 
     #[test]
-    fn agent_repair_reports_missing_log_path_without_a_runtime_store() {
+    fn model_repair_reports_missing_log_path_without_a_runtime_store() {
         let document = document("agent-no-store.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-no-store.txt".into());
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.retries = 0;
         let mut pipeline = SubtitlePipeline::new(
-            AgentRepairBackend {
+            ModelRepairBackend {
                 regular_calls: Arc::new(AtomicUsize::new(0)),
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: true,
@@ -4017,13 +4024,15 @@ mod tests {
             options,
         );
 
-        let run = pipeline.run_document(&document).expect("agent repairs");
-        assert_eq!(run.result.agent_repairs.len(), 1);
-        assert_eq!(run.result.agent_repairs[0].log_path, None);
+        let run = pipeline
+            .run_document(&document)
+            .expect("model repair succeeds");
+        assert_eq!(run.result.model_repairs.len(), 1);
+        assert_eq!(run.result.model_repairs[0].log_path, None);
     }
 
     #[test]
-    fn agent_repair_cache_bypasses_second_repair_call() {
+    fn model_repair_cache_bypasses_second_repair_call() {
         let document = document("agent-cache.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-cache.txt".into());
         options.execution.review_policy = ReviewPolicy::Off;
@@ -4043,7 +4052,7 @@ mod tests {
             data: Arc::clone(&captured),
         };
         let mut first = SubtitlePipeline::new(
-            AgentRepairBackend {
+            ModelRepairBackend {
                 regular_calls: Arc::new(AtomicUsize::new(0)),
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: true,
@@ -4055,7 +4064,7 @@ mod tests {
 
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut second = SubtitlePipeline::new(
-            AgentRepairBackend {
+            ModelRepairBackend {
                 regular_calls: Arc::new(AtomicUsize::new(0)),
                 repair_calls: Arc::clone(&repair_calls),
                 repair_succeeds: false,
@@ -4067,11 +4076,11 @@ mod tests {
 
         assert_eq!(repair_calls.load(Ordering::SeqCst), 0);
         assert_eq!(run.result.cache_hits, 1);
-        assert_eq!(run.translated_segments[0].text, "[AGENT] Alpha.");
+        assert_eq!(run.translated_segments[0].text, "[MODEL_REPAIR] Alpha.");
     }
 
     #[test]
-    fn agent_can_repair_review_validation_failure() {
+    fn model_can_repair_review_validation_failure() {
         let document = document("review-agent.txt", &[REVIEW_CANDIDATE_A]);
         let mut options = PipelineOptions::new("review-agent.txt".into());
         options.execution.batch_size = 1;
@@ -4080,7 +4089,7 @@ mod tests {
         let review_calls = Arc::new(AtomicUsize::new(0));
         let repair_calls = Arc::new(AtomicUsize::new(0));
         let mut pipeline = SubtitlePipeline::new(
-            AgentReviewBackend {
+            ModelReviewRepairBackend {
                 review_calls: Arc::clone(&review_calls),
                 repair_calls: Arc::clone(&repair_calls),
             },
@@ -4091,8 +4100,8 @@ mod tests {
 
         assert_eq!(review_calls.load(Ordering::SeqCst), 1);
         assert_eq!(repair_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(run.result.agent_repairs.len(), 1);
-        assert_eq!(run.result.agent_repairs[0].stage, "review");
+        assert_eq!(run.result.model_repairs.len(), 1);
+        assert_eq!(run.result.model_repairs[0].stage, "review");
         assert_eq!(
             run.translated_segments[0].text,
             format!("[ECHO] {REVIEW_CANDIDATE_A}")
@@ -4100,12 +4109,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_agent_repair_persists_failure_and_attempts() {
+    fn failed_model_repair_persists_failure_and_attempts() {
         let document = document("agent-fail.txt", &["Alpha."]);
         let mut options = PipelineOptions::new("agent-fail.txt".into());
         options.execution.review_policy = ReviewPolicy::Off;
         options.execution.retries = 0;
-        options.execution.agent_repair_attempts = 2;
+        options.execution.model_repair_attempts = 2;
         let captured = Arc::new(Mutex::new(CapturedStoreData::default()));
         let store = CapturedStore {
             paths: build_runtime_paths(
@@ -4120,7 +4129,7 @@ mod tests {
             data: Arc::clone(&captured),
         };
         let mut pipeline = SubtitlePipeline::new(
-            AgentRepairBackend {
+            ModelRepairBackend {
                 regular_calls: Arc::new(AtomicUsize::new(0)),
                 repair_calls: Arc::new(AtomicUsize::new(0)),
                 repair_succeeds: false,
@@ -4131,16 +4140,23 @@ mod tests {
 
         let error = pipeline
             .run_document(&document)
-            .expect_err("agent repair fails");
+            .expect_err("model repair fails");
 
-        assert!(error.to_string().contains("Agent repair failed after 2"));
+        assert!(error.to_string().contains("Model repair failed after 2"));
         let data = captured.lock().expect("capture lock");
-        assert_eq!(data.agent_logs.last().expect("agent log").attempts.len(), 2);
+        assert_eq!(
+            data.model_repair_logs
+                .last()
+                .expect("model repair log")
+                .attempts
+                .len(),
+            2
+        );
         assert_eq!(
             data.failure_logs
                 .last()
                 .expect("failure log")
-                .agent_attempts
+                .model_repair_attempts
                 .len(),
             2
         );
@@ -5441,7 +5457,7 @@ mod tests {
         saved_state: Option<RunState>,
         cached_responses: Vec<(CacheStage, String, BackendJsonResult)>,
         failure_logs: Vec<FailureLog>,
-        agent_logs: Vec<AgentLog>,
+        model_repair_logs: Vec<ModelRepairLog>,
     }
 
     #[derive(Debug, Clone)]
@@ -5606,15 +5622,15 @@ mod tests {
                 .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
         }
 
-        fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf> {
+        fn save_model_repair_log(&self, log: &ModelRepairLog) -> CoreResult<PathBuf> {
             self.data
                 .lock()
                 .expect("capture lock")
-                .agent_logs
+                .model_repair_logs
                 .push(log.clone());
             Ok(self
                 .paths
-                .agent_logs_dir
+                .model_repair_logs_dir
                 .join(format!("{}_batch_{:04}.json", log.stage, log.batch_index)))
         }
     }

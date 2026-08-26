@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::CancellationGuard;
 use crate::entities::{
-    AgentLog, BatchTranslationResult, FailureLog, ReviewReport, ReviewResult, SubtitleDocument,
-    SubtitleSegment, TerminologyPreflightResult, Usage,
+    BatchTranslationResult, FailureLog, ModelRepairLog, ReviewReport, ReviewResult,
+    SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, Usage,
 };
 use crate::error::{CoreResult, LlmCallError};
 use crate::storage::{RunState, RuntimePaths};
@@ -286,8 +286,8 @@ pub enum CacheStage {
     Review,
     Terminology,
     OcrCorrection,
-    AgentTranslateRepair,
-    AgentReviewRepair,
+    ModelTranslateRepair,
+    ModelReviewRepair,
 }
 
 impl CacheStage {
@@ -297,8 +297,8 @@ impl CacheStage {
             Self::Review => "review",
             Self::Terminology => "terminology",
             Self::OcrCorrection => "ocr_correction",
-            Self::AgentTranslateRepair => "agent_translate_repair",
-            Self::AgentReviewRepair => "agent_review_repair",
+            Self::ModelTranslateRepair => "model_translate_repair",
+            Self::ModelReviewRepair => "model_review_repair",
         }
     }
 }
@@ -544,7 +544,7 @@ pub trait RuntimeCacheStore {
 pub trait RuntimeDiagnosticStore {
     fn save_failure_log(&self, log: &FailureLog) -> CoreResult<PathBuf>;
 
-    fn save_agent_log(&self, log: &AgentLog) -> CoreResult<PathBuf>;
+    fn save_model_repair_log(&self, log: &ModelRepairLog) -> CoreResult<PathBuf>;
 }
 
 pub trait RuntimeStore:

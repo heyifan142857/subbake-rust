@@ -122,6 +122,8 @@ mod tests {
             assert!(script.contains("project"));
         }
         assert!(bash().contains("--qa-fail-on"));
+        assert!(bash().contains("--model-repair"));
         assert!(fish().contains("qa-fail-on"));
+        assert!(fish().contains("model-repair-attempts"));
     }
 }

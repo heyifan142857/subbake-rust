@@ -27,20 +27,20 @@ pub use cancellation::{CancellationGuard, CancellationToken};
 pub use diagnostics::DiagnosticReport;
 pub use editing::SubtitleEditPayload;
 pub use entities::{
-    AgentLog, AgentRepairRecord, AssDialogueRecord, AssDocumentMetadata, AssRecord, AttemptLog,
-    BatchPlanEntry, BatchTranslationResult, BilingualOrder, BitmapOcrSource, ConcurrencyStrategy,
+    AssDialogueRecord, AssDocumentMetadata, AssRecord, AttemptLog, BatchPlanEntry,
+    BatchTranslationResult, BilingualOrder, BitmapOcrSource, ConcurrencyStrategy,
     ConfirmedTranslationContext, ContextStrategy, DocumentCharacter, DocumentGuide, FailureLog,
-    GlossaryEntry, OcrCorrectionChange, OcrCorrectionLine, OcrCorrectionMode, OcrCorrectionOrigin,
-    OcrCorrectionReport, OcrCorrectionResult, OcrCorrectionSummary, OcrCueMetadata,
-    OcrWordConfidence, PassthroughBlock, PipelineExecutionOptions, PipelineOptions,
-    PipelineRenderingOptions, PipelineResult, PipelineRuntimeIdentity, PipelineValidationOptions,
-    PreflightFailurePolicy, PromptCacheStrategy, ReviewAnnotation, ReviewChange, ReviewIssueKind,
-    ReviewPolicy, ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, ReviewStrategy,
-    SplitRetryLog, StructuralRecoveryStrategy, SubtitleDocument, SubtitleDocumentMetadata,
-    SubtitleSegment, SubtitleSemanticContext, TerminologyEntity, TerminologyKind,
-    TerminologyPreflightResult, TerminologyStats, TerminologyStrategy, TranslationLine,
-    TranslationMode, TranslationPolicy, TranslationReadabilityDefaults, Usage,
-    translation_readability_defaults,
+    GlossaryEntry, ModelRepairLog, ModelRepairRecord, OcrCorrectionChange, OcrCorrectionLine,
+    OcrCorrectionMode, OcrCorrectionOrigin, OcrCorrectionReport, OcrCorrectionResult,
+    OcrCorrectionSummary, OcrCueMetadata, OcrWordConfidence, PassthroughBlock,
+    PipelineExecutionOptions, PipelineOptions, PipelineRenderingOptions, PipelineResult,
+    PipelineRuntimeIdentity, PipelineValidationOptions, PreflightFailurePolicy,
+    PromptCacheStrategy, ReviewAnnotation, ReviewChange, ReviewIssueKind, ReviewPolicy,
+    ReviewReport, ReviewRoute, ReviewRouteKind, ReviewStats, ReviewStrategy, SplitRetryLog,
+    StructuralRecoveryStrategy, SubtitleDocument, SubtitleDocumentMetadata, SubtitleSegment,
+    SubtitleSemanticContext, TerminologyEntity, TerminologyKind, TerminologyPreflightResult,
+    TerminologyStats, TerminologyStrategy, TranslationLine, TranslationMode, TranslationPolicy,
+    TranslationReadabilityDefaults, Usage, translation_readability_defaults,
 };
 pub use error::{CoreError, CoreResult, LlmCallError, StorageError, StorageIoKind};
 pub use evaluation::{

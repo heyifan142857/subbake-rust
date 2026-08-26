@@ -13,7 +13,7 @@ pub const DEFAULT_MODEL: &str = "mock-zh";
 pub const DEFAULT_TARGET_LANGUAGE: &str = "zh-Hans";
 pub const DEFAULT_SOURCE_LANGUAGE: &str = "Auto";
 pub const DEFAULT_RETRIES: usize = 2;
-pub const DEFAULT_AGENT_REPAIR_ATTEMPTS: usize = 2;
+pub const DEFAULT_MODEL_REPAIR_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -732,7 +732,7 @@ pub struct BatchPlanEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AgentRepairRecord {
+pub struct ModelRepairRecord {
     pub stage: String,
     pub batch_index: usize,
     pub attempts: usize,
@@ -776,11 +776,11 @@ pub struct FailureLog {
     pub translated_segments: Vec<SubtitleSegment>,
     pub attempts: Vec<AttemptLog>,
     #[serde(default)]
-    pub agent_attempts: Vec<AttemptLog>,
+    pub model_repair_attempts: Vec<AttemptLog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentLog {
+pub struct ModelRepairLog {
     pub stage: String,
     pub batch_index: usize,
     pub success: bool,
@@ -818,8 +818,8 @@ pub struct PipelineExecutionOptions {
     pub dry_run: bool,
     pub resume: bool,
     pub use_cache: bool,
-    pub agent: bool,
-    pub agent_repair_attempts: usize,
+    pub model_repair: bool,
+    pub model_repair_attempts: usize,
     pub max_requests: Option<usize>,
     pub max_tokens: Option<usize>,
 }
@@ -880,8 +880,8 @@ impl PipelineOptions {
                 dry_run: false,
                 resume: true,
                 use_cache: true,
-                agent: true,
-                agent_repair_attempts: DEFAULT_AGENT_REPAIR_ATTEMPTS,
+                model_repair: true,
+                model_repair_attempts: DEFAULT_MODEL_REPAIR_ATTEMPTS,
                 max_requests: None,
                 max_tokens: None,
             },
@@ -945,7 +945,7 @@ pub struct PipelineResult {
     pub translation_memory_hits: usize,
     pub state_path: Option<PathBuf>,
     pub glossary_path: Option<PathBuf>,
-    pub agent_repairs: Vec<AgentRepairRecord>,
+    pub model_repairs: Vec<ModelRepairRecord>,
     pub terminology: TerminologyStats,
     pub review: ReviewStats,
 }

@@ -258,6 +258,9 @@ Options:
                                    Token budget for confirmed translation context
       --review <POLICY>            Review policy: targeted or full (default: off)
       --no-review                  Disable review
+      --model-repair               Repair invalid model output after normal retries (default)
+      --no-model-repair            Disable constrained model-output repair
+      --model-repair-attempts <N>  Maximum model-repair attempts after normal retries
       --max-characters-per-second <N>
                                    Reject subtitles above this reading speed
       --max-characters-per-line <N>
@@ -545,6 +548,9 @@ const COMMON_TRANSLATION_OPTIONS: &[&str] = &[
     "--ocr-correction",
     "--review",
     "--no-review",
+    "--model-repair",
+    "--no-model-repair",
+    "--model-repair-attempts",
     "--dry-run",
     "--json",
     "--qa-fail-on",

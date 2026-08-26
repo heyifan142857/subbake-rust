@@ -16,7 +16,7 @@ pub const RENDER_FINGERPRINT_VERSION: u64 = 6;
 pub const CACHE_VERSION: u64 = 6;
 /// Bump when any translation, terminology, review, or repair prompt contract
 /// changes in a way that can alter persisted translated/reviewed shards.
-pub const PROMPT_CONTRACT_VERSION: u64 = 14;
+pub const PROMPT_CONTRACT_VERSION: u64 = 15;
 /// Bump when translation-memory keying, lookup, or application semantics change.
 pub const TRANSLATION_MEMORY_POLICY_VERSION: u64 = 5;
 /// Bump when deterministic final-output validation semantics change.
@@ -37,7 +37,7 @@ pub struct RuntimePaths {
     pub reviewed_batches_dir: PathBuf,
     pub finalized_batches_dir: PathBuf,
     pub translation_memory_path: PathBuf,
-    pub agent_logs_dir: PathBuf,
+    pub model_repair_logs_dir: PathBuf,
     pub review_report_path: PathBuf,
     pub ocr_correction_report_path: PathBuf,
 }
@@ -250,7 +250,7 @@ pub fn build_runtime_paths(
         translation_memory_path: root_dir.join(format!(
             "translation_memory.v5.{language_pair}.{translation_memory_mode}.json"
         )),
-        agent_logs_dir: run_dir.join("agent_logs"),
+        model_repair_logs_dir: run_dir.join("model_repair_logs"),
         review_report_path: run_dir.join("review_report.json"),
         ocr_correction_report_path: run_dir.join("ocr_correction_report.json"),
     }
@@ -417,10 +417,13 @@ pub fn build_translation_fingerprint(
             "review_policy".to_owned(),
             JsonValue::String(options.execution.review_policy.as_str().to_owned()),
         ),
-        ("agent".to_owned(), JsonValue::Bool(options.execution.agent)),
         (
-            "agent_repair_attempts".to_owned(),
-            JsonValue::Number(options.execution.agent_repair_attempts.to_string()),
+            "model_repair".to_owned(),
+            JsonValue::Bool(options.execution.model_repair),
+        ),
+        (
+            "model_repair_attempts".to_owned(),
+            JsonValue::Number(options.execution.model_repair_attempts.to_string()),
         ),
         (
             "max_characters_per_second".to_owned(),
@@ -781,11 +784,10 @@ mod tests {
     }
 
     #[test]
-    fn translation_fingerprint_matches_python_canonical_json() {
+    fn translation_fingerprint_has_stable_canonical_json_hash() {
         let mut options = PipelineOptions::new("clip.txt".into());
         options.execution.batch_size = 2;
-        // Pin the legacy Python-compatible option value independently of the
-        // current product default.
+        // Pin this non-default option so the snapshot covers the field.
         options.execution.online_terminology = true;
         let signature = InputSignature {
             sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
@@ -795,7 +797,7 @@ mod tests {
 
         assert_eq!(
             build_translation_fingerprint(&options, &signature),
-            "eab53adc3f57f5cc8a95269b80bcfe54ffce1a30"
+            "defd5b9807daf66e3019fc00be1de5cbf3329215"
         );
     }
 

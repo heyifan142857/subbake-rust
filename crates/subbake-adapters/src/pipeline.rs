@@ -805,7 +805,7 @@ fn empty_pipeline_result(
         translation_memory_hits: 0,
         state_path: Some(store.root.join("complete.json")),
         glossary_path: request.settings.storage.glossary_path.clone(),
-        agent_repairs: Vec::new(),
+        model_repairs: Vec::new(),
         terminology: subbake_core::TerminologyStats::default(),
         review: subbake_core::ReviewStats::default(),
     }

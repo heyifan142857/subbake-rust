@@ -345,7 +345,7 @@ fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> 
         CacheStage::Review
             | CacheStage::Terminology
             | CacheStage::OcrCorrection
-            | CacheStage::AgentReviewRepair
+            | CacheStage::ModelReviewRepair
     ) {
         return options
             .identity
@@ -356,7 +356,7 @@ fn request_backend_fingerprint(options: &PipelineOptions, stage: CacheStage) -> 
     options.identity.provider_fingerprint.clone()
 }
 
-pub(super) fn is_agent_repairable(error: &CoreError) -> bool {
+pub(super) fn is_model_repairable(error: &CoreError) -> bool {
     match error {
         CoreError::InvalidTranslation(_) => true,
         CoreError::Llm(crate::error::LlmCallError::InvalidResponse(_)) => true,
@@ -792,7 +792,7 @@ mod tests {
             Some("reviewer-route")
         );
         assert_eq!(
-            request_backend_fingerprint(&options, CacheStage::AgentReviewRepair).as_deref(),
+            request_backend_fingerprint(&options, CacheStage::ModelReviewRepair).as_deref(),
             Some("reviewer-route")
         );
         assert_eq!(

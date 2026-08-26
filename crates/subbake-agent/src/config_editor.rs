@@ -155,8 +155,8 @@ config_fields! {
     Resume => (Translation, "Resume", ConfigFieldKind::Boolean, ["translation", "resume"]),
     UseCache => (Translation, "Use cache", ConfigFieldKind::Boolean, ["translation", "use_cache"]),
     Retries => (Translation, "Retries", ConfigFieldKind::Integer, ["translation", "retries"]),
-    TranslationAgent => (Translation, "Agent repair", ConfigFieldKind::Boolean, ["translation", "agent"]),
-    AgentRepairAttempts => (Translation, "Repair attempts", ConfigFieldKind::Integer, ["translation", "agent_repair_attempts"]),
+    TranslationModelRepair => (Translation, "Model repair", ConfigFieldKind::Boolean, ["translation", "model_repair"]),
+    ModelRepairAttempts => (Translation, "Model repair attempts", ConfigFieldKind::Integer, ["translation", "model_repair_attempts"]),
     MaxRequests => (Translation, "Maximum requests", ConfigFieldKind::Integer, ["translation", "max_requests"]),
     MaxTokens => (Translation, "Maximum tokens", ConfigFieldKind::Integer, ["translation", "max_tokens"]),
     TranscriptionModel => (Transcription, "Whisper model", ConfigFieldKind::Text, ["transcription", "model"]),
@@ -417,9 +417,9 @@ fn effective_value(
         ConfigFieldId::Resume => resolved.translation.resume.to_string(),
         ConfigFieldId::UseCache => resolved.translation.use_cache.to_string(),
         ConfigFieldId::Retries => resolved.translation.retries.to_string(),
-        ConfigFieldId::TranslationAgent => resolved.translation.agent.to_string(),
-        ConfigFieldId::AgentRepairAttempts => {
-            resolved.translation.agent_repair_attempts.to_string()
+        ConfigFieldId::TranslationModelRepair => resolved.translation.model_repair.to_string(),
+        ConfigFieldId::ModelRepairAttempts => {
+            resolved.translation.model_repair_attempts.to_string()
         }
         ConfigFieldId::MaxRequests => some_string!(resolved.translation.max_requests),
         ConfigFieldId::MaxTokens => some_string!(resolved.translation.max_tokens),
@@ -542,8 +542,8 @@ fn has_override(id: ConfigFieldId, settings: &SettingsOverrides) -> bool {
         ConfigFieldId::Resume => settings.translation.resume.is_some(),
         ConfigFieldId::UseCache => settings.translation.use_cache.is_some(),
         ConfigFieldId::Retries => settings.translation.retries.is_some(),
-        ConfigFieldId::TranslationAgent => settings.translation.agent.is_some(),
-        ConfigFieldId::AgentRepairAttempts => settings.translation.agent_repair_attempts.is_some(),
+        ConfigFieldId::TranslationModelRepair => settings.translation.model_repair.is_some(),
+        ConfigFieldId::ModelRepairAttempts => settings.translation.model_repair_attempts.is_some(),
         ConfigFieldId::MaxRequests => settings.translation.max_requests.is_some(),
         ConfigFieldId::MaxTokens => settings.translation.max_tokens.is_some(),
         ConfigFieldId::TranscriptionModel => settings.transcription.model.is_some(),
@@ -593,7 +593,7 @@ mod tests {
     fn snapshot_marks_profile_values_as_inherited_until_overridden() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             default_profile = "work"
 
             [defaults.translation]
@@ -641,7 +641,7 @@ mod tests {
     fn snapshot_exposes_translation_and_external_whisper_configuration() {
         let config = ConfigFile::parse(
             r#"
-            version = 2
+            version = 3
             default_profile = "work"
 
             [backends.remote]
@@ -699,7 +699,7 @@ mod tests {
         let cases = [
             (
                 ConfigFieldId::ProviderModel,
-                "translator-v2",
+                "translator-v3",
                 vec!["backend", "model"],
             ),
             (

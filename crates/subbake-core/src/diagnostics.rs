@@ -24,7 +24,7 @@ pub fn diagnose_failure_value(
 ) -> DiagnosticReport {
     let mut errors = Vec::new();
     let mut metadata = Vec::new();
-    for key in ["attempts", "agent_attempts"] {
+    for key in ["attempts", "model_repair_attempts"] {
         let Some(attempts) = value.get(key).and_then(serde_json::Value::as_array) else {
             continue;
         };

@@ -195,7 +195,7 @@ mod tests {
         let path = temporary_path("comments");
         fs::write(
             &path,
-            r#"version = 2
+            r#"version = 3
 # keep this comment
 [defaults.translation]
 target_language = "French"
@@ -225,7 +225,7 @@ id = "mock"
     }
 
     #[test]
-    fn creates_private_version_two_configuration() {
+    fn creates_private_current_version_configuration() {
         let path = temporary_path("create");
         let prepared = prepare_config_update(
             &path,
