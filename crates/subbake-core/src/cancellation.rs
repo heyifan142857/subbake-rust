@@ -15,6 +15,7 @@ impl CancellationToken {
         CancellationGuard {
             generation: self.0.load(Ordering::Acquire),
             token: self.clone(),
+            linked: Vec::new(),
         }
     }
 }
@@ -23,6 +24,7 @@ impl CancellationToken {
 pub struct CancellationGuard {
     token: CancellationToken,
     generation: u64,
+    linked: Vec<(CancellationToken, u64)>,
 }
 
 impl CancellationGuard {
@@ -32,6 +34,17 @@ impl CancellationGuard {
 
     pub fn is_cancelled(&self) -> bool {
         self.token.0.load(Ordering::Acquire) != self.generation
+            || self
+                .linked
+                .iter()
+                .any(|(token, generation)| token.0.load(Ordering::Acquire) != *generation)
+    }
+
+    /// Return a guard cancelled when either source guard is cancelled.
+    pub fn combined_with(mut self, other: &Self) -> Self {
+        self.linked.push((other.token.clone(), other.generation));
+        self.linked.extend(other.linked.iter().cloned());
+        self
     }
 
     pub fn check(&self) -> CoreResult<()> {
@@ -61,5 +74,17 @@ mod tests {
         token.cancel();
         assert!(old.is_cancelled());
         assert!(!token.guard().is_cancelled());
+    }
+
+    #[test]
+    fn combined_guard_observes_either_cancellation_source() {
+        let operation = CancellationToken::default();
+        let steering = CancellationToken::default();
+        let combined = operation.guard().combined_with(&steering.guard());
+
+        assert!(!combined.is_cancelled());
+        steering.cancel();
+        assert!(combined.is_cancelled());
+        assert!(!operation.guard().is_cancelled());
     }
 }

@@ -145,6 +145,8 @@ pub struct PendingToolCall {
 pub struct PendingAgentTurn {
     pub input: String,
     #[serde(default)]
+    pub steering: Vec<String>,
+    #[serde(default)]
     pub dialogue: Option<String>,
     pub effective_defaults: String,
     #[serde(default)]

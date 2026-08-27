@@ -23,7 +23,6 @@ pub(super) struct ViewSnapshot {
     pub(super) input_hint: &'static str,
     pub(super) suggestions: Vec<(String, String)>,
     pub(super) selected_suggestion: usize,
-    pub(super) processing: bool,
     pub(super) editing: bool,
     pub(super) progress: Option<(ProgressEvent, std::time::Instant)>,
     pub(super) active_tool: Option<ActiveTool>,
@@ -76,7 +75,9 @@ impl ViewSnapshot {
 
         Self {
             input: app.input.clone(),
-            input_hint: if matches!(
+            input_hint: if processing {
+                "Type a follow-up while SubBake works"
+            } else if matches!(
                 app.interaction_state.input_mode(),
                 InputMode::RevisingApproval
             ) {
@@ -86,7 +87,6 @@ impl ViewSnapshot {
             },
             suggestions,
             selected_suggestion: app.suggestion_index.min(selected_count.saturating_sub(1)),
-            processing,
             editing: matches!(
                 app.interaction_state.input_mode(),
                 InputMode::Editing | InputMode::RevisingApproval
@@ -200,7 +200,6 @@ mod tests {
             input_hint: "hint",
             suggestions: Vec::new(),
             selected_suggestion: 0,
-            processing: false,
             editing: true,
             progress: None,
             active_tool: None,
@@ -256,7 +255,6 @@ mod tests {
                     "revise with instructions".to_owned(),
                 ),
             ];
-            approvals.processing = true;
             approvals.show_progress = true;
             let (_, buffer, _) = render_snapshot(width, 12, &approvals);
             assert_eq!(buffer.area.width, width);

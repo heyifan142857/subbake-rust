@@ -135,6 +135,20 @@ struct SubtitleStream {
     forced: bool,
 }
 
+/// Read-only metadata exposed to callers that need to choose a subtitle
+/// source before starting translation or transcription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedSubtitleStreamInfo {
+    pub index: usize,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    pub translatable: bool,
+    pub bitmap_ocr: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddedSubtitleSource<'a> {
     Text(&'a SubtitleStream),
@@ -209,6 +223,44 @@ struct ProbeDisposition {
 
 pub fn is_supported_subtitle_container_path(path: &Path) -> bool {
     SubtitleContainerKind::from_path(path).is_some()
+}
+
+/// Inspect embedded subtitle streams without extracting or modifying the
+/// container. Existing SubBake-generated translated tracks remain visible so
+/// an agent can avoid selecting them as a new source.
+pub fn inspect_embedded_subtitle_streams(
+    input_path: &Path,
+    cancellation: &CancellationGuard,
+) -> AdapterResult<Vec<EmbeddedSubtitleStreamInfo>> {
+    if !is_supported_subtitle_container_path(input_path) {
+        return Err(AdapterError::invalid_input(format!(
+            "unsupported subtitle container: {}",
+            input_path.display()
+        )));
+    }
+    Ok(
+        probe_subtitle_streams(Path::new(FFPROBE), input_path, cancellation)?
+            .into_iter()
+            .map(subtitle_stream_info)
+            .collect(),
+    )
+}
+
+fn subtitle_stream_info(stream: SubtitleStream) -> EmbeddedSubtitleStreamInfo {
+    EmbeddedSubtitleStreamInfo {
+        index: stream.index,
+        translatable: is_text_subtitle_codec(&stream.codec)
+            && !stream
+                .title
+                .as_deref()
+                .is_some_and(is_subbake_translation_title),
+        bitmap_ocr: bitmap_subtitle_kind(&stream.codec).is_some(),
+        codec: stream.codec,
+        language: stream.language,
+        title: stream.title,
+        default: stream.default,
+        forced: stream.forced,
+    }
 }
 
 pub(crate) fn has_translatable_text_subtitle(
@@ -2096,6 +2148,26 @@ mod tests {
         assert!(subtitle_codec_matches("subrip", "srt"));
         assert!(subtitle_codec_matches("ass", "ass"));
         assert!(!subtitle_codec_matches("subrip", "ass"));
+    }
+
+    #[test]
+    fn inspection_classifies_text_bitmap_and_generated_tracks() {
+        let mut text_stream = stream(2, "subrip", Some("eng"), true, false);
+        text_stream.title = Some("English".to_owned());
+        let text = subtitle_stream_info(text_stream);
+        let mut bitmap_stream = stream(3, "hdmv_pgs_subtitle", Some("jpn"), false, false);
+        bitmap_stream.title = Some("Japanese PGS".to_owned());
+        let bitmap = subtitle_stream_info(bitmap_stream);
+        let mut generated_stream = stream(4, "ass", Some("zho"), false, false);
+        generated_stream.title = Some("zh-Hans (SubBake translation)".to_owned());
+        let generated = subtitle_stream_info(generated_stream);
+
+        assert!(text.translatable);
+        assert!(!text.bitmap_ocr);
+        assert!(!bitmap.translatable);
+        assert!(bitmap.bitmap_ocr);
+        assert!(!generated.translatable);
+        assert!(!generated.bitmap_ocr);
     }
 
     #[test]

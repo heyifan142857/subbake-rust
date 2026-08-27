@@ -51,6 +51,14 @@ fn system_contract(
     );
     system = system
         .replace(
+            "a status or list-models check is only an intermediate observation and never completes a transcription request. For a media-to-bilingual-subtitle request",
+            "a status or list-models check is only an intermediate observation and never completes a transcription request. Before translating or transcribing a specific MKV, MP4, M4V, MOV, or WebM container, call inspect_media on that exact path first and use its embedded subtitle metadata to choose the source. For a media-to-bilingual-subtitle request",
+        )
+        .replace(
+            "When the user asks to translate existing subtitles in a specific MKV, MP4, M4V, MOV, or WebM, call translate_file directly:",
+            "When the user asks to translate existing subtitles in a specific MKV, MP4, M4V, MOV, or WebM, call inspect_media first and then call translate_file:",
+        )
+        .replace(
             "OCRs PGS bitmap streams with Tesseract",
             "OCRs PGS, VobSub, and DVB bitmap streams with Tesseract",
         )
@@ -127,6 +135,16 @@ fn user_context(
                 ));
             }
         }
+        if !loop_state.steering.is_empty() {
+            user.push_str(
+                "\n\nNew user instructions sent while this task was running (later instructions take priority):\n",
+            );
+            for instruction in &loop_state.steering {
+                user.push_str("- ");
+                user.push_str(instruction);
+                user.push('\n');
+            }
+        }
         if let Some(error) = repair_error {
             user.push_str("\n\nYour previous JSON decision was invalid. Correct it:\n");
             user.push_str(error);
@@ -160,6 +178,7 @@ mod tests {
         assert!(system.contains("plain text only"));
         assert!(system.contains("Do not reproduce or summarize individual subtitle entries"));
         assert!(system.contains("translate existing subtitles in a specific MKV"));
+        assert!(system.contains("call inspect_media on that exact path first"));
         assert!(system.contains("without transcribing audio"));
         assert!(system.contains("OCRs PGS, VobSub, and DVB bitmap streams with Tesseract"));
         assert!(system.contains("FFmpeg, ffprobe, Tesseract"));

@@ -66,6 +66,7 @@ pub(super) struct ToolExchange {
 #[derive(Debug, Default)]
 pub(super) struct AgentTaskLoop {
     pub(super) exchanges: Vec<ToolExchange>,
+    pub(super) steering: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

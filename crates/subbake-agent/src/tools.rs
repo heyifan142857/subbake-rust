@@ -58,6 +58,7 @@ pub(crate) enum ToolExecutor {
     EditSubtitle,
     TranscribeAudio,
     ManageWhisper,
+    InspectMedia,
     DiagnosePath,
     DiagnoseText,
     ListFiles,
@@ -673,6 +674,17 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         ManageWhisper
     ),
     tool!(
+        "inspect_media",
+        Diagnose,
+        false,
+        false,
+        true,
+        true,
+        "Inspect subtitle streams in an MKV, MP4/M4V/MOV, or WebM container before choosing translation or transcription. Reports stream index, codec, language, title, dispositions, and whether direct text extraction or bitmap OCR is supported.",
+        PATH_ARGS,
+        InspectMedia
+    ),
+    tool!(
         "diagnose_path",
         Diagnose,
         false,
@@ -1063,6 +1075,7 @@ mod tests {
         let capabilities = subbake_adapters::platform::CapabilitySet::current();
         let names = ToolRegistry::new(capabilities).model_visible_names();
         assert!(names.contains(&"translate_series"));
+        assert!(names.contains(&"inspect_media"));
         assert!(names.contains(&"candidate_subtitles"));
         assert!(names.contains(&"apply_patch"));
         assert_eq!(

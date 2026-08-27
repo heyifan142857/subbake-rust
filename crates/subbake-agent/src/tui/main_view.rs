@@ -55,14 +55,19 @@ fn render_progress(frame: &mut ratatui::Frame<'_>, area: Rect, view: &ViewSnapsh
         || "Working".to_owned(),
         |activity| activity.headline.clone(),
     );
+    let key_hint = if view.input.is_empty() {
+        "Enter queue · Esc cancel"
+    } else {
+        "Enter queue · Esc send now"
+    };
     let detail = view
         .progress
         .as_ref()
         .map(|(event, started)| format_progress(event, started.elapsed()))
         .or_else(|| activity.and_then(|activity| activity.detail))
         .map_or_else(
-            || "Esc cancel".to_owned(),
-            |detail| format!("{detail} · Esc cancel"),
+            || key_hint.to_owned(),
+            |detail| format!("{detail} · {key_hint}"),
         );
     let width = usize::from(area.width);
     let prefix = format!("  {} ", view.spinner);
@@ -92,7 +97,7 @@ fn render_progress(frame: &mut ratatui::Frame<'_>, area: Rect, view: &ViewSnapsh
 fn render_input(frame: &mut ratatui::Frame<'_>, layout: ComposerLayout, view: &ViewSnapshot) {
     let mut input = view.input.clone();
     let input_width = layout.input_content_width;
-    let input_lines = if view.input.is_empty() && view.editing && !view.processing {
+    let input_lines = if view.input.is_empty() && view.editing {
         vec![Line::from(vec![
             Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::styled(

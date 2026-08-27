@@ -31,6 +31,9 @@ pub(crate) trait AgentServices: Send + Sync {
 
     fn diagnose_path(&self, path: &Path) -> AdapterResult<String>;
 
+    fn inspect_media(&self, path: &Path, cancellation: &CancellationGuard)
+    -> AdapterResult<String>;
+
     fn default_translation_output_path(
         &self,
         input_path: &Path,
@@ -124,6 +127,50 @@ impl AgentServices for DefaultAgentServices {
                 .collect::<Vec<_>>()
                 .join("\n\n---\n\n"))
         }
+    }
+
+    fn inspect_media(
+        &self,
+        path: &Path,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<String> {
+        let streams = subbake_adapters::inspect_embedded_subtitle_streams(path, cancellation)?;
+        if streams.is_empty() {
+            return Ok("No embedded subtitle streams found.".to_owned());
+        }
+        Ok(streams
+            .into_iter()
+            .map(|stream| {
+                let source_kind = if stream.translatable {
+                    "text"
+                } else if stream.bitmap_ocr {
+                    "bitmap OCR"
+                } else {
+                    "unsupported"
+                };
+                let mut flags = Vec::new();
+                if stream.default {
+                    flags.push("default");
+                }
+                if stream.forced {
+                    flags.push("forced");
+                }
+                format!(
+                    "stream={} codec={} language={} title={} source={} flags={}",
+                    stream.index,
+                    stream.codec,
+                    stream.language.as_deref().unwrap_or("und"),
+                    stream.title.as_deref().unwrap_or("-"),
+                    source_kind,
+                    if flags.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        flags.join(",")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     fn default_translation_output_path(
@@ -254,6 +301,24 @@ impl AgentServices for TestAgentServices {
 
     fn diagnose_path(&self, path: &Path) -> AdapterResult<String> {
         DefaultAgentServices.diagnose_path(path)
+    }
+
+    fn inspect_media(
+        &self,
+        path: &Path,
+        cancellation: &CancellationGuard,
+    ) -> AdapterResult<String> {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pgs-only") || name.contains("pgs-ocr-fails"))
+        {
+            return Ok(
+                "stream=2 codec=hdmv_pgs_subtitle language=eng title=English PGS source=bitmap OCR flags=default"
+                    .to_owned(),
+            );
+        }
+        DefaultAgentServices.inspect_media(path, cancellation)
     }
 
     fn default_translation_output_path(

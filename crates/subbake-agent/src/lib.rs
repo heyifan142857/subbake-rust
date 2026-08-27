@@ -16,6 +16,7 @@ mod profile_coordinator;
 mod services;
 pub mod session;
 mod session_controller;
+mod steering;
 mod tool_execution;
 mod tool_presentation;
 mod tool_runner;
@@ -37,6 +38,7 @@ pub use error::{AgentError, AgentResult};
 pub use guard::FileGuard;
 pub use presentation::{ProfileChoice, SessionChoice};
 pub use session::*;
+pub use steering::TurnSteering;
 pub use subbake_core::{CancellationGuard, CancellationToken};
 pub use tools::{ALL_TOOL_SPECS, ToolKind};
 pub use tui::{

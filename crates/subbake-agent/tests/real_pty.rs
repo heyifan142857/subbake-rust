@@ -11,7 +11,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use subbake_agent::{
     AgentError, AgentResult, ApprovalKind, ApprovalPrompt, CancellationGuard, CancellationToken,
     ConfigEditorSnapshot, ConfigFieldId, ConfigFieldView, EngineObserver, ProfileChoice,
-    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver,
+    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, TuiObserver, TurnSteering,
 };
 
 const CHILD_ENV: &str = "SUBBAKE_REAL_PTY_CHILD";
@@ -385,6 +385,18 @@ exit "$status"
     wait_for_action(&action_log, "ApproveApproval", &transcript);
     wait_for_output(&transcript, b"command continued", STEP_TIMEOUT);
 
+    send_text(&writer, "slow work");
+    send(&writer, enter_key);
+    wait_for_action(&action_log, "SubmitText:slow work", &transcript);
+    send_text(&writer, "steer current work");
+    send(&writer, escape_key);
+    wait_for_output(&transcript, b"Sent to the active turn.", STEP_TIMEOUT);
+    send_text(&writer, "queued follow-up");
+    send(&writer, enter_key);
+    wait_for_output(&transcript, b"Queued for the next turn.", STEP_TIMEOUT);
+    wait_for_action(&action_log, "SubmitText:queued follow-up", &transcript);
+    wait_for_output(&transcript, b"queued follow-up complete", STEP_TIMEOUT);
+
     send_text(&writer, "cancel me");
     send(&writer, enter_key);
     wait_for_action(&action_log, "SubmitText:cancel me", &transcript);
@@ -502,6 +514,7 @@ fn pty_child_driver() {
         cwd: "/pty-test".to_owned(),
     });
     tui.set_cancellation_token(cancellation);
+    tui.set_turn_steering(TurnSteering::default());
 
     tui.run(move |action, guard, observer| {
         append_action(&action_log, &action_label(&action))?;
@@ -587,6 +600,17 @@ fn scripted_interaction(
         TuiAction::ReviseApproval(input) => Ok(TuiInteraction::Message {
             message: format!("approval revised: {input}"),
         }),
+        TuiAction::SubmitText(input) if input == "slow work" => {
+            thread::sleep(Duration::from_millis(1500));
+            Ok(TuiInteraction::Message {
+                message: "slow work complete".to_owned(),
+            })
+        }
+        TuiAction::SubmitText(input) if input == "queued follow-up" => {
+            Ok(TuiInteraction::Message {
+                message: "queued follow-up complete".to_owned(),
+            })
+        }
         TuiAction::SubmitText(input) if input == "cancel me" => {
             while !guard.is_cancelled() {
                 thread::sleep(Duration::from_millis(10));

@@ -13,6 +13,7 @@
 //! │ > _                             │
 //! └─────────────────────────────────┘
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use crate::engine::{ApprovalPrompt, SessionChoice};
 use crate::error::AgentResult;
 use crate::input_editor::InputEditor;
+use crate::steering::TurnSteering;
 use crate::tui_state::{
     APPROVAL_OPTIONS, ConfigEditorState, EmptyModeChoice, InputMode, InteractionState,
     SessionPicker, TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_up,
@@ -110,10 +112,12 @@ pub struct SubBakeTui {
     active_tool: std::sync::Arc<std::sync::Mutex<Option<ActiveTool>>>,
     input: InputEditor,
     input_history: Vec<String>,
+    pending_inputs: VecDeque<String>,
     running: bool,
     suggestion_index: usize,
     interaction_state: InteractionState,
     cancellation: Option<CancellationToken>,
+    turn_steering: Option<TurnSteering>,
     input_hint: &'static str,
     startup_info: StartupInfo,
     plan_mode: bool,
@@ -141,10 +145,12 @@ impl SubBakeTui {
             active_tool: std::sync::Arc::new(std::sync::Mutex::new(None)),
             input: InputEditor::default(),
             input_history: Vec::new(),
+            pending_inputs: VecDeque::new(),
             running: true,
             suggestion_index: 0,
             interaction_state: InteractionState::default(),
             cancellation: None,
+            turn_steering: None,
             input_hint: session_input_hint(),
             startup_info: StartupInfo::default(),
             plan_mode: false,
@@ -188,6 +194,10 @@ impl SubBakeTui {
 
     pub fn set_cancellation_token(&mut self, token: CancellationToken) {
         self.cancellation = Some(token);
+    }
+
+    pub fn set_turn_steering(&mut self, steering: TurnSteering) {
+        self.turn_steering = Some(steering);
     }
 
     fn commit_progress_summary(&mut self) {
@@ -516,6 +526,7 @@ impl SubBakeTui {
                             }
                         }
                     }
+                    input_router::submit_next_queued(self, worker.sender()?)?;
                 }
                 self.sync_inline_terminal_size()?;
                 self.flush_history()?;

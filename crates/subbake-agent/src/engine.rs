@@ -25,6 +25,7 @@ use crate::profile_coordinator::ProfileCoordinator;
 use crate::services::{AgentServices, DefaultAgentServices};
 use crate::session::{AgentSessionStore, SessionMode};
 use crate::session_controller::SessionController;
+use crate::steering::TurnSteering;
 use crate::tools::{ToolKind, ToolRegistry, find_tool_spec};
 use crate::undo::UndoService;
 use crate::{ConfigChange, ConfigEditorSnapshot};
@@ -288,6 +289,7 @@ pub struct AgentEngine {
     pub(crate) session: Option<crate::session::AgentSession>,
     pub(crate) observer: Option<Box<dyn EngineObserver>>,
     cancellation: CancellationToken,
+    pub(crate) turn_steering: TurnSteering,
     pub(crate) operation_guard: CancellationGuard,
     pub(crate) progress: Option<SharedProgress>,
     pub(crate) pending_native_continuation: Option<PendingNativeContinuation>,
@@ -362,6 +364,7 @@ impl AgentEngine {
             session: None,
             observer: None,
             cancellation: CancellationToken::default(),
+            turn_steering: TurnSteering::default(),
             operation_guard: CancellationGuard::never(),
             progress: None,
             pending_native_continuation: None,
@@ -404,6 +407,10 @@ impl AgentEngine {
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub fn turn_steering(&self) -> TurnSteering {
+        self.turn_steering.clone()
     }
 
     pub fn begin_operation(&mut self, guard: CancellationGuard) {

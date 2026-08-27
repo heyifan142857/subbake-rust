@@ -101,6 +101,13 @@ fn action_label(
             }
         }
         Some(ToolExecutor::ManageWhisper) => whisper_action(arguments, completed),
+        Some(ToolExecutor::InspectMedia) => {
+            if completed {
+                "Inspected media"
+            } else {
+                "Inspecting media"
+            }
+        }
         Some(ToolExecutor::DiagnosePath | ToolExecutor::DiagnoseText) => {
             if completed {
                 "Diagnosed"
@@ -185,6 +192,7 @@ fn failure_label(executor: Option<ToolExecutor>) -> &'static str {
         Some(ToolExecutor::EditSubtitle) => "Edit failed",
         Some(ToolExecutor::TranscribeAudio) => "Transcription failed",
         Some(ToolExecutor::ManageWhisper) => "Whisper operation failed",
+        Some(ToolExecutor::InspectMedia) => "Media inspection failed",
         Some(ToolExecutor::DiagnosePath | ToolExecutor::DiagnoseText) => "Diagnosis failed",
         Some(
             ToolExecutor::ListFiles

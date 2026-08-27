@@ -42,7 +42,7 @@ fn dispatch_event(
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.interaction_state.is_processing() {
-                return handle_processing_key(app, key.code, key.modifiers);
+                return handle_processing_key(app, key);
             }
             if app.config_editor.is_some() {
                 return handle_config_event(app, request_tx, key.code, key.modifiers);
@@ -483,17 +483,31 @@ fn handle_escape(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>)
     Ok(())
 }
 
-fn handle_processing_key(
-    app: &mut SubBakeTui,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-) -> io::Result<()> {
-    match processing_key_action(code, modifiers, app.input.is_empty()) {
+fn handle_processing_key(app: &mut SubBakeTui, key: crossterm::event::KeyEvent) -> io::Result<()> {
+    match processing_key_action(key) {
         ProcessingKeyAction::Exit => {
             request_active_cancellation(app);
             app.running = false;
         }
-        ProcessingKeyAction::Cancel => request_active_cancellation(app),
+        ProcessingKeyAction::Escape => submit_processing_input(app, ProcessingSubmit::Steer),
+        ProcessingKeyAction::Submit => submit_processing_input(app, ProcessingSubmit::Queue),
+        ProcessingKeyAction::InsertNewline => app.input.insert_newline(),
+        ProcessingKeyAction::Insert(character) => app.input.insert_char(character),
+        ProcessingKeyAction::Backspace => app.input.backspace(),
+        ProcessingKeyAction::MoveLeft => app.input.move_left(),
+        ProcessingKeyAction::MoveRight => app.input.move_right(),
+        ProcessingKeyAction::MoveUp | ProcessingKeyAction::MoveDown => {
+            let width = app
+                .active_layout
+                .and_then(|layout| layout.composer)
+                .map_or(1, |layout| layout.input_content_width);
+            if matches!(processing_key_action(key), ProcessingKeyAction::MoveUp) {
+                app.input.move_up(width);
+            } else {
+                app.input.move_down(width);
+            }
+        }
+        ProcessingKeyAction::Complete => complete_input(app),
         ProcessingKeyAction::Ignore => {}
     }
     Ok(())
@@ -501,25 +515,122 @@ fn handle_processing_key(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessingKeyAction {
-    Cancel,
+    Escape,
     Exit,
+    Submit,
+    InsertNewline,
+    Insert(char),
+    Backspace,
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    Complete,
     Ignore,
 }
 
-fn processing_key_action(
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    input_empty: bool,
-) -> ProcessingKeyAction {
-    if (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')))
-        || (code == KeyCode::Char('q') && input_empty)
-    {
+fn processing_key_action(key: crossterm::event::KeyEvent) -> ProcessingKeyAction {
+    let code = key.code;
+    let modifiers = key.modifiers;
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')) {
         ProcessingKeyAction::Exit
     } else if code == KeyCode::Esc {
-        ProcessingKeyAction::Cancel
+        ProcessingKeyAction::Escape
+    } else if is_insert_newline_key(key) {
+        ProcessingKeyAction::InsertNewline
     } else {
-        ProcessingKeyAction::Ignore
+        match code {
+            KeyCode::Enter => ProcessingKeyAction::Submit,
+            KeyCode::Char(character) => ProcessingKeyAction::Insert(character),
+            KeyCode::Backspace => ProcessingKeyAction::Backspace,
+            KeyCode::Left => ProcessingKeyAction::MoveLeft,
+            KeyCode::Right => ProcessingKeyAction::MoveRight,
+            KeyCode::Up => ProcessingKeyAction::MoveUp,
+            KeyCode::Down => ProcessingKeyAction::MoveDown,
+            KeyCode::Tab => ProcessingKeyAction::Complete,
+            _ => ProcessingKeyAction::Ignore,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessingSubmit {
+    Queue,
+    Steer,
+}
+
+fn submit_processing_input(app: &mut SubBakeTui, disposition: ProcessingSubmit) {
+    let text = app.input.take().trim().to_owned();
+    if text.is_empty() {
+        if disposition == ProcessingSubmit::Steer {
+            request_active_cancellation(app);
+        }
+        return;
+    }
+    if matches!(text.as_str(), "/exit" | "/quit") {
+        request_active_cancellation(app);
+        app.running = false;
+        return;
+    }
+    if app
+        .input_history
+        .last()
+        .is_none_or(|previous| previous != &text)
+    {
+        app.input_history.push(text.clone());
+    }
+    if let Ok(mut view) = app.msg_view.lock() {
+        view.push(MsgStyle::User, format!("[{}] {text}", iso_now()));
+    }
+    match disposition {
+        ProcessingSubmit::Queue => {
+            app.pending_inputs.push_back(text);
+            if let Ok(mut view) = app.msg_view.lock() {
+                view.push(MsgStyle::System, "Queued for the next turn.".to_owned());
+            }
+        }
+        ProcessingSubmit::Steer => {
+            if app
+                .turn_steering
+                .as_ref()
+                .is_some_and(|steering| steering.submit(text.clone()))
+            {
+                if let Ok(mut view) = app.msg_view.lock() {
+                    view.push(MsgStyle::System, "Sent to the active turn.".to_owned());
+                }
+            } else {
+                app.pending_inputs.push_front(text);
+                if let Ok(mut view) = app.msg_view.lock() {
+                    view.push(
+                        MsgStyle::System,
+                        "Active-turn input is unavailable; queued for the next turn.".to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    app.suggestion_index = 0;
+}
+
+pub(super) fn submit_next_queued(
+    app: &mut SubBakeTui,
+    request_tx: &mpsc::Sender<WorkerRequest>,
+) -> io::Result<()> {
+    if app.interaction_state.is_processing()
+        || !matches!(app.interaction_state.input_mode(), InputMode::Editing)
+        || app.config_editor.is_some()
+        || app.approval_prompt.is_some()
+    {
+        return Ok(());
+    }
+    let Some(text) = app.pending_inputs.pop_front() else {
+        return Ok(());
+    };
+    if let Ok(mut progress) = app.progress.lock() {
+        *progress = None;
+    }
+    app.interaction_state.begin_processing(None);
+    send(app, request_tx, TuiAction::SubmitText(text))
 }
 
 fn request_active_cancellation(app: &mut SubBakeTui) {
@@ -805,34 +916,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn processing_keys_ignore_edits_and_cancel_before_exit() {
+    fn processing_keys_edit_and_queue_without_losing_cancellation() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
         assert_eq!(
-            processing_key_action(KeyCode::Char('x'), KeyModifiers::NONE, true),
-            ProcessingKeyAction::Ignore
+            processing_key_action(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            ProcessingKeyAction::Insert('x')
         );
         assert_eq!(
-            processing_key_action(KeyCode::Backspace, KeyModifiers::NONE, true),
-            ProcessingKeyAction::Ignore
+            processing_key_action(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            ProcessingKeyAction::Backspace
         );
         assert_eq!(
-            processing_key_action(KeyCode::Esc, KeyModifiers::NONE, true),
-            ProcessingKeyAction::Cancel
+            processing_key_action(key(KeyCode::Enter, KeyModifiers::NONE)),
+            ProcessingKeyAction::Submit
         );
         assert_eq!(
-            processing_key_action(KeyCode::Char('c'), KeyModifiers::CONTROL, true),
+            processing_key_action(key(KeyCode::Esc, KeyModifiers::NONE)),
+            ProcessingKeyAction::Escape
+        );
+        assert_eq!(
+            processing_key_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             ProcessingKeyAction::Exit
         );
         assert_eq!(
-            processing_key_action(KeyCode::Char('d'), KeyModifiers::CONTROL, true),
+            processing_key_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             ProcessingKeyAction::Exit
         );
         assert_eq!(
-            processing_key_action(KeyCode::Char('q'), KeyModifiers::NONE, true),
-            ProcessingKeyAction::Exit
-        );
-        assert_eq!(
-            processing_key_action(KeyCode::Char('q'), KeyModifiers::NONE, false),
-            ProcessingKeyAction::Ignore
+            processing_key_action(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            ProcessingKeyAction::Insert('q')
         );
     }
 

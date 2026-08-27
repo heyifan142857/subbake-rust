@@ -142,7 +142,8 @@ impl AgentEngine {
     ) -> AgentResult<String> {
         while state.steps_used < self.runtime_policy.max_steps() {
             self.check_cancelled()?;
-            let decision = self.call_model(
+            self.apply_pending_steering(&mut state, &mut native_turn)?;
+            let Some(decision) = self.call_model(
                 backend,
                 &state.input,
                 &state.task,
@@ -151,8 +152,15 @@ impl AgentEngine {
                 &mut state.legacy_mode,
                 true,
                 &state.effective_defaults,
-            )?;
+            )?
+            else {
+                self.apply_pending_steering(&mut state, &mut native_turn)?;
+                continue;
+            };
             state.steps_used += 1;
+            if self.apply_pending_steering(&mut state, &mut native_turn)? {
+                continue;
+            }
             match decision.action {
                 DecisionAction::Respond => {
                     self.clear_pending_agent_turn()?;
@@ -174,6 +182,9 @@ impl AgentEngine {
                         &mut state.completed_mutations,
                         &mut state.source_fallback,
                     )?;
+                    if self.apply_pending_steering(&mut state, &mut native_turn)? {
+                        continue;
+                    }
                     match processed {
                         ProcessedCalls::Continue(results) => {
                             native_turn = continuation.map(|continuation| NativeTurn {
@@ -234,16 +245,25 @@ impl AgentEngine {
         if let Some(observer) = self.observer.as_mut() {
             observer.on_step_limit();
         }
-        let final_decision = self.call_model(
-            backend,
-            &state.input,
-            &state.task,
-            state.dialogue.as_deref(),
-            &mut native_turn,
-            &mut state.legacy_mode,
-            false,
-            &state.effective_defaults,
-        )?;
+        let final_decision = loop {
+            self.apply_pending_steering(&mut state, &mut native_turn)?;
+            let Some(decision) = self.call_model(
+                backend,
+                &state.input,
+                &state.task,
+                state.dialogue.as_deref(),
+                &mut native_turn,
+                &mut state.legacy_mode,
+                false,
+                &state.effective_defaults,
+            )?
+            else {
+                continue;
+            };
+            if !self.apply_pending_steering(&mut state, &mut native_turn)? {
+                break decision;
+            }
+        };
         self.clear_pending_agent_turn()?;
         match final_decision.action {
             DecisionAction::Respond => {
@@ -292,7 +312,9 @@ impl AgentEngine {
         legacy_mode: &mut bool,
         tools_enabled: bool,
         effective_defaults: &str,
-    ) -> AgentResult<Decision> {
+    ) -> AgentResult<Option<Decision>> {
+        let steering_guard = self.turn_steering.model_interrupt_guard();
+        let model_guard = self.operation_guard.clone().combined_with(&steering_guard);
         if !*legacy_mode {
             let was_continuation = native_turn.is_some();
             let definitions = if tools_enabled {
@@ -330,17 +352,17 @@ impl AgentEngine {
             if let Some(observer) = self.observer.as_mut() {
                 observer.on_thinking("Deciding next action…");
             }
-            match backend.execute(request, &self.operation_guard) {
-                Ok(response) => return native_decision(response),
+            match backend.execute(request, &model_guard) {
+                Ok(response) => return native_decision(response).map(Some),
                 Err(LlmCallError::UnsupportedCapability(_)) if !was_continuation => {
                     *legacy_mode = true;
                 }
-                Err(LlmCallError::Cancelled) => return Err(AgentError::Cancelled),
+                Err(LlmCallError::Cancelled) => return self.interrupted_model_result(),
                 Err(error) => {
                     if let Some(observer) = self.observer.as_mut() {
                         observer.on_error(&error.to_string());
                     }
-                    return Ok(Decision::response(format!("Provider error: {error}")));
+                    return Ok(Some(Decision::response(format!("Provider error: {error}"))));
                 }
             }
         }
@@ -357,26 +379,56 @@ impl AgentEngine {
             effective_defaults,
             self.tool_registry,
         );
-        match execute_json(backend, messages, &self.operation_guard) {
+        match execute_json(backend, messages, &model_guard) {
             Ok((value, _)) => match parse_json_decision(&value) {
-                Ok(decision) => Ok(decision),
+                Ok(decision) => Ok(Some(decision)),
                 Err(error) => {
                     if let Some(observer) = self.observer.as_mut() {
                         observer.on_error(&error.to_string());
                     }
-                    Ok(Decision::ask_user(format!(
+                    Ok(Some(Decision::ask_user(format!(
                         "I couldn't obtain a valid model decision: {error}"
-                    )))
+                    ))))
                 }
             },
-            Err(LlmCallError::Cancelled) => Err(AgentError::Cancelled),
+            Err(LlmCallError::Cancelled) => self.interrupted_model_result(),
             Err(error) => {
                 if let Some(observer) = self.observer.as_mut() {
                     observer.on_error(&error.to_string());
                 }
-                Ok(Decision::response(format!("Provider error: {error}")))
+                Ok(Some(Decision::response(format!("Provider error: {error}"))))
             }
         }
+    }
+
+    fn interrupted_model_result(&self) -> AgentResult<Option<Decision>> {
+        if self.operation_guard.is_cancelled() {
+            Err(AgentError::Cancelled)
+        } else if self.turn_steering.has_pending() {
+            Ok(None)
+        } else {
+            Err(AgentError::Cancelled)
+        }
+    }
+
+    fn apply_pending_steering(
+        &mut self,
+        state: &mut AgentTurnState,
+        native_turn: &mut Option<NativeTurn>,
+    ) -> AgentResult<bool> {
+        let instructions = self.turn_steering.drain();
+        if instructions.is_empty() {
+            return Ok(false);
+        }
+        *native_turn = None;
+        self.pending_native_continuation = None;
+        for instruction in &instructions {
+            self.record_if_active(EventKind::User {
+                text: instruction.clone(),
+            })?;
+        }
+        state.task.steering.extend(instructions);
+        Ok(true)
     }
 
     fn process_tool_calls(
@@ -435,7 +487,38 @@ impl AgentEngine {
         let mut native_results = Vec::new();
         let mut calls = VecDeque::from(calls);
         while let Some(mut call) = calls.pop_front() {
+            // A steer does not abort a tool that is already running, but it must
+            // prevent later calls from the now-stale model turn from starting.
+            if self.turn_steering.has_pending() {
+                return Ok(ProcessedCalls::Continue(native_results));
+            }
             self.check_cancelled()?;
+            if let Some(path) = media_call_requiring_inspection(&call)
+                && !container_was_inspected(task, path)
+            {
+                let call_key = CallKey::new(&call.name, &call.arguments);
+                let feedback = ToolFeedback::failure(
+                    &call.name,
+                    format!(
+                        "inspect container `{path}` with `inspect_media` before choosing an embedded subtitle or audio source"
+                    ),
+                    "media_inspection_required",
+                    available_tools.clone(),
+                );
+                let recorded = self.record_tool_feedback(
+                    &call,
+                    &call_key,
+                    feedback,
+                    task,
+                    failure_counts,
+                    aggregate_failure_counts,
+                )?;
+                native_results.push(recorded.result);
+                if let Some(message) = recorded.stop_message {
+                    return Ok(ProcessedCalls::RepeatedFailure(message));
+                }
+                continue;
+            }
             if let Some(fallback) = source_fallback
                 .as_ref()
                 .filter(|fallback| !fallback.approved && !fallback.sidecar_search_completed)
@@ -1333,6 +1416,7 @@ impl AgentTurnState {
     fn to_pending(&self) -> PendingAgentTurn {
         PendingAgentTurn {
             input: self.input.clone(),
+            steering: self.task.steering.clone(),
             dialogue: self.dialogue.clone(),
             effective_defaults: self.effective_defaults.clone(),
             exchanges: self
@@ -1401,6 +1485,7 @@ impl AgentTurnState {
                         is_error: exchange.is_error,
                     })
                     .collect(),
+                steering: pending.steering,
             },
             legacy_mode: pending.legacy_mode,
             failure_counts: pending
@@ -1535,6 +1620,23 @@ fn requires_source_substitution_approval(tool_name: &str) -> bool {
     )
 }
 
+fn media_call_requiring_inspection(call: &ModelToolCall) -> Option<&str> {
+    matches!(call.name.as_str(), "translate_file" | "transcribe_audio")
+        .then(|| call.arguments.get("path").and_then(JsonValue::as_str))
+        .flatten()
+        .filter(|path| {
+            subbake_adapters::is_supported_subtitle_container_path(std::path::Path::new(path))
+        })
+}
+
+fn container_was_inspected(task: &AgentTaskLoop, path: &str) -> bool {
+    task.exchanges.iter().any(|exchange| {
+        exchange.name == "inspect_media"
+            && !exchange.is_error
+            && exchange.arguments.get("path").and_then(JsonValue::as_str) == Some(path)
+    })
+}
+
 fn truncate_text(text: &str, limit: usize) -> String {
     let value = text.chars().take(limit).collect::<String>();
     if text.chars().count() > limit {
@@ -1656,6 +1758,48 @@ mod tests {
         prompts: Vec<Vec<ChatMessage>>,
     }
 
+    struct SteeringBackend {
+        steering: crate::TurnSteering,
+        prompts: Vec<Vec<ChatMessage>>,
+        calls: usize,
+    }
+
+    impl LlmBackend for SteeringBackend {
+        fn provider_name(&self) -> &str {
+            "steering-test"
+        }
+
+        fn model_name(&self) -> &str {
+            "steering-test"
+        }
+
+        fn execute(
+            &mut self,
+            request: GenerationRequest,
+            cancellation: &subbake_core::CancellationGuard,
+        ) -> Result<GenerationResponse, LlmCallError> {
+            let GenerationInput::Messages(messages) = request.input else {
+                return Err(LlmCallError::ContinuationMismatch(
+                    "steering test backend cannot continue".to_owned(),
+                ));
+            };
+            self.prompts.push(messages);
+            self.calls += 1;
+            if self.calls == 1 {
+                assert!(
+                    self.steering
+                        .submit("Use the English embedded subtitle track")
+                );
+                cancellation.check().map_err(LlmCallError::from)?;
+            }
+            cancellation.check().map_err(LlmCallError::from)?;
+            Ok(GenerationResponse::json(
+                json!({"action":"respond","text":"Steering applied."}),
+                Usage::default(),
+            ))
+        }
+    }
+
     impl LlmBackend for JsonSequenceBackend {
         fn provider_name(&self) -> &str {
             "json-test"
@@ -1688,6 +1832,39 @@ mod tests {
                 Usage::default(),
             ))
         }
+    }
+
+    #[test]
+    fn steering_interrupts_the_model_and_is_added_to_the_active_turn() {
+        let root = temp_root("active-turn-steering");
+        std::fs::create_dir_all(&root).expect("root");
+        let mut engine = active_engine(root.clone());
+        let mut backend = SteeringBackend {
+            steering: engine.turn_steering(),
+            prompts: Vec::new(),
+            calls: 0,
+        };
+
+        let response = engine
+            .run_line("Translate the movie", &mut backend)
+            .expect("steered run");
+
+        assert_eq!(response, "Steering applied.");
+        assert_eq!(backend.calls, 2);
+        let revised_prompt = &backend.prompts[1];
+        assert!(revised_prompt.iter().any(|message| {
+            message
+                .content
+                .contains("New user instructions sent while this task was running")
+                && message
+                    .content
+                    .contains("Use the English embedded subtitle track")
+        }));
+        assert!(engine.session_events().iter().any(|event| {
+            event.tag() == crate::session::EventTag::User
+                && event.text == "Use the English embedded subtitle track"
+        }));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     enum NativeStep {
@@ -1922,6 +2099,46 @@ mod tests {
     }
 
     #[test]
+    fn container_execution_is_blocked_until_the_agent_inspects_subtitle_streams() {
+        let root = temp_root("container-inspection-gate");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("movie.pgs-only.mkv"), b"test media").expect("media");
+        let mut engine = active_engine(root.clone());
+        let mut backend = JsonSequenceBackend {
+            decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
+                json!({"action":"tool_call","tool_name":"inspect_media","arguments":{"path":"movie.pgs-only.mkv"}}),
+                json!({"action":"respond","text":"Inspected before choosing the source."}),
+            ]),
+            prompts: Vec::new(),
+        };
+
+        let response = engine
+            .run_line("翻译这个 MKV", &mut backend)
+            .expect("inspection recovery");
+
+        assert_eq!(response, "Inspected before choosing the source.");
+        assert!(
+            backend.prompts[1]
+                .iter()
+                .any(|message| message.content.contains("media_inspection_required"))
+        );
+        assert!(engine.session_events().iter().any(|event| {
+            matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "inspect_media"
+            )
+        }));
+        assert!(!engine.session_events().iter().any(|event| {
+            matches!(
+                event.typed(),
+                Some(EventKind::ToolStarted { tool_name, .. }) if tool_name == "translate_file"
+            )
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pgs_source_blocks_every_audio_substitution_tool_before_approval() {
         for (label, tool_name, arguments) in [
             ("whisper", "manage_whisper", json!({"action":"status"})),
@@ -1942,6 +2159,12 @@ mod tests {
             let mut engine = active_engine(root.clone());
             let mut backend = JsonSequenceBackend {
                 decisions: VecDeque::from([
+                    json!({
+                        "action":"tool_call",
+                        "commentary":"我先检查容器中的字幕流。",
+                        "tool_name":"inspect_media",
+                        "arguments":{"path":"movie.pgs-only.mkv"}
+                    }),
                     json!({
                         "action":"tool_call",
                         "commentary":"我先翻译容器里的现有字幕。",
@@ -1989,6 +2212,7 @@ mod tests {
         let mut engine = active_engine(root.clone());
         let mut backend = JsonSequenceBackend {
             decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"inspect_media","arguments":{"path":"movie.pgs-ocr-fails.mkv"}}),
                 json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-ocr-fails.mkv"}}),
                 json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"wrong"}}),
                 json!({"action":"tool_call","tool_name":"transcribe_audio","arguments":{"path":"movie.pgs-ocr-fails.mkv"}}),
@@ -2035,6 +2259,7 @@ mod tests {
         let mut engine = active_engine(root.clone());
         let mut backend = JsonSequenceBackend {
             decisions: VecDeque::from([
+                json!({"action":"tool_call","tool_name":"inspect_media","arguments":{"path":"movie.pgs-only.mkv"}}),
                 json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
                 json!({"action":"tool_call","tool_name":"transcribe_audio","arguments":{"path":"movie.pgs-only.mkv"}}),
                 json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"wrong query"}}),
@@ -2086,6 +2311,7 @@ mod tests {
             let engine = active_engine(root.clone());
             let backend = JsonSequenceBackend {
                 decisions: VecDeque::from([
+                    json!({"action":"tool_call","tool_name":"inspect_media","arguments":{"path":"movie.pgs-only.mkv"}}),
                     json!({"action":"tool_call","tool_name":"translate_file","arguments":{"path":"movie.pgs-only.mkv"}}),
                     json!({"action":"tool_call","tool_name":"candidate_subtitles","arguments":{"path":".","query":"movie.pgs-only.mkv"}}),
                     json!({"action":"tool_call","tool_name":"run_command","arguments":{"command":"printf approved"}}),

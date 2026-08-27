@@ -482,6 +482,14 @@ pub(crate) fn execute_adapter_tool_with_services(
                 Err(error) => return Err(error.into()),
             }
         }
+        ToolExecutor::InspectMedia => {
+            let full = guard.resolve_path(&required_path(args, "path")?)?;
+            let text = services.inspect_media(&full, cancellation)?;
+            AdapterToolOutcome {
+                outcome: observation("inspect_media", text),
+                file_operation: None,
+            }
+        }
         ToolExecutor::DiagnosePath => {
             let full = guard.resolve_path(&required_path(args, "path")?)?;
             let text = services.diagnose_path(&full)?;
@@ -1275,6 +1283,14 @@ mod tests {
 
         fn diagnose_path(&self, path: &Path) -> AdapterResult<String> {
             TestAgentServices.diagnose_path(path)
+        }
+
+        fn inspect_media(
+            &self,
+            path: &Path,
+            cancellation: &CancellationGuard,
+        ) -> AdapterResult<String> {
+            TestAgentServices.inspect_media(path, cancellation)
         }
 
         fn default_translation_output_path(

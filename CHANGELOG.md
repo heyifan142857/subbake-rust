@@ -21,6 +21,12 @@ breaking changes when they are called out in advance.
 
 ### Fixed
 
+- Inspect embedded subtitle streams before the interactive agent translates or
+  transcribes a media container, so it chooses between existing text, bitmap
+  OCR, and audio sources with current stream metadata.
+- Keep the interactive composer editable while the agent is working: Enter
+  queues a follow-up for the next turn, while Esc sends non-empty input into
+  the active turn and interrupts only its in-flight model request.
 - Preserve non-zero embedded subtitle timestamps while extracting text or PGS
   tracks, embedding translated tracks, and remuxing container undo output, so a
   subtitle-only container no longer rebases its first cue to `00:00:00`.

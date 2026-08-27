@@ -318,12 +318,22 @@ Important interactive controls include:
 - `/plan` or Shift+Tab to toggle plan mode;
 - `/undo` to restore the latest supported mutation;
 - `/clear`, `/help`, and `/exit`;
-- Esc to cancel an active operation cooperatively.
+- while work is active, Enter queues the composer input for the next turn;
+- while work is active, Esc sends non-empty composer input into the current
+  turn; it interrupts an in-flight model request, but lets an already-running
+  tool finish safely before the agent follows the new instruction;
+- Esc with an empty composer cancels the active operation cooperatively.
 
 Mutating plans require an explicit approve/reject/revise decision. Commands
 outside the strict read-only auto-run set require command approval. Project file
 operations reject path traversal, project escape, protected runtime/VCS paths,
 and common credential paths.
+
+Before the agent translates or transcribes a specific MKV, MP4/M4V/MOV, or
+WebM file, it performs a read-only ffprobe inspection of embedded subtitle
+streams. The resulting stream index, codec, language, title, default/forced
+flags, and text/OCR support guide source selection; the inspection itself does
+not extract or modify media.
 
 ## Translate subtitle files
 
