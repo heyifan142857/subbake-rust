@@ -69,7 +69,7 @@ pub(super) fn build_translation_messages(
     build_translation_messages_with_rules(
         (options, &language_rules),
         batch_index,
-        batch,
+        (batch, batch),
         prompt_context,
         memory,
         required_glossary,
@@ -80,13 +80,14 @@ pub(super) fn build_translation_messages(
 pub(super) fn build_translation_messages_with_rules(
     policy: (&PipelineOptions, &ResolvedLanguageRules),
     batch_index: usize,
-    batch: &[SubtitleSegment],
+    scope: (&[SubtitleSegment], &[SubtitleSegment]),
     prompt_context: &TranslationPromptContext,
     memory: &ContextMemory,
     required_glossary: &BTreeMap<String, String>,
     compact_wire: bool,
 ) -> Vec<ChatMessage> {
     let (options, language_rules) = policy;
+    let (batch, marker_scope) = scope;
     let mut context = serde_json::json!({
         "src": options.validation.source_language,
         "tgt": options.validation.target_language,
@@ -116,7 +117,7 @@ pub(super) fn build_translation_messages_with_rules(
         && !options.execution.online_terminology
         && !options.validation.preserve_names;
     let name_markers = if lightweight_names {
-        select_name_markers(batch, &memory.name_candidates)
+        select_name_markers(marker_scope, &memory.name_candidates)
     } else {
         Vec::new()
     };

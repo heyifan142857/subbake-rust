@@ -601,13 +601,19 @@ where
                     &candidates,
                     &self.language_rules,
                 ) {
+                    let initial_alignment_error = error.to_string();
                     let mut retried = self.translate_batch_impl(
                         index,
                         &batch.pending,
                         &batch.prompt_context,
                         true,
                         Some(error),
-                    )?;
+                    )
+                    .map_err(|retry_error| {
+                        CoreError::InvalidTranslation(format!(
+                            "batch {index} name alignment retry failed; initial error: {initial_alignment_error}; retry error: {retry_error}"
+                        ))
+                    })?;
                     name_alignment::reconcile_batch_with_rules(
                         &batch.pending,
                         &mut retried,
@@ -618,7 +624,7 @@ where
                     )
                     .map_err(|retry_error| {
                         CoreError::InvalidTranslation(format!(
-                            "batch {index} name alignment failed after retry: {retry_error}"
+                            "batch {index} name alignment failed after retry; initial error: {initial_alignment_error}; retry error: {retry_error}"
                         ))
                     })?;
                     *result = retried;
@@ -759,7 +765,7 @@ where
             let messages = build_translation_messages_with_rules(
                 (&self.options, &self.language_rules),
                 *batch_index,
-                batch,
+                (batch, batch),
                 prompt_context,
                 &self.memory,
                 &self.required_glossary,
@@ -785,6 +791,7 @@ where
                     lightweight_name_alignment(&self.options),
                     self.options.execution.online_terminology,
                     marker_candidates(&self.options, &self.memory),
+                    batch,
                     batch,
                     &mut payload,
                     true,
@@ -814,7 +821,7 @@ where
                     let split = split_index(batch);
                     results.insert(
                         *batch_index,
-                        self.translate_split(*batch_index, batch, prompt_context, split)?,
+                        self.translate_split(*batch_index, batch, batch, prompt_context, split)?,
                     );
                     continue;
                 }
@@ -860,6 +867,7 @@ where
                     lightweight_name_alignment(&self.options),
                     self.options.execution.online_terminology,
                     marker_candidates(&self.options, &self.memory),
+                    &batch,
                     &batch,
                     &mut payload,
                     false,
@@ -922,6 +930,25 @@ where
         record_failure: bool,
         initial_error: Option<CoreError>,
     ) -> CoreResult<BatchWithUsage> {
+        self.translate_batch_impl_with_marker_scope(
+            batch_index,
+            batch,
+            batch,
+            prompt_context,
+            record_failure,
+            initial_error,
+        )
+    }
+
+    fn translate_batch_impl_with_marker_scope(
+        &mut self,
+        batch_index: usize,
+        batch: &[SubtitleSegment],
+        marker_scope: &[SubtitleSegment],
+        prompt_context: &TranslationPromptContext,
+        record_failure: bool,
+        initial_error: Option<CoreError>,
+    ) -> CoreResult<BatchWithUsage> {
         if let Some(error) = initial_error.as_ref()
             && is_operational_llm_failure(error)
         {
@@ -940,7 +967,7 @@ where
             let mut messages = build_translation_messages_with_rules(
                 (&self.options, &self.language_rules),
                 batch_index,
-                batch,
+                (batch, marker_scope),
                 prompt_context,
                 &self.memory,
                 &self.required_glossary,
@@ -955,6 +982,7 @@ where
                     return self.translate_split(
                         batch_index,
                         batch,
+                        marker_scope,
                         prompt_context,
                         split_index(batch),
                     );
@@ -965,7 +993,7 @@ where
                 )));
             }
             let request_hash = request_hash(&self.options, CacheStage::Translate, &messages);
-            match self.translate_once(batch, &messages, &request_hash) {
+            match self.translate_once(batch, marker_scope, &messages, &request_hash) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     if matches!(error, CoreError::Cancelled) {
@@ -1006,7 +1034,13 @@ where
                             resolved: false,
                             error: None,
                         });
-                        match self.translate_split(batch_index, batch, prompt_context, split) {
+                        match self.translate_split(
+                            batch_index,
+                            batch,
+                            marker_scope,
+                            prompt_context,
+                            split,
+                        ) {
                             Ok(result) => {
                                 if let Some(split_log) = attempt_log.split_retry.as_mut() {
                                     split_log.resolved = true;
@@ -1059,6 +1093,7 @@ where
     fn translate_once(
         &mut self,
         batch: &[SubtitleSegment],
+        marker_scope: &[SubtitleSegment],
         messages: &[ChatMessage],
         request_hash: &str,
     ) -> CoreResult<BatchWithUsage> {
@@ -1095,6 +1130,7 @@ where
             lightweight_name_alignment(&self.options),
             self.options.execution.online_terminology,
             marker_candidates(&self.options, &self.memory),
+            marker_scope,
             batch,
             result,
             cached,
@@ -1124,18 +1160,31 @@ where
         &mut self,
         batch_index: usize,
         batch: &[SubtitleSegment],
+        marker_scope: &[SubtitleSegment],
         prompt_context: &TranslationPromptContext,
         split: usize,
     ) -> CoreResult<BatchWithUsage> {
         let left_context = prompt_context.for_left_split(&batch[split..]);
         let right_context = prompt_context.for_right_split(&batch[..split]);
-        let left =
-            self.translate_batch_impl(batch_index, &batch[..split], &left_context, false, None)?;
-        let right =
-            self.translate_batch_impl(batch_index, &batch[split..], &right_context, false, None)?;
+        let left = self.translate_batch_impl_with_marker_scope(
+            batch_index,
+            &batch[..split],
+            marker_scope,
+            &left_context,
+            false,
+            None,
+        )?;
+        let right = self.translate_batch_impl_with_marker_scope(
+            batch_index,
+            &batch[split..],
+            marker_scope,
+            &right_context,
+            false,
+            None,
+        )?;
         let mut usage = left.usage;
         usage.add(right.usage);
-        Ok(BatchWithUsage {
+        let combined = BatchWithUsage {
             lines: left.lines.into_iter().chain(right.lines).collect(),
             summary: String::new(),
             glossary_updates: combine_glossary(left.glossary_updates, right.glossary_updates),
@@ -1146,7 +1195,16 @@ where
                 .collect(),
             usage,
             cache_key: None,
-        })
+        };
+        if lightweight_name_alignment(&self.options) {
+            let markers = name_alignment::select_markers(
+                marker_scope,
+                marker_candidates(&self.options, &self.memory),
+            );
+            name_alignment::validate_markers(batch, &combined.lines, &markers)?;
+        }
+        validate_translation_batch(batch, &combined.lines)?;
+        Ok(combined)
     }
 
     fn review_batch(
@@ -1664,6 +1722,7 @@ where
                             self.options.execution.online_terminology,
                             marker_candidates(&self.options, &self.memory),
                             source,
+                            source,
                             result,
                             cached,
                         )?;
@@ -1904,6 +1963,7 @@ fn prepare_translation_result(
     lightweight_names: bool,
     online_terminology: bool,
     candidates: &[String],
+    marker_scope: &[SubtitleSegment],
     source: &[SubtitleSegment],
     result: &mut BatchTranslationResult,
     cached: bool,
@@ -1912,7 +1972,7 @@ fn prepare_translation_result(
     // context is now derived from subtitle lines and confirmed translations.
     result.summary.clear();
     if lightweight_names {
-        let markers = name_alignment::select_markers(source, candidates);
+        let markers = name_alignment::select_markers(marker_scope, candidates);
         name_alignment::validate_markers(source, &result.lines, &markers)?;
         if !cached {
             // The lightweight contract learns names only from inline markers.
@@ -4424,6 +4484,63 @@ mod tests {
         assert!(aligned.contains(&"Mary".to_owned()));
         assert!(aligned.contains(&"トキタ".to_owned()));
         assert!(!aligned.contains(&"Meet Alice".to_owned()));
+    }
+
+    #[test]
+    fn lightweight_name_candidates_reject_recurring_ordinary_dialogue_starters() {
+        let candidates = extract_terminology_candidates(&[
+            segment("1", "Because we waited."),
+            segment("2", "Because it mattered."),
+            segment("3", "Time to leave."),
+            segment("4", "Time to begin."),
+            segment("5", "Target acquired."),
+            segment("6", "Target lost."),
+            segment("7", "Secure the room."),
+            segment("8", "Secure the perimeter."),
+            segment("9", "Mary arrived."),
+            segment("10", "Mary stayed."),
+        ]);
+        let aligned = candidates
+            .into_iter()
+            .filter(|candidate| candidate.align_as_name)
+            .map(|candidate| candidate.source)
+            .collect::<Vec<_>>();
+
+        assert_eq!(aligned, vec!["Mary".to_owned()]);
+    }
+
+    #[test]
+    fn split_translation_inherits_the_parent_name_marker_scope() {
+        let mut options = PipelineOptions::new("marker-split.srt".into());
+        options.execution.mode = crate::entities::TranslationMode::Turbo;
+        options.execution.use_cache = false;
+        let mut pipeline = SubtitlePipeline::new(EchoBackend, options);
+        pipeline.memory.name_candidates = (0..12)
+            .map(|index| format!("Name{index}"))
+            .chain([
+                "Unused12".to_owned(),
+                "Unused13".to_owned(),
+                "Unused14".to_owned(),
+            ])
+            .chain(["Bucky".to_owned()])
+            .collect();
+        let left = (0..12)
+            .map(|index| format!("Name{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let batch = vec![segment("1", &left), segment("2", "Bucky arrived.")];
+
+        let translated = pipeline
+            .translate_split(3, &batch, &batch, &TranslationPromptContext::default(), 1)
+            .expect("split translation");
+
+        assert_eq!(translated.lines[1].translation, "[ECHO] Bucky arrived.");
+        assert!(
+            translated
+                .lines
+                .iter()
+                .all(|line| !line.translation.contains("⟦N15⟧"))
+        );
     }
 
     #[test]

@@ -24,6 +24,10 @@ breaking changes when they are called out in advance.
 
 ### Fixed
 
+- Keep Turbo personal-name marker contracts stable when retrying a translation
+  through smaller split batches, revalidate merged results, reject recurring
+  dialogue starters as name candidates, and diagnose marker failures without
+  incorrectly attributing them to runtime cache state.
 - Inspect embedded subtitle streams before the interactive agent translates or
   transcribes a media container, so it chooses between existing text, bitmap
   OCR, and audio sources with current stream metadata.

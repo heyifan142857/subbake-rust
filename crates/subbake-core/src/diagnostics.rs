@@ -140,6 +140,18 @@ fn build_report(source: String, errors: &[String], metadata: &[ErrorMetadata]) -
 fn classify(errors: &[String], metadata: &[ErrorMetadata]) -> (String, Vec<String>) {
     for error in errors.iter().rev() {
         let lower = error.to_lowercase();
+        if lower.contains("turbo personal-name marker")
+            || (lower.contains("name alignment") && lower.contains("marker"))
+        {
+            return diagnosis(
+                "Turbo personal-name marker contract was violated during translation.",
+                &[
+                    "Retry the translation; SubBake will reject the malformed batch rather than persist it.",
+                    "If the same batch repeats this error, report the failure text as a marker-contract bug; clearing runtime state is not normally required.",
+                    "Use --preserve-names only as a temporary workaround if name transliteration is not required.",
+                ],
+            );
+        }
         if lower.contains("line count mismatch")
             || (lower.contains("expected")
                 && lower.contains("translated line")
@@ -272,5 +284,21 @@ mod tests {
         );
         assert!(report.diagnosis.contains("rate limit"));
         assert!(report.details.iter().any(|line| line.contains("req-1")));
+    }
+
+    #[test]
+    fn diagnoses_turbo_name_marker_contract_without_blame_on_runtime_cache() {
+        let report = diagnose_text(
+            "invalid translation result: batch 3 name alignment failed after retry: invalid Turbo personal-name marker: unknown marker id `15`",
+            "terminal output",
+        );
+
+        assert!(report.diagnosis.contains("marker contract"));
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.contains("not normally required"))
+        );
     }
 }
