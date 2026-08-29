@@ -11,7 +11,6 @@ use super::{
     previous_suggestion, slash_suggestions, vertical_navigation,
 };
 use crate::ConfigFieldKind;
-use crate::session::iso_now;
 use crate::tui_state::{ConfigConfirm, ConfigFocus, TuiPicker};
 
 pub(super) fn handle_event(
@@ -580,7 +579,7 @@ fn submit_processing_input(app: &mut SubBakeTui, disposition: ProcessingSubmit) 
         app.input_history.push(text.clone());
     }
     if let Ok(mut view) = app.msg_view.lock() {
-        view.push(MsgStyle::User, format!("[{}] {text}", iso_now()));
+        view.push(MsgStyle::User, text.clone());
     }
     match disposition {
         ProcessingSubmit::Queue => {
@@ -731,7 +730,7 @@ fn handle_enter(app: &mut SubBakeTui, request_tx: &mpsc::Sender<WorkerRequest>) 
     {
         let response = app.handle_slash(text);
         if let Ok(mut view) = app.msg_view.lock() {
-            view.push(MsgStyle::Response, response);
+            view.push_response(response);
         }
         return Ok(());
     }
@@ -790,7 +789,7 @@ fn submit_action(
         && let TuiAction::SubmitText(text) = &action
         && let Ok(mut view) = app.msg_view.lock()
     {
-        view.push(MsgStyle::User, format!("[{}] {text}", iso_now()));
+        view.push(MsgStyle::User, text.clone());
     }
     if matches!(
         &action,

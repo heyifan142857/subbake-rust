@@ -17,6 +17,7 @@ pub(super) struct UiLayoutState<'a> {
     pub(super) input: &'a InputEditor,
     pub(super) suggestion_count: usize,
     pub(super) show_progress: bool,
+    pub(super) progress_line_count: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +79,7 @@ impl ComposerLayout {
         let input_height = requested_input_height.min(area.height);
         let remaining = area.height.saturating_sub(input_height);
         let progress_height = if state.show_progress {
-            2.min(remaining)
+            state.progress_line_count.min(remaining)
         } else {
             0
         };
@@ -217,6 +218,7 @@ mod tests {
                         input: &input,
                         suggestion_count: 12,
                         show_progress: true,
+                        progress_line_count: 6,
                     },
                 );
                 for rect in rects(layout) {
@@ -244,6 +246,7 @@ mod tests {
                     input: &input,
                     suggestion_count: 0,
                     show_progress: false,
+                    progress_line_count: 0,
                 },
             )
             .overlay
@@ -264,6 +267,7 @@ mod tests {
                     input: &input,
                     suggestion_count: 8,
                     show_progress: true,
+                    progress_line_count: 6,
                 },
             )
             .composer
@@ -285,6 +289,7 @@ mod tests {
                 input: &input,
                 suggestion_count: 0,
                 show_progress: false,
+                progress_line_count: 0,
             },
         )
         .composer

@@ -8,6 +8,9 @@ breaking changes when they are called out in advance.
 
 ### Changed
 
+- Redesign the interactive agent transcript with distinct commentary and final
+  response markers, structured connected tool activity groups, live in-place
+  status transitions, and width-aware wrapping for long paths and CJK text.
 - Rename translation failure repair from `agent` to `model_repair` throughout
   configuration, CLI flags, runtime diagnostics, and JSON output. Configuration
   version 3 intentionally rejects the former names instead of aliasing them.

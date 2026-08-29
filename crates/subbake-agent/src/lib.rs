@@ -42,8 +42,8 @@ pub use steering::TurnSteering;
 pub use subbake_core::{CancellationGuard, CancellationToken};
 pub use tools::{ALL_TOOL_SPECS, ToolKind};
 pub use tui::{
-    ConfigApplyAfter, Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, TuiAction, TuiInteraction,
-    TuiObserver,
+    ConfigApplyAfter, Msg, MsgStyle, MsgView, StartupInfo, SubBakeTui, ToolActivity,
+    ToolActivityStatus, ToolGroup, TranscriptItem, TuiAction, TuiInteraction, TuiObserver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

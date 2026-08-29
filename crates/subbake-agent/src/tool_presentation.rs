@@ -36,6 +36,22 @@ pub(crate) fn failed_activity(name: &str, arguments: &JsonValue, error: &str) ->
     text
 }
 
+pub(crate) fn cancelled_activity(
+    name: &str,
+    arguments: &JsonValue,
+    elapsed: Duration,
+) -> ToolActivityText {
+    let executor = find_tool_handler(name).map(|handler| handler.executor());
+    let target = target_label(executor, name, arguments);
+    ToolActivityText {
+        headline: target.map_or_else(
+            || "Cancelled tool".to_owned(),
+            |target| format!("Cancelled {target}"),
+        ),
+        detail: Some(format!("cancelled · {}", format_elapsed(elapsed))),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ActivityPhase {
     Running,

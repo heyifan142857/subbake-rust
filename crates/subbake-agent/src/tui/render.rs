@@ -2,6 +2,7 @@ use std::io;
 
 use subbake_core::ProgressEvent;
 
+use super::ToolGroup;
 use super::history::ActiveTool;
 use super::layout::{ActiveLayout, ActiveSurface, UiLayoutState};
 use super::progress::spinner_frame;
@@ -26,6 +27,7 @@ pub(super) struct ViewSnapshot {
     pub(super) editing: bool,
     pub(super) progress: Option<(ProgressEvent, std::time::Instant)>,
     pub(super) active_tool: Option<ActiveTool>,
+    pub(super) active_tool_group: Option<ToolGroup>,
     pub(super) spinner: char,
     pub(super) startup_info: StartupInfo,
     pub(super) plan_mode: bool,
@@ -97,6 +99,11 @@ impl ViewSnapshot {
                 .lock()
                 .ok()
                 .and_then(|activity| activity.clone()),
+            active_tool_group: app
+                .msg_view
+                .lock()
+                .ok()
+                .and_then(|view| view.active_tool_group().cloned()),
             spinner: spinner_frame(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -127,6 +134,11 @@ impl ViewSnapshot {
             input: &self.input,
             suggestion_count: self.suggestions.len(),
             show_progress: self.show_progress,
+            progress_line_count: self.active_tool_group.as_ref().map_or(2, |group| {
+                u16::try_from(group.activities.len().saturating_mul(2))
+                    .unwrap_or(u16::MAX)
+                    .clamp(2, 6)
+            }),
         }
     }
 }
@@ -203,6 +215,7 @@ mod tests {
             editing: true,
             progress: None,
             active_tool: None,
+            active_tool_group: None,
             spinner: '·',
             startup_info: super::StartupInfo {
                 model: "very-long-model-name".to_owned(),
@@ -381,6 +394,7 @@ mod tests {
                     input: &input,
                     suggestion_count: 0,
                     show_progress: false,
+                    progress_line_count: 0,
                 },
             );
             assert_eq!(layout.frame.width, width);

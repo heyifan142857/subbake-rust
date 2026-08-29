@@ -1330,13 +1330,18 @@ impl AgentEngine {
         arguments: &JsonValue,
         started: Instant,
     ) -> AgentResult<()> {
-        let activity = crate::tool_presentation::running_activity(name, arguments);
+        let duration_ms = elapsed_millis(started);
+        let activity = crate::tool_presentation::cancelled_activity(
+            name,
+            arguments,
+            std::time::Duration::from_millis(duration_ms),
+        );
         let result = self.record_if_active(EventKind::ToolCancelled {
             call_id: call_id.to_owned(),
             tool_name: name.to_owned(),
             headline: activity.headline,
             detail: activity.detail,
-            duration_ms: elapsed_millis(started),
+            duration_ms,
         });
         if let Some(observer) = self.observer.as_mut() {
             observer.on_tool_cancelled(call_id, name);

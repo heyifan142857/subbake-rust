@@ -1,13 +1,14 @@
 //! Chat-style inline TUI: committed output is written to the terminal's native
 //! scrollback while the composer and active picker are redrawn below it.
 //!
-//! Layout (inspired by Codex / OpenCode):
+//! Layout:
 //!
 //! ┌─────────────────────────────────┐
 //! │  Terminal-native scrollback     │
-//! │  [You] translate hello.srt      │
-//! │  ✓ Translated hello.srt          │
-//! │  ➔ Translated: out.srt          │
+//! │  › translate hello.srt          │
+//! │  · I will translate the file.   │
+//! │    └─ ✓ Translated hello.srt    │
+//! │  • Output: hello.zh-CN.srt      │
 //! │  ...                            │
 //! ├─────────────────────────────────┤
 //! │ > _                             │
@@ -48,15 +49,20 @@ mod protocol;
 mod render;
 mod terminal;
 mod text;
+mod transcript;
 mod worker;
 
 use history::ActiveTool;
-pub use history::{Msg, MsgStyle, MsgView, TuiObserver};
+pub use history::{
+    Msg, MsgStyle, MsgView, ToolActivity, ToolActivityStatus, ToolGroup, TranscriptItem,
+    TuiObserver,
+};
 use layout::ActiveLayout;
 use progress::format_progress;
 pub use protocol::{ConfigApplyAfter, StartupInfo, TuiAction, TuiInteraction};
 use terminal::TerminalSessionGuard;
 use text::{display_width, truncate_with_ellipsis};
+use transcript::{history_lines_height, transcript_item_lines};
 use worker::{TuiWorker, WorkerRequest};
 
 const EVENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -232,125 +238,14 @@ impl SubBakeTui {
 
     pub fn set_session_replay(&mut self, events: Vec<crate::session::AgentEvent>) {
         if let Ok(mut view) = self.msg_view.lock() {
-            if !view.messages.is_empty() {
+            view.seal_tool_group();
+            if !view.items.is_empty() {
                 view.push(
                     MsgStyle::System,
                     "──────── resumed session ────────".to_owned(),
                 );
             }
-            let finished_calls = events
-                .iter()
-                .filter_map(|event| match event.typed() {
-                    Some(
-                        crate::event::EventKind::ToolCompleted { call_id, .. }
-                        | crate::event::EventKind::ToolFailed { call_id, .. }
-                        | crate::event::EventKind::ToolCancelled { call_id, .. },
-                    ) => Some(call_id),
-                    _ => None,
-                })
-                .collect::<std::collections::HashSet<_>>();
-            for event in events {
-                let (style, text) = match event.tag() {
-                    crate::session::EventTag::User => (
-                        MsgStyle::User,
-                        format!("[{}] {}", event.created_at, event.text),
-                    ),
-                    crate::session::EventTag::Assistant | crate::session::EventTag::AskUser => {
-                        (MsgStyle::Response, format!("➔ {}", event.text))
-                    }
-                    crate::session::EventTag::Commentary => {
-                        (MsgStyle::Commentary, format!("➔ {}", event.text))
-                    }
-                    crate::session::EventTag::ToolStarted => {
-                        let Some(crate::event::EventKind::ToolStarted {
-                            call_id,
-                            headline,
-                            detail,
-                            ..
-                        }) = event.typed()
-                        else {
-                            continue;
-                        };
-                        if finished_calls.contains(&call_id) {
-                            continue;
-                        }
-                        let activity =
-                            crate::tool_presentation::ToolActivityText { headline, detail };
-                        (
-                            MsgStyle::ToolCancelled,
-                            format_activity_message("■", activity, Some("interrupted")),
-                        )
-                    }
-                    crate::session::EventTag::ToolCompleted => {
-                        let Some(crate::event::EventKind::ToolCompleted {
-                            headline, detail, ..
-                        }) = event.typed()
-                        else {
-                            continue;
-                        };
-                        let activity =
-                            crate::tool_presentation::ToolActivityText { headline, detail };
-                        (
-                            MsgStyle::ToolCall,
-                            format_activity_message("✓", activity, None),
-                        )
-                    }
-                    crate::session::EventTag::FileOperation => continue,
-                    crate::session::EventTag::Plan => {
-                        (MsgStyle::System, format!("Plan: {}", event.text))
-                    }
-                    crate::session::EventTag::ToolFailed => {
-                        let Some(crate::event::EventKind::ToolFailed {
-                            headline, detail, ..
-                        }) = event.typed()
-                        else {
-                            continue;
-                        };
-                        let activity =
-                            crate::tool_presentation::ToolActivityText { headline, detail };
-                        (
-                            MsgStyle::ToolFailure,
-                            format_activity_message("×", activity, None),
-                        )
-                    }
-                    crate::session::EventTag::ToolCancelled => {
-                        let Some(crate::event::EventKind::ToolCancelled {
-                            headline,
-                            detail,
-                            duration_ms,
-                            ..
-                        }) = event.typed()
-                        else {
-                            continue;
-                        };
-                        let activity =
-                            crate::tool_presentation::ToolActivityText { headline, detail };
-                        (
-                            MsgStyle::ToolCancelled,
-                            format_activity_message(
-                                "■",
-                                activity,
-                                Some(&format!("cancelled · {:.1}s", duration_ms as f64 / 1000.0)),
-                            ),
-                        )
-                    }
-                    crate::session::EventTag::Error => {
-                        (MsgStyle::Error, format!("× {}", event.text))
-                    }
-                    crate::session::EventTag::Cancelled => {
-                        (MsgStyle::System, "Cancelled.".to_owned())
-                    }
-                    _ => continue,
-                };
-                if view.messages.len() >= view.max {
-                    view.messages.remove(0);
-                }
-                view.messages.push(Msg {
-                    style,
-                    text,
-                    stamp: event.created_at,
-                });
-            }
+            view.replay(events);
         }
     }
 
@@ -404,6 +299,9 @@ impl SubBakeTui {
         let loop_result = (|| -> io::Result<()> {
             while self.running {
                 if let Ok(result) = worker.try_recv() {
+                    if let Ok(mut view) = self.msg_view.lock() {
+                        view.seal_tool_group();
+                    }
                     self.commit_progress_summary();
                     let plan_mode_rollback = self.interaction_state.finish();
                     match result {
@@ -628,18 +526,18 @@ Or just type what you want, e.g. "translate @clip.srt""#
             self.insert_history_lines(lines, width)?;
         }
 
-        let messages = self
+        let items = self
             .msg_view
             .lock()
-            .map(|view| view.messages[self.history_cursor.min(view.messages.len())..].to_vec())
+            .map(|view| view.items[self.history_cursor.min(view.items.len())..].to_vec())
             .unwrap_or_default();
-        if messages.is_empty() {
+        if items.is_empty() {
             return Ok(());
         }
-        self.history_cursor = self.history_cursor.saturating_add(messages.len());
-        let lines = messages
+        self.history_cursor = self.history_cursor.saturating_add(items.len());
+        let lines = items
             .iter()
-            .flat_map(message_lines)
+            .flat_map(|item| transcript_item_lines(item, width, None))
             .collect::<Vec<Line<'static>>>();
         self.insert_history_lines(lines, width)
     }
@@ -732,83 +630,6 @@ const INPUT_HINTS: &[&str] = &[
     "Use /history to revisit earlier requests",
 ];
 
-fn message_lines(message: &Msg) -> Vec<Line<'static>> {
-    match message.style {
-        MsgStyle::ToolCall => return tool_message_lines(&message.text, "✓", Color::Green),
-        MsgStyle::ToolFailure => return tool_message_lines(&message.text, "×", Color::Red),
-        MsgStyle::ToolCancelled => return tool_message_lines(&message.text, "■", Color::Blue),
-        _ => {}
-    }
-    let style = match message.style {
-        MsgStyle::User => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        MsgStyle::Observation => Style::default().fg(Color::DarkGray),
-        MsgStyle::Response => Style::default().fg(Color::White),
-        MsgStyle::Commentary => Style::default().fg(Color::Gray),
-        MsgStyle::Error => Style::default().fg(Color::Red),
-        MsgStyle::System => Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-        MsgStyle::ToolCall | MsgStyle::ToolFailure | MsgStyle::ToolCancelled => unreachable!(),
-    };
-    message
-        .text
-        .split('\n')
-        .map(|line| Line::from(Span::styled(line.to_owned(), style)))
-        .collect()
-}
-
-fn format_activity_message(
-    marker: &str,
-    activity: crate::tool_presentation::ToolActivityText,
-    override_detail: Option<&str>,
-) -> String {
-    override_detail
-        .map(str::to_owned)
-        .or(activity.detail)
-        .map_or_else(
-            || format!("  {marker} {}", activity.headline),
-            |detail| format!("  {marker} {}\n    {detail}", activity.headline),
-        )
-}
-
-fn tool_message_lines(text: &str, marker: &str, marker_color: Color) -> Vec<Line<'static>> {
-    text.split('\n')
-        .enumerate()
-        .map(|(index, line)| {
-            if index > 0 {
-                return Line::from(Span::styled(
-                    line.to_owned(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            let prefix = format!("  {marker} ");
-            let headline = line.strip_prefix(&prefix).unwrap_or(line).to_owned();
-            Line::from(vec![
-                Span::styled(
-                    prefix,
-                    Style::default()
-                        .fg(marker_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    headline,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ])
-        })
-        .collect()
-}
-
-fn history_lines_height(lines: &[Line<'static>], width: u16) -> u16 {
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(usize::from(width.max(1))))
-        .sum::<usize>()
-        .min(usize::from(u16::MAX)) as u16
-}
-
 fn startup_panel_lines(info: &StartupInfo, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(4));
     let inner_width = width.saturating_sub(2);
@@ -899,7 +720,7 @@ fn suggestions_for(input: &str, mode: &InputMode) -> Vec<(String, String)> {
 
 fn push_immediate_response(view: &mut MsgView, text: String) {
     if !text.is_empty() {
-        view.push(MsgStyle::Response, format!("➔ {text}"));
+        view.push_response(text);
     }
 }
 
@@ -952,12 +773,13 @@ mod tests {
         profile_picker_choice,
     };
 
+    use super::transcript::{message_lines, tool_group_lines};
     use super::{
-        EmptyModeChoice, InputMode, Msg, MsgStyle, ResizeReflowState, StartupInfo, TuiAction,
-        TuiPicker, VerticalNavigation, empty_mode_choice, history_down, history_lines_height,
-        history_up, is_insert_newline_key, is_profile_name_character, message_lines,
-        picker_viewport, previous_suggestion, push_immediate_response, slash_suggestions,
-        startup_panel_lines, suggestions_for, vertical_navigation,
+        EmptyModeChoice, InputMode, Msg, MsgStyle, ResizeReflowState, StartupInfo,
+        ToolActivityStatus, TranscriptItem, TuiAction, TuiPicker, VerticalNavigation,
+        empty_mode_choice, history_down, history_lines_height, history_up, is_insert_newline_key,
+        is_profile_name_character, picker_viewport, previous_suggestion, push_immediate_response,
+        slash_suggestions, startup_panel_lines, suggestions_for, vertical_navigation,
     };
 
     #[test]
@@ -1070,12 +892,12 @@ mod tests {
     fn history_height_uses_display_width_for_mixed_cjk_text() {
         let message = Msg {
             style: MsgStyle::Response,
-            text: "➔ 翻译此文件：<i>[Robert, the 17th Earl of Bruce:]</i>".to_owned(),
+            text: "翻译此文件：<i>[Robert, the 17th Earl of Bruce:]</i>".to_owned(),
             stamp: String::new(),
         };
-        let lines = message_lines(&message);
-        assert_eq!(history_lines_height(&lines, 40), 2);
-        assert!(lines[0].width() > 40);
+        let lines = message_lines(&message, 40);
+        assert_eq!(history_lines_height(&lines, 40), 3);
+        assert!(lines.iter().all(|line| line.width() <= 40));
     }
 
     #[test]
@@ -1271,7 +1093,10 @@ mod tests {
         let mut view = super::MsgView::new(10);
         push_immediate_response(&mut view, "one.srt\ntwo.srt".to_owned());
         assert_eq!(view.all().len(), 1);
-        assert_eq!(view.all()[0].text, "➔ one.srt\ntwo.srt");
+        let TranscriptItem::Message(message) = &view.all()[0] else {
+            panic!("response message");
+        };
+        assert_eq!(message.text, "one.srt\ntwo.srt");
     }
 
     #[test]
@@ -1333,10 +1158,64 @@ mod tests {
             &outcome,
         );
         let messages = view.lock().expect("view");
-        assert_eq!(messages.all().len(), 1);
-        assert!(messages.all()[0].text.contains("Read sample.srt"));
-        assert!(!messages.all()[0].text.contains("subtitle body"));
+        assert!(messages.all().is_empty());
+        let group = messages.active_tool_group().expect("active tool group");
+        assert_eq!(group.activities.len(), 1);
+        assert_eq!(group.activities[0].status, ToolActivityStatus::Completed);
+        assert!(group.activities[0].headline.contains("Read sample.srt"));
+        assert!(
+            !group.activities[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("subtitle body")
+        );
+        let lines = tool_group_lines(group, 40, None);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("└─ ✓ Read sample.srt"))
+        );
         assert!(active_tool.lock().expect("active tool").is_none());
+    }
+
+    #[test]
+    fn tool_group_uses_a_continuous_rail_and_width_aware_wrapping() {
+        let mut view = super::MsgView::new(10);
+        view.finish_tool(
+            "command",
+            "run_command",
+            crate::tool_presentation::ToolActivityText {
+                headline: "Ran iconv Captain.America.The.First.Avenger.source.srt".to_owned(),
+                detail: Some("exit 0 · 0.1s".to_owned()),
+            },
+            ToolActivityStatus::Completed,
+        );
+        view.finish_tool(
+            "translate",
+            "translate_file",
+            crate::tool_presentation::ToolActivityText {
+                headline: "Translated Captain.America.The.First.Avenger.utf8.srt".to_owned(),
+                detail: Some("→ output.zh-CN.srt · 1,842 cues · 42.8s".to_owned()),
+            },
+            ToolActivityStatus::Completed,
+        );
+        let group = view.active_tool_group().expect("active group");
+        let lines = tool_group_lines(group, 30, None);
+        let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert!(rendered[0].starts_with("  ┌─ ✓ Ran iconv"));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("  │    Captain"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("  └─ ✓ Translated"))
+        );
+        assert!(lines.iter().all(|line| line.width() <= 30));
     }
 
     #[test]

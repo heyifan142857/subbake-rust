@@ -51,10 +51,6 @@ fn render_progress(frame: &mut ratatui::Frame<'_>, area: Rect, view: &ViewSnapsh
         .active_tool
         .as_ref()
         .map(|active| crate::tool_presentation::running_activity(&active.name, &active.arguments));
-    let headline = activity.as_ref().map_or_else(
-        || "Working".to_owned(),
-        |activity| activity.headline.clone(),
-    );
     let key_hint = if view.input.is_empty() {
         "Enter queue · Esc cancel"
     } else {
@@ -64,11 +60,44 @@ fn render_progress(frame: &mut ratatui::Frame<'_>, area: Rect, view: &ViewSnapsh
         .progress
         .as_ref()
         .map(|(event, started)| format_progress(event, started.elapsed()))
-        .or_else(|| activity.and_then(|activity| activity.detail))
+        .or_else(|| {
+            activity
+                .as_ref()
+                .and_then(|activity| activity.detail.clone())
+        })
         .map_or_else(
             || key_hint.to_owned(),
             |detail| format!("{detail} · {key_hint}"),
         );
+    if let Some(group) = &view.active_tool_group {
+        let mut lines = super::transcript::tool_group_lines(
+            group,
+            area.width,
+            Some((view.spinner, detail.as_str())),
+        );
+        if !group
+            .activities
+            .iter()
+            .any(|activity| activity.status == super::ToolActivityStatus::Running)
+        {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", view.spinner),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("Working · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(key_hint, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        let visible_from = lines.len().saturating_sub(usize::from(area.height));
+        frame.render_widget(Paragraph::new(lines.split_off(visible_from)), area);
+        return;
+    }
+
+    let headline = activity.as_ref().map_or_else(
+        || "Working".to_owned(),
+        |activity| activity.headline.clone(),
+    );
     let width = usize::from(area.width);
     let prefix = format!("  {} ", view.spinner);
     let lines = vec![
