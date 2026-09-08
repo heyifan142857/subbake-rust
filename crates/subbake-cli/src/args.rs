@@ -904,19 +904,6 @@ pub fn parse_whisper_args(args: &[String]) -> CliResult<WhisperArgs> {
                 .ok_or_else(|| CliError::usage("whisper model requires a model name"))?;
             (WhisperAction::DownloadModel { name }, 2usize)
         }
-        "vad-model" if args.get(1).is_some_and(|value| value == "list") => {
-            (WhisperAction::ListVadModels, 2usize)
-        }
-        "vad-model" | "download-vad-model" => {
-            let explicit_name = args.get(1).filter(|value| !value.starts_with('-'));
-            let name = explicit_name
-                .cloned()
-                .unwrap_or_else(|| subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned());
-            (
-                WhisperAction::DownloadVadModel { name },
-                usize::from(explicit_name.is_some()) + 1,
-            )
-        }
         other => {
             return Err(CliError::usage(format!(
                 "unknown whisper command `{other}`"
@@ -1010,33 +997,6 @@ fn parse_batch_size(args: &[String], index: &mut usize, flag: &str) -> CliResult
         return Err(CliError::usage(format!("{flag} must be greater than zero")));
     }
     Ok(value)
-}
-
-fn parse_unit_f32(args: &[String], index: &mut usize, flag: &str) -> CliResult<f32> {
-    let raw = required_value(args, index, flag)?;
-    let value = raw
-        .parse::<f32>()
-        .map_err(|_| CliError::usage(format!("{flag} must be a number from 0 through 1")))?;
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(CliError::usage(format!(
-            "{flag} must be a number from 0 through 1"
-        )));
-    }
-    Ok(value)
-}
-
-fn parse_positive_u64(args: &[String], index: &mut usize, flag: &str) -> CliResult<u64> {
-    let value = parse_nonnegative_u64(args, index, flag)?;
-    if value == 0 {
-        return Err(CliError::usage(format!("{flag} must be greater than zero")));
-    }
-    Ok(value)
-}
-
-fn parse_nonnegative_u64(args: &[String], index: &mut usize, flag: &str) -> CliResult<u64> {
-    required_value(args, index, flag)?
-        .parse::<u64>()
-        .map_err(|_| CliError::usage(format!("{flag} must be a non-negative integer")))
 }
 
 fn parse_bilingual_font_scale(args: &[String], index: &mut usize, flag: &str) -> CliResult<f64> {
@@ -1715,30 +1675,44 @@ mod tests {
     }
 
     #[test]
-    fn transcription_vad_defaults_to_silero_and_cli_can_disable_it() {
-        let config = empty_config("transcribe-vad-default");
-        let config_value = config.to_string_lossy().into_owned();
-        let configured = parse_transcribe_args(&[
+    fn removed_vad_cli_option_is_rejected() {
+        let config = empty_config("removed-vad-option");
+        let error = parse_transcribe_args(&[
             "movie.mp4".to_owned(),
             "--config".to_owned(),
-            config_value.clone(),
-        ])
-        .expect("parse default VAD settings");
-        let disabled = parse_transcribe_args(&[
-            "movie.mp4".to_owned(),
-            "--config".to_owned(),
-            config_value,
+            config.to_string_lossy().into_owned(),
             "--no-vad".to_owned(),
         ])
-        .expect("parse disabled VAD settings");
+        .expect_err("removed VAD option must not be accepted");
         let _ = std::fs::remove_file(config);
 
-        assert_eq!(configured.settings.vad_enabled, Some(true));
-        assert_eq!(
-            configured.settings.vad_model.as_deref(),
-            Some(subbake_adapters::DEFAULT_WHISPER_VAD_MODEL)
+        assert!(
+            error
+                .to_string()
+                .contains("unknown transcribe option `--no-vad`")
         );
-        assert_eq!(disabled.settings.vad_enabled, Some(false));
+    }
+
+    #[test]
+    fn removed_vad_configuration_is_rejected() {
+        let path = std::env::temp_dir().join(format!(
+            "subbake-test-{}-removed-vad-config.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "version = 3\n[defaults.transcription]\nvad_enabled = false\n",
+        )
+        .expect("write config");
+        let error = parse_transcribe_args(&[
+            "movie.mp4".to_owned(),
+            "--config".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .expect_err("removed VAD field must not be accepted");
+        let _ = std::fs::remove_file(path);
+
+        assert!(error.to_string().contains("unknown field `vad_enabled`"));
     }
 
     #[test]
@@ -1926,25 +1900,6 @@ mod tests {
 
         assert_eq!(parsed.action, WhisperAction::ListModels);
         assert_eq!(parsed.models_dir, Some(PathBuf::from("models")));
-    }
-
-    #[test]
-    fn parse_whisper_vad_model_defaults_to_silero() {
-        let config = empty_config("whisper-vad-model");
-        let parsed = parse_whisper_args(&[
-            "vad-model".to_owned(),
-            "--config".to_owned(),
-            config.to_string_lossy().into_owned(),
-        ])
-        .expect("whisper VAD model args should parse");
-        let _ = std::fs::remove_file(config);
-
-        assert_eq!(
-            parsed.action,
-            WhisperAction::DownloadVadModel {
-                name: subbake_adapters::DEFAULT_WHISPER_VAD_MODEL.to_owned(),
-            }
-        );
     }
 
     #[test]

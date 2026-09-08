@@ -1062,49 +1062,6 @@ fn streaming_fingerprint(
                     "filter_hallucinations".to_owned(),
                     request.transcription_settings.filter_hallucinations.into(),
                 ),
-                (
-                    "vad_enabled".to_owned(),
-                    request
-                        .transcription_settings
-                        .effective_vad_enabled()
-                        .into(),
-                ),
-                (
-                    "vad_model".to_owned(),
-                    request.transcription_settings.effective_vad_model().into(),
-                ),
-                (
-                    "vad_threshold".to_owned(),
-                    request
-                        .transcription_settings
-                        .effective_vad_threshold()
-                        .to_string()
-                        .into(),
-                ),
-                (
-                    "vad_min_speech_duration_ms".to_owned(),
-                    request
-                        .transcription_settings
-                        .effective_vad_min_speech_duration_ms()
-                        .to_string()
-                        .into(),
-                ),
-                (
-                    "vad_min_silence_duration_ms".to_owned(),
-                    request
-                        .transcription_settings
-                        .effective_vad_min_silence_duration_ms()
-                        .to_string()
-                        .into(),
-                ),
-                (
-                    "vad_speech_pad_ms".to_owned(),
-                    request
-                        .transcription_settings
-                        .effective_vad_speech_pad_ms()
-                        .to_string()
-                        .into(),
-                ),
             ]),
         ),
     ])))

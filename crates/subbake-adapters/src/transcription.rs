@@ -18,13 +18,9 @@ pub use subbake_core::{TranscriberBackend, TranscriptionFormat};
 use crate::error::{AdapterError, AdapterResult};
 use crate::fs::{read_document, render_and_write_document};
 use crate::process::ProcessSupervisor;
-use crate::settings::{
-    DEFAULT_VAD_MIN_SILENCE_DURATION_MS, DEFAULT_VAD_MIN_SPEECH_DURATION_MS,
-    DEFAULT_VAD_SPEECH_PAD_MS, DEFAULT_VAD_THRESHOLD, ResolvedSettings, StorageSettings,
-};
+use crate::settings::{ResolvedSettings, StorageSettings};
 use crate::whisper::{
-    DEFAULT_WHISPER_VAD_MODEL, default_whisper_binary_path_for, default_whisper_models_dir_for,
-    vad_model_path, verify_whisper_cli,
+    default_whisper_binary_path_for, default_whisper_models_dir_for, verify_whisper_cli,
 };
 
 mod model_resolution;
@@ -61,12 +57,6 @@ pub struct TranscriptionSettings {
     pub filter_hallucinations: bool,
     pub normalize_text: Option<bool>,
     pub speaker_labels: Option<bool>,
-    pub vad_enabled: Option<bool>,
-    pub vad_model: Option<String>,
-    pub vad_threshold: Option<f32>,
-    pub vad_min_speech_duration_ms: Option<u64>,
-    pub vad_min_silence_duration_ms: Option<u64>,
-    pub vad_speech_pad_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -149,51 +139,17 @@ impl Default for TranscriptionSettings {
             filter_hallucinations: true,
             normalize_text: None,
             speaker_labels: None,
-            vad_enabled: None,
-            vad_model: None,
-            vad_threshold: None,
-            vad_min_speech_duration_ms: None,
-            vad_min_silence_duration_ms: None,
-            vad_speech_pad_ms: None,
         }
     }
 }
 
 impl TranscriptionSettings {
-    pub(crate) fn effective_vad_enabled(&self) -> bool {
-        self.vad_enabled.unwrap_or(true)
-    }
-
     pub(crate) fn effective_normalize_text(&self) -> bool {
         self.normalize_text.unwrap_or(true)
     }
 
     pub(crate) fn effective_speaker_labels(&self) -> bool {
         self.speaker_labels.unwrap_or(true)
-    }
-
-    pub(crate) fn effective_vad_model(&self) -> &str {
-        self.vad_model
-            .as_deref()
-            .unwrap_or(DEFAULT_WHISPER_VAD_MODEL)
-    }
-
-    pub(crate) fn effective_vad_threshold(&self) -> f32 {
-        self.vad_threshold.unwrap_or(DEFAULT_VAD_THRESHOLD)
-    }
-
-    pub(crate) fn effective_vad_min_speech_duration_ms(&self) -> u64 {
-        self.vad_min_speech_duration_ms
-            .unwrap_or(DEFAULT_VAD_MIN_SPEECH_DURATION_MS)
-    }
-
-    pub(crate) fn effective_vad_min_silence_duration_ms(&self) -> u64 {
-        self.vad_min_silence_duration_ms
-            .unwrap_or(DEFAULT_VAD_MIN_SILENCE_DURATION_MS)
-    }
-
-    pub(crate) fn effective_vad_speech_pad_ms(&self) -> u64 {
-        self.vad_speech_pad_ms.unwrap_or(DEFAULT_VAD_SPEECH_PAD_MS)
     }
 }
 
@@ -392,65 +348,6 @@ fn parse_whisper_progress(line: &str) -> Option<u64> {
         .and_then(|(_, value)| value.trim().strip_suffix('%'))
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.min(100))
-}
-
-fn whisper_vad_args(settings: &TranscriptionSettings) -> AdapterResult<Vec<String>> {
-    if !settings.effective_vad_enabled() {
-        return Ok(Vec::new());
-    }
-    let model = settings.effective_vad_model().trim();
-    if model.is_empty() {
-        return Err(AdapterError::invalid_input(
-            "VAD model must not be empty when VAD is enabled",
-        ));
-    }
-    let configured_path = PathBuf::from(model);
-    let model_path = if configured_path.is_file()
-        || configured_path.is_absolute()
-        || configured_path.components().count() > 1
-    {
-        configured_path
-    } else {
-        let models_dir = settings
-            .whisper_models_dir
-            .clone()
-            .unwrap_or_else(|| default_whisper_models_dir_for(None));
-        vad_model_path(&models_dir, model)
-    };
-    if !model_path.is_file() {
-        return Err(AdapterError::invalid_input(format!(
-            "whisper.cpp VAD model `{model}` was not found at `{}`; run `sbake whisper vad-model {model}` or disable VAD explicitly with `--no-vad`",
-            model_path.display()
-        )));
-    }
-
-    let threshold = settings.effective_vad_threshold();
-    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-        return Err(AdapterError::invalid_input(
-            "VAD threshold must be from 0 through 1",
-        ));
-    }
-    let min_speech = settings.effective_vad_min_speech_duration_ms();
-    let min_silence = settings.effective_vad_min_silence_duration_ms();
-    let speech_pad = settings.effective_vad_speech_pad_ms();
-    if min_speech == 0 || min_silence == 0 {
-        return Err(AdapterError::invalid_input(
-            "VAD minimum speech and silence durations must be greater than zero",
-        ));
-    }
-    Ok(vec![
-        "--vad".to_owned(),
-        "--vad-model".to_owned(),
-        model_path.to_string_lossy().into_owned(),
-        "--vad-threshold".to_owned(),
-        threshold.to_string(),
-        "--vad-min-speech-duration-ms".to_owned(),
-        min_speech.to_string(),
-        "--vad-min-silence-duration-ms".to_owned(),
-        min_silence.to_string(),
-        "--vad-speech-pad-ms".to_owned(),
-        speech_pad.to_string(),
-    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -897,12 +794,11 @@ fn transcribe_prepared_audio(
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
 ) -> AdapterResult<SubtitleDocument> {
-    let vad_args = whisper_vad_args(settings)?;
     let Some(duration_ms) = prepared_audio.duration_ms() else {
         return WhisperCppTranscriber::new(
             binary.to_path_buf(),
             model_path.to_path_buf(),
-            vad_args,
+            Vec::new(),
         )
         .with_progress(progress.clone())
         .transcribe_cancellable(
@@ -917,7 +813,7 @@ fn transcribe_prepared_audio(
         return WhisperCppTranscriber::new(
             binary.to_path_buf(),
             model_path.to_path_buf(),
-            vad_args,
+            Vec::new(),
         )
         .with_progress(progress.clone())
         .transcribe_cancellable(
@@ -938,7 +834,6 @@ fn transcribe_prepared_audio(
         cancellation,
         progress,
         &chunks,
-        &vad_args,
     )
 }
 
@@ -955,7 +850,6 @@ fn transcribe_prepared_audio_incremental(
     observer: &mut dyn TranscriptionChunkObserver,
     timeline_offset_ms: i64,
 ) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
-    let vad_args = whisper_vad_args(settings)?;
     let duration_ms = prepared_audio.duration_ms();
     let chunks = duration_ms.map(transcription_chunks).unwrap_or_else(|| {
         vec![TranscriptionChunk {
@@ -988,7 +882,7 @@ fn transcribe_prepared_audio_incremental(
                 let mut document = WhisperCppTranscriber::new(
                     binary.to_path_buf(),
                     model_path.to_path_buf(),
-                    vad_args.clone(),
+                    Vec::new(),
                 )
                 .with_progress(progress.clone())
                 .transcribe_cancellable(
@@ -1039,7 +933,6 @@ fn transcribe_prepared_audio_incremental(
         &chunks,
         duration_ms,
         observer,
-        &vad_args,
         timeline_offset_ms,
     )
 }
@@ -1057,7 +950,6 @@ fn transcribe_long_audio_incremental(
     chunks: &[TranscriptionChunk],
     duration_ms: Option<u64>,
     observer: &mut dyn TranscriptionChunkObserver,
-    vad_args: &[String],
     timeline_offset_ms: i64,
 ) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
     let runtime_dir = settings
@@ -1101,12 +993,10 @@ fn transcribe_long_audio_incremental(
                 extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
                 let progress_start = (index as u64 * 100) / chunks.len() as u64;
                 let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
-                let mut extra_args = vad_args.to_vec();
-                extra_args.extend(["--max-context".to_owned(), "0".to_owned()]);
                 let transcriber = WhisperCppTranscriber::new(
                     binary.to_path_buf(),
                     model_path.to_path_buf(),
-                    extra_args,
+                    vec!["--max-context".to_owned(), "0".to_owned()],
                 )
                 .with_progress(progress.clone())
                 .with_progress_window(progress_start, progress_end);
@@ -1209,7 +1099,6 @@ fn transcribe_long_audio(
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
     chunks: &[TranscriptionChunk],
-    vad_args: &[String],
 ) -> AdapterResult<SubtitleDocument> {
     let runtime_dir = settings
         .runtime_dir
@@ -1237,12 +1126,13 @@ fn transcribe_long_audio(
         extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
         let progress_start = (index as u64 * 100) / chunks.len() as u64;
         let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
-        let mut extra_args = vad_args.to_vec();
-        extra_args.extend(["--max-context".to_owned(), "0".to_owned()]);
-        let transcriber =
-            WhisperCppTranscriber::new(binary.to_path_buf(), model_path.to_path_buf(), extra_args)
-                .with_progress(progress.clone())
-                .with_progress_window(progress_start, progress_end);
+        let transcriber = WhisperCppTranscriber::new(
+            binary.to_path_buf(),
+            model_path.to_path_buf(),
+            vec!["--max-context".to_owned(), "0".to_owned()],
+        )
+        .with_progress(progress.clone())
+        .with_progress_window(progress_start, progress_end);
         let mut document = transcriber.transcribe_cancellable(
             &chunk_path,
             language,
@@ -1914,26 +1804,6 @@ pub fn apply_whisper_configuration(
     }
     if transcription.speaker_labels.is_none() {
         transcription.speaker_labels = Some(settings.transcription.speaker_labels);
-    }
-    if transcription.vad_enabled.is_none() {
-        transcription.vad_enabled = Some(settings.transcription.vad_enabled);
-    }
-    if transcription.vad_model.is_none() {
-        transcription.vad_model = Some(settings.transcription.vad_model.clone());
-    }
-    if transcription.vad_threshold.is_none() {
-        transcription.vad_threshold = Some(settings.transcription.vad_threshold);
-    }
-    if transcription.vad_min_speech_duration_ms.is_none() {
-        transcription.vad_min_speech_duration_ms =
-            Some(settings.transcription.vad_min_speech_duration_ms);
-    }
-    if transcription.vad_min_silence_duration_ms.is_none() {
-        transcription.vad_min_silence_duration_ms =
-            Some(settings.transcription.vad_min_silence_duration_ms);
-    }
-    if transcription.vad_speech_pad_ms.is_none() {
-        transcription.vad_speech_pad_ms = Some(settings.transcription.vad_speech_pad_ms);
     }
 }
 
@@ -2622,15 +2492,13 @@ mod tests {
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp version: fake-1"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context --vad --vad-model" >&2
+  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
   exit 0
 fi
 output=""
 format=""
 threads=""
 print_progress=0
-vad=0
-vad_model=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -os) echo "unexpected legacy -os" >&2; exit 17 ;;
@@ -2639,15 +2507,12 @@ while [ "$#" -gt 0 ]; do
     --output-vtt) format="vtt" ;;
     --threads) shift; threads="$1" ;;
     --print-progress) print_progress=1 ;;
-    --vad) vad=1 ;;
-    --vad-model) shift; vad_model="$1" ;;
+    --vad|--vad-model|--vad-*) echo "unexpected VAD option $1" >&2; exit 20 ;;
   esac
   shift
 done
 if [ -z "$threads" ]; then echo "missing --threads" >&2; exit 18; fi
 if [ "$print_progress" -ne 1 ]; then echo "missing --print-progress" >&2; exit 19; fi
-if [ "$vad" -ne 1 ]; then echo "missing --vad" >&2; exit 20; fi
-if [ ! -f "$vad_model" ]; then echo "missing --vad-model" >&2; exit 21; fi
 i=0
 while [ "$i" -lt 20000 ]; do echo "diagnostic-$i" >&2; i=$((i + 1)); done
 echo "whisper_print_progress_callback: progress =  25%" >&2
@@ -2662,10 +2527,8 @@ fi
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod fake CLI");
         let audio = root.join("audio.wav");
         let model = root.join("ggml-fake.bin");
-        let vad_model = root.join("ggml-silero-v6.2.0.bin");
         fs::write(&audio, b"fake audio").expect("write audio");
         fs::write(&model, b"fake model").expect("write model");
-        fs::write(&vad_model, b"fake VAD model").expect("write VAD model");
 
         let output = root.join("result.srt");
         let recorder = Arc::new(Recorder::default());

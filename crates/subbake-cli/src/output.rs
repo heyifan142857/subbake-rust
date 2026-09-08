@@ -412,13 +412,11 @@ fn batch_json(outcome: &BatchTranslationOutcome) -> serde_json::Value {
 fn whisper_text(outcome: &WhisperOutcome) -> String {
     match outcome {
         WhisperOutcome::Status(status) => format!(
-            "Whisper binary: {} ({})\nModel directory: {} ({})\nDefault VAD model: {} ({})\n{}{}",
+            "Whisper binary: {} ({})\nModel directory: {} ({})\n{}{}",
             status.binary_path.display(),
             exists_label(status.binary_exists),
             status.models_dir.display(),
             exists_label(status.models_dir_exists),
-            status.default_vad_model_path.display(),
-            exists_label(status.default_vad_model_exists),
             status
                 .version
                 .as_ref()
@@ -430,12 +428,8 @@ fn whisper_text(outcome: &WhisperOutcome) -> String {
                 .map(|error| format!("Compatibility: {error}\n"))
                 .unwrap_or_default()
         ),
-        WhisperOutcome::ModelList(list) | WhisperOutcome::VadModelList(list) => {
-            let kind = if matches!(outcome, WhisperOutcome::VadModelList(_)) {
-                "VAD models"
-            } else {
-                "models"
-            };
+        WhisperOutcome::ModelList(list) => {
+            let kind = "models";
             let mut output = format!(
                 "Model directory: {} ({})\nInstalled {kind}: {}\n",
                 list.models_dir.display(),
@@ -549,8 +543,6 @@ fn whisper_json(outcome: &WhisperOutcome) -> serde_json::Value {
             "models_dir_exists": status.models_dir_exists,
             "version": status.version,
             "capability_error": status.capability_error,
-            "default_vad_model_path": status.default_vad_model_path,
-            "default_vad_model_exists": status.default_vad_model_exists,
         }),
         WhisperOutcome::VersionList(list) => serde_json::json!({
             "action": "list_versions",
@@ -563,12 +555,8 @@ fn whisper_json(outcome: &WhisperOutcome) -> serde_json::Value {
             })).collect::<Vec<_>>(),
             "refresh_warning": list.refresh_warning,
         }),
-        WhisperOutcome::ModelList(list) | WhisperOutcome::VadModelList(list) => serde_json::json!({
-            "action": if matches!(outcome, WhisperOutcome::VadModelList(_)) {
-                "list_vad_models"
-            } else {
-                "list_models"
-            },
+        WhisperOutcome::ModelList(list) => serde_json::json!({
+            "action": "list_models",
             "models_dir": list.models_dir,
             "models_dir_exists": list.models_dir_exists,
             "models": list.models.iter().map(|model| serde_json::json!({
@@ -817,8 +805,6 @@ mod tests {
             models_dir_exists: true,
             version: None,
             capability_error: None,
-            default_vad_model_path: "models/ggml-silero-v6.2.0.bin".into(),
-            default_vad_model_exists: false,
         }));
 
         assert!(output.contains("whisper-cli (missing)"));

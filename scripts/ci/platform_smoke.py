@@ -85,7 +85,6 @@ def main() -> None:
             "en",
             "--model",
             "tiny.en",
-            "--no-vad",
             "--runtime-dir",
             runtime,
             "--output",

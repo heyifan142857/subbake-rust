@@ -24,7 +24,7 @@ fn termination_signal_cancels_cli_and_terminates_whisper_process_group() {
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp fake"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context --vad --vad-model" >&2
+  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
   exit 0
 fi
 echo $$ > "{}"
@@ -39,8 +39,6 @@ sleep 30
     let audio = root.join("audio.wav");
     std::fs::write(&audio, b"fake wav").expect("write audio");
     std::fs::write(root.join("ggml-fake.bin"), b"fake model").expect("write model");
-    std::fs::write(root.join("ggml-silero-v6.2.0.bin"), b"fake VAD model")
-        .expect("write VAD model");
 
     // libtest itself ignores SIGINT, so exercise the same cancellation bridge
     // through SIGTERM in this isolated process. Normal CLI launches register
@@ -145,7 +143,7 @@ fn main() {
         return;
     }
     if args.iter().any(|arg| arg == "--help") {
-        eprintln!("--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context --vad --vad-model");
+        eprintln!("--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context");
         return;
     }
     fs::write(env::var_os("SUBBAKE_TEST_READY").expect("ready path"), b"ready")
@@ -167,8 +165,6 @@ fn main() {
     let audio = root.join("audio.wav");
     std::fs::write(&audio, b"fake wav").expect("write audio");
     std::fs::write(root.join("ggml-fake.bin"), b"fake model").expect("write model");
-    std::fs::write(root.join("ggml-silero-v6.2.0.bin"), b"fake VAD model")
-        .expect("write VAD model");
     let driver = root.join("send_ctrl_break.py");
     std::fs::write(
         &driver,

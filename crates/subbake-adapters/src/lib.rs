@@ -100,9 +100,8 @@ pub use translation::{
     translate_subtitle_cancellable_with_progress_and_quality,
 };
 pub use whisper::{
-    DEFAULT_WHISPER_VAD_MODEL, WhisperAction, WhisperBuildVariant, WhisperModel, WhisperModelList,
-    WhisperOutcome, WhisperRequest, WhisperStatus, WhisperVersion, WhisperVersionList,
-    default_whisper_binary_path, default_whisper_binary_path_for, default_whisper_models_dir,
-    default_whisper_models_dir_for, run_whisper, run_whisper_cancellable,
-    run_whisper_cancellable_with_progress,
+    WhisperAction, WhisperBuildVariant, WhisperModel, WhisperModelList, WhisperOutcome,
+    WhisperRequest, WhisperStatus, WhisperVersion, WhisperVersionList, default_whisper_binary_path,
+    default_whisper_binary_path_for, default_whisper_models_dir, default_whisper_models_dir_for,
+    run_whisper, run_whisper_cancellable, run_whisper_cancellable_with_progress,
 };

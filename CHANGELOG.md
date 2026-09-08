@@ -8,6 +8,10 @@ breaking changes when they are called out in advance.
 
 ### Changed
 
+- Remove Silero voice-activity detection and all related configuration, CLI,
+  model-management, agent-tool, status, and Resume fingerprint surfaces.
+  Transcription now always processes the complete audio waveform; configuration
+  files containing the removed fields are intentionally rejected.
 - Redesign the interactive agent transcript with distinct commentary and final
   response markers, structured connected tool activity groups, live in-place
   status transitions, and width-aware wrapping for long paths and CJK text.
