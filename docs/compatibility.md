@@ -17,6 +17,21 @@ distinguishes user data from command-line conveniences.
 - Windows x64 and macOS arm64/Intel remain experimental source-build and CI
   targets; no precompiled assets are published for them in this preview.
 
+## Transcription contract changes after alpha.1
+
+- whisper.cpp must support full JSON (`--output-json-full`) and `--language`;
+  direct SRT/VTT output is no longer the recognition interchange format.
+- `transcription.language` defaults to `Auto`; an explicit CLI/tool Auto wins
+  over a profile language. `transcription.segmentation` defaults to `smart`.
+- `filter_hallucinations` and the matching CLI switches are removed without
+  aliases. Use `filter_silence_markers`; repeated dialogue is never discarded.
+- Stable transcribed cue IDs and boundaries change. Recognition artifacts use
+  a new versioned, content-addressed namespace; streaming pipeline contract
+  version 3 does not reuse older shards. Old files remain untouched.
+- Existing subtitle, memory, translation cache, failure-log, and session readers
+  are retained. Historical session transcription outcomes may omit the new
+  diagnostics report.
+
 ## Persisted data
 
 Persisted data is more expensive for users to replace than a CLI spelling.

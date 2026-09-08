@@ -159,6 +159,9 @@ config_fields! {
     ModelRepairAttempts => (Translation, "Model repair attempts", ConfigFieldKind::Integer, ["translation", "model_repair_attempts"]),
     MaxRequests => (Translation, "Maximum requests", ConfigFieldKind::Integer, ["translation", "max_requests"]),
     MaxTokens => (Translation, "Maximum tokens", ConfigFieldKind::Integer, ["translation", "max_tokens"]),
+    TranscriptionLanguage => (Transcription, "Spoken language", ConfigFieldKind::Text, ["transcription", "language"]),
+    TranscriptionSegmentation => (Transcription, "Segmentation", ConfigFieldKind::Choice(&["smart", "segment"]), ["transcription", "segmentation"]),
+    TranscriptionSilenceMarkers => (Transcription, "Filter silence markers", ConfigFieldKind::Boolean, ["transcription", "filter_silence_markers"]),
     TranscriptionModel => (Transcription, "Whisper model", ConfigFieldKind::Text, ["transcription", "model"]),
     OutputFormat => (Output, "Output format", ConfigFieldKind::Text, ["output", "format"]),
     Bilingual => (Output, "Bilingual output", ConfigFieldKind::Boolean, ["output", "bilingual"]),
@@ -417,6 +420,13 @@ fn effective_value(
         }
         ConfigFieldId::MaxRequests => some_string!(resolved.translation.max_requests),
         ConfigFieldId::MaxTokens => some_string!(resolved.translation.max_tokens),
+        ConfigFieldId::TranscriptionLanguage => resolved.transcription.language.clone(),
+        ConfigFieldId::TranscriptionSegmentation => {
+            resolved.transcription.segmentation.as_str().to_owned()
+        }
+        ConfigFieldId::TranscriptionSilenceMarkers => {
+            resolved.transcription.filter_silence_markers.to_string()
+        }
         ConfigFieldId::TranscriptionModel => some_string!(resolved.transcription.model),
         ConfigFieldId::OutputFormat => some_string!(resolved.output.format),
         ConfigFieldId::Bilingual => resolved.output.bilingual.to_string(),
@@ -528,6 +538,11 @@ fn has_override(id: ConfigFieldId, settings: &SettingsOverrides) -> bool {
         ConfigFieldId::ModelRepairAttempts => settings.translation.model_repair_attempts.is_some(),
         ConfigFieldId::MaxRequests => settings.translation.max_requests.is_some(),
         ConfigFieldId::MaxTokens => settings.translation.max_tokens.is_some(),
+        ConfigFieldId::TranscriptionLanguage => settings.transcription.language.is_some(),
+        ConfigFieldId::TranscriptionSegmentation => settings.transcription.segmentation.is_some(),
+        ConfigFieldId::TranscriptionSilenceMarkers => {
+            settings.transcription.filter_silence_markers.is_some()
+        }
         ConfigFieldId::TranscriptionModel => settings.transcription.model.is_some(),
         ConfigFieldId::OutputFormat => settings.output.format.is_some(),
         ConfigFieldId::Bilingual => settings.output.bilingual.is_some(),

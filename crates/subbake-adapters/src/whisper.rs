@@ -1292,7 +1292,7 @@ fn validate_available_model(name: &str, available_models: &[String]) -> AdapterR
     )))
 }
 
-fn hash_file(path: &Path, cancellation: &CancellationGuard) -> AdapterResult<String> {
+pub(crate) fn hash_file(path: &Path, cancellation: &CancellationGuard) -> AdapterResult<String> {
     use std::io::Read;
 
     let mut file = fs::File::open(path).map_err(|source| {
@@ -1469,8 +1469,8 @@ pub(crate) fn verify_whisper_cli(
         "--model",
         "--file",
         "--output-file",
-        "--output-srt",
-        "--output-vtt",
+        "--output-json-full",
+        "--language",
         "--threads",
         "--print-progress",
         "--no-prints",

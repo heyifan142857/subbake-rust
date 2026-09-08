@@ -24,7 +24,7 @@ fn termination_signal_cancels_cli_and_terminates_whisper_process_group() {
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp fake"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
+  echo "--model --file --output-file --output-json-full --language --threads --print-progress --no-prints --max-context" >&2
   exit 0
 fi
 echo $$ > "{}"
@@ -59,6 +59,8 @@ sleep 30
             whisper.to_str().expect("whisper path"),
             "--whisper-models-dir",
             root.to_str().expect("models path"),
+            "--runtime-dir",
+            root.to_str().expect("runtime path"),
             "--model",
             "fake",
             "--output",
@@ -143,7 +145,7 @@ fn main() {
         return;
     }
     if args.iter().any(|arg| arg == "--help") {
-        eprintln!("--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context");
+        eprintln!("--model --file --output-file --output-json-full --language --threads --print-progress --no-prints --max-context");
         return;
     }
     fs::write(env::var_os("SUBBAKE_TEST_READY").expect("ready path"), b"ready")
@@ -176,6 +178,7 @@ command = [
     sbake, "transcribe", audio,
     "--whisper-bin", whisper,
     "--whisper-models-dir", root,
+    "--runtime-dir", root,
     "--model", "fake",
     "--output", str(pathlib.Path(root) / "cancelled.srt"),
 ]

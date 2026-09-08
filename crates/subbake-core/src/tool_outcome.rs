@@ -75,6 +75,8 @@ fn is_zero(value: &usize) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptionToolOutcome {
+    #[serde(default)]
+    pub report: crate::transcription::TranscriptionReport,
     pub status: ToolExecutionStatus,
     pub input: PathBuf,
     pub output: PathBuf,

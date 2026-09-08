@@ -306,7 +306,16 @@ pub(crate) fn execute_adapter_tool_with_services(
                         message: error.to_string(),
                     }
                 })?;
-                settings.language = (normalized != "Auto").then_some(normalized);
+                settings.language = Some(normalized);
+            }
+            if let Some(segmentation) = optional_argument(args, "segmentation") {
+                settings.segmentation = Some(
+                    subbake_core::transcription::Segmentation::parse(segmentation).ok_or_else(
+                        || AgentError::InvalidInput {
+                            message: "segmentation must be smart or segment".to_owned(),
+                        },
+                    )?,
+                );
             }
             if let Some(model) = optional_argument(args, "model") {
                 settings.model = Some(nonempty_value("model", model)?);
@@ -347,6 +356,7 @@ pub(crate) fn execute_adapter_tool_with_services(
                 Err(error) if error.is_cancelled() => return Err(error.into()),
                 Ok(outcome) => AdapterToolOutcome {
                     outcome: AgentToolOutcome::Transcription(TranscriptionToolOutcome {
+                        report: outcome.report,
                         status: ToolExecutionStatus::Written,
                         input,
                         output: outcome.output_path,

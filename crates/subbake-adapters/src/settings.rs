@@ -29,6 +29,9 @@ pub struct AgentDomainSettings {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionDomainSettings {
+    pub language: String,
+    pub segmentation: subbake_core::transcription::Segmentation,
+    pub filter_silence_markers: bool,
     pub model: Option<String>,
     pub normalize_text: bool,
     pub speaker_labels: bool,
@@ -171,6 +174,9 @@ pub struct TranslationOverrides {
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionOverrides {
+    pub language: Option<String>,
+    pub segmentation: Option<subbake_core::transcription::Segmentation>,
+    pub filter_silence_markers: Option<bool>,
     pub model: Option<String>,
     pub normalize_text: Option<bool>,
     pub speaker_labels: Option<bool>,
@@ -272,6 +278,9 @@ impl SettingsOverrides {
                 max_tokens: settings.translation.max_tokens,
             },
             transcription: TranscriptionOverrides {
+                language: Some(settings.transcription.language.clone()),
+                segmentation: Some(settings.transcription.segmentation),
+                filter_silence_markers: Some(settings.transcription.filter_silence_markers),
                 model: settings.transcription.model.clone(),
                 normalize_text: Some(settings.transcription.normalize_text),
                 speaker_labels: Some(settings.transcription.speaker_labels),
@@ -367,7 +376,16 @@ impl AgentOverrides {
 
 impl TranscriptionOverrides {
     fn merge(&mut self, other: Self) {
-        merge_optional_fields!(self, other, model, normalize_text, speaker_labels);
+        merge_optional_fields!(
+            self,
+            other,
+            model,
+            language,
+            segmentation,
+            filter_silence_markers,
+            normalize_text,
+            speaker_labels
+        );
     }
 }
 
@@ -472,6 +490,9 @@ impl Default for ResolvedSettings {
                 max_tokens: None,
             },
             transcription: TranscriptionDomainSettings {
+                language: "Auto".to_owned(),
+                segmentation: Default::default(),
+                filter_silence_markers: true,
                 model: None,
                 normalize_text: true,
                 speaker_labels: true,
@@ -575,6 +596,15 @@ impl ResolvedSettings {
             max_requests,
             max_tokens,
         } = overrides.translation;
+        if let Some(language) = overrides.transcription.language {
+            self.transcription.language = language;
+        }
+        if let Some(segmentation) = overrides.transcription.segmentation {
+            self.transcription.segmentation = segmentation;
+        }
+        if let Some(filter) = overrides.transcription.filter_silence_markers {
+            self.transcription.filter_silence_markers = filter;
+        }
         if let Some(model) = overrides.transcription.model {
             self.transcription.model = Some(model);
         }
@@ -727,6 +757,7 @@ impl ResolvedSettings {
     }
 
     pub fn validate(&self) -> AdapterResult<()> {
+        subbake_core::transcription::SpokenLanguage::parse(&self.transcription.language)?;
         for (name, value) in [
             ("backend.id", self.backend.id.as_str()),
             ("backend.model", self.backend.model.as_str()),

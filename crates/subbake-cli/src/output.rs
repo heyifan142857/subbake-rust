@@ -104,6 +104,25 @@ pub fn print_pipeline_outcome(
 ) -> io::Result<Option<PathBuf>> {
     match outcome {
         PipelineOutcome::Subtitle(outcome) => print_translation_outcome(outcome, json),
+        PipelineOutcome::Media {
+            translation,
+            transcription,
+        } => {
+            if json {
+                let mut value = translation_outcome_value(translation);
+                value["result"]["transcription_report"] = serde_json::to_value(transcription)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                println!("{value}");
+                Ok(translation.output_path.clone())
+            } else {
+                println!(
+                    "Recognized languages: {}; timing fallbacks: {}",
+                    transcription.languages().join(", "),
+                    transcription.fallback_count()
+                );
+                print_translation_outcome(translation, false)
+            }
+        }
     }
 }
 
@@ -120,9 +139,10 @@ pub fn print_transcription_outcome(outcome: &TranscriptionOutcome, json: bool) {
                 "output_format": outcome.output_format.extension(),
                 "subtitle_entries": outcome.subtitle_entries,
                 "quality": outcome.quality,
+                "transcription_report": outcome.report,
                 "cleanup": {
                     "removed_empty_or_silence": outcome.cleanup.removed_empty_or_silence,
-                    "removed_repeated": outcome.cleanup.removed_repeated,
+                    "suspected_repetitions": outcome.cleanup.suspected_repetitions,
                     "normalized_segments": outcome.cleanup.normalized_segments,
                     "speaker_labels_detected": outcome.cleanup.speaker_labels_detected,
                 }
@@ -134,11 +154,21 @@ pub fn print_transcription_outcome(outcome: &TranscriptionOutcome, json: bool) {
         println!("Model: {} (automatically selected)", outcome.model);
     }
     println!("Output: {}", outcome.output_path.display());
-    let removed = outcome.cleanup.removed_empty_or_silence + outcome.cleanup.removed_repeated;
+    println!(
+        "Spoken language: requested {}; recognized {}",
+        outcome.language,
+        outcome.report.languages().join(", ")
+    );
+    println!(
+        "Timing: {} segment fallback(s); {} suspected repetition(s) retained",
+        outcome.report.fallback_count(),
+        outcome.cleanup.suspected_repetitions
+    );
+    let removed = outcome.cleanup.removed_empty_or_silence;
     if removed > 0 {
         println!(
-            "Cleanup: {removed} segment(s) removed ({} empty/silence, {} repeated)",
-            outcome.cleanup.removed_empty_or_silence, outcome.cleanup.removed_repeated
+            "Cleanup: {removed} silence marker(s) removed; {} empty/silence, {} suspected repetitions retained",
+            outcome.cleanup.removed_empty_or_silence, outcome.cleanup.suspected_repetitions
         );
     }
     if outcome.cleanup.normalized_segments > 0 || outcome.cleanup.speaker_labels_detected > 0 {
@@ -582,6 +612,9 @@ pub fn result_json(result: &PipelineResult) -> String {
 }
 
 fn translation_outcome_json(outcome: &TranslationOutcome) -> String {
+    translation_outcome_value(outcome).to_string()
+}
+fn translation_outcome_value(outcome: &TranslationOutcome) -> serde_json::Value {
     let mut result = translation_result_value(&outcome.result, outcome.quality.as_ref());
     if let Some(ocr) = &outcome.source_ocr
         && let Some(result) = result.as_object_mut()
@@ -602,8 +635,7 @@ fn translation_outcome_json(outcome: &TranslationOutcome) -> String {
             }),
         );
     }
-    serde_json::to_string(&json_envelope("translation_result", result))
-        .unwrap_or_else(|_| "{}".to_owned())
+    json_envelope("translation_result", result)
 }
 
 fn translation_result_value(

@@ -719,6 +719,8 @@ pub fn parse_transcribe_args(args: &[String]) -> CliResult<TranscribeArgs> {
         match args[index].as_str() {
             "-o" | "--output" => parsed.output = Some(required_path(args, &mut index, "--output")?),
             "--overwrite" => parsed.overwrite = true,
+            "--no-cache" => overrides.translation.use_cache = Some(false),
+            "--no-resume" => overrides.translation.resume = Some(false),
             "--json" => parsed.json = true,
             "--qa-fail-on" => {
                 parsed.qa_fail_on = parse_quality_gate(
@@ -1672,6 +1674,65 @@ mod tests {
 
         assert_eq!(configured.settings.model.as_deref(), Some("small-q8_0"));
         assert_eq!(overridden.settings.model.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn transcription_language_and_segmentation_obey_profile_and_call_overrides() {
+        let config = empty_config("language-segmentation");
+        std::fs::write(&config, "version = 3\n[defaults.transcription]\nlanguage = 'en'\nsegmentation = 'segment'\n[profiles.japanese.transcription]\nlanguage = 'ja'\nsegmentation = 'smart'\n").expect("config");
+        let base = vec![
+            "movie.wav".to_owned(),
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+        ];
+        let defaults = parse_transcribe_args(&base).expect("defaults");
+        assert_eq!(defaults.settings.language.as_deref(), Some("en"));
+        assert_eq!(
+            defaults.settings.segmentation,
+            Some(subbake_core::transcription::Segmentation::Segment)
+        );
+        let mut profile = base.clone();
+        profile.extend(["--profile".to_owned(), "japanese".to_owned()]);
+        assert_eq!(
+            parse_transcribe_args(&profile)
+                .expect("profile")
+                .settings
+                .language
+                .as_deref(),
+            Some("ja")
+        );
+        profile.extend([
+            "--language".to_owned(),
+            "Auto".to_owned(),
+            "--segmentation".to_owned(),
+            "segment".to_owned(),
+            "--no-cache".to_owned(),
+            "--no-resume".to_owned(),
+        ]);
+        let call = parse_transcribe_args(&profile).expect("call");
+        assert_eq!(call.settings.language.as_deref(), Some("Auto"));
+        assert_eq!(
+            call.settings.segmentation,
+            Some(subbake_core::transcription::Segmentation::Segment)
+        );
+        assert!(!call.settings.use_cache && !call.settings.resume);
+        let mut pipeline = base;
+        pipeline.extend([
+            "--transcribe-language".to_owned(),
+            "Auto".to_owned(),
+            "--transcribe-segmentation".to_owned(),
+            "smart".to_owned(),
+        ]);
+        let parsed = parse_pipeline_args(&pipeline).expect("pipeline");
+        assert_eq!(
+            parsed.transcription_settings.language.as_deref(),
+            Some("Auto")
+        );
+        assert_eq!(
+            parsed.transcription_settings.segmentation,
+            Some(subbake_core::transcription::Segmentation::Smart)
+        );
+        let _ = std::fs::remove_file(config);
     }
 
     #[test]

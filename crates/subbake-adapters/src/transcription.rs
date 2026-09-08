@@ -2,13 +2,16 @@
 //
 // Orchestration: ffmpeg audio extraction (video-only) → backend transcribe → render.
 
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
 use subbake_core::entities::SubtitleSegment;
 use subbake_core::formats::RenderOptions;
-use subbake_core::languages::normalize_language;
+use subbake_core::transcription::{
+    RecognitionResult, Segmentation, SpokenLanguage, TranscriptionReport,
+};
 use subbake_core::{
     CancellationGuard, NoopProgress, ProgressEvent, ProgressUnit, QualityGate, QualityPolicy,
     QualityReport, SharedProgress, SubtitleDocument, TaskKind, TaskState, inspect_quality,
@@ -24,6 +27,10 @@ use crate::whisper::{
 };
 
 mod model_resolution;
+#[cfg(test)]
+mod regression_tests;
+mod source_store;
+mod whisper_json;
 
 use model_resolution::{ResolvedWhisperModel, locate_whisper_binary, resolve_whisper_model};
 
@@ -54,7 +61,10 @@ pub struct TranscriptionSettings {
     pub whisper_models_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub multiple_model_policy: MultipleModelPolicy,
-    pub filter_hallucinations: bool,
+    pub segmentation: Option<Segmentation>,
+    pub filter_silence_markers: Option<bool>,
+    pub use_cache: bool,
+    pub resume: bool,
     pub normalize_text: Option<bool>,
     pub speaker_labels: Option<bool>,
 }
@@ -68,6 +78,8 @@ pub enum MultipleModelPolicy {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptionOutcome {
+    /// Timed source remains structured even when the requested rendering is TXT.
+    pub document: SubtitleDocument,
     pub output_path: PathBuf,
     pub language: String,
     pub provider: String,
@@ -76,18 +88,19 @@ pub struct TranscriptionOutcome {
     pub output_format: TranscriptionFormat,
     pub subtitle_entries: usize,
     pub cleanup: TranscriptionCleanupStats,
+    pub report: TranscriptionReport,
     pub quality: QualityReport,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptionCleanupStats {
     pub removed_empty_or_silence: usize,
-    pub removed_repeated: usize,
+    pub suspected_repetitions: usize,
     pub normalized_segments: usize,
     pub speaker_labels_detected: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TranscriptionChunkDescriptor {
     pub index: usize,
     pub input_start_ms: u64,
@@ -105,12 +118,6 @@ pub(crate) struct StableTranscriptionChunk {
 }
 
 pub(crate) trait TranscriptionChunkObserver: Send {
-    fn load(
-        &mut self,
-        descriptor: TranscriptionChunkDescriptor,
-        format: TranscriptionFormat,
-    ) -> AdapterResult<Option<Vec<SubtitleSegment>>>;
-
     fn stable(&mut self, chunk: StableTranscriptionChunk) -> AdapterResult<()>;
 }
 
@@ -123,6 +130,7 @@ pub(crate) struct IncrementalTranscriptionOutcome {
     pub model_auto_selected: bool,
     pub output_format: TranscriptionFormat,
     pub cleanup: TranscriptionCleanupStats,
+    pub report: TranscriptionReport,
 }
 
 impl Default for TranscriptionSettings {
@@ -136,7 +144,10 @@ impl Default for TranscriptionSettings {
             whisper_models_dir: None,
             runtime_dir: None,
             multiple_model_policy: MultipleModelPolicy::RequireExplicit,
-            filter_hallucinations: true,
+            segmentation: None,
+            filter_silence_markers: None,
+            use_cache: true,
+            resume: true,
             normalize_text: None,
             speaker_labels: None,
         }
@@ -144,6 +155,13 @@ impl Default for TranscriptionSettings {
 }
 
 impl TranscriptionSettings {
+    pub(crate) fn effective_segmentation(&self) -> Segmentation {
+        self.segmentation.unwrap_or_default()
+    }
+    pub(crate) fn effective_filter_silence_markers(&self) -> bool {
+        self.filter_silence_markers.unwrap_or(true)
+    }
+
     pub(crate) fn effective_normalize_text(&self) -> bool {
         self.normalize_text.unwrap_or(true)
     }
@@ -199,27 +217,12 @@ impl WhisperCppTranscriber {
 impl TranscriberBackend for WhisperCppTranscriber {
     type Error = AdapterError;
 
-    fn transcribe(
-        &self,
-        audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
-    ) -> AdapterResult<SubtitleDocument> {
-        self.transcribe_cancellable(
-            audio_path,
-            language,
-            output_format,
-            &CancellationGuard::never(),
-        )
-    }
-
     fn transcribe_cancellable(
         &self,
         audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
+        language: &SpokenLanguage,
         cancellation: &CancellationGuard,
-    ) -> AdapterResult<SubtitleDocument> {
+    ) -> AdapterResult<RecognitionResult> {
         check_cancelled(cancellation)?;
         let output_dir = audio_path.parent().unwrap_or_else(|| Path::new("."));
         let base_name = audio_path
@@ -240,17 +243,11 @@ impl TranscriberBackend for WhisperCppTranscriber {
             "--threads",
             &threads,
         ]);
-        match output_format {
-            TranscriptionFormat::Srt | TranscriptionFormat::Txt => {
-                cmd.arg("--output-srt");
-            }
-            TranscriptionFormat::Vtt => {
-                cmd.arg("--output-vtt");
-            }
-        }
-        if let Some(lang) = language {
-            cmd.args(["-l", whisper_language_code(lang)]);
-        }
+        cmd.args([
+            "--output-json-full",
+            "--language",
+            language.recognition_code(),
+        ]);
         for arg in &self.extra_args {
             cmd.arg(arg);
         }
@@ -295,42 +292,16 @@ impl TranscriberBackend for WhisperCppTranscriber {
             ));
         }
 
-        let suffix = match output_format {
-            TranscriptionFormat::Vtt => "vtt",
-            _ => "srt",
-        };
-        let generated = output_base.with_extension(suffix);
+        let generated = output_base.with_extension("json");
         if !generated.is_file() {
-            return Err(AdapterError::ChildProcess {
-                program: "whisper.cpp",
-                status: out.status.code(),
-                message: child_diagnostics(&out, "whisper.cpp did not create its output file"),
-            });
+            return Err(AdapterError::invalid_input(child_diagnostics(
+                &out,
+                "whisper.cpp did not create its JSON output",
+            )));
         }
-        let mut doc = read_document(&generated)?;
-        let _ = std::fs::remove_file(&generated);
-
-        if matches!(output_format, TranscriptionFormat::Txt) {
-            doc.segments = doc
-                .segments
-                .iter()
-                .map(|s| SubtitleSegment {
-                    start: None,
-                    end: None,
-                    identifier: None,
-                    settings: None,
-                    semantic: Default::default(),
-                    ..s.clone()
-                })
-                .collect();
-            doc.format = "txt".to_owned();
-        }
-        Ok(doc)
+        let bytes = fs::read(&generated)?;
+        whisper_json::parse(&bytes, language)
     }
-}
-
-fn whisper_language_code(language: &str) -> &str {
-    language.split('-').next().unwrap_or(language)
 }
 
 fn default_whisper_threads() -> usize {
@@ -389,12 +360,10 @@ pub fn transcribe_media_cancellable_with_progress_and_quality(
     quality_gate: QualityGate,
 ) -> AdapterResult<TranscriptionOutcome> {
     check_cancelled(cancellation)?;
-    let language = match request.settings.language.as_deref() {
-        Some(value) => normalize_language(value, true)
-            .map_err(|error| AdapterError::invalid_input(error.to_string()))?,
-        None => "Auto".to_owned(),
-    };
-    request.settings.language = (language != "Auto").then(|| language.clone());
+    let language = SpokenLanguage::parse(request.settings.language.as_deref().unwrap_or("Auto"))?
+        .as_str()
+        .to_owned();
+    request.settings.language = Some(language.clone());
     if request
         .settings
         .model
@@ -454,52 +423,28 @@ pub fn transcribe_media_cancellable_with_progress_and_quality(
             output_format: request.settings.output_format,
             subtitle_entries: document.segments.len(),
             cleanup,
+            report: TranscriptionReport::default(),
             quality,
+            document,
         });
     }
 
-    let prepared_audio = prepare_audio(
-        &request.media_path,
-        &request.settings,
-        cancellation,
-        &progress,
-    )?;
-    progress.emit(ProgressEvent::running(
-        TaskKind::Transcription,
-        "TRANSCRIBE",
-        0,
-        Some(100),
-        ProgressUnit::Percent,
-    ));
     let fmt = request.settings.output_format;
-
-    let ResolvedWhisperModel {
-        name: effective_model,
-        path: model_path,
-        auto_selected: model_auto_selected,
-    } = resolve_whisper_model(&request.settings)?;
-    let binary = locate_whisper_binary(&request.settings)?;
-    verify_whisper_cli(&binary, cancellation)?;
-    let mut doc = transcribe_prepared_audio(
-        &binary,
-        &model_path,
-        &prepared_audio,
-        request.settings.language.as_deref(),
-        fmt,
-        &request.settings,
+    let outcome = transcribe_media_incremental_with_progress(
+        TranscriptionRequest {
+            media_path: request.media_path.clone(),
+            output_path: None,
+            overwrite: true,
+            settings: request.settings.clone(),
+        },
         cancellation,
-        &progress,
+        progress.clone(),
+        &mut DiscardObserver,
     )?;
-    let raw_last_timestamp = last_timed_end_ms(&doc);
-    let cleanup = postprocess_transcription_document(&mut doc, &request.settings);
-    validate_transcription_coverage(
-        &doc,
-        raw_last_timestamp,
-        prepared_audio.duration_ms(),
-        cleanup,
-        0,
-    )?;
-    shift_document_timestamps(&mut doc, prepared_audio.timeline_offset_ms());
+    let doc = outcome.document;
+    let cleanup = outcome.cleanup;
+    let effective_model = outcome.model;
+    let model_auto_selected = outcome.model_auto_selected;
     let quality = inspect_quality(&doc, QualityPolicy::default());
     enforce_quality_gate(&quality, quality_gate)?;
 
@@ -524,7 +469,9 @@ pub fn transcribe_media_cancellable_with_progress_and_quality(
         output_format: fmt,
         subtitle_entries: doc.segments.len(),
         cleanup,
+        report: outcome.report,
         quality,
+        document: doc,
     })
 }
 
@@ -549,12 +496,10 @@ pub(crate) fn transcribe_media_incremental_with_progress(
     observer: &mut dyn TranscriptionChunkObserver,
 ) -> AdapterResult<IncrementalTranscriptionOutcome> {
     check_cancelled(cancellation)?;
-    let language = match request.settings.language.as_deref() {
-        Some(value) => normalize_language(value, true)
-            .map_err(|error| AdapterError::invalid_input(error.to_string()))?,
-        None => "Auto".to_owned(),
-    };
-    request.settings.language = (language != "Auto").then(|| language.clone());
+    let language = SpokenLanguage::parse(request.settings.language.as_deref().unwrap_or("Auto"))?
+        .as_str()
+        .to_owned();
+    request.settings.language = Some(language.clone());
     if request
         .settings
         .model
@@ -589,6 +534,7 @@ pub(crate) fn transcribe_media_incremental_with_progress(
             model_auto_selected: false,
             output_format: request.settings.output_format,
             cleanup: TranscriptionCleanupStats::default(),
+            report: TranscriptionReport::default(),
         });
     }
 
@@ -611,18 +557,26 @@ pub(crate) fn transcribe_media_incremental_with_progress(
         auto_selected: model_auto_selected,
     } = resolve_whisper_model(&request.settings)?;
     let binary = locate_whisper_binary(&request.settings)?;
-    verify_whisper_cli(&binary, cancellation)?;
-    let (document, cleanup) = transcribe_prepared_audio_incremental(
+    let version = verify_whisper_cli(&binary, cancellation)?;
+    let store = source_store::SourceStore::new(
+        &request.media_path,
+        &model_path,
+        &binary,
+        &version,
+        &request.settings,
+        cancellation,
+    )?;
+    let (document, cleanup, report) = transcribe_prepared_audio_incremental(
         &binary,
         &model_path,
         &prepared_audio,
         request.settings.language.as_deref(),
-        request.settings.output_format,
         &request.settings,
         cancellation,
         &progress,
         observer,
         prepared_audio.timeline_offset_ms(),
+        &store,
     )?;
 
     Ok(IncrementalTranscriptionOutcome {
@@ -633,6 +587,7 @@ pub(crate) fn transcribe_media_incremental_with_progress(
         model_auto_selected,
         output_format: request.settings.output_format,
         cleanup,
+        report,
     })
 }
 
@@ -657,34 +612,50 @@ fn postprocess_transcription_document(
             }
         }
     }
-    if !settings.filter_hallucinations {
-        return stats;
-    }
-    let mut previous = String::new();
-    let mut repeated = 0usize;
     document.segments.retain(|segment| {
         let normalized = segment
             .text
             .split_whitespace()
             .collect::<String>()
             .to_ascii_lowercase();
-        if normalized.is_empty() || matches!(normalized.as_str(), "[blank_audio]" | "[silence]") {
+        if settings.effective_filter_silence_markers()
+            && (normalized.is_empty()
+                || matches!(normalized.as_str(), "[blank_audio]" | "[silence]"))
+        {
             stats.removed_empty_or_silence += 1;
             return false;
+        }
+        true
+    });
+    stats.suspected_repetitions = count_suspected_repetitions(
+        document
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str()),
+    );
+    stats
+}
+
+fn count_suspected_repetitions<'a>(texts: impl Iterator<Item = &'a str>) -> usize {
+    let mut previous = String::new();
+    let mut repeated = 0;
+    let mut suspected = 0;
+    for text in texts {
+        let normalized = text.split_whitespace().collect::<String>().to_lowercase();
+        if normalized.is_empty() || matches!(normalized.as_str(), "[blank_audio]" | "[silence]") {
+            continue;
         }
         if normalized == previous {
             repeated += 1;
             if repeated >= 2 {
-                stats.removed_repeated += 1;
-                return false;
+                suspected += 1;
             }
         } else {
             previous = normalized;
             repeated = 0;
         }
-        true
-    });
-    stats
+    }
+    suspected
 }
 
 fn extract_speaker_label(text: &str) -> Option<(String, String)> {
@@ -783,58 +754,19 @@ fn transcription_chunks(duration_ms: u64) -> Vec<TranscriptionChunk> {
     chunks
 }
 
-#[allow(clippy::too_many_arguments)]
-fn transcribe_prepared_audio(
-    binary: &Path,
-    model_path: &Path,
-    prepared_audio: &PreparedAudio,
-    language: Option<&str>,
-    output_format: TranscriptionFormat,
-    settings: &TranscriptionSettings,
-    cancellation: &CancellationGuard,
-    progress: &SharedProgress,
-) -> AdapterResult<SubtitleDocument> {
-    let Some(duration_ms) = prepared_audio.duration_ms() else {
-        return WhisperCppTranscriber::new(
-            binary.to_path_buf(),
-            model_path.to_path_buf(),
-            Vec::new(),
-        )
-        .with_progress(progress.clone())
-        .transcribe_cancellable(
-            prepared_audio.path(),
-            language,
-            output_format,
-            cancellation,
-        );
-    };
-    let chunks = transcription_chunks(duration_ms);
-    if chunks.len() == 1 {
-        return WhisperCppTranscriber::new(
-            binary.to_path_buf(),
-            model_path.to_path_buf(),
-            Vec::new(),
-        )
-        .with_progress(progress.clone())
-        .transcribe_cancellable(
-            prepared_audio.path(),
-            language,
-            output_format,
-            cancellation,
-        );
+struct DiscardObserver;
+impl TranscriptionChunkObserver for DiscardObserver {
+    fn stable(&mut self, _chunk: StableTranscriptionChunk) -> AdapterResult<()> {
+        Ok(())
     }
+}
 
-    transcribe_long_audio(
-        binary,
-        model_path,
-        prepared_audio.path(),
-        language,
-        output_format,
-        settings,
-        cancellation,
-        progress,
-        &chunks,
-    )
+#[derive(Serialize, Deserialize)]
+struct PreparedChunk {
+    segments: Vec<SubtitleSegment>,
+    cleanup: TranscriptionCleanupStats,
+    report: subbake_core::transcription::ChunkTranscriptionReport,
+    raw_last_timestamp: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -843,13 +775,18 @@ fn transcribe_prepared_audio_incremental(
     model_path: &Path,
     prepared_audio: &PreparedAudio,
     language: Option<&str>,
-    output_format: TranscriptionFormat,
     settings: &TranscriptionSettings,
     cancellation: &CancellationGuard,
     progress: &SharedProgress,
     observer: &mut dyn TranscriptionChunkObserver,
     timeline_offset_ms: i64,
-) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
+    store: &source_store::SourceStore,
+) -> AdapterResult<(
+    SubtitleDocument,
+    TranscriptionCleanupStats,
+    TranscriptionReport,
+)> {
+    let language = SpokenLanguage::parse(language.unwrap_or("Auto"))?;
     let duration_ms = prepared_audio.duration_ms();
     let chunks = duration_ms.map(transcription_chunks).unwrap_or_else(|| {
         vec![TranscriptionChunk {
@@ -859,201 +796,210 @@ fn transcribe_prepared_audio_incremental(
             core_end_ms: 0,
         }]
     });
-    let whisper_format = if output_format == TranscriptionFormat::Txt {
-        TranscriptionFormat::Srt
-    } else {
-        output_format
-    };
-
-    if chunks.len() == 1 {
-        let descriptor = chunk_descriptor(0, chunks[0]);
-        let cached = observer.load(descriptor, whisper_format)?;
-        let resumed = cached.is_some();
-        let mut document = match cached {
-            Some(segments) => SubtitleDocument {
-                path: prepared_audio.path().to_path_buf(),
-                format: whisper_format.extension().to_owned(),
-                segments,
-                header: None,
-                passthrough_blocks: Vec::new(),
-                metadata: subbake_core::SubtitleDocumentMetadata::None,
-            },
-            None => {
-                let mut document = WhisperCppTranscriber::new(
-                    binary.to_path_buf(),
-                    model_path.to_path_buf(),
-                    Vec::new(),
-                )
-                .with_progress(progress.clone())
-                .transcribe_cancellable(
-                    prepared_audio.path(),
-                    language,
-                    whisper_format,
-                    cancellation,
-                )?;
-                shift_document_timestamps(&mut document, timeline_offset_ms);
-                document
-            }
-        };
-        let raw_last_timestamp = last_timed_end_ms_on_audio(&document, timeline_offset_ms);
-        let cleanup = if !resumed {
-            postprocess_transcription_document(&mut document, settings)
-        } else {
-            TranscriptionCleanupStats::default()
-        };
-        assign_stable_chunk_ids(&mut document.segments, 0, whisper_format);
-        observer.stable(StableTranscriptionChunk {
-            descriptor,
-            format: whisper_format,
-            segments: document.segments.clone(),
-            resumed,
-        })?;
-        validate_transcription_coverage(
-            &document,
-            raw_last_timestamp,
-            duration_ms,
-            cleanup,
-            timeline_offset_ms,
-        )?;
-        if output_format == TranscriptionFormat::Txt {
-            clear_timing_for_text(&mut document);
-        }
-        return Ok((document, cleanup));
-    }
-
-    transcribe_long_audio_incremental(
-        binary,
-        model_path,
-        prepared_audio.path(),
-        language,
-        output_format,
-        settings,
-        cancellation,
-        progress,
-        &chunks,
-        duration_ms,
-        observer,
-        timeline_offset_ms,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn transcribe_long_audio_incremental(
-    binary: &Path,
-    model_path: &Path,
-    audio_path: &Path,
-    language: Option<&str>,
-    output_format: TranscriptionFormat,
-    settings: &TranscriptionSettings,
-    cancellation: &CancellationGuard,
-    progress: &SharedProgress,
-    chunks: &[TranscriptionChunk],
-    duration_ms: Option<u64>,
-    observer: &mut dyn TranscriptionChunkObserver,
-    timeline_offset_ms: i64,
-) -> AdapterResult<(SubtitleDocument, TranscriptionCleanupStats)> {
-    let runtime_dir = settings
+    let long_audio = chunks.len() > 1;
+    let temporary_root = settings
         .runtime_dir
         .clone()
-        .unwrap_or_else(|| PathBuf::from(".subbake"));
-    let chunk_root = runtime_dir.join("tmp").join("transcription");
-    fs::create_dir_all(&chunk_root).map_err(|source| {
-        AdapterError::external_io(
-            "create transcription chunk root",
-            Some(chunk_root.clone()),
-            source,
-        )
-    })?;
-    let chunk_dir = unique_audio_temp_dir(&chunk_root)?;
-    let whisper_format = if output_format == TranscriptionFormat::Txt {
-        TranscriptionFormat::Srt
-    } else {
-        output_format
+        .unwrap_or_else(|| PathBuf::from(".subbake"))
+        .join("tmp/transcription");
+    fs::create_dir_all(&temporary_root)?;
+    let temporary = unique_audio_temp_dir(&temporary_root)?;
+    let mut output = SubtitleDocument {
+        path: prepared_audio.path().to_path_buf(),
+        format: "srt".to_owned(),
+        segments: Vec::new(),
+        header: None,
+        passthrough_blocks: Vec::new(),
+        metadata: Default::default(),
     };
-    let mut merged: Option<SubtitleDocument> = None;
+    let mut report = TranscriptionReport::default();
     let mut cleanup = TranscriptionCleanupStats::default();
     let mut raw_last_timestamp = None;
-
     for (index, chunk) in chunks.iter().copied().enumerate() {
         check_cancelled(cancellation)?;
         let descriptor = chunk_descriptor(index, chunk);
-        let cached = observer.load(descriptor, whisper_format)?;
+        let raw_path = store.recognition_path(&descriptor, long_audio);
+        let segmented_path = store.segmented_path(&raw_path, settings, timeline_offset_ms);
+        let cached: Option<PreparedChunk> = if store.resume {
+            source_store::read(&segmented_path)?
+        } else {
+            None
+        };
         let resumed = cached.is_some();
-        let mut document = match cached {
-            Some(segments) => SubtitleDocument {
-                path: audio_path.to_path_buf(),
-                format: whisper_format.extension().to_owned(),
-                segments,
-                header: None,
-                passthrough_blocks: Vec::new(),
-                metadata: subbake_core::SubtitleDocumentMetadata::None,
-            },
-            None => {
-                let chunk_path = chunk_dir.path().join(format!("chunk-{index:04}.wav"));
-                extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
-                let progress_start = (index as u64 * 100) / chunks.len() as u64;
-                let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
+        let prepared = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut recognition = if store.use_cache && raw_path.is_file() {
+                whisper_json::parse(&fs::read(&raw_path)?, &language)?
+            } else {
+                let audio_path = temporary.path().join(format!("chunk-{index:04}.wav"));
+                if long_audio {
+                    extract_audio_chunk(prepared_audio.path(), &audio_path, chunk, cancellation)?;
+                } else {
+                    fs::copy(prepared_audio.path(), &audio_path)?;
+                }
                 let transcriber = WhisperCppTranscriber::new(
                     binary.to_path_buf(),
                     model_path.to_path_buf(),
-                    vec!["--max-context".to_owned(), "0".to_owned()],
+                    if long_audio {
+                        vec!["--max-context".to_owned(), "0".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
                 )
                 .with_progress(progress.clone())
-                .with_progress_window(progress_start, progress_end);
-                let mut document = transcriber.transcribe_cancellable(
-                    &chunk_path,
-                    language,
-                    whisper_format,
-                    cancellation,
-                )?;
-                let _ = fs::remove_file(&chunk_path);
-                select_and_shift_chunk_segments(
-                    &mut document.segments,
-                    chunk,
-                    index + 1 == chunks.len(),
-                    whisper_format,
+                .with_progress_window(
+                    index as u64 * 100 / chunks.len() as u64,
+                    (index as u64 + 1) * 100 / chunks.len() as u64,
                 );
-                shift_document_timestamps(&mut document, timeline_offset_ms);
-                document
+                let recognition =
+                    transcriber.transcribe_cancellable(&audio_path, &language, cancellation)?;
+                if store.use_cache {
+                    source_store::write_bytes(
+                        &raw_path,
+                        &fs::read(audio_path.with_extension("json"))?,
+                        cancellation,
+                    )?;
+                    source_store::write(
+                        &raw_path.with_file_name("recognition.json"),
+                        &recognition,
+                        cancellation,
+                    )?;
+                }
+                recognition
+            };
+            let raw_end = recognition
+                .segments
+                .iter()
+                .map(|segment| segment.timing.end_ms.saturating_add(chunk.input_start_ms))
+                .max();
+            // Ownership is decided on original segments before any mode-independent resegmentation.
+            let original_indices = recognition
+                .segments
+                .iter()
+                .enumerate()
+                .filter_map(|(original_index, segment)| {
+                    (!long_audio
+                        || owns_original_segment(segment.timing, chunk, index + 1 == chunks.len()))
+                    .then_some(original_index)
+                })
+                .collect::<Vec<_>>();
+            recognition.segments = original_indices
+                .iter()
+                .map(|&i| recognition.segments[i].clone())
+                .collect();
+            let mut rebuilt = subbake_core::transcription::segment_recognition(
+                &recognition,
+                settings.effective_segmentation(),
+            )?;
+            for cue in &mut rebuilt.cues {
+                cue.source.segment_index = original_indices[cue.source.segment_index];
             }
+            for diagnostic in &mut rebuilt.diagnostics {
+                diagnostic.segment_index = original_indices[diagnostic.segment_index];
+            }
+            let sources = rebuilt.cues.iter().map(|cue| cue.source.clone()).collect();
+            let segments = rebuilt
+                .cues
+                .into_iter()
+                .enumerate()
+                .map(|(local, cue)| {
+                    let id = format!("c{index:04}-{local:06}");
+                    SubtitleSegment {
+                        id: id.clone(),
+                        identifier: Some(id),
+                        text: cue.text,
+                        start: Some(format_timestamp_ms(
+                            cue.timing.start_ms + chunk.input_start_ms,
+                            ',',
+                        )),
+                        end: Some(format_timestamp_ms(
+                            cue.timing.end_ms + chunk.input_start_ms,
+                            ',',
+                        )),
+                        settings: None,
+                        semantic: subbake_core::SubtitleSemanticContext {
+                            speaker: cue.speaker,
+                            ..Default::default()
+                        },
+                    }
+                })
+                .collect();
+            let mut document = SubtitleDocument {
+                segments,
+                ..output.clone()
+            };
+            let mut chunk_cleanup = postprocess_transcription_document(&mut document, settings);
+            // Splitting a repeated original phrase must not hide its diagnostic.
+            chunk_cleanup.suspected_repetitions =
+                chunk_cleanup
+                    .suspected_repetitions
+                    .max(count_suspected_repetitions(
+                        recognition
+                            .segments
+                            .iter()
+                            .map(|segment| segment.text.as_str()),
+                    ));
+            shift_document_timestamps(&mut document, timeline_offset_ms);
+            let prepared = PreparedChunk {
+                raw_last_timestamp: raw_end,
+                report: subbake_core::transcription::ChunkTranscriptionReport {
+                    index,
+                    language: recognition.language,
+                    input_start_ms: chunk.input_start_ms,
+                    input_end_ms: chunk.input_end_ms,
+                    diagnostics: rebuilt.diagnostics,
+                    sources,
+                    recognized_cues: document.segments.len(),
+                    suspected_repetitions: chunk_cleanup.suspected_repetitions,
+                    boundary_overlap_ms: 0,
+                    raw_json_path: store.use_cache.then_some(raw_path.clone()),
+                },
+                segments: document.segments,
+                cleanup: chunk_cleanup,
+            };
+            if store.resume {
+                source_store::write(&segmented_path, &prepared, cancellation)?;
+            }
+            prepared
         };
-        raw_last_timestamp =
-            last_timed_end_ms_on_audio(&document, timeline_offset_ms).or(raw_last_timestamp);
-        if !resumed {
-            let chunk_cleanup = postprocess_transcription_document(&mut document, settings);
-            cleanup.removed_empty_or_silence += chunk_cleanup.removed_empty_or_silence;
-            cleanup.removed_repeated += chunk_cleanup.removed_repeated;
-            cleanup.normalized_segments += chunk_cleanup.normalized_segments;
-            cleanup.speaker_labels_detected += chunk_cleanup.speaker_labels_detected;
-        }
-        assign_stable_chunk_ids(&mut document.segments, index, whisper_format);
+        raw_last_timestamp = prepared.raw_last_timestamp.or(raw_last_timestamp);
+        cleanup.removed_empty_or_silence += prepared.cleanup.removed_empty_or_silence;
+        cleanup.suspected_repetitions += prepared.cleanup.suspected_repetitions;
+        cleanup.normalized_segments += prepared.cleanup.normalized_segments;
+        cleanup.speaker_labels_detected += prepared.cleanup.speaker_labels_detected;
+        let mut chunk_report = prepared.report;
+        chunk_report.boundary_overlap_ms = output
+            .segments
+            .last()
+            .and_then(|cue| cue.end.as_deref().and_then(parse_timestamp_ms))
+            .zip(
+                prepared
+                    .segments
+                    .first()
+                    .and_then(|cue| cue.start.as_deref().and_then(parse_timestamp_ms)),
+            )
+            .map_or(0, |(previous_end, current_start)| {
+                previous_end.saturating_sub(current_start)
+            });
+        report.chunks.push(chunk_report);
+        check_cancelled(cancellation)?;
         observer.stable(StableTranscriptionChunk {
             descriptor,
-            format: whisper_format,
-            segments: document.segments.clone(),
+            format: TranscriptionFormat::Srt,
+            segments: prepared.segments.clone(),
             resumed,
         })?;
-        if let Some(output) = &mut merged {
-            output.segments.extend(document.segments);
-        } else {
-            merged = Some(document);
-        }
+        output.segments.extend(prepared.segments);
     }
-
-    let mut document = merged.ok_or_else(|| {
-        AdapterError::invalid_input("long-audio transcription produced no chunks")
-    })?;
     validate_transcription_coverage(
-        &document,
+        &output,
         raw_last_timestamp,
         duration_ms,
         cleanup,
         timeline_offset_ms,
     )?;
-    if output_format == TranscriptionFormat::Txt {
-        clear_timing_for_text(&mut document);
-    }
-    Ok((document, cleanup))
+    Ok((output, cleanup, report))
 }
 
 fn chunk_descriptor(index: usize, chunk: TranscriptionChunk) -> TranscriptionChunkDescriptor {
@@ -1064,107 +1010,6 @@ fn chunk_descriptor(index: usize, chunk: TranscriptionChunk) -> TranscriptionChu
         core_start_ms: chunk.core_start_ms,
         core_end_ms: chunk.core_end_ms,
     }
-}
-
-fn assign_stable_chunk_ids(
-    segments: &mut [SubtitleSegment],
-    chunk_index: usize,
-    format: TranscriptionFormat,
-) {
-    for (local_index, segment) in segments.iter_mut().enumerate() {
-        let id = format!("c{chunk_index:04}-{local_index:06}");
-        segment.id.clone_from(&id);
-        segment.identifier = (format == TranscriptionFormat::Srt).then_some(id);
-    }
-}
-
-fn clear_timing_for_text(document: &mut SubtitleDocument) {
-    for segment in &mut document.segments {
-        segment.start = None;
-        segment.end = None;
-        segment.identifier = None;
-        segment.settings = None;
-    }
-    document.format = "txt".to_owned();
-}
-
-#[allow(clippy::too_many_arguments)]
-fn transcribe_long_audio(
-    binary: &Path,
-    model_path: &Path,
-    audio_path: &Path,
-    language: Option<&str>,
-    output_format: TranscriptionFormat,
-    settings: &TranscriptionSettings,
-    cancellation: &CancellationGuard,
-    progress: &SharedProgress,
-    chunks: &[TranscriptionChunk],
-) -> AdapterResult<SubtitleDocument> {
-    let runtime_dir = settings
-        .runtime_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".subbake"));
-    let chunk_root = runtime_dir.join("tmp").join("transcription");
-    fs::create_dir_all(&chunk_root).map_err(|source| {
-        AdapterError::external_io(
-            "create transcription chunk root",
-            Some(chunk_root.clone()),
-            source,
-        )
-    })?;
-    let chunk_dir = unique_audio_temp_dir(&chunk_root)?;
-    let whisper_format = if output_format == TranscriptionFormat::Txt {
-        TranscriptionFormat::Srt
-    } else {
-        output_format
-    };
-    let mut merged: Option<SubtitleDocument> = None;
-
-    for (index, chunk) in chunks.iter().copied().enumerate() {
-        check_cancelled(cancellation)?;
-        let chunk_path = chunk_dir.path().join(format!("chunk-{index:04}.wav"));
-        extract_audio_chunk(audio_path, &chunk_path, chunk, cancellation)?;
-        let progress_start = (index as u64 * 100) / chunks.len() as u64;
-        let progress_end = ((index as u64 + 1) * 100) / chunks.len() as u64;
-        let transcriber = WhisperCppTranscriber::new(
-            binary.to_path_buf(),
-            model_path.to_path_buf(),
-            vec!["--max-context".to_owned(), "0".to_owned()],
-        )
-        .with_progress(progress.clone())
-        .with_progress_window(progress_start, progress_end);
-        let mut document = transcriber.transcribe_cancellable(
-            &chunk_path,
-            language,
-            whisper_format,
-            cancellation,
-        )?;
-        let _ = fs::remove_file(&chunk_path);
-        select_and_shift_chunk_segments(
-            &mut document.segments,
-            chunk,
-            index + 1 == chunks.len(),
-            whisper_format,
-        );
-        if let Some(output) = &mut merged {
-            output.segments.extend(document.segments);
-        } else {
-            merged = Some(document);
-        }
-    }
-
-    let mut document = merged.ok_or_else(|| {
-        AdapterError::invalid_input("long-audio transcription produced no chunks")
-    })?;
-    for (index, segment) in document.segments.iter_mut().enumerate() {
-        let id = (index + 1).to_string();
-        segment.id.clone_from(&id);
-        segment.identifier = (whisper_format == TranscriptionFormat::Srt).then_some(id);
-    }
-    if output_format == TranscriptionFormat::Txt {
-        document.format = "txt".to_owned();
-    }
-    Ok(document)
 }
 
 fn extract_audio_chunk(
@@ -1213,37 +1058,17 @@ fn format_seconds(milliseconds: u64) -> String {
     format!("{}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
 }
 
-fn select_and_shift_chunk_segments(
-    segments: &mut Vec<SubtitleSegment>,
+fn owns_original_segment(
+    timing: subbake_core::transcription::TimeSpan,
     chunk: TranscriptionChunk,
     is_last: bool,
-    format: TranscriptionFormat,
-) {
-    let separator = if format == TranscriptionFormat::Vtt {
-        '.'
-    } else {
-        ','
-    };
-    let mut selected = Vec::new();
-    for mut segment in segments.drain(..) {
-        let Some(start) = segment.start.as_deref().and_then(parse_timestamp_ms) else {
-            continue;
-        };
-        let Some(end) = segment.end.as_deref().and_then(parse_timestamp_ms) else {
-            continue;
-        };
-        let global_start = start.saturating_add(chunk.input_start_ms);
-        let global_end = end.saturating_add(chunk.input_start_ms);
-        let midpoint = global_start.saturating_add(global_end.saturating_sub(global_start) / 2);
-        let in_core = midpoint >= chunk.core_start_ms
-            && (midpoint < chunk.core_end_ms || (is_last && midpoint <= chunk.core_end_ms));
-        if in_core {
-            segment.start = Some(format_timestamp_ms(global_start, separator));
-            segment.end = Some(format_timestamp_ms(global_end, separator));
-            selected.push(segment);
-        }
-    }
-    *segments = selected;
+) -> bool {
+    let midpoint = chunk
+        .input_start_ms
+        .saturating_add(timing.start_ms)
+        .saturating_add(timing.end_ms.saturating_sub(timing.start_ms) / 2);
+    midpoint >= chunk.core_start_ms
+        && (midpoint < chunk.core_end_ms || (is_last && midpoint == chunk.core_end_ms))
 }
 
 fn parse_timestamp_ms(value: &str) -> Option<u64> {
@@ -1345,12 +1170,12 @@ fn validate_transcription_coverage(
         return Ok(());
     }
     Err(AdapterError::invalid_input(format!(
-        "transcription is incomplete: the media is {}, but the last retained cue ends at {} ({} missing at the end); raw output reached {} and cleanup removed {} repeated cues. No output was written. This usually indicates a Whisper hallucination loop",
+        "transcription is incomplete: the media is {}, but the last retained cue ends at {} ({} missing at the end); raw output reached {} and {} suspected repeated cues were retained. No output was written. This usually indicates a Whisper hallucination loop",
         display_duration(duration_ms),
         display_duration(last_timestamp),
         display_duration(trailing_gap),
         raw_last_timestamp.map_or_else(|| "no timed cue".to_owned(), display_duration),
-        cleanup.removed_repeated,
+        cleanup.suspected_repetitions,
     )))
 }
 
@@ -1771,24 +1596,24 @@ fn wav_duration_ms(path: &Path) -> Option<u64> {
 }
 
 pub fn apply_whisper_storage(transcription: &mut TranscriptionSettings, storage: &StorageSettings) {
-    transcription.runtime_dir = Some(
+    transcription.runtime_dir.get_or_insert_with(|| {
         storage
             .runtime_dir
             .clone()
-            .unwrap_or_else(|| PathBuf::from(".subbake")),
-    );
-    transcription.whisper_binary_path = Some(
+            .unwrap_or_else(|| PathBuf::from(".subbake"))
+    });
+    transcription.whisper_binary_path.get_or_insert_with(|| {
         storage
             .whisper_binary_path
             .clone()
-            .unwrap_or_else(|| default_whisper_binary_path_for(storage.runtime_dir.as_deref())),
-    );
-    transcription.whisper_models_dir = Some(
+            .unwrap_or_else(|| default_whisper_binary_path_for(storage.runtime_dir.as_deref()))
+    });
+    transcription.whisper_models_dir.get_or_insert_with(|| {
         storage
             .whisper_models_dir
             .clone()
-            .unwrap_or_else(|| default_whisper_models_dir_for(storage.runtime_dir.as_deref())),
-    );
+            .unwrap_or_else(|| default_whisper_models_dir_for(storage.runtime_dir.as_deref()))
+    });
 }
 
 pub fn apply_whisper_configuration(
@@ -1796,6 +1621,17 @@ pub fn apply_whisper_configuration(
     settings: &ResolvedSettings,
 ) {
     apply_whisper_storage(transcription, &settings.storage);
+    if transcription.language.is_none() {
+        transcription.language = Some(settings.transcription.language.clone());
+    }
+    if transcription.segmentation.is_none() {
+        transcription.segmentation = Some(settings.transcription.segmentation);
+    }
+    if transcription.filter_silence_markers.is_none() {
+        transcription.filter_silence_markers = Some(settings.transcription.filter_silence_markers);
+    }
+    transcription.use_cache = settings.translation.use_cache;
+    transcription.resume = settings.translation.resume;
     if transcription.model.is_none() {
         transcription.model = settings.transcription.model.clone();
     }
@@ -1891,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn conservative_cleanup_removes_silence_markers_and_third_repetition() {
+    fn cleanup_removes_silence_markers_but_retains_repeated_dialogue() {
         let mut document = SubtitleDocument {
             path: PathBuf::from("whisper.srt"),
             format: "srt".to_owned(),
@@ -1915,8 +1751,8 @@ mod tests {
         let stats =
             postprocess_transcription_document(&mut document, &TranscriptionSettings::default());
         assert_eq!(stats.removed_empty_or_silence, 1);
-        assert_eq!(stats.removed_repeated, 1);
-        assert_eq!(document.segments.len(), 2);
+        assert_eq!(stats.suspected_repetitions, 1);
+        assert_eq!(document.segments.len(), 3);
     }
 
     #[test]
@@ -1978,45 +1814,33 @@ mod tests {
 
     #[test]
     fn overlap_merge_keeps_cross_boundary_dialogue_once() {
-        let mut left = vec![timed_segment(
-            "left",
-            "crossing dialogue",
-            "00:09:58,000",
-            "00:10:03,000",
-        )];
-        select_and_shift_chunk_segments(
-            &mut left,
-            TranscriptionChunk {
-                input_start_ms: 0,
-                input_end_ms: 630_000,
-                core_start_ms: 0,
-                core_end_ms: 600_000,
+        use subbake_core::transcription::TimeSpan;
+        let chunks = transcription_chunks(1_500_000);
+        assert!(!owns_original_segment(
+            TimeSpan {
+                start_ms: 598_000,
+                end_ms: 603_000
             },
-            false,
-            TranscriptionFormat::Srt,
-        );
-        assert!(left.is_empty());
-
-        let mut right = vec![timed_segment(
-            "right",
-            "crossing dialogue",
-            "00:00:28,000",
-            "00:00:33,000",
-        )];
-        select_and_shift_chunk_segments(
-            &mut right,
-            TranscriptionChunk {
-                input_start_ms: 570_000,
-                input_end_ms: 1_230_000,
-                core_start_ms: 600_000,
-                core_end_ms: 1_200_000,
+            chunks[0],
+            false
+        ));
+        assert!(owns_original_segment(
+            TimeSpan {
+                start_ms: 28_000,
+                end_ms: 33_000
             },
-            false,
-            TranscriptionFormat::Srt,
-        );
-        assert_eq!(right.len(), 1);
-        assert_eq!(right[0].start.as_deref(), Some("00:09:58,000"));
-        assert_eq!(right[0].end.as_deref(), Some("00:10:03,000"));
+            chunks[1],
+            false
+        ));
+        // Ownership must precede splitting: the first child's midpoint is on the other side.
+        assert!(!owns_original_segment(
+            TimeSpan {
+                start_ms: 28_000,
+                end_ms: 29_000
+            },
+            chunks[1],
+            false
+        ));
     }
 
     #[test]
@@ -2040,7 +1864,7 @@ mod tests {
             Some(8_582_000),
             TranscriptionCleanupStats {
                 removed_empty_or_silence: 0,
-                removed_repeated: 250,
+                suspected_repetitions: 250,
                 ..TranscriptionCleanupStats::default()
             },
             0,
@@ -2048,7 +1872,7 @@ mod tests {
         .expect_err("truncated long transcription must fail");
         let message = error.to_string();
         assert!(message.contains("transcription is incomplete"));
-        assert!(message.contains("cleanup removed 250 repeated cues"));
+        assert!(message.contains("250 suspected repeated cues were retained"));
     }
 
     #[test]
@@ -2492,19 +2316,20 @@ mod tests {
         let script = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "whisper.cpp version: fake-1"; exit 0; fi
 if [ "$1" = "--help" ]; then
-  echo "--model --file --output-file --output-srt --output-vtt --threads --print-progress --no-prints --max-context" >&2
+  echo "--model --file --output-file --output-json-full --language --threads --print-progress --no-prints --max-context" >&2
   exit 0
 fi
 output=""
 format=""
+language=""
 threads=""
 print_progress=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -os) echo "unexpected legacy -os" >&2; exit 17 ;;
     --output-file) shift; output="$1" ;;
-    --output-srt) format="srt" ;;
-    --output-vtt) format="vtt" ;;
+    --output-json-full) format="json" ;;
+    --language) shift; language="$1" ;;
     --threads) shift; threads="$1" ;;
     --print-progress) print_progress=1 ;;
     --vad|--vad-model|--vad-*) echo "unexpected VAD option $1" >&2; exit 20 ;;
@@ -2517,11 +2342,9 @@ i=0
 while [ "$i" -lt 20000 ]; do echo "diagnostic-$i" >&2; i=$((i + 1)); done
 echo "whisper_print_progress_callback: progress =  25%" >&2
 echo "whisper_print_progress_callback: progress = 100%" >&2
-if [ "$format" = "srt" ]; then
-  printf '1\n00:00:00,000 --> 00:00:01,000\nhello\n' > "${output}.srt"
-else
-  printf 'WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n' > "${output}.vtt"
-fi
+if [ "$format" != "json" ]; then exit 21; fi
+if [ "$language" != "en" ]; then exit 22; fi
+printf '%s' '{"model":{"multilingual":true},"result":{"language":"en"},"transcription":[{"text":"hello","offsets":{"from":0,"to":1000},"tokens":[{"id":123,"text":"hello","offsets":{"from":0,"to":1000},"p":0.001}]}]}' > "${output}.json"
 "#;
         fs::write(&binary, script).expect("write fake CLI");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod fake CLI");

@@ -20,6 +20,7 @@ mod review;
 pub mod storage;
 pub mod term_matcher;
 pub mod tool_outcome;
+pub mod transcription;
 pub mod transcription_evaluation;
 pub mod validation;
 

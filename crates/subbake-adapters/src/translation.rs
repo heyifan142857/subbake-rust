@@ -88,6 +88,8 @@ pub struct ContainerTranslationChange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranslationInputIdentity {
+    /// Already validated source, preserving stable IDs and semantic metadata across format boundaries.
+    pub document: Option<subbake_core::SubtitleDocument>,
     pub path: PathBuf,
     pub signature: InputSignature,
     pub output_path: PathBuf,
@@ -320,7 +322,13 @@ pub(crate) fn translate_subtitle_cancellable_with_progress_and_identity(
         .as_ref()
         .map(|identity| identity.signature.clone())
         .unwrap_or_else(|| input_signature_from_bytes(&input_bytes, mtime_ns));
-    let document = read_document(&request.input_path)?;
+    let document = match identity
+        .as_ref()
+        .and_then(|identity| identity.document.clone())
+    {
+        Some(document) => document,
+        None => read_document(&request.input_path)?,
+    };
     let output_path = match request.output_path.clone() {
         Some(path) => path,
         None => default_output_path_with_language(
@@ -1174,6 +1182,7 @@ mod tests {
         settings.output.bilingual = true;
         settings.storage.runtime_dir = Some(root.join("runtime"));
         let identity = TranslationInputIdentity {
+            document: None,
             path: input_path.clone(),
             signature: input_signature_from_bytes(input, None),
             output_path: output_path.clone(),

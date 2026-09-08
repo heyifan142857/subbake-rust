@@ -8,6 +8,12 @@ breaking changes when they are called out in advance.
 
 ### Changed
 
+- Use whisper.cpp full JSON as the recognition contract and share stable source
+  cues across Economy, Turbo, and Cinema. Raw recognition and segmented-source
+  caches are mode-independent; older media pipeline shards are not reused.
+- Replace `transcription.filter_hallucinations` and its CLI switches with
+  `filter_silence_markers`; repeated dialogue is now retained and diagnosed.
+
 - Remove Silero voice-activity detection and all related configuration, CLI,
   model-management, agent-tool, status, and Resume fingerprint surfaces.
   Transcription now always processes the complete audio waveform; configuration
@@ -20,6 +26,10 @@ breaking changes when they are called out in advance.
   version 3 intentionally rejects the former names instead of aliasing them.
 
 ### Added
+
+- Add profile-configurable spoken language (default Auto), per-chunk actual
+  language reports, and deterministic `smart`/`segment` source segmentation using
+  token timestamps with lossless whole-segment fallback on uncertain alignment.
 
 - Add constrained bitmap-subtitle OCR correction before terminology and
   translation, with deterministic Economy behavior, targeted model correction

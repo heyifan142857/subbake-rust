@@ -565,6 +565,7 @@ Transcribe media without translation:
 ```bash
 sbake transcribe interview.mp4 \
   --language English \
+  --segmentation smart \
   --model base \
   --format srt \
   --output interview.srt
@@ -573,9 +574,42 @@ sbake transcribe interview.mp4 \
 Transcription also preserves an existing output unless `--overwrite` is
 passed explicitly.
 
-Set the spoken language explicitly when it is known. `Auto` remains available,
-but an explicit language avoids language-detection errors on short or noisy
-dialogue.
+The spoken-language default is `Auto`. Set `--language en` when it is known
+to avoid automatic language detection on short or noisy dialogue. This controls
+recognition, not the translation target. An explicit `--language Auto` overrides
+a profile's fixed language. Auto detection runs independently for each audio
+chunk; JSON results report the actual language of every chunk.
+
+Profiles and defaults can configure the same policy:
+
+```toml
+[defaults.transcription]
+language = "Auto"
+segmentation = "smart"
+filter_silence_markers = true
+
+[profiles.english.transcription]
+language = "en"
+```
+
+SubBake reads whisper.cpp's full JSON, retaining segment text and available token
+timestamps/probabilities. `smart` deterministically splits within original segments
+at safe word boundaries using pauses, sentence endings, duration, and Unicode
+text length. It never asks a translation model to invent source timestamps.
+Token timestamps are estimates, not forced alignment: if text or timing cannot
+be aligned safely, the entire original segment is retained and the fallback
+reason is reported. `--segmentation segment` keeps original segment boundaries.
+Neither strategy can recover speech already missing from Whisper's recognition.
+
+Recognition JSON and derived stable cues are cached separately beneath the
+runtime root's `cache/transcription/`. Changing segmentation reuses raw JSON;
+changing media/model/binary contents, language, or chunk parameters invalidates
+recognition reuse. Source cache keys do not depend on translation mode or output
+format. Use `--no-cache --no-resume` to force fresh recognition without saving
+source artifacts; either flag alone disables only its respective layer.
+`--json` includes per-chunk languages, fallback diagnostics, source text ranges,
+boundary overlaps, and paths to retained raw JSON. In the `sources` array, entry N corresponds to
+stable cue ID `c{chunk:04}-{N:06}` before optional marker cleanup.
 
 Use an existing timed sidecar instead of running whisper.cpp:
 
@@ -586,8 +620,10 @@ sbake transcribe interview.mp4 \
   --output interview.srt
 ```
 
-Long media is processed in overlapping chunks. SubBake merges boundary text,
-checks coverage, and does not publish an obviously incomplete final subtitle.
+Long media is processed in overlapping chunks. SubBake assigns original segments
+to chunk cores by their midpoint before resegmentation, checks coverage, and does
+not publish an obviously incomplete final subtitle. Independent recognition of
+overlapping audio can still disagree; chunk ownership is not forced alignment.
 Every chunk is transcribed from its complete audio waveform. For container
 media, the selected audio stream's `start_time` is added back after FFmpeg
 normalization so a delayed audio track does not produce a globally early
@@ -607,8 +643,22 @@ sbake pipeline lecture.mp4 \
 
 `pipeline` accepts translation options plus transcription-specific flags such
 as `--transcribe-format`, `--sidecar`, `--whisper-bin`, and
-`--whisper-models-dir`. Transcription chunks and translation groups have
-separate resume state.
+`--whisper-models-dir`. Use `--transcribe-segmentation smart|segment` to select
+source segmentation. Existing subtitle/sidecar input retains its cue boundaries.
+
+All three translation modes consume the same stable source cues (IDs, text,
+order, and timing). Economy buffers them into larger translation groups; Turbo
+starts translation as each stable chunk arrives; Cinema finishes the source
+before scene-aware planning and review. Translation batches may regroup cues
+for context but cannot change their source identities or timing. Explicit
+preflight/dry-run settings can also require the sequential path.
+
+Recognition and translation groups have separate resume state. Mode changes may
+reuse recognition but never reuse incompatible translation state; translation
+group fingerprints include exact source cues and confirmed-translation context.
+Completed groups re-enter the core Resume/final-validation path rather than
+trusting a previously rendered subtitle. Structured source documents preserve
+stable IDs and speaker metadata across translation-format boundaries.
 
 ## Subtitle quality commands
 
@@ -638,6 +688,10 @@ punctuation by default. It also recognizes Whisper-style prefixes such as
 speaker metadata for translation context. Use `--no-normalize-transcript` or
 `--no-speaker-labels` to disable either behavior; profile configuration accepts
 `transcription.normalize_text` and `transcription.speaker_labels` as well.
+Only explicit empty/silence markers are filtered by default; disable this with
+`--no-filter-silence-markers`. Repeated dialogue and low-probability words are
+retained. Suspected repetitions are diagnostic, not grounds for deletion.
+The old `filter_hallucinations` setting and CLI switches are rejected.
 
 Current CLI checks include empty text, invalid/overlapping timing, reading
 speed, line length/count, and repeated segments.

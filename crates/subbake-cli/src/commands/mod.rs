@@ -371,11 +371,12 @@ Usage: sbake transcribe <MEDIA> [OPTIONS]
 Options:
   -o, --output <PATH>          Output file path
       --overwrite              Replace an existing output
-      --language <LANGUAGE>    Spoken language
+      --language <LANGUAGE>    Spoken language (profile default, otherwise Auto)
       --model <NAME>           Transcription model
       --format <FORMAT>        Output format: srt, vtt, or txt
       --sidecar <PATH>         Use a sidecar transcript
-      --no-filter-hallucinations Keep repeated/silence marker segments
+      --segmentation <MODE>   smart (default) or segment
+      --no-filter-silence-markers Keep silence marker segments
       --normalize-transcript / --no-normalize-transcript
                               Enable or disable whitespace/punctuation cleanup
       --speaker-labels / --no-speaker-labels
@@ -383,6 +384,8 @@ Options:
       --config <PATH>          Configuration file
       --profile <NAME>         Named profile
       --runtime-dir <DIR>      Runtime storage root
+      --no-cache               Do not reuse or save raw recognition JSON
+      --no-resume              Do not reuse or save segmented source state
       --whisper-bin <PATH>     Override whisper-cli path
       --whisper-models-dir <DIR> Override whisper model directory
       --json                   Emit structured JSON output
@@ -397,9 +400,10 @@ Accepts the translation settings from `translate` plus:
       --subtitle-stream <INDEX>       Explicit embedded text subtitle stream index
       --preserve-source-container     Write a separate translated media file
       --in-place-container            Atomically replace the source media (default)
-      --transcribe-language <LANGUAGE> Spoken language
+      --transcribe-language <LANGUAGE> Spoken language (default: Auto)
       --transcribe-model <NAME>        Transcription model
       --transcribe-format <FORMAT>     srt, vtt, or txt
+      --transcribe-segmentation <MODE> smart (default) or segment
       --sidecar <PATH>                 Use a sidecar transcript
       --whisper-bin <PATH>             Override whisper-cli path
       --whisper-models-dir <DIR>       Override whisper model directory

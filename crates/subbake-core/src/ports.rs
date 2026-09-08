@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::CancellationGuard;
 use crate::entities::{
     BatchTranslationResult, FailureLog, ModelRepairLog, ReviewReport, ReviewResult,
-    SubtitleDocument, SubtitleSegment, TerminologyPreflightResult, Usage,
+    SubtitleSegment, TerminologyPreflightResult, Usage,
 };
 use crate::error::{CoreResult, LlmCallError};
 use crate::storage::{RunState, RuntimePaths};
@@ -437,20 +437,17 @@ pub trait TranscriberBackend {
     fn transcribe(
         &self,
         audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
-    ) -> Result<SubtitleDocument, Self::Error>;
+        language: &crate::transcription::SpokenLanguage,
+    ) -> Result<crate::transcription::RecognitionResult, Self::Error> {
+        self.transcribe_cancellable(audio_path, language, &CancellationGuard::never())
+    }
 
     fn transcribe_cancellable(
         &self,
         audio_path: &Path,
-        language: Option<&str>,
-        output_format: TranscriptionFormat,
+        language: &crate::transcription::SpokenLanguage,
         cancellation: &CancellationGuard,
-    ) -> Result<SubtitleDocument, Self::Error> {
-        cancellation.check()?;
-        self.transcribe(audio_path, language, output_format)
-    }
+    ) -> Result<crate::transcription::RecognitionResult, Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -47,8 +47,16 @@ impl TranscriptionOptionGroup {
                     CliError::usage(format!("{flag} must be one of: srt, vtt, txt"))
                 })?;
             }
-            (_, "--filter-hallucinations") => settings.filter_hallucinations = true,
-            (_, "--no-filter-hallucinations") => settings.filter_hallucinations = false,
+            (TranscriptionOptionSurface::Direct, "--segmentation")
+            | (TranscriptionOptionSurface::Pipeline, "--transcribe-segmentation") => {
+                let value = required_value(args, index, option)?;
+                settings.segmentation = Some(
+                    subbake_core::transcription::Segmentation::parse(&value)
+                        .ok_or_else(|| CliError::usage("segmentation must be smart or segment"))?,
+                );
+            }
+            (_, "--filter-silence-markers") => settings.filter_silence_markers = Some(true),
+            (_, "--no-filter-silence-markers") => settings.filter_silence_markers = Some(false),
             (_, "--normalize-transcript") => settings.normalize_text = Some(true),
             (_, "--no-normalize-transcript") => settings.normalize_text = Some(false),
             (_, "--speaker-labels") => settings.speaker_labels = Some(true),

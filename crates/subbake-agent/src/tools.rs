@@ -431,6 +431,12 @@ const EDIT_SUBTITLE_ARGS: &[ToolArgSpec] = &[
     ),
 ];
 const TRANSCRIBE_AUDIO_ARGS: &[ToolArgSpec] = &[
+    arg(
+        "segmentation",
+        StringArg,
+        false,
+        "smart (default) or segment; independent of translation mode",
+    ),
     arg("path", StringArg, true, "project-local media file path"),
     arg(
         "language",

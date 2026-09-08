@@ -26,16 +26,16 @@ use crate::fs::{
 };
 use crate::settings::ResolvedSettings;
 use crate::transcription::{
-    IncrementalTranscriptionOutcome, StableTranscriptionChunk, TranscriptionChunkDescriptor,
-    TranscriptionChunkObserver, TranscriptionRequest, TranscriptionSettings,
-    transcribe_media_cancellable_with_progress, transcribe_media_incremental_with_progress,
+    IncrementalTranscriptionOutcome, StableTranscriptionChunk, TranscriptionChunkObserver,
+    TranscriptionRequest, TranscriptionSettings, transcribe_media_cancellable_with_progress,
+    transcribe_media_incremental_with_progress,
 };
 use crate::translation::{
     TranslationInputIdentity, TranslationOutcome, TranslationRequest,
     translate_subtitle_cancellable_with_progress_and_identity,
 };
 
-const STREAMING_PIPELINE_VERSION: u64 = 2;
+const STREAMING_PIPELINE_VERSION: u64 = 3;
 const STREAMING_CHANNEL_CAPACITY: usize = 2;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +49,10 @@ pub struct PipelineRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineOutcome {
     Subtitle(TranslationOutcome),
+    Media {
+        translation: TranslationOutcome,
+        transcription: subbake_core::transcription::TranscriptionReport,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,7 @@ struct TranscriptionChunkShard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TranslationGroupShard {
+    source_fingerprint: String,
     version: u64,
     fingerprint: String,
     index: usize,
@@ -193,29 +198,6 @@ impl StreamingPipelineStore {
             .join(format!("{index:04}"))
     }
 
-    fn load_chunk(
-        &self,
-        descriptor: TranscriptionChunkDescriptor,
-        format: subbake_core::TranscriptionFormat,
-    ) -> AdapterResult<Option<Vec<SubtitleSegment>>> {
-        let path = self.chunk_path(descriptor.index);
-        let Some(shard): Option<TranscriptionChunkShard> = self.read_json_if_exists(&path)? else {
-            return Ok(None);
-        };
-        if shard.version != STREAMING_PIPELINE_VERSION
-            || shard.fingerprint != self.fingerprint
-            || shard.index != descriptor.index
-            || shard.input_start_ms != descriptor.input_start_ms
-            || shard.input_end_ms != descriptor.input_end_ms
-            || shard.core_start_ms != descriptor.core_start_ms
-            || shard.core_end_ms != descriptor.core_end_ms
-            || shard.format != format.extension()
-        {
-            return Ok(None);
-        }
-        Ok(Some(shard.segments))
-    }
-
     fn save_chunk(&self, chunk: &StableTranscriptionChunk) -> AdapterResult<()> {
         self.write_json(
             &self.chunk_path(chunk.descriptor.index),
@@ -231,17 +213,6 @@ impl StreamingPipelineStore {
                 segments: chunk.segments.clone(),
             },
         )
-    }
-
-    fn load_group(&self, index: usize) -> AdapterResult<Option<TranslationGroupShard>> {
-        let path = self.group_dir(index).join("complete.json");
-        let Some(shard): Option<TranslationGroupShard> = self.read_json_if_exists(&path)? else {
-            return Ok(None);
-        };
-        if shard.version != STREAMING_PIPELINE_VERSION || shard.fingerprint != self.fingerprint {
-            return Ok(None);
-        }
-        Ok(Some(shard))
     }
 
     fn save_group(&self, shard: &TranslationGroupShard) -> AdapterResult<()> {
@@ -286,29 +257,6 @@ impl StreamingPipelineStore {
             })?;
         write_file_atomically(path, &bytes)
     }
-
-    fn read_json_if_exists<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &Path,
-    ) -> AdapterResult<Option<T>> {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(AdapterError::external_io(
-                    "read pipeline Resume shard",
-                    Some(path.to_path_buf()),
-                    source,
-                ));
-            }
-        };
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| AdapterError::Serialization {
-                context: "parse pipeline Resume shard",
-                source,
-            })
-    }
 }
 
 struct ChannelChunkObserver {
@@ -317,18 +265,8 @@ struct ChannelChunkObserver {
 }
 
 impl TranscriptionChunkObserver for ChannelChunkObserver {
-    fn load(
-        &mut self,
-        descriptor: TranscriptionChunkDescriptor,
-        format: subbake_core::TranscriptionFormat,
-    ) -> AdapterResult<Option<Vec<SubtitleSegment>>> {
-        self.store.load_chunk(descriptor, format)
-    }
-
     fn stable(&mut self, chunk: StableTranscriptionChunk) -> AdapterResult<()> {
-        if !chunk.resumed {
-            self.store.save_chunk(&chunk)?;
-        }
+        self.store.save_chunk(&chunk)?;
         self.sender
             .send(chunk)
             .map_err(|_| AdapterError::invalid_input("incremental translation consumer stopped"))
@@ -357,11 +295,15 @@ pub fn run_pipeline_cancellable_with_progress(
 }
 
 pub fn run_pipeline_cancellable_with_progress_and_quality(
-    request: PipelineRequest,
+    mut request: PipelineRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
     quality_gate: QualityGate,
 ) -> AdapterResult<PipelineOutcome> {
+    crate::transcription::apply_whisper_configuration(
+        &mut request.transcription_settings,
+        &request.settings,
+    );
     if is_supported_subtitle_path(&request.input_path) {
         let outcome = crate::translation::translate_subtitle_cancellable_with_progress_and_quality(
             TranslationRequest {
@@ -448,21 +390,54 @@ fn run_sequential_media_pipeline(
         cancellation,
         progress.clone(),
     )?;
-    let translation_out =
-        crate::translation::translate_subtitle_cancellable_with_progress_and_quality(
-            TranslationRequest {
-                input_path: transcription_out.output_path,
-                output_path: request.output_path,
-                output_language_tag: None,
-                overwrite: true,
-                runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
-                settings: request.settings,
-            },
-            cancellation,
-            progress,
-            quality_gate,
-        )?;
-    Ok(PipelineOutcome::Subtitle(translation_out))
+    let mut settings = request.settings;
+    settings
+        .output
+        .format
+        .get_or_insert_with(|| transcription_out.output_format.extension().to_owned());
+    let bytes = serde_json::to_vec(&transcription_out.document.segments).map_err(|source| {
+        AdapterError::Serialization {
+            context: "fingerprint stable transcription",
+            source,
+        }
+    })?;
+    let output_path = request.output_path.clone().map(Ok).unwrap_or_else(|| {
+        default_output_path_with_language(
+            &transcription_out.output_path,
+            settings.output_format(),
+            settings.output.bilingual,
+            None,
+        )
+    })?;
+    let translation_out = translate_subtitle_cancellable_with_progress_and_identity(
+        TranslationRequest {
+            input_path: transcription_out.output_path.clone(),
+            output_path: Some(output_path.clone()),
+            output_language_tag: None,
+            overwrite: true,
+            runtime_reuse: crate::translation::RuntimeReusePolicy::Configured,
+            settings,
+        },
+        cancellation,
+        progress,
+        Some(TranslationInputIdentity {
+            document: Some(transcription_out.document),
+            path: transcription_out.output_path.clone(),
+            signature: input_signature_from_bytes(&bytes, None),
+            output_path,
+            execution_fingerprint: Some(format!(
+                "stable-source-v{}",
+                subbake_core::transcription::SEGMENTATION_VERSION
+            )),
+            initial_confirmed_context: Vec::new(),
+            ocr_source: None,
+        }),
+        quality_gate,
+    )?;
+    Ok(PipelineOutcome::Media {
+        translation: translation_out,
+        transcription: transcription_out.report,
+    })
 }
 
 fn run_streaming_media_pipeline(
@@ -639,21 +614,16 @@ fn translate_chunk_group(
         .map(|segment| segment.id.clone())
         .unwrap_or_default();
 
-    if let Some(shard) = store.load_group(index)?
-        && shard.first_chunk == first_chunk
-        && shard.last_chunk == last_chunk
-        && shard.source_first_id == source_first_id
-        && shard.source_last_id == source_last_id
-        && shard.subtitle_entries == source_segments.len()
-        && shard.translated_path.is_file()
-    {
-        let translated = read_document(&shard.translated_path)?;
-        validate_group_alignment(&source_segments, &translated.segments)?;
-        return Ok(TranslatedGroup {
-            segments: translated.segments,
-            shard,
-        });
-    }
+    let source_fingerprint = subbake_core::storage::sha1_hex(
+        &serde_json::to_vec(&(&source_segments, initial_confirmed_context)).map_err(|source| {
+            AdapterError::Serialization {
+                context: "fingerprint transcription source",
+                source,
+            }
+        })?,
+    );
+    // Re-enter the core pipeline even for completed groups: it owns resume
+    // fingerprints (including loaded glossary/routes) and deterministic final validation.
 
     let group_dir = store.group_dir(index);
     fs::create_dir_all(&group_dir).map_err(|source| {
@@ -706,11 +676,12 @@ fn translate_chunk_group(
         cancellation,
         progress,
         Some(TranslationInputIdentity {
+            document: Some(source_document),
             path: source_path,
             signature: input_signature_from_bytes(&bytes, None),
             output_path: translated_path.clone(),
             execution_fingerprint: Some(format!(
-                "{}:group:{index}:chunks:{first_chunk}-{last_chunk}",
+                "{}:group:{index}:chunks:{first_chunk}-{last_chunk}:source:{source_fingerprint}",
                 store.fingerprint
             )),
             initial_confirmed_context: initial_confirmed_context.to_vec(),
@@ -718,9 +689,11 @@ fn translate_chunk_group(
         }),
         subbake_core::QualityGate::Never,
     )?;
-    let translated = read_document(&translated_path)?;
+    let mut translated = read_document(&translated_path)?;
+    restore_stable_source_identity(&source_segments, &mut translated.segments)?;
     validate_group_alignment(&source_segments, &translated.segments)?;
     let shard = TranslationGroupShard {
+        source_fingerprint,
         version: STREAMING_PIPELINE_VERSION,
         fingerprint: store.fingerprint.clone(),
         index,
@@ -766,6 +739,34 @@ fn confirmed_translation_tail(
             translation: translated.text.clone(),
         })
         .collect()
+}
+
+/// SRT display identifiers carry the stable IDs; generic parsers deliberately use
+/// positional internal IDs. Verify the serialization boundary before restoring them.
+fn restore_stable_source_identity(
+    source: &[SubtitleSegment],
+    translated: &mut [SubtitleSegment],
+) -> AdapterResult<()> {
+    if source.len() != translated.len() {
+        return Err(AdapterError::invalid_input(
+            "translation changed stable cue count",
+        ));
+    }
+    for (source, translated) in source.iter().zip(translated) {
+        if translated.identifier.as_deref()
+            != source.identifier.as_deref().or(Some(source.id.as_str()))
+            || translated.start != source.start
+            || translated.end != source.end
+        {
+            return Err(AdapterError::invalid_input(
+                "translation changed stable cue identity or timing",
+            ));
+        }
+        let text = std::mem::take(&mut translated.text);
+        *translated = source.clone();
+        translated.text = text;
+    }
+    Ok(())
 }
 
 fn validate_group_alignment(
@@ -922,15 +923,18 @@ fn finalize_streaming_pipeline_with_quality(
     )?;
     store.mark_complete(&output_path, translated.chunks, translated.groups)?;
     translated.result.output_path = Some(output_path.clone());
-    Ok(PipelineOutcome::Subtitle(TranslationOutcome {
-        result: translated.result,
-        output_path: Some(output_path),
-        subtitle_entries: transcription.document.segments.len(),
-        container_change: None,
-        runtime_dir: None,
-        quality: Some(quality),
-        source_ocr: None,
-    }))
+    Ok(PipelineOutcome::Media {
+        translation: TranslationOutcome {
+            result: translated.result,
+            output_path: Some(output_path),
+            subtitle_entries: transcription.document.segments.len(),
+            container_change: None,
+            runtime_dir: None,
+            quality: Some(quality),
+            source_ocr: None,
+        },
+        transcription: transcription.report,
+    })
 }
 
 fn streaming_fingerprint(
@@ -1051,6 +1055,20 @@ fn streaming_fingerprint(
                         .into(),
                 ),
                 (
+                    "segmentation".to_owned(),
+                    request
+                        .transcription_settings
+                        .effective_segmentation()
+                        .as_str()
+                        .into(),
+                ),
+                (
+                    "segmentation_version".to_owned(),
+                    subbake_core::transcription::SEGMENTATION_VERSION
+                        .to_string()
+                        .into(),
+                ),
+                (
                     "output_format".to_owned(),
                     request
                         .transcription_settings
@@ -1059,8 +1077,11 @@ fn streaming_fingerprint(
                         .into(),
                 ),
                 (
-                    "filter_hallucinations".to_owned(),
-                    request.transcription_settings.filter_hallucinations.into(),
+                    "filter_silence_markers".to_owned(),
+                    request
+                        .transcription_settings
+                        .effective_filter_silence_markers()
+                        .into(),
                 ),
             ]),
         ),
@@ -1092,6 +1113,7 @@ mod tests {
         .expect("run pipeline");
         let output_path = match outcome {
             PipelineOutcome::Subtitle(outcome) => outcome.output_path.expect("output path"),
+            PipelineOutcome::Media { .. } => panic!("subtitle input should not transcribe"),
         };
         let output = fs::read_to_string(&output_path).expect("read output");
         let _ = fs::remove_dir_all(&root);
@@ -1210,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn transcription_shards_resume_independently() {
+    fn pipeline_keeps_an_audit_copy_of_stable_source() {
         let root = temp_root("transcription-resume");
         fs::create_dir_all(&root).expect("create root");
         let input = root.join("movie.mkv");
@@ -1228,12 +1250,12 @@ mod tests {
             .expect("open store");
         let chunk = test_chunk(0, 2);
         store.save_chunk(&chunk).expect("save chunk");
-        let resumed = store
-            .load_chunk(chunk.descriptor, chunk.format)
-            .expect("load chunk")
-            .expect("persisted chunk");
+        let resumed: TranscriptionChunkShard = serde_json::from_slice(
+            &fs::read(store.chunk_path(chunk.descriptor.index)).expect("audit file"),
+        )
+        .expect("audit shape");
         let _ = fs::remove_dir_all(root);
-        assert_eq!(resumed, chunk.segments);
+        assert_eq!(resumed.segments, chunk.segments);
     }
 
     #[test]
@@ -1270,6 +1292,7 @@ mod tests {
             model_auto_selected: false,
             output_format: subbake_core::TranscriptionFormat::Srt,
             cleanup: Default::default(),
+            report: Default::default(),
         };
         let translated = ConsumedTranslations {
             segments: Vec::new(),
@@ -1284,9 +1307,59 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn group_resume_uses_current_source_and_does_not_trust_published_translation() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let input = temporary.path().join("media.wav");
+        fs::write(&input, b"fixture").expect("media");
+        let mut settings = ResolvedSettings::default();
+        settings.storage.runtime_dir = Some(temporary.path().join("runtime"));
+        settings.translation.target_language = "en".to_owned();
+        settings.translation.review_policy = subbake_core::ReviewPolicy::Off;
+        let request = PipelineRequest {
+            input_path: input,
+            output_path: None,
+            settings,
+            transcription_settings: Default::default(),
+        };
+        let store = StreamingPipelineStore::open(&request, MediaPipelineStrategy::TurboImmediate)
+            .expect("store");
+        let mut chunks = vec![test_chunk(0, 1)];
+        chunks[0].segments[0].identifier = Some(chunks[0].segments[0].id.clone());
+        let run = |chunks: &[StableTranscriptionChunk]| {
+            translate_chunk_group(
+                0,
+                chunks,
+                &request,
+                &store,
+                &CancellationGuard::never(),
+                std::sync::Arc::new(NoopProgress),
+                &[],
+            )
+            .expect("translation")
+        };
+        let first = run(&chunks);
+        assert_eq!(first.segments[0].text, "[MOCK-EN] hello");
+        // A completed file is an output, not a trusted substitute for core validation.
+        fs::write(&first.shard.translated_path, b"corrupted published file")
+            .expect("corrupt fixture");
+        let resumed = run(&chunks);
+        assert_eq!(resumed.segments, first.segments);
+        chunks[0].segments[0].text = "goodbye".to_owned();
+        chunks[0].segments[0].start = Some("00:00:10,000".to_owned());
+        chunks[0].segments[0].end = Some("00:00:11,000".to_owned());
+        let changed = run(&chunks);
+        assert_ne!(
+            changed.shard.source_fingerprint,
+            first.shard.source_fingerprint
+        );
+        assert_eq!(changed.segments[0].text, "[MOCK-EN] goodbye");
+        assert_eq!(changed.segments[0].start, chunks[0].segments[0].start);
+    }
+
     fn test_chunk(index: usize, segments: usize) -> StableTranscriptionChunk {
         StableTranscriptionChunk {
-            descriptor: TranscriptionChunkDescriptor {
+            descriptor: crate::transcription::TranscriptionChunkDescriptor {
                 index,
                 input_start_ms: index as u64 * 600_000,
                 input_end_ms: (index as u64 + 1) * 600_000,

@@ -674,6 +674,7 @@ fn translate_embedded_subtitle_with_programs(
         )
     })?;
     let identity = TranslationInputIdentity {
+        document: None,
         path: embedded_stream_identity(&request.input_path, source_stream.index, payload_format)?,
         signature: input_signature_from_bytes(&extracted_bytes, None),
         output_path: final_output.clone(),
