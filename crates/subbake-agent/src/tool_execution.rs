@@ -128,6 +128,7 @@ pub(crate) fn execute_command_tool_with_services(
         staging_root: staging.clone(),
         output_aliases: outputs.iter().map(|(alias, _)| alias.clone()).collect(),
         network: optional_bool(args, "network", false),
+        protected_paths: guard.protected_paths(),
         timeout: std::time::Duration::from_secs(timeout_seconds),
     };
     let executed = services.run_command(&request, cancellation)?;

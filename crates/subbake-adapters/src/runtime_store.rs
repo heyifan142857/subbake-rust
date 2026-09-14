@@ -1,6 +1,8 @@
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use subbake_core::entities::{
@@ -10,9 +12,12 @@ use subbake_core::entities::{
 use subbake_core::error::{CoreError, CoreResult, StorageError, StorageIoKind};
 use subbake_core::ports::{
     BackendJsonResult, BackendPayload, BatchShardKind, CacheStage, RuntimeCacheStore,
-    RuntimeCheckpointStore, RuntimeDiagnosticStore, RuntimeLayoutStore, RuntimeMemoryStore,
+    RuntimeCheckpoint, RuntimeCheckpointStore, RuntimeDiagnosticStore, RuntimeLayoutStore,
+    RuntimeMemoryStore,
 };
-use subbake_core::storage::{RunState, RuntimePaths};
+use subbake_core::storage::{
+    CheckpointManifest, CheckpointShardRef, RUN_STATE_VERSION, RunState, RuntimePaths,
+};
 
 use crate::error::AdapterError;
 use crate::fs::write_file_atomically;
@@ -23,11 +28,15 @@ pub(crate) const RUNTIME_MARKER_CONTENT: &str = "subbake-runtime-v1\n";
 #[derive(Debug, Clone)]
 pub struct FileRuntimeStore {
     paths: RuntimePaths,
+    checkpoint: Arc<Mutex<Option<RunState>>>,
 }
 
 impl FileRuntimeStore {
     pub fn new(paths: RuntimePaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            checkpoint: Arc::default(),
+        }
     }
 
     pub fn batch_shard_path(&self, kind: BatchShardKind, batch_index: usize) -> PathBuf {
@@ -45,6 +54,147 @@ impl FileRuntimeStore {
             .join(stage.as_str())
             .join(format!("{request_hash}.json"))
     }
+}
+
+impl FileRuntimeStore {
+    fn immutable_shard_path(&self, digest: &str) -> CoreResult<PathBuf> {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CoreError::DataInvariant(
+                "invalid checkpoint shard digest".into(),
+            ));
+        }
+        Ok(self
+            .paths
+            .run_dir
+            .join("shards-v1")
+            .join(format!("{digest}.json")))
+    }
+
+    fn write_immutable_shard(
+        &self,
+        first_batch: usize,
+        last_batch: usize,
+        segments: &[SubtitleSegment],
+    ) -> CoreResult<CheckpointShardRef> {
+        let payload =
+            serde_json::json!({"segments": segments.iter().map(segment_json).collect::<Vec<_>>()});
+        let bytes = serde_json::to_vec(&payload)
+            .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+        let digest = shard_digest(&bytes);
+        let path = self.immutable_shard_path(&digest)?;
+        // Identical content shares a file; no checkpoint ever overwrites a
+        // different payload at a path referenced by an earlier state.
+        write_file_atomically(&path, &bytes).map_err(|error| {
+            storage_error(
+                "write immutable shard",
+                Some(&path),
+                io::Error::other(error),
+            )
+        })?;
+        Ok(CheckpointShardRef {
+            first_batch,
+            last_batch,
+            sha256: digest,
+        })
+    }
+
+    fn read_immutable_shard(
+        &self,
+        reference: &CheckpointShardRef,
+    ) -> CoreResult<Vec<SubtitleSegment>> {
+        let path = self.immutable_shard_path(&reference.sha256)?;
+        let bytes = fs::read(&path)
+            .map_err(|error| storage_error("read immutable shard", Some(&path), error))?;
+        if shard_digest(&bytes) != reference.sha256 {
+            return Err(CoreError::DataInvariant(
+                "checkpoint shard checksum mismatch".into(),
+            ));
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+        payload["segments"]
+            .as_array()
+            .ok_or_else(|| CoreError::DataInvariant("checkpoint shard missing segments".into()))?
+            .iter()
+            .map(segment_from_json)
+            .collect()
+    }
+
+    fn import_manifest(&self, state: &RunState) -> CoreResult<CheckpointManifest> {
+        if let Some(manifest) = &state.shard_manifest {
+            return Ok(manifest.clone());
+        }
+        let mut manifest = CheckpointManifest::default();
+        for (kind, count) in checkpoint_counts(state) {
+            let inline = match kind {
+                BatchShardKind::Translated => &state.translated_segments,
+                BatchShardKind::Reviewed => &state.reviewed_segments,
+                BatchShardKind::Finalized => &Vec::new(),
+            };
+            let refs = manifest_refs_mut(&mut manifest, kind);
+            if count > 0 && !inline.is_empty() {
+                refs.push(self.write_immutable_shard(1, count, inline)?);
+                continue;
+            }
+            for index in 1..=count {
+                let path = self.batch_shard_path(kind, index);
+                let text = fs::read_to_string(&path)
+                    .map_err(|error| storage_error("read legacy checkpoint", Some(&path), error))?;
+                let payload: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|error| CoreError::DataInvariant(error.to_string()))?;
+                let segments = payload["segments"]
+                    .as_array()
+                    .ok_or_else(|| {
+                        CoreError::DataInvariant("legacy shard missing segments".into())
+                    })?
+                    .iter()
+                    .map(segment_from_json)
+                    .collect::<CoreResult<Vec<_>>>()?;
+                refs.push(self.write_immutable_shard(index, index, &segments)?);
+            }
+        }
+        Ok(manifest)
+    }
+}
+
+fn shard_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn manifest_refs(manifest: &CheckpointManifest, kind: BatchShardKind) -> &[CheckpointShardRef] {
+    match kind {
+        BatchShardKind::Translated => &manifest.translated,
+        BatchShardKind::Reviewed => &manifest.reviewed,
+        BatchShardKind::Finalized => &manifest.finalized,
+    }
+}
+
+fn manifest_refs_mut(
+    manifest: &mut CheckpointManifest,
+    kind: BatchShardKind,
+) -> &mut Vec<CheckpointShardRef> {
+    match kind {
+        BatchShardKind::Translated => &mut manifest.translated,
+        BatchShardKind::Reviewed => &mut manifest.reviewed,
+        BatchShardKind::Finalized => &mut manifest.finalized,
+    }
+}
+
+fn checkpoint_counts(state: &RunState) -> [(BatchShardKind, usize); 3] {
+    [
+        (
+            BatchShardKind::Translated,
+            state.translation_batches_completed,
+        ),
+        (BatchShardKind::Reviewed, state.review_batches_completed),
+        (
+            BatchShardKind::Finalized,
+            usize::from(state.version >= 4 && state.validation_completed),
+        ),
+    ]
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -242,11 +392,91 @@ impl RuntimeCheckpointStore for FileRuntimeStore {
         Ok(loaded)
     }
 
+    fn load_checkpoint_segments(
+        &self,
+        state: &RunState,
+        kind: BatchShardKind,
+        completed_batches: usize,
+    ) -> CoreResult<Vec<SubtitleSegment>> {
+        let Some(manifest) = &state.shard_manifest else {
+            return self.load_batch_segments(kind, completed_batches);
+        };
+        let mut next_batch = 1;
+        let mut segments = Vec::new();
+        for reference in manifest_refs(manifest, kind) {
+            if reference.first_batch > completed_batches {
+                break;
+            }
+            if reference.first_batch != next_batch
+                || reference.last_batch < reference.first_batch
+                || reference.last_batch > completed_batches
+            {
+                return Err(CoreError::DataInvariant(
+                    "checkpoint shard ranges do not match completed batches".into(),
+                ));
+            }
+            segments.extend(self.read_immutable_shard(reference)?);
+            next_batch = reference.last_batch.checked_add(1).ok_or_else(|| {
+                CoreError::DataInvariant("checkpoint batch index overflow".into())
+            })?;
+        }
+        if next_batch != completed_batches.saturating_add(1) {
+            return Err(CoreError::DataInvariant(
+                "checkpoint manifest is missing completed batches".into(),
+            ));
+        }
+        Ok(segments)
+    }
+
     fn save_run_state(&self, state: &RunState) -> CoreResult<()> {
-        let payload = serde_json::to_value(state).map_err(|error| {
+        self.commit_checkpoint(&RuntimeCheckpoint {
+            state: state.clone(),
+            shards: Vec::new(),
+        })
+    }
+
+    fn commit_checkpoint(&self, checkpoint: &RuntimeCheckpoint) -> CoreResult<()> {
+        let mut current = self
+            .checkpoint
+            .lock()
+            .map_err(|_| CoreError::DataInvariant("checkpoint lock poisoned".into()))?;
+        let mut manifest = match current.as_ref().filter(|state| {
+            state.translation_fingerprint == checkpoint.state.translation_fingerprint
+        }) {
+            Some(prior) => self.import_manifest(prior)?,
+            None => CheckpointManifest::default(),
+        };
+        for shard in &checkpoint.shards {
+            let refs = manifest_refs_mut(&mut manifest, shard.kind);
+            if refs.iter().any(|reference| {
+                reference.first_batch != reference.last_batch
+                    && (reference.first_batch..=reference.last_batch).contains(&shard.batch_index)
+            }) {
+                return Err(CoreError::DataInvariant(
+                    "cannot partially replace a legacy inline checkpoint".into(),
+                ));
+            }
+            refs.retain(|reference| reference.first_batch != shard.batch_index);
+            refs.push(self.write_immutable_shard(
+                shard.batch_index,
+                shard.batch_index,
+                &shard.segments,
+            )?);
+            refs.sort_by_key(|reference| reference.first_batch);
+        }
+        let mut state = checkpoint.state.clone();
+        state.version = RUN_STATE_VERSION;
+        state.shard_manifest = Some(manifest);
+        // Do not publish a state referring to missing or corrupted data.
+        for (kind, count) in checkpoint_counts(&state) {
+            self.load_checkpoint_segments(&state, kind, count)?;
+        }
+        let payload = serde_json::to_value(&state).map_err(|error| {
             CoreError::DataInvariant(format!("serialize run state failed: {error}"))
         })?;
-        write_json_verified(&self.paths.state_path, &payload)
+        write_json_verified(&self.paths.state_path, &payload)?;
+        *current = Some(state);
+        Ok(())
     }
 
     fn load_run_state(&self) -> CoreResult<Option<RunState>> {
@@ -256,9 +486,15 @@ impl RuntimeCheckpointStore for FileRuntimeStore {
         let text = fs::read_to_string(&self.paths.state_path).map_err(|error| {
             storage_error("read run state", Some(&self.paths.state_path), error)
         })?;
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|error| CoreError::DataInvariant(format!("run state parse failed: {error}")))
+        let state: RunState = serde_json::from_str(&text).map_err(|error| {
+            CoreError::DataInvariant(format!("run state parse failed: {error}"))
+        })?;
+        *self
+            .checkpoint
+            .lock()
+            .map_err(|_| CoreError::DataInvariant("checkpoint lock poisoned".into()))? =
+            Some(state.clone());
+        Ok(Some(state))
     }
 }
 
@@ -548,6 +784,152 @@ mod tests {
     use subbake_core::storage::{RunState, build_runtime_paths, input_signature_from_bytes};
 
     use super::*;
+
+    fn checkpoint_fixture(
+        root: &Path,
+        model: &str,
+        text: &str,
+    ) -> (FileRuntimeStore, RuntimeCheckpoint) {
+        let input = root.join("clip.txt");
+        let paths = build_runtime_paths(&input, &input, Some(root), None, "Auto", "Chinese", false);
+        let mut options = PipelineOptions::new(input);
+        options.identity.model = model.into();
+        let state = RunState::new(
+            &options,
+            input_signature_from_bytes(b"hello", None),
+            Usage::default(),
+            ContextMemory::new(),
+            1,
+            0,
+            false,
+        );
+        let shard = subbake_core::ports::CheckpointShard {
+            kind: BatchShardKind::Translated,
+            batch_index: 1,
+            segments: vec![SubtitleSegment {
+                id: "1".into(),
+                text: text.into(),
+                start: None,
+                end: None,
+                identifier: None,
+                settings: None,
+                semantic: Default::default(),
+            }],
+        };
+        (
+            FileRuntimeStore::new(paths),
+            RuntimeCheckpoint {
+                state,
+                shards: vec![shard],
+            },
+        )
+    }
+
+    #[test]
+    fn checkpoints_survive_another_writer_and_an_unpublished_shard() {
+        let temporary = temp_root("checkpoint-isolation");
+        let (a, checkpoint_a) = checkpoint_fixture(temporary.path(), "model-A", "来自 A");
+        let (b, checkpoint_b) = checkpoint_fixture(temporary.path(), "model-B", "来自 B");
+        a.commit_checkpoint(&checkpoint_a).expect("publish A");
+        let accepted_a = a.load_run_state().expect("load A").expect("state A");
+        // A crash after writing B's content but before publishing B's state.
+        b.write_immutable_shard(1, 1, &checkpoint_b.shards[0].segments)
+            .expect("stage B");
+        let still_a = b
+            .load_run_state()
+            .expect("read published state")
+            .expect("state");
+        assert_eq!(
+            still_a.translation_fingerprint,
+            accepted_a.translation_fingerprint
+        );
+        b.commit_checkpoint(&checkpoint_b).expect("publish B");
+        assert_eq!(
+            a.load_checkpoint_segments(&accepted_a, BatchShardKind::Translated, 1)
+                .expect("pinned A"),
+            checkpoint_a.shards[0].segments
+        );
+        let published_b = b.load_run_state().expect("read B").expect("B");
+        assert_eq!(
+            b.load_checkpoint_segments(&published_b, BatchShardKind::Translated, 1)
+                .expect("B data"),
+            checkpoint_b.shards[0].segments
+        );
+    }
+
+    #[test]
+    fn checkpoint_digest_detects_corruption_and_rejects_path_traversal() {
+        let temporary = temp_root("checkpoint-digest");
+        let (store, checkpoint) = checkpoint_fixture(temporary.path(), "model", "hello");
+        store.commit_checkpoint(&checkpoint).expect("publish");
+        let mut state = store.load_run_state().expect("read").expect("state");
+        let reference = &state.shard_manifest.as_ref().expect("manifest").translated[0];
+        fs::write(
+            store.immutable_shard_path(&reference.sha256).expect("path"),
+            b"{}",
+        )
+        .expect("corrupt");
+        assert!(
+            store
+                .load_checkpoint_segments(&state, BatchShardKind::Translated, 1)
+                .expect_err("corruption")
+                .to_string()
+                .contains("checksum")
+        );
+        state.shard_manifest.as_mut().expect("manifest").translated[0].sha256 =
+            "../../outside".into();
+        assert!(
+            store
+                .load_checkpoint_segments(&state, BatchShardKind::Translated, 1)
+                .expect_err("traversal")
+                .to_string()
+                .contains("digest")
+        );
+    }
+
+    #[test]
+    fn legacy_checkpoint_is_readable_and_migrates_without_overwriting_its_shard() {
+        let temporary = temp_root("checkpoint-legacy");
+        let (store, mut checkpoint) = checkpoint_fixture(temporary.path(), "model", "legacy");
+        checkpoint.state.version = 5;
+        store
+            .save_batch_segments(
+                BatchShardKind::Translated,
+                1,
+                &checkpoint.shards[0].segments,
+            )
+            .expect("legacy shard");
+        write_json_verified(
+            &store.paths.state_path,
+            &serde_json::to_value(&checkpoint.state).expect("state JSON"),
+        )
+        .expect("legacy state");
+        let legacy = store.load_run_state().expect("read legacy").expect("state");
+        assert_eq!(
+            store
+                .load_checkpoint_segments(&legacy, BatchShardKind::Translated, 1)
+                .expect("legacy data"),
+            checkpoint.shards[0].segments
+        );
+        store.save_run_state(&legacy).expect("migrate");
+        let migrated = store
+            .load_run_state()
+            .expect("read migrated")
+            .expect("state");
+        assert_eq!(migrated.version, RUN_STATE_VERSION);
+        assert!(migrated.shard_manifest.is_some());
+        assert!(
+            store
+                .batch_shard_path(BatchShardKind::Translated, 1)
+                .exists()
+        );
+        assert_eq!(
+            store
+                .load_checkpoint_segments(&migrated, BatchShardKind::Translated, 1)
+                .expect("migrated data"),
+            checkpoint.shards[0].segments
+        );
+    }
 
     #[test]
     fn runtime_io_errors_include_operation_and_path() {
@@ -883,7 +1265,32 @@ mod tests {
             true,
         );
 
-        store.save_run_state(&state).expect("save state");
+        let segment = SubtitleSegment {
+            id: "1".into(),
+            text: "你好".into(),
+            start: None,
+            end: None,
+            identifier: None,
+            settings: None,
+            semantic: Default::default(),
+        };
+        store
+            .commit_checkpoint(&RuntimeCheckpoint {
+                state: state.clone(),
+                shards: vec![
+                    subbake_core::ports::CheckpointShard {
+                        kind: BatchShardKind::Translated,
+                        batch_index: 1,
+                        segments: vec![segment.clone()],
+                    },
+                    subbake_core::ports::CheckpointShard {
+                        kind: BatchShardKind::Finalized,
+                        batch_index: 1,
+                        segments: vec![segment],
+                    },
+                ],
+            })
+            .expect("save state");
         let loaded = store
             .load_run_state()
             .expect("load state")
@@ -892,8 +1299,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(loaded, state);
-        assert_eq!(value["version"], 5);
+        let mut expected = state;
+        expected.shard_manifest = loaded.shard_manifest.clone();
+        assert!(expected.shard_manifest.is_some());
+        assert_eq!(loaded, expected);
+        assert_eq!(value["version"], RUN_STATE_VERSION);
         assert_eq!(value["translation_batches_completed"], 1);
         assert!(value.get("translated_segments").is_none());
         assert!(value.get("pipeline_fingerprint").is_none());

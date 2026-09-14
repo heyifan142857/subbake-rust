@@ -3,6 +3,7 @@ pub mod editing;
 pub mod entities;
 pub mod error;
 pub mod evaluation;
+pub mod file_policy;
 pub mod formats;
 mod formatting;
 mod language_rules;

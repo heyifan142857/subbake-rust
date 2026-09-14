@@ -6,7 +6,7 @@ use subbake_core::{AgentToolOutcome, FileToolOutcome, ToolExecutionStatus};
 use crate::engine::AgentEngine;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, FileOpEventData};
-use crate::guard::{FileOpAction, FileOpResult};
+use crate::guard::{FileOpAction, FileOpResult, SemanticUndo};
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::services::AgentServices;
 use crate::tool_execution::{
@@ -34,6 +34,9 @@ impl ToolRunner {
         services: &dyn AgentServices,
     ) -> AgentResult<AgentToolOutcome> {
         engine.check_cancelled()?;
+        if let Some(path) = engine.active_config_path().map(std::path::PathBuf::from) {
+            engine.guard.protect_path(&path)?;
+        }
         let call =
             ValidatedToolCall::parse(name, args).map_err(|error| AgentError::ToolArguments {
                 message: error.to_string(),
@@ -213,8 +216,26 @@ impl ToolRunner {
             backup_path: result
                 .backup_path
                 .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            semantic_undo: result.semantic_undo.clone(),
+                .map(|path| event_path(&engine.project_root, path)),
+            semantic_undo: result.semantic_undo.clone().map(|semantic| match semantic {
+                SemanticUndo::RestoreRenamed {
+                    destination_backup_path,
+                } => SemanticUndo::RestoreRenamed {
+                    destination_backup_path: destination_backup_path
+                        .map(|path| event_path(&engine.project_root, &path).into()),
+                },
+                SemanticUndo::RestoreEmbeddedSubtitle {
+                    title,
+                    subtitle_backup_path,
+                    subtitle_format,
+                } => SemanticUndo::RestoreEmbeddedSubtitle {
+                    title,
+                    subtitle_backup_path: event_path(&engine.project_root, &subtitle_backup_path)
+                        .into(),
+                    subtitle_format,
+                },
+                other => other,
+            }),
             group_id,
             undone: false,
         }))

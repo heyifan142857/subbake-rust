@@ -8,7 +8,7 @@ use crate::language_rules::{LANGUAGE_RULES_POLICY_VERSION, LanguageRuleRegistry}
 use crate::languages::language_pair_slug;
 use crate::memory::ContextMemory;
 
-pub const RUN_STATE_VERSION: u64 = 5;
+pub const RUN_STATE_VERSION: u64 = 6;
 pub const REVIEW_REPORT_VERSION: u64 = 2;
 pub const OCR_CORRECTION_REPORT_VERSION: u64 = 1;
 pub const TRANSLATION_FINGERPRINT_VERSION: u64 = 19;
@@ -69,9 +69,26 @@ pub struct ResumeSnapshot {
     pub validation_completed: bool,
 }
 
+/// Immutable shard references belonging to one published checkpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointManifest {
+    pub translated: Vec<CheckpointShardRef>,
+    pub reviewed: Vec<CheckpointShardRef>,
+    pub finalized: Vec<CheckpointShardRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointShardRef {
+    pub first_batch: usize,
+    pub last_batch: usize,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunState {
     pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_manifest: Option<CheckpointManifest>,
     #[serde(default, alias = "pipeline_fingerprint")]
     pub translation_fingerprint: String,
     #[serde(default)]
@@ -116,6 +133,7 @@ impl RunState {
     ) -> Self {
         Self {
             version: RUN_STATE_VERSION,
+            shard_manifest: None,
             translation_fingerprint: build_translation_fingerprint(options, &input_signature),
             render_fingerprint: build_render_fingerprint(options),
             input_path: options.identity.input_path.to_string_lossy().into_owned(),
@@ -140,7 +158,7 @@ impl RunState {
 
     pub fn resume_snapshot(self, expected_translation_fingerprint: &str) -> Option<ResumeSnapshot> {
         let state_version = self.version;
-        if !matches!(state_version, 1 | 2 | 3 | RUN_STATE_VERSION)
+        if !matches!(state_version, 1 | 2 | 3 | 4 | 5 | RUN_STATE_VERSION)
             || self.translation_fingerprint != expected_translation_fingerprint
         {
             return None;

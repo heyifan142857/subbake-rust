@@ -508,6 +508,17 @@ pub trait RuntimeCheckpointStore {
         completed_batches: usize,
     ) -> CoreResult<Vec<SubtitleSegment>>;
 
+    /// Read shards through the exact state already accepted by Resume, even
+    /// when another writer publishes a newer checkpoint concurrently.
+    fn load_checkpoint_segments(
+        &self,
+        _state: &RunState,
+        kind: BatchShardKind,
+        completed_batches: usize,
+    ) -> CoreResult<Vec<SubtitleSegment>> {
+        self.load_batch_segments(kind, completed_batches)
+    }
+
     fn save_run_state(&self, state: &RunState) -> CoreResult<()>;
 
     fn load_run_state(&self) -> CoreResult<Option<RunState>>;

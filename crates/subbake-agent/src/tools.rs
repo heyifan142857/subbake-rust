@@ -613,7 +613,7 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
         true,
         false,
         true,
-        "Run a sandboxed Linux command. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits. Never use commands to extract audio or invoke speech recognition as a substitute for bitmap subtitles before the runtime obtains current-task source-substitution approval.",
+        "Run a sandboxed Linux command. Only filtered project files and standard system/Rust tools are visible; protected files, symlinks, sockets, and tagged build caches are omitted. The project is read-only; persistent regular-file artifacts must be written to declared $SUBBAKE_OUTPUT_<ALIAS> paths. Use apply_patch for source edits. Never use commands to extract audio or invoke speech recognition as a substitute for bitmap subtitles before the runtime obtains current-task source-substitution approval.",
         RUN_COMMAND_ARGS,
         RunCommand,
         requires CommandSandbox

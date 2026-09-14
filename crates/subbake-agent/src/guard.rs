@@ -59,24 +59,7 @@ impl From<std::io::Error> for FileGuardError {
     }
 }
 
-/// Path components that are never allowed in file operations.
-pub const PROTECTED_PATH_PARTS: [&str; 15] = [
-    ".git",
-    ".hg",
-    ".svn",
-    ".env",
-    ".ssh",
-    ".venv",
-    "venv",
-    ".subbake",
-    "__pycache__",
-    "id_rsa",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
-    "credentials.json",
-    "service-account.json",
-];
+pub use subbake_core::file_policy::{PROTECTED_PATH_PARTS, is_protected_component};
 
 /// The result of a successful file operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +74,9 @@ pub struct FileOpResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticUndo {
+    RestoreRenamed {
+        destination_backup_path: Option<PathBuf>,
+    },
     RemoveEmbeddedSubtitle {
         title: String,
     },
@@ -122,6 +108,7 @@ pub struct FileGuard {
     project_root: PathBuf,
     project_identity: PathIdentity,
     backup_root: PathBuf,
+    protected_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,11 +235,44 @@ impl FileGuard {
         }
         let project_root = project_identity.logical().to_path_buf();
         let backup_root = project_root.join(".subbake/agent/backups");
-        Ok(Self {
+        let mut guard = Self {
             project_root,
             project_identity,
             backup_root,
-        })
+            protected_paths: Vec::new(),
+        };
+        if let Some(path) = subbake_adapters::discover_config_path() {
+            guard.protect_path(&path)?;
+        }
+        Ok(guard)
+    }
+
+    /// Protect selected configuration by resolved identity, including aliases.
+    pub(crate) fn protect_path(&mut self, path: &Path) -> FileGuardResult<()> {
+        let identity = identify_with_missing_tail(path, "resolve protected configuration")?;
+        let path = identity.resolved().to_path_buf();
+        if !self.protected_paths.contains(&path) {
+            self.protected_paths.push(path);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn protected_paths(&self) -> Vec<PathBuf> {
+        self.protected_paths.clone()
+    }
+
+    fn reject_protected_identity(&self, identity: &PathIdentity) -> FileGuardResult<()> {
+        if self
+            .protected_paths
+            .iter()
+            .any(|path| identity.resolved().starts_with(path))
+        {
+            return Err(FileGuardError::ProtectedPath {
+                component: "active configuration (use /config)".into(),
+                path: identity.logical().to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn project_root(&self) -> &Path {
@@ -347,11 +367,17 @@ impl FileGuard {
     pub fn rename_path(&self, from: &Path, to: &Path) -> FileGuardResult<FileOpResult> {
         let safe_from = self.resolve(from)?;
         let safe_to = self.resolve(to)?;
-        // Backup both: the source (will be gone) and the destination (will be overwritten).
-        let backup = self.backup(&safe_from)?;
-        if safe_to.io.exists() {
-            let _ = self.backup(&safe_to)?;
+        if safe_from.io == safe_to.io {
+            return Err(FileGuardError::AlreadyExists {
+                path: safe_to.logical,
+            });
         }
+        let backup = self.backup(&safe_from)?;
+        let destination_backup_path = if safe_to.io.exists() {
+            Some(self.backup(&safe_to)?)
+        } else {
+            None
+        };
         if let Some(parent) = safe_to.io.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -361,7 +387,9 @@ impl FileGuard {
             path: safe_from.logical,
             backup_path: Some(backup),
             new_path: Some(safe_to.logical),
-            semantic_undo: None,
+            semantic_undo: Some(SemanticUndo::RestoreRenamed {
+                destination_backup_path,
+            }),
         })
     }
 
@@ -570,7 +598,11 @@ impl FileGuard {
             {
                 continue;
             }
-            files.push(self.path_from_io(&entry.path())?.logical);
+            match self.path_from_io(&entry.path()) {
+                Ok(path) => files.push(path.logical),
+                Err(FileGuardError::ProtectedPath { .. }) => continue,
+                Err(error) => return Err(error),
+            }
         }
         files.sort();
         Ok(files)
@@ -583,7 +615,11 @@ impl FileGuard {
         self.search_recursive(&safe.io, pattern, &mut results)?;
         let mut results = results
             .into_iter()
-            .map(|path| self.path_from_io(&path).map(|safe| safe.logical))
+            .filter_map(|path| match self.path_from_io(&path) {
+                Ok(safe) => Some(Ok(safe.logical)),
+                Err(FileGuardError::ProtectedPath { .. }) => None,
+                Err(error) => Some(Err(error)),
+            })
             .collect::<FileGuardResult<Vec<_>>>()?;
         results.sort();
         Ok(results)
@@ -713,6 +749,7 @@ impl FileGuard {
             self.reject_protected_components(requested_relative)?;
         }
         let identity = identify_with_missing_tail(&anchored, "resolve project path")?;
+        self.reject_protected_identity(&identity)?;
         let Some(relative) = identity.resolved_relative_to(&self.project_identity) else {
             return Err(FileGuardError::PathEscape {
                 root: self.project_root.clone(),
@@ -730,6 +767,7 @@ impl FileGuard {
 
     fn path_from_io(&self, path: &Path) -> FileGuardResult<GuardedProjectPath> {
         let identity = identify_existing(path, "resolve discovered project path")?;
+        self.reject_protected_identity(&identity)?;
         let Some(relative) = identity.resolved_relative_to(&self.project_identity) else {
             return Err(FileGuardError::PathEscape {
                 root: self.project_root.clone(),
@@ -844,12 +882,6 @@ impl FileGuard {
     }
 }
 
-pub(crate) fn is_protected_component(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase();
-    PROTECTED_PATH_PARTS.contains(&normalized.as_str())
-        || (normalized.starts_with(".env.") && normalized != ".env.example")
-}
-
 fn rollback_committed_files(committed: &[(PathBuf, Option<PathBuf>)]) {
     for (path, prior) in committed.iter().rev() {
         let _ = std::fs::remove_file(path);
@@ -955,6 +987,36 @@ mod tests {
         let root = temporary.path().to_path_buf();
         let guard = FileGuard::new(root.clone()).expect("create file guard");
         (temporary, root, guard)
+    }
+
+    #[test]
+    fn configuration_files_and_selected_aliases_are_not_project_data() {
+        let temporary = tempfile::tempdir().expect("root");
+        let root = temporary.path();
+        let mut guard = FileGuard::new(root.into()).expect("guard");
+        for name in ["subbake.toml", ".subbake.toml", "custom-settings.toml"] {
+            std::fs::write(root.join(name), "api_key = 'synthetic-secret'").expect("config");
+        }
+        guard
+            .protect_path(&root.join("custom-settings.toml"))
+            .expect("pin config");
+        for name in ["subbake.toml", ".subbake.toml", "custom-settings.toml"] {
+            assert!(guard.read_file(Path::new(name)).is_err());
+            assert!(guard.replace_file(Path::new(name), "modified").is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("custom-settings.toml", root.join("alias.txt"))
+                .expect("alias");
+            assert!(guard.read_file(Path::new("alias.txt")).is_err());
+        }
+        assert!(guard.list_files(Path::new(".")).expect("list").is_empty());
+        assert!(
+            guard
+                .search_files(Path::new("."), "")
+                .expect("search")
+                .is_empty()
+        );
     }
 
     #[test]

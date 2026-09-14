@@ -2841,6 +2841,29 @@ mod tests {
     }
 
     #[test]
+    fn resumed_custom_config_is_protected_before_tool_execution() {
+        let temporary = tempfile::tempdir().expect("root");
+        let root = temporary.path().to_path_buf();
+        let config = root.join("custom-settings.toml");
+        std::fs::write(&config, "api_key = 'synthetic-secret'").expect("config");
+        let mut engine = active_engine(root.clone());
+        engine.set_config_path(Some(&config)).expect("pin config");
+        let id = engine.session.as_ref().expect("session").id.clone();
+        engine
+            .record(EventKind::User {
+                text: "fixture".into(),
+            })
+            .expect("persist session");
+        let mut resumed = AgentEngine::new(root).expect("engine");
+        resumed.resume_session(Some(&id)).expect("resume");
+        let error = resumed
+            .run_tool("read_file", &json!({"path":"custom-settings.toml"}))
+            .expect_err("config must be protected");
+        assert!(!error.to_string().contains("synthetic-secret"));
+        assert!(error.to_string().contains("protected"));
+    }
+
+    #[test]
     fn completed_activity_persists_summary_without_observation_contents() {
         let root = temp_root("activity-summary-redaction");
         std::fs::create_dir_all(&root).expect("root");

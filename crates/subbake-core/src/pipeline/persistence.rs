@@ -27,7 +27,7 @@ impl PipelinePersistence<'_> {
         let Some(state) = store.load_run_state()? else {
             return Ok(ResumeSnapshot::default());
         };
-        let Some(mut snapshot) = state.resume_snapshot(&expected_fingerprint) else {
+        let Some(mut snapshot) = state.clone().resume_snapshot(&expected_fingerprint) else {
             return Ok(ResumeSnapshot::default());
         };
         if snapshot.translation_batches_completed > batches.len() {
@@ -44,7 +44,8 @@ impl PipelinePersistence<'_> {
             .map(Vec::len)
             .sum::<usize>();
         if snapshot.translation_batches_completed > 0 && snapshot.translated_segments.is_empty() {
-            snapshot.translated_segments = store.load_batch_segments(
+            snapshot.translated_segments = store.load_checkpoint_segments(
+                &state,
                 BatchShardKind::Translated,
                 snapshot.translation_batches_completed,
             )?;
@@ -65,12 +66,15 @@ impl PipelinePersistence<'_> {
         validate_full_alignment(&resumed_source, &snapshot.translated_segments)?;
 
         if snapshot.review_batches_completed > 0 && snapshot.reviewed_segments.is_empty() {
-            snapshot.reviewed_segments = store
-                .load_batch_segments(BatchShardKind::Reviewed, snapshot.review_batches_completed)?;
+            snapshot.reviewed_segments = store.load_checkpoint_segments(
+                &state,
+                BatchShardKind::Reviewed,
+                snapshot.review_batches_completed,
+            )?;
         }
         if snapshot.validation_completed {
             snapshot.finalized_segments =
-                store.load_batch_segments(BatchShardKind::Finalized, 1)?;
+                store.load_checkpoint_segments(&state, BatchShardKind::Finalized, 1)?;
         }
         *memory = snapshot.memory.clone();
         Ok(snapshot)

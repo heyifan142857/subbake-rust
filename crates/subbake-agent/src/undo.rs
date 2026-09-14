@@ -46,7 +46,10 @@ impl UndoService {
             vec![target_index]
         };
 
-        let guard = FileGuard::new(project_root.to_path_buf())?;
+        let mut guard = FileGuard::new(project_root.to_path_buf())?;
+        if let Some(path) = session.config_path.as_deref() {
+            guard.protect_path(Path::new(path))?;
+        }
         for index in indices.iter().rev().copied() {
             let data = file_operation(&session.events[index])?;
             restore_event(&guard, &data, cancellation)?;
@@ -76,6 +79,31 @@ fn restore_event(
 
     if let Some(semantic) = event.semantic_undo.clone() {
         match semantic {
+            SemanticUndo::RestoreRenamed {
+                destination_backup_path,
+            } => {
+                let new_path = event
+                    .new_path
+                    .as_deref()
+                    .ok_or_else(|| std::io::Error::other("renamed undo is missing new_path"))?;
+                let new_path = guard.resolve_undo_target(Path::new(new_path))?;
+                if new_path == target_path {
+                    return Err(std::io::Error::other("rename undo targets must differ").into());
+                }
+                let source_backup = guard.resolve_undo_backup(&required_backup(event)?)?;
+                let destination_backup = destination_backup_path
+                    .as_deref()
+                    .map(|path| guard.resolve_undo_backup(path))
+                    .transpose()?;
+                // Validate both backups and targets before restoring either side.
+                guard.restore_for_undo(&source_backup, &target_path)?;
+                if let Some(backup) = destination_backup {
+                    guard.restore_for_undo(&backup, &new_path)?;
+                } else {
+                    guard.remove_for_undo(&new_path)?;
+                }
+                return Ok(());
+            }
             SemanticUndo::RemoveEmbeddedSubtitle { title } => {
                 subbake_adapters::remove_embedded_subtitle_by_title(
                     &target_path,
@@ -112,6 +140,9 @@ fn restore_event(
                 .new_path
                 .as_deref()
                 .ok_or_else(|| std::io::Error::other("renamed undo is missing new_path"))?;
+            if guard.resolve_undo_target(Path::new(new_path))? == target_path {
+                return Err(std::io::Error::other("rename undo targets must differ").into());
+            }
             let backup = required_backup(event)?;
             guard.restore_for_undo(&backup, Path::new(&event.path))?;
             // Restore first. If removing the renamed path then fails, retrying
@@ -162,6 +193,49 @@ mod tests {
 
     fn operation(data: FileOpEventData) -> AgentEvent {
         AgentEvent::from_kind(&EventKind::FileOperation(data))
+    }
+
+    #[test]
+    fn overwrite_rename_undo_restores_both_files_after_session_reload() {
+        let (_temporary, root, _store, _) = setup("overwrite-rename");
+        std::fs::write(root.join("a.txt"), "original A").expect("source");
+        std::fs::write(root.join("b.txt"), "original B").expect("destination");
+        let mut engine = crate::AgentEngine::new(root.clone()).expect("engine");
+        engine.start_session().expect("session");
+        engine
+            .run_tool(
+                "rename_path",
+                &serde_json::json!({"from":"a.txt","to":"b.txt"}),
+            )
+            .expect("rename");
+        let mut resumed = crate::AgentEngine::new(root.clone()).expect("engine");
+        resumed.resume_session(None).expect("resume");
+        resumed.undo_last().expect("undo");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("source"),
+            "original A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).expect("destination"),
+            "original B"
+        );
+    }
+
+    #[test]
+    fn self_rename_fails_before_mutation_or_backup() {
+        let (_temporary, root, _store, _) = setup("self-rename");
+        std::fs::write(root.join("a.txt"), "only copy").expect("source");
+        let guard = FileGuard::new(root.clone()).expect("guard");
+        assert!(
+            guard
+                .rename_path(Path::new("a.txt"), Path::new("./a.txt"))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("source"),
+            "only copy"
+        );
+        assert!(!root.join(".subbake/agent/backups").exists());
     }
 
     #[test]

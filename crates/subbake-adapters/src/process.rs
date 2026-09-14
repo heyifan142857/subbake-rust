@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -23,6 +25,95 @@ enum LineStream {
     Stderr,
 }
 
+const COMPLETE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+const PROGRESS_LINE_LIMIT: usize = 64 * 1024;
+const PROGRESS_QUEUE_LIMIT: usize = 64;
+
+#[derive(Clone, Copy)]
+struct CapturePolicy {
+    limit: usize,
+    fail_on_overflow: bool,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self {
+            limit: COMPLETE_OUTPUT_LIMIT,
+            fail_on_overflow: true,
+        }
+    }
+}
+
+struct ProcessOptions {
+    timeout: Option<Duration>,
+    line_stream: LineStream,
+    capture: CapturePolicy,
+}
+
+pub(crate) struct CapturedProcessOutput {
+    pub output: Output,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Retains a prefix and rolling suffix without ever accumulating full output.
+struct OutputBuffer {
+    prefix: Vec<u8>,
+    tail: VecDeque<u8>,
+    policy: CapturePolicy,
+    total: usize,
+}
+
+impl OutputBuffer {
+    fn new(policy: CapturePolicy) -> Self {
+        Self {
+            prefix: Vec::new(),
+            tail: VecDeque::new(),
+            policy,
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let prefix_limit = if self.policy.fail_on_overflow {
+            self.policy.limit
+        } else {
+            self.policy.limit / 2
+        };
+        let take = bytes
+            .len()
+            .min(prefix_limit.saturating_sub(self.prefix.len()));
+        self.prefix.extend_from_slice(&bytes[..take]);
+        let remaining = &bytes[take..];
+        let tail_limit = self.policy.limit - prefix_limit;
+        if tail_limit == 0 {
+            return;
+        }
+        if remaining.len() >= tail_limit {
+            self.tail.clear();
+            self.tail.extend(&remaining[remaining.len() - tail_limit..]);
+        } else {
+            let discard = (self.tail.len() + remaining.len()).saturating_sub(tail_limit);
+            self.tail.drain(..discard);
+            self.tail.extend(remaining);
+        }
+    }
+
+    fn finish(mut self) -> CapturedStream {
+        self.prefix.extend(self.tail);
+        CapturedStream {
+            bytes: self.prefix,
+            truncated: self.total > self.policy.limit,
+        }
+    }
+}
+
 impl ProcessSupervisor {
     /// Run a child process while continuously draining both output pipes.
     ///
@@ -38,12 +129,17 @@ impl ProcessSupervisor {
             command,
             cancellation,
             context,
-            None,
-            LineStream::None,
+            ProcessOptions {
+                timeout: None,
+                line_stream: LineStream::None,
+                capture: CapturePolicy::default(),
+            },
             |_| {},
         )
+        .map(|captured| captured.output)
     }
 
+    #[cfg(test)]
     pub(crate) fn run_with_timeout(
         command: &mut Command,
         cancellation: &CancellationGuard,
@@ -54,10 +150,14 @@ impl ProcessSupervisor {
             command,
             cancellation,
             context,
-            Some(timeout),
-            LineStream::None,
+            ProcessOptions {
+                timeout: Some(timeout),
+                line_stream: LineStream::None,
+                capture: CapturePolicy::default(),
+            },
             |_| {},
         )
+        .map(|captured| captured.output)
     }
 
     /// Run a child while delivering complete stdout lines to the caller as they
@@ -72,10 +172,14 @@ impl ProcessSupervisor {
             command,
             cancellation,
             context,
-            None,
-            LineStream::Stdout,
+            ProcessOptions {
+                timeout: None,
+                line_stream: LineStream::Stdout,
+                capture: CapturePolicy::default(),
+            },
             on_line,
         )
+        .map(|captured| captured.output)
     }
 
     /// Run a child while delivering complete stderr lines to the caller as they
@@ -90,9 +194,36 @@ impl ProcessSupervisor {
             command,
             cancellation,
             context,
-            None,
-            LineStream::Stderr,
+            ProcessOptions {
+                timeout: None,
+                line_stream: LineStream::Stderr,
+                capture: CapturePolicy::default(),
+            },
             on_line,
+        )
+        .map(|captured| captured.output)
+    }
+
+    pub(crate) fn run_bounded_with_timeout(
+        command: &mut Command,
+        cancellation: &CancellationGuard,
+        context: &str,
+        timeout: Duration,
+        limit: usize,
+    ) -> AdapterResult<CapturedProcessOutput> {
+        Self::run_inner(
+            command,
+            cancellation,
+            context,
+            ProcessOptions {
+                timeout: Some(timeout),
+                line_stream: LineStream::None,
+                capture: CapturePolicy {
+                    limit,
+                    fail_on_overflow: false,
+                },
+            },
+            |_| {},
         )
     }
 
@@ -100,10 +231,9 @@ impl ProcessSupervisor {
         command: &mut Command,
         cancellation: &CancellationGuard,
         context: &str,
-        timeout: Option<Duration>,
-        line_stream: LineStream,
+        options: ProcessOptions,
         mut on_line: impl FnMut(&str),
-    ) -> AdapterResult<Output> {
+    ) -> AdapterResult<CapturedProcessOutput> {
         cancellation.check().map_err(AdapterError::from)?;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let program = command.get_program().to_os_string();
@@ -120,45 +250,74 @@ impl ProcessSupervisor {
             .stderr
             .take()
             .ok_or_else(|| io::Error::other(format!("{context}: stderr pipe unavailable")))?;
-        let (sender, receiver) = mpsc::channel();
-        let (stdout_reader, stderr_reader) = match line_stream {
-            LineStream::None => {
-                drop(sender);
-                (
-                    thread::spawn(move || read_all(stdout)),
-                    thread::spawn(move || read_all(stderr)),
-                )
-            }
-            LineStream::Stdout => (
-                thread::spawn(move || Self::read_lines(stdout, sender)),
-                thread::spawn(move || read_all(stderr)),
-            ),
-            LineStream::Stderr => (
-                thread::spawn(move || read_all(stdout)),
-                thread::spawn(move || Self::read_lines(stderr, sender)),
-            ),
-        };
+        let (sender, receiver) = mpsc::sync_channel(PROGRESS_QUEUE_LIMIT);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let capture = options.capture;
+        let stdout_sender = (options.line_stream == LineStream::Stdout).then(|| sender.clone());
+        let stderr_sender = (options.line_stream == LineStream::Stderr).then(|| sender.clone());
+        drop(sender);
+        let stdout_overflow = Arc::clone(&overflow);
+        let stderr_overflow = Arc::clone(&overflow);
+        let stdout_reader =
+            thread::spawn(move || read_stream(stdout, capture, stdout_sender, stdout_overflow));
+        let stderr_reader =
+            thread::spawn(move || read_stream(stderr, capture, stderr_sender, stderr_overflow));
         let started = std::time::Instant::now();
 
+        let mut exit_status = None;
         let status = loop {
-            while let Ok(line) = receiver.try_recv() {
+            for _ in 0..PROGRESS_QUEUE_LIMIT {
+                let Ok(line) = receiver.try_recv() else {
+                    break;
+                };
                 on_line(&line);
             }
             if cancellation.is_cancelled() {
                 Self::terminate(&mut child);
+                drop(receiver);
                 join_readers_after_termination(stdout_reader, stderr_reader, context)?;
                 return Err(AdapterError::Cancelled);
             }
-            if let Some(limit) = timeout
+            if let Some(limit) = options.timeout
                 && started.elapsed() >= limit
             {
                 Self::terminate(&mut child);
+                drop(receiver);
                 join_readers_after_termination(stdout_reader, stderr_reader, context)?;
                 return Err(AdapterError::Timeout {
                     message: format!("{context} exceeded its {} second timeout", limit.as_secs()),
                 });
             }
-            if let Some(status) = child.try_wait()? {
+            if overflow.load(Ordering::Acquire) {
+                Self::terminate(&mut child);
+                drop(receiver);
+                join_readers_after_termination(stdout_reader, stderr_reader, context)?;
+                return Err(AdapterError::ChildProcess {
+                    program: "external process",
+                    status: None,
+                    message: format!(
+                        "{context}: output exceeded the {} byte capture limit",
+                        capture.limit
+                    ),
+                });
+            }
+            if exit_status.is_none() {
+                match child.try_wait() {
+                    Ok(status) => exit_status = status,
+                    Err(error) => {
+                        Self::terminate(&mut child);
+                        drop(receiver);
+                        join_readers_after_termination(stdout_reader, stderr_reader, context)?;
+                        return Err(error.into());
+                    }
+                }
+            }
+            // Descendants can retain pipes after the group leader exits. Keep
+            // enforcing cancellation/timeouts until both readers reach EOF.
+            if let Some(status) = exit_status
+                && stdout_reader.is_finished()
+                && stderr_reader.is_finished()
+            {
                 break status;
             }
             thread::sleep(Duration::from_millis(25));
@@ -168,25 +327,27 @@ impl ProcessSupervisor {
         }
         let stdout = join_reader(stdout_reader, context, "stdout");
         let stderr = join_reader(stderr_reader, context, "stderr");
-        Ok(Output {
-            status,
-            stdout: stdout?,
-            stderr: stderr?,
-        })
-    }
-
-    fn read_lines(reader: impl Read, sender: mpsc::Sender<String>) -> io::Result<Vec<u8>> {
-        let mut reader = BufReader::new(reader);
-        let mut output = Vec::new();
-        loop {
-            let start = output.len();
-            if reader.read_until(b'\n', &mut output)? == 0 {
-                break;
-            }
-            let line = String::from_utf8_lossy(&output[start..]);
-            let _ = sender.send(line.trim().to_owned());
+        let stdout = stdout?;
+        let stderr = stderr?;
+        if capture.fail_on_overflow && (stdout.truncated || stderr.truncated) {
+            return Err(AdapterError::ChildProcess {
+                program: "external process",
+                status: Some(status.code().unwrap_or(-1)),
+                message: format!(
+                    "{context}: output exceeded the {} byte capture limit",
+                    capture.limit
+                ),
+            });
         }
-        Ok(output)
+        Ok(CapturedProcessOutput {
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            output: Output {
+                status,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+            },
+        })
     }
 
     pub(crate) fn terminate(child: &mut GroupChild) {
@@ -222,17 +383,59 @@ fn ffmpeg_install_hint(program: &OsStr) -> Option<String> {
     ))
 }
 
-fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
+fn read_stream(
+    mut reader: impl Read,
+    policy: CapturePolicy,
+    sender: Option<mpsc::SyncSender<String>>,
+    overflow: Arc<AtomicBool>,
+) -> io::Result<CapturedStream> {
+    let mut output = OutputBuffer::new(policy);
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut line = Vec::new();
+    let mut line_overflow = false;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if count == 0 {
+            break;
+        }
+        let bytes = &buffer[..count];
+        output.push(bytes);
+        if policy.fail_on_overflow && output.total > policy.limit {
+            overflow.store(true, Ordering::Release);
+        }
+        if let Some(sender) = &sender {
+            for byte in bytes {
+                if *byte == b'\n' {
+                    if !line_overflow {
+                        let _ = sender.send(String::from_utf8_lossy(&line).trim().to_owned());
+                    }
+                    line.clear();
+                    line_overflow = false;
+                } else if line.len() < PROGRESS_LINE_LIMIT {
+                    line.push(*byte);
+                } else {
+                    line_overflow = true;
+                }
+            }
+        }
+    }
+    if let Some(sender) = sender
+        && !line.is_empty()
+        && !line_overflow
+    {
+        let _ = sender.send(String::from_utf8_lossy(&line).trim().to_owned());
+    }
+    Ok(output.finish())
 }
 
 fn join_reader(
-    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    reader: thread::JoinHandle<io::Result<CapturedStream>>,
     context: &str,
     stream: &str,
-) -> AdapterResult<Vec<u8>> {
+) -> AdapterResult<CapturedStream> {
     reader
         .join()
         .map_err(|_| io::Error::other(format!("{context}: {stream} reader panicked")))?
@@ -240,8 +443,8 @@ fn join_reader(
 }
 
 fn join_readers_after_termination(
-    stdout_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stderr_reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stdout_reader: thread::JoinHandle<io::Result<CapturedStream>>,
+    stderr_reader: thread::JoinHandle<io::Result<CapturedStream>>,
     context: &str,
 ) -> AdapterResult<()> {
     let stdout = join_reader(stdout_reader, context, "stdout");
@@ -278,11 +481,21 @@ mod tests {
                 let path = std::env::var_os(HELPER_SENTINEL).expect("sentinel path");
                 fs::write(path, b"survived").expect("write sentinel");
             }
+            "orphan-pipe" => {
+                // Deliberately orphan the helper to exercise inherited-pipe shutdown.
+                #[allow(clippy::zombie_processes)]
+                let _child = helper_command("sleep").spawn().expect("spawn pipe owner");
+            }
             "tree" => {
                 let mut grandchild = helper_command("grandchild")
                     .spawn()
                     .expect("spawn grandchild");
                 let _ = grandchild.wait();
+            }
+            "progress-flood" => {
+                for _ in 0..100_000 {
+                    println!("progress=123");
+                }
             }
             "output" => {
                 let block = vec![b'x'; 128 * 1024];
@@ -331,6 +544,115 @@ mod tests {
         .expect_err("child should time out");
 
         assert!(matches!(error, AdapterError::Timeout { .. }));
+    }
+
+    #[test]
+    fn timeout_remains_active_after_leader_exits_with_inherited_pipes() {
+        let started = std::time::Instant::now();
+        let error = ProcessSupervisor::run_with_timeout(
+            &mut helper_command("orphan-pipe"),
+            &CancellationGuard::never(),
+            "inherited pipes",
+            Duration::from_millis(200),
+        )
+        .expect_err("pipe drain must time out");
+        assert!(matches!(error, AdapterError::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn cancellation_remains_active_after_leader_exits_with_inherited_pipes() {
+        let token = CancellationToken::default();
+        let guard = token.guard();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = ProcessSupervisor::run(
+            &mut helper_command("orphan-pipe"),
+            &guard,
+            "inherited pipes",
+        )
+        .expect_err("pipe drain must cancel");
+        canceller.join().expect("canceller");
+        assert!(error.is_cancelled());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn diagnostic_capture_is_bounded_while_draining_both_pipes() {
+        let captured = ProcessSupervisor::run_bounded_with_timeout(
+            &mut helper_command("output"),
+            &CancellationGuard::never(),
+            "large diagnostics",
+            Duration::from_secs(5),
+            1024,
+        )
+        .expect("drain bounded output");
+        assert!(captured.output.status.success());
+        assert_eq!(captured.output.stdout.len(), 1024);
+        assert_eq!(captured.output.stderr.len(), 1024);
+        assert!(captured.stdout_truncated && captured.stderr_truncated);
+    }
+
+    #[test]
+    fn structured_capture_fails_instead_of_returning_truncated_payload() {
+        let error = ProcessSupervisor::run_inner(
+            &mut helper_command("output"),
+            &CancellationGuard::never(),
+            "structured data",
+            ProcessOptions {
+                timeout: Some(Duration::from_secs(5)),
+                line_stream: LineStream::None,
+                capture: CapturePolicy {
+                    limit: 1024,
+                    fail_on_overflow: true,
+                },
+            },
+            |_| {},
+        )
+        .err()
+        .expect("overflow must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("output exceeded the 1024 byte capture limit")
+        );
+    }
+
+    #[test]
+    fn rolling_capture_preserves_prefix_suffix_and_never_grows_past_limit() {
+        let mut output = OutputBuffer::new(CapturePolicy {
+            limit: 1024,
+            fail_on_overflow: false,
+        });
+        output.push(b"first marker");
+        for _ in 0..1000 {
+            output.push(&[b'x'; 8192]);
+            assert!(output.prefix.len() + output.tail.len() <= 1024);
+        }
+        output.push(b"last marker");
+        let result = output.finish();
+        assert!(result.truncated);
+        assert!(result.bytes.starts_with(b"first marker"));
+        assert!(result.bytes.ends_with(b"last marker"));
+    }
+
+    #[test]
+    fn cancellation_does_not_deadlock_a_full_progress_queue() {
+        let token = CancellationToken::default();
+        let guard = token.guard();
+        let started = std::time::Instant::now();
+        let error = ProcessSupervisor::run_with_stdout_lines(
+            &mut helper_command("progress-flood"),
+            &guard,
+            "progress flood",
+            |_| token.cancel(),
+        )
+        .expect_err("cancel flood");
+        assert!(error.is_cancelled());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

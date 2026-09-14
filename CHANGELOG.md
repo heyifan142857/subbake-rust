@@ -38,6 +38,20 @@ breaking changes when they are called out in advance.
 
 ### Fixed
 
+- Enforce shared sensitive-path protection in the agent command sandbox with a
+  filtered project view; hide project symlinks, sockets, credentials, VCS/runtime
+  data, and unrelated host files even from recursive shell commands.
+- Protect default and session-selected configuration files from generic agent
+  reads and edits, including resolved aliases and resumed sessions.
+- Restore both original files when undoing an overwrite rename, retain relative
+  backup references, and reject self-renames before any mutation.
+- Publish immutable, SHA-256-verified checkpoint shards with version 6 run-state
+  manifests so concurrent runs and interrupted publications cannot mix batches.
+  Existing run-state and legacy batch readers remain supported.
+- Keep process cancellation and timeouts active until inherited output pipes
+  close, and bound command output and progress queues during collection.
+  Structured process output exceeding 64 MiB per stream now fails explicitly.
+
 - Keep Turbo personal-name marker contracts stable when retrying a translation
   through smaller split batches, revalidate merged results, reject recurring
   dialogue starters as name candidates, and diagnose marker failures without

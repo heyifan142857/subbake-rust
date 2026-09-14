@@ -321,7 +321,26 @@ Important interactive controls include:
 Mutating plans require an explicit approve/reject/revise decision. Commands
 outside the strict read-only auto-run set require command approval. Project file
 operations reject path traversal, project escape, protected runtime/VCS paths,
-and common credential paths.
+and common credential paths. Default `subbake.toml`/`.subbake.toml` files and
+session-selected configuration files are protected from generic file tools;
+use `/config` to inspect or update settings without sending inline secrets to
+the model.
+
+On Linux, `run_command` sees a filtered project view plus system executables,
+libraries, certificate/DNS files and the standard Rust toolchain/cache. It does
+not expose project symlinks, sockets, directories marked by `CACHEDIR.TAG`
+(such as Cargo build caches), protected VCS/runtime directories, or
+unrelated host files. Commands relying on those paths (including Git metadata)
+will fail explicitly. Custom executables outside the system PATH and standard
+`~/.cargo/bin` are not automatically exposed. Retained artifacts must still be
+written through declared output aliases. Each command output stream retains
+at most 64 KiB of its first and last bytes, with a visible truncation marker.
+Other external-process capture is limited to 64 MiB per stream and fails on
+overflow; structured responses are never silently truncated. Cancellation and
+command timeouts cover pipe draining after the main process exits.
+
+Undo of an overwrite rename restores both the source and the previous
+destination. Renaming a path to itself is rejected.
 
 Before the agent translates or transcribes a specific MKV, MP4/M4V/MOV, or
 WebM file, it performs a read-only ffprobe inspection of embedded subtitle
@@ -841,3 +860,13 @@ Evaluation documentation:
 
 - [Agent evaluation](agent-evaluation.md)
 - [Subtitle and transcription evaluation](subtitle-evaluation.md)
+
+## Checkpoint integrity
+
+New translation checkpoints store immutable batches under `shards-v1/` in the
+run directory. Version 6 `run_state.json` names the exact batches and their
+SHA-256 checksums. Resume reads the accepted manifest even if another run
+publishes a newer state; unpublished batches cannot change an older checkpoint.
+The latest published state is still the default Resume candidate for an input.
+Older states and padded batch files remain readable and are retained when a
+checkpoint is upgraded. Use runtime cleanup to remove obsolete run artifacts.

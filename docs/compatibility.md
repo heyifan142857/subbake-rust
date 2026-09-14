@@ -47,6 +47,21 @@ When a persisted shape changes, SubBake must either retain a backwards-compatibl
 reader or provide an explicit migration. It must never silently reinterpret an
 older shape as a different current value.
 
+## Checkpoint and undo updates
+
+- New run-state files use version 6 with immutable `shards-v1` content references
+  and SHA-256 integrity checks. Readers retain versions 1 through 5 and their
+  padded or inline batch representations. Upgrading a checkpoint leaves legacy
+  files intact; older executables cannot resume a version 6 checkpoint.
+- New rename events include a `restore_renamed` semantic undo payload containing
+  the prior destination backup, when present. New backup references are project
+  relative. Existing absolute backup references and historical rename events
+  remain readable; old events cannot recover destination backups they did not
+  record.
+- Agent file protection now includes default and pinned configuration files.
+  Linux command execution uses a filtered filesystem view and no longer exposes
+  project symlinks, protected VCS/runtime directories, or arbitrary host paths.
+
 ## What is not legacy compatibility
 
 The following behavior is part of normal runtime resilience and must not be
