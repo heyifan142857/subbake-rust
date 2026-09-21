@@ -6,8 +6,10 @@ use std::sync::Arc;
 use serde_json::json;
 use subbake_core::{CancellationGuard, CancellationToken, ProgressEvent, ProgressSink, TaskKind};
 
+#[cfg(unix)]
+use crate::FileGuard;
 use crate::event::ToolCallDraft;
-use crate::{AgentEngine, EngineObserver, FileGuard};
+use crate::{AgentEngine, EngineObserver};
 
 const SUBTITLE: &str = "1\n00:00:05,000 --> 00:00:07,000\nHello.\n";
 

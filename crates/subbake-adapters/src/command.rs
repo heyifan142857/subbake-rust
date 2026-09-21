@@ -352,17 +352,15 @@ mod tests {
             &CancellationGuard::never(),
         )
         .expect("mount plan");
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>();
+        let args = command.get_args().map(Path::new).collect::<Vec<_>>();
         assert!(args.iter().any(|arg| arg.ends_with("visible.txt")));
         assert!(args.iter().any(|arg| arg.ends_with(".env.example")));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.ends_with("/.env") || arg.contains("/.git"))
-        );
+        assert!(!args.iter().any(|arg| {
+            arg.ends_with(".env")
+                || arg
+                    .components()
+                    .any(|component| component.as_os_str() == ".git")
+        }));
     }
 
     #[test]
@@ -384,11 +382,11 @@ mod tests {
             &CancellationGuard::never(),
         )
         .expect("mount plan");
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>();
-        assert!(!args.iter().any(|arg| arg.contains("build-cache")));
+        let args = command.get_args().map(Path::new).collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| {
+            arg.components()
+                .any(|component| component.as_os_str() == "build-cache")
+        }));
         assert!(args.iter().any(|arg| arg.ends_with("target/subtitle.srt")));
     }
 
