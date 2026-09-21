@@ -173,7 +173,7 @@ impl AgentEngine {
                 DecisionAction::ToolCalls => {
                     let commentary =
                         self.announce_commentary(&decision.text, &state.input, &decision.calls)?;
-                    let continuation = decision.continuation;
+                    let mut continuation = decision.continuation;
                     let processed = self.process_tool_calls(
                         decision.calls,
                         &mut state.task,
@@ -182,6 +182,15 @@ impl AgentEngine {
                         &mut state.completed_mutations,
                         &mut state.source_fallback,
                     )?;
+                    if self.profile_backend_changed {
+                        // Results from the old provider cannot form a continuation
+                        // for the replacement, including across an approval pause.
+                        continuation = None;
+                        state.legacy_mode = self.profile_backend.as_ref().is_some_and(|backend| {
+                            backend.native_tool_support() == NativeToolSupport::Unsupported
+                        });
+                        state.effective_defaults = self.effective_defaults_summary()?;
+                    }
                     if self.apply_pending_steering(&mut state, &mut native_turn)? {
                         continue;
                     }
@@ -303,6 +312,60 @@ impl AgentEngine {
 
     #[allow(clippy::too_many_arguments)]
     fn call_model(
+        &mut self,
+        backend: &mut dyn LlmBackend,
+        input: &str,
+        task: &AgentTaskLoop,
+        dialogue: Option<&str>,
+        native_turn: &mut Option<NativeTurn>,
+        legacy_mode: &mut bool,
+        tools_enabled: bool,
+        effective_defaults: &str,
+    ) -> AgentResult<Option<Decision>> {
+        let refreshed_defaults = self
+            .profile_backend
+            .as_ref()
+            .map(|_| self.effective_defaults_summary())
+            .transpose()?;
+        let mut owned_backend = self.profile_backend.take();
+        if self.profile_backend_changed {
+            *native_turn = None;
+            *legacy_mode = owned_backend.as_ref().map_or_else(
+                || backend.native_tool_support(),
+                |backend| backend.native_tool_support(),
+            ) == NativeToolSupport::Unsupported;
+            self.profile_backend_changed = false;
+        }
+        let defaults = refreshed_defaults.as_deref().unwrap_or(effective_defaults);
+        let result = if let Some(replacement) = owned_backend.as_mut() {
+            self.call_model_with_backend(
+                replacement.as_mut(),
+                input,
+                task,
+                dialogue,
+                native_turn,
+                legacy_mode,
+                tools_enabled,
+                defaults,
+            )
+        } else {
+            self.call_model_with_backend(
+                backend,
+                input,
+                task,
+                dialogue,
+                native_turn,
+                legacy_mode,
+                tools_enabled,
+                defaults,
+            )
+        };
+        self.profile_backend = owned_backend;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_model_with_backend(
         &mut self,
         backend: &mut dyn LlmBackend,
         input: &str,
@@ -1227,19 +1290,28 @@ impl AgentEngine {
         args: &JsonValue,
     ) -> AgentResult<subbake_core::AgentToolOutcome> {
         let activity_id = new_activity_id();
-        let started = self.start_tool_activity(&activity_id, name, args)?;
+        self.run_observed_tool_with_id(name, args, &activity_id)
+    }
+
+    pub(crate) fn run_observed_tool_with_id(
+        &mut self,
+        name: &str,
+        args: &JsonValue,
+        activity_id: &str,
+    ) -> AgentResult<subbake_core::AgentToolOutcome> {
+        let started = self.start_tool_activity(activity_id, name, args)?;
         match self.run_tool(name, args) {
             Ok(outcome) => {
-                self.complete_tool_activity(&activity_id, name, args, &outcome, started)?;
+                self.complete_tool_activity(activity_id, name, args, &outcome, started)?;
                 Ok(outcome)
             }
             Err(error) if error.is_cancelled() => {
-                self.cancel_tool_activity(&activity_id, name, args, started)?;
+                self.cancel_tool_activity(activity_id, name, args, started)?;
                 Err(error)
             }
             Err(error) => {
                 self.fail_tool_activity(
-                    &activity_id,
+                    activity_id,
                     name,
                     args,
                     &error.tool_failure_category(),
@@ -1388,7 +1460,7 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn new_activity_id() -> String {
+pub(crate) fn new_activity_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1948,6 +2020,101 @@ mod tests {
                 }),
             }
         }
+    }
+
+    #[test]
+    fn model_profile_switch_replaces_the_backend_and_discards_old_native_continuations() {
+        for native in [false, true] {
+            let temporary = tempfile::tempdir().expect("project");
+            let root = temporary.path().to_path_buf();
+            std::fs::write(
+                root.join("subbake.toml"),
+                "version = 3\n[profiles.next.backend]\nid = \"mock\"\nmodel = \"mock-zh\"\n",
+            )
+            .expect("config");
+            let mut engine = active_engine(root);
+            let input = "Switch to profile next";
+            if native {
+                let mut backend = NativeSequenceBackend {
+                    steps: VecDeque::from([NativeStep::Calls(vec![ModelToolCall {
+                        id: "switch".into(),
+                        name: "switch_profile".into(),
+                        arguments: json!({"name":"next"}),
+                    }])]),
+                    definitions: Vec::new(),
+                    continued_results: Vec::new(),
+                };
+                assert_eq!(
+                    engine
+                        .run_line(input, &mut backend)
+                        .expect("new backend responds"),
+                    input
+                );
+                assert_eq!(backend.definitions.len(), 1);
+                assert!(backend.continued_results.is_empty());
+            } else {
+                let mut backend = JsonSequenceBackend {
+                    decisions: VecDeque::from([
+                        json!({"action":"tool_call","tool_name":"switch_profile","arguments":{"name":"next"}}),
+                    ]),
+                    prompts: Vec::new(),
+                };
+                assert_eq!(
+                    engine
+                        .run_line(input, &mut backend)
+                        .expect("new backend responds"),
+                    input
+                );
+                assert_eq!(backend.prompts.len(), 1);
+            }
+            assert_eq!(engine.active_profile(), Some("next"));
+            assert_eq!(
+                engine
+                    .take_profile_backend()
+                    .expect("handoff to CLI")
+                    .provider_name(),
+                "echo-decision"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_switch_before_approval_does_not_persist_the_old_provider_continuation() {
+        let temporary = tempfile::tempdir().expect("project");
+        let root = temporary.path().to_path_buf();
+        std::fs::write(
+            root.join("subbake.toml"),
+            "version = 3\n[profiles.next.backend]\nid = \"mock\"\nmodel = \"mock-zh\"\n",
+        )
+        .expect("config");
+        let mut engine = active_engine(root);
+        let mut backend = NativeSequenceBackend {
+            steps: VecDeque::from([NativeStep::Calls(vec![
+                ModelToolCall {
+                    id: "switch".into(),
+                    name: "switch_profile".into(),
+                    arguments: json!({"name":"next"}),
+                },
+                ModelToolCall {
+                    id: "command".into(),
+                    name: "run_command".into(),
+                    arguments: json!({"command":"printf hello | cat"}),
+                },
+            ])]),
+            definitions: Vec::new(),
+            continued_results: Vec::new(),
+        };
+        engine
+            .run_line("Switch profile, then run a command", &mut backend)
+            .expect("approval pause");
+        assert!(engine.has_pending_command_approval());
+        assert!(engine.pending_native_continuation.is_none());
+        let mut replacement = engine.take_profile_backend().expect("validated backend");
+        let response = engine
+            .handle_command_decision(crate::CommandDecision::Reject, replacement.as_mut())
+            .expect("resume with new provider");
+        assert!(!response.contains("Provider error"));
+        assert_eq!(backend.definitions.len(), 1);
     }
 
     #[test]

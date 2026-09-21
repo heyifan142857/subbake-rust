@@ -16,7 +16,9 @@ pub struct FileOpEventData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_undo: Option<crate::guard::SemanticUndo>,
     pub group_id: Option<String>,
-    #[serde(default)]
+    pub post_state: crate::guard::FileState,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub new_path_post_state: Option<crate::guard::FileState>,
     pub undone: bool,
 }
 
@@ -105,19 +107,18 @@ pub struct PendingPlan {
     pub message: String,
     pub tool_calls: Vec<ToolCallDraft>,
     pub created_at: String,
+    /// Written before execution; completion and cursor advancement are one save.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub in_flight_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingCommandApproval {
     pub tool_call: ToolCallDraft,
-    #[serde(default)]
     pub call_id: String,
-    #[serde(default)]
     pub remaining_tool_calls: Vec<PendingToolCall>,
     pub reason: String,
-    #[serde(default)]
     pub kind: PendingApprovalKind,
-    #[serde(default)]
     pub purpose: String,
     pub created_at: String,
 }

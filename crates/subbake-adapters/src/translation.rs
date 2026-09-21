@@ -578,11 +578,49 @@ pub fn translate_subtitle_batch_with_progress(
 }
 
 pub fn translate_subtitle_batch_with_progress_and_quality(
-    mut request: BatchTranslationRequest,
+    request: BatchTranslationRequest,
     cancellation: &CancellationGuard,
     progress: SharedProgress,
     quality_gate: QualityGate,
 ) -> AdapterResult<BatchTranslationOutcome> {
+    translate_batch_inner(
+        request,
+        None,
+        cancellation,
+        progress,
+        quality_gate,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Execute exactly the caller's selected inputs. The completion hook runs after
+/// each output is published, before another file or fallible manifest write.
+pub fn translate_selected_subtitle_files(
+    request: BatchTranslationRequest,
+    inputs: Vec<PathBuf>,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+    on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
+) -> AdapterResult<BatchTranslationOutcome> {
+    translate_batch_inner(
+        request,
+        Some(inputs),
+        cancellation,
+        progress,
+        QualityGate::Never,
+        on_output,
+    )
+}
+
+fn translate_batch_inner(
+    mut request: BatchTranslationRequest,
+    inputs: Option<Vec<PathBuf>>,
+    cancellation: &CancellationGuard,
+    progress: SharedProgress,
+    quality_gate: QualityGate,
+    on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
+) -> AdapterResult<BatchTranslationOutcome> {
+    check_cancelled(cancellation)?;
     normalize_translation_languages(&mut request.settings)?;
     request.output_language_tag = request
         .output_language_tag
@@ -590,9 +628,12 @@ pub fn translate_subtitle_batch_with_progress_and_quality(
         .map(|value| normalize_language(value, false))
         .transpose()
         .map_err(|error| AdapterError::invalid_input(error.to_string()))?;
-    let files = match request.retry_manifest.as_deref() {
-        Some(path) => failed_inputs_from_manifest(path, &request.root)?,
-        None => discover_subtitle_files(&request.root, request.recursive)?,
+    let files = match inputs {
+        Some(files) => files,
+        None => match request.retry_manifest.as_deref() {
+            Some(path) => failed_inputs_from_manifest(path, &request.root)?,
+            None => discover_subtitle_files(&request.root, request.recursive)?,
+        },
     };
     check_cancelled(cancellation)?;
     let runtime_dir = prepare_fresh_runtime(&mut request, true)?;
@@ -685,6 +726,9 @@ pub fn translate_subtitle_batch_with_progress_and_quality(
             }
         };
         if let Some(output_path) = outcome.output_path {
+            if !outcome.result.dry_run {
+                on_output(&output_path)?;
+            }
             outputs.push(output_path);
         }
         subtitle_entries += outcome.subtitle_entries;

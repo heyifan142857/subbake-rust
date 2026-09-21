@@ -20,6 +20,14 @@ pub enum AgentError {
     ToolPolicy { message: String },
     #[error("{message}")]
     InvalidState { message: String },
+    #[error(
+        "session `{id}` uses unsupported version {version}; expected version {expected}; start a new session"
+    )]
+    UnsupportedSessionVersion {
+        id: String,
+        version: u64,
+        expected: u64,
+    },
     #[error(transparent)]
     FileGuard(#[from] crate::guard::FileGuardError),
     #[error("{operation}{path_suffix}: {source}", path_suffix = path.as_ref().map(|value| format!(" `{}`", value.display())).unwrap_or_default())]
@@ -96,7 +104,9 @@ impl AgentError {
             Self::ToolPolicy { .. } => "tool_policy".to_owned(),
             Self::InvalidState { .. } => "invalid_state".to_owned(),
             Self::FileGuard(_) => "file_guard".to_owned(),
-            Self::SessionStorage { .. } | Self::SessionData { .. } => "session_storage".to_owned(),
+            Self::SessionStorage { .. }
+            | Self::SessionData { .. }
+            | Self::UnsupportedSessionVersion { .. } => "session_storage".to_owned(),
             Self::Adapter(source) => adapter_failure_category(source),
             Self::AdapterContext { source, .. } => adapter_failure_category(source),
             Self::Core(_) => "core".to_owned(),

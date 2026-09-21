@@ -8,6 +8,9 @@ breaking changes when they are called out in advance.
 
 ### Changed
 
+- Upgrade agent sessions to version 3 with mandatory undo fingerprints and
+  explicit plan execution state. Drop version 1/2 session and legacy undo readers
+  without migration; old sessions are hidden from discovery and cannot resume.
 - Use whisper.cpp full JSON as the recognition contract and share stable source
   cues across Economy, Turbo, and Cinema. Raw recognition and segmented-source
   caches are mode-independent; older media pipeline shards are not reused.
@@ -38,6 +41,18 @@ breaking changes when they are called out in advance.
 
 ### Fixed
 
+- Keep agent batch translation within its authorized file selection, excluding
+  protected directories and symlink escapes; record each completed output before
+  processing another file so cancellation retains its undo history.
+- Preserve subsequent user edits during undo with required content fingerprints
+  and group-wide conflict checks. Give independent mutations unique undo group IDs.
+- Reject symbolic links in internal backup and command staging directories,
+  including after a guard has been constructed.
+- Persist plan operation IDs before execution and save successful completion
+  together with plan progress; stop uncertain interrupted operations from being
+  replayed automatically.
+- Validate replacement profile backends before persisting a switch, and use the
+  replacement for subsequent model requests in both JSON and native tool loops.
 - Enforce shared sensitive-path protection in the agent command sandbox with a
   filtered project view; hide project symlinks, sockets, credentials, VCS/runtime
   data, and unrelated host files even from recursive shell commands.

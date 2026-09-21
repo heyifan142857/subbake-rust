@@ -7,8 +7,24 @@ use subbake_adapters::{
 };
 use subbake_core::{CancellationGuard, SharedProgress};
 
+/// Shared construction policy for initial and replacement decision backends.
+pub fn build_decision_backend(
+    settings: &subbake_adapters::ResolvedSettings,
+) -> AdapterResult<Box<dyn subbake_core::ports::LlmBackend>> {
+    if settings.backend.id == "mock" {
+        Ok(Box::new(crate::EchoDecisionBackend::new("mock-decision")))
+    } else {
+        subbake_adapters::build_backend(&settings.backend_config())
+    }
+}
+
 /// Narrow boundary between agent tool decisions and side-effecting adapter services.
 pub(crate) trait AgentServices: Send + Sync {
+    fn build_decision_backend(
+        &self,
+        settings: &subbake_adapters::ResolvedSettings,
+    ) -> AdapterResult<Box<dyn subbake_core::ports::LlmBackend>>;
+
     fn run_command(
         &self,
         request: &SandboxedCommandRequest,
@@ -59,6 +75,8 @@ pub(crate) trait AgentServices: Send + Sync {
     fn translate_batch(
         &self,
         request: BatchTranslationRequest,
+        inputs: Vec<PathBuf>,
+        on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
         cancellation: &CancellationGuard,
         progress: Option<SharedProgress>,
     ) -> AdapterResult<BatchTranslationOutcome>;
@@ -74,6 +92,13 @@ pub(crate) trait AgentServices: Send + Sync {
 pub(crate) struct DefaultAgentServices;
 
 impl AgentServices for DefaultAgentServices {
+    fn build_decision_backend(
+        &self,
+        settings: &subbake_adapters::ResolvedSettings,
+    ) -> AdapterResult<Box<dyn subbake_core::ports::LlmBackend>> {
+        build_decision_backend(settings)
+    }
+
     fn run_command(
         &self,
         request: &SandboxedCommandRequest,
@@ -218,18 +243,18 @@ impl AgentServices for DefaultAgentServices {
     fn translate_batch(
         &self,
         request: BatchTranslationRequest,
+        inputs: Vec<PathBuf>,
+        on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
         cancellation: &CancellationGuard,
         progress: Option<SharedProgress>,
     ) -> AdapterResult<BatchTranslationOutcome> {
-        if let Some(progress) = progress {
-            subbake_adapters::translate_subtitle_batch_with_progress(
-                request,
-                cancellation,
-                progress,
-            )
-        } else {
-            subbake_adapters::translate_subtitle_batch_cancellable(request, cancellation)
-        }
+        subbake_adapters::translation::translate_selected_subtitle_files(
+            request,
+            inputs,
+            cancellation,
+            progress.unwrap_or_else(|| std::sync::Arc::new(subbake_core::NoopProgress)),
+            on_output,
+        )
     }
 
     fn edit_subtitle(
@@ -247,6 +272,13 @@ pub(crate) struct TestAgentServices;
 
 #[cfg(test)]
 impl AgentServices for TestAgentServices {
+    fn build_decision_backend(
+        &self,
+        settings: &subbake_adapters::ResolvedSettings,
+    ) -> AdapterResult<Box<dyn subbake_core::ports::LlmBackend>> {
+        build_decision_backend(settings)
+    }
+
     fn run_command(
         &self,
         request: &SandboxedCommandRequest,
@@ -381,10 +413,12 @@ impl AgentServices for TestAgentServices {
     fn translate_batch(
         &self,
         request: BatchTranslationRequest,
+        inputs: Vec<PathBuf>,
+        on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
         cancellation: &CancellationGuard,
         progress: Option<SharedProgress>,
     ) -> AdapterResult<BatchTranslationOutcome> {
-        DefaultAgentServices.translate_batch(request, cancellation, progress)
+        DefaultAgentServices.translate_batch(request, inputs, on_output, cancellation, progress)
     }
 
     fn edit_subtitle(

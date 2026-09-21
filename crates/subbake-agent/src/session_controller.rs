@@ -45,9 +45,15 @@ impl<'a> SessionController<'a> {
             .active
             .as_mut()
             .ok_or_else(|| std::io::Error::other("no active session"))?;
-        session.events.push(AgentEvent::from_kind(&kind));
-        session.updated_at = crate::session::iso_now();
-        self.store.save(session)
+        let mut candidate = session.clone();
+        candidate.events.push(AgentEvent::from_kind(&kind));
+        candidate.updated_at = crate::session::iso_now();
+        if let EventKind::ToolCompleted { call_id, .. } = &kind {
+            crate::plan_coordinator::PlanCoordinator::complete_call(&mut candidate, call_id);
+        }
+        self.store.save(&candidate)?;
+        *session = candidate;
+        Ok(())
     }
 
     pub(crate) fn record_error(&mut self, error: &str) -> AgentResult<PathBuf> {

@@ -173,6 +173,7 @@ impl Drop for CommandStagingCleanup {
 
 #[derive(Debug)]
 pub(crate) struct ProfileSwitch {
+    pub settings: ResolvedSettings,
     pub name: String,
     pub config_path: PathBuf,
 }
@@ -543,15 +544,45 @@ pub(crate) fn execute_translation_tool(
     )
 }
 
+pub(crate) struct TranslationToolExecution<'a> {
+    pub services: &'a dyn AgentServices,
+    pub record_file_operation: &'a mut dyn FnMut(&FileOpResult) -> AgentResult<()>,
+}
+
+#[cfg(test)]
 pub(crate) fn execute_translation_tool_with_services(
     executor: ToolExecutor,
     args: &JsonValue,
     guard: &FileGuard,
     cancellation: &CancellationGuard,
     progress: Option<SharedProgress>,
-    mut settings: ResolvedSettings,
+    settings: ResolvedSettings,
     services: &dyn AgentServices,
 ) -> AgentResult<Option<TranslationExecutionOutcome>> {
+    execute_translation_tool_with_commits(
+        executor,
+        args,
+        guard,
+        cancellation,
+        progress,
+        settings,
+        TranslationToolExecution {
+            services,
+            record_file_operation: &mut |_| Ok(()),
+        },
+    )
+}
+
+pub(crate) fn execute_translation_tool_with_commits(
+    executor: ToolExecutor,
+    args: &JsonValue,
+    guard: &FileGuard,
+    cancellation: &CancellationGuard,
+    progress: Option<SharedProgress>,
+    mut settings: ResolvedSettings,
+    execution: TranslationToolExecution<'_>,
+) -> AgentResult<Option<TranslationExecutionOutcome>> {
+    let services = execution.services;
     let explicit_target_language = optional_argument(args, "target_language").is_some();
     settings.translation.source_language = normalize_language(
         optional_argument(args, "source_language").unwrap_or(&settings.translation.source_language),
@@ -671,7 +702,11 @@ pub(crate) fn execute_translation_tool_with_services(
             {
                 let semantic_undo = if let Some(previous) = &change.previous_subtitle {
                     let subtitle_format =
-                        change.previous_subtitle_format.as_deref().unwrap_or("srt");
+                        change.previous_subtitle_format.as_deref().ok_or_else(|| {
+                            AgentError::invalid_state(
+                                "container change is missing the previous subtitle format",
+                            )
+                        })?;
                     SemanticUndo::RestoreEmbeddedSubtitle {
                         title: change.subtitle_title.clone(),
                         subtitle_backup_path: guard.store_embedded_subtitle_undo(
@@ -679,7 +714,7 @@ pub(crate) fn execute_translation_tool_with_services(
                             previous,
                             subtitle_format,
                         )?,
-                        subtitle_format: Some(subtitle_format.to_owned()),
+                        subtitle_format: subtitle_format.to_owned(),
                     }
                 } else {
                     SemanticUndo::RemoveEmbeddedSubtitle {
@@ -793,18 +828,46 @@ pub(crate) fn execute_translation_tool_with_services(
             } else {
                 guard.list_files(&input)?
             };
-            let mut undo_snapshots = Vec::new();
-            for source in source_files
+            let source_files = source_files
                 .into_iter()
                 .filter(|path| path.is_file() && is_supported_subtitle_path(path))
                 .filter(|path| !is_generated_subtitle(path))
-            {
-                let output = services.batch_translation_output_path(&request, &source)?;
+                .collect::<Vec<_>>();
+            let mut undo_snapshots = Vec::new();
+            for source in &source_files {
+                let output = services.batch_translation_output_path(&request, source)?;
                 if !settings.translation.dry_run && (overwrite || !output.exists()) {
                     undo_snapshots.push((output.clone(), guard.snapshot_write(&output)?));
                 }
             }
-            let translated = services.translate_batch(request, cancellation, progress)?;
+            let mut record_error = None;
+            let translated = services.translate_batch(
+                request,
+                source_files,
+                &mut |output| {
+                    let snapshot = undo_snapshots
+                        .iter()
+                        .find(|(path, _)| path == output)
+                        .map(|(_, snapshot)| snapshot)
+                        .ok_or_else(|| {
+                            subbake_adapters::AdapterError::invalid_input(
+                                "batch produced an output without an authorized snapshot",
+                            )
+                        })?;
+                    (execution.record_file_operation)(snapshot).map_err(|error| {
+                        record_error = Some(error);
+                        subbake_adapters::AdapterError::invalid_input(
+                            "could not persist completed batch output",
+                        )
+                    })
+                },
+                cancellation,
+                progress,
+            );
+            if let Some(error) = record_error {
+                return Err(error);
+            }
+            let translated = translated?;
             let file_operations = translated
                 .outputs
                 .iter()
@@ -1006,12 +1069,16 @@ pub(crate) fn execute_session_tool(
                     status: ToolExecutionStatus::Completed,
                     action: "switch".to_owned(),
                     active_profile: Some(name.clone()),
-                    provider: Some(settings.backend.id),
-                    model: Some(settings.backend.model),
+                    provider: Some(settings.backend.id.clone()),
+                    model: Some(settings.backend.model.clone()),
                     available_profiles: Vec::new(),
                     message: format!("Profile switched: {name}"),
                 }),
-                profile_switch: Some(ProfileSwitch { name, config_path }),
+                profile_switch: Some(ProfileSwitch {
+                    name,
+                    config_path,
+                    settings,
+                }),
             }
         }
         _ => return Ok(None),
@@ -1256,6 +1323,13 @@ mod tests {
     }
 
     impl AgentServices for RecordingTranslationServices {
+        fn build_decision_backend(
+            &self,
+            settings: &ResolvedSettings,
+        ) -> AdapterResult<Box<dyn subbake_core::ports::LlmBackend>> {
+            TestAgentServices.build_decision_backend(settings)
+        }
+
         fn run_command(
             &self,
             request: &SandboxedCommandRequest,
@@ -1343,6 +1417,8 @@ mod tests {
         fn translate_batch(
             &self,
             request: BatchTranslationRequest,
+            _inputs: Vec<PathBuf>,
+            _on_output: &mut dyn FnMut(&Path) -> AdapterResult<()>,
             _cancellation: &CancellationGuard,
             _progress: Option<SharedProgress>,
         ) -> AdapterResult<BatchTranslationOutcome> {

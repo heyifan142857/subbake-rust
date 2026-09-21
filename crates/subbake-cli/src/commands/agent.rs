@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use subbake_adapters::{
-    ConfigurationResolver, ResolveRequest, ResolvedSettings, build_backend, discover_config_path,
+    ConfigurationResolver, ResolveRequest, ResolvedSettings, discover_config_path,
 };
 use subbake_agent::event::EventKind;
 use subbake_agent::{
     AgentActionKind, AgentEngine, AgentError, AgentResult, AgentRuntimePolicy, ApprovalKind,
-    CommandDecision, ConfigApplyAfter, ConfigChange, EchoDecisionBackend, PlanDecision,
-    StartupInfo, SubBakeTui, TuiAction, TuiInteraction, is_known_slash_command,
+    CommandDecision, ConfigApplyAfter, ConfigChange, PlanDecision, StartupInfo, SubBakeTui,
+    TuiAction, TuiInteraction, is_known_slash_command,
 };
 
 use crate::CliResult;
@@ -125,11 +125,6 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
                 .filter(|id| !id.is_empty()),
             _ => None,
         };
-        let candidate_backend = if let Some(profile) = requested_profile {
-            prepare_profile_backend(&engine, config_path.as_deref(), profile)?
-        } else {
-            None
-        };
         let candidate_session_backend = if let Some(id) = requested_session {
             let (profile, stored_config_path) = engine.session_config(id)?;
             let needs_config_pin = stored_config_path.is_none();
@@ -233,10 +228,12 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             }
         };
 
-        if let Some((candidate, settings)) = candidate_backend {
-            apply_agent_runtime_policy(&mut engine, &settings)?;
+        let tool_changed_profile = if let Some(candidate) = engine.take_profile_backend() {
             backend = candidate;
-        }
+            true
+        } else {
+            false
+        };
         if let Some(pending) = prepared_config_action.take() {
             apply_agent_runtime_policy(&mut engine, &pending.settings)?;
             backend = pending.backend;
@@ -316,6 +313,7 @@ fn run_tui_with_engine(mut engine: AgentEngine, open_session_picker: bool) -> Cl
             action,
             TuiAction::SelectProfile(_) | TuiAction::CreateProfile(_)
         ) || requested_profile.is_some()
+            || tool_changed_profile
         {
             let profile = engine.active_profile();
             let settings = resolved_settings(config_path.as_deref(), profile)?;
@@ -395,26 +393,10 @@ fn prepare_config_action(
 fn build_backend_for_settings(
     settings: &ResolvedSettings,
 ) -> AgentResult<Box<dyn subbake_core::ports::LlmBackend>> {
-    if settings.backend.id == "mock" {
-        return Ok(Box::new(EchoDecisionBackend::new("mock-decision")));
-    }
-    build_backend(&settings.backend_config()).map_err(|source| AgentError::AdapterContext {
+    subbake_agent::build_decision_backend(settings).map_err(|source| AgentError::AdapterContext {
         operation: "build agent backend",
         source: Box::new(source),
     })
-}
-
-fn prepare_profile_backend(
-    engine: &AgentEngine,
-    config_path: Option<&Path>,
-    profile: &str,
-) -> AgentResult<Option<(Box<dyn subbake_core::ports::LlmBackend>, ResolvedSettings)>> {
-    if !engine.profile_choices()?.iter().any(|name| name == profile) {
-        return Ok(None);
-    }
-    let settings = resolved_settings(config_path, Some(profile))?;
-    let backend = build_agent_decision_backend(config_path, Some(profile))?;
-    Ok(Some((backend, settings)))
 }
 
 fn apply_agent_runtime_policy(
@@ -470,10 +452,7 @@ fn display_config_path(path: &Path) -> String {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{
-        build_agent_decision_backend, prepare_config_action, prepare_profile_backend,
-        session_config_path,
-    };
+    use super::{build_agent_decision_backend, prepare_config_action, session_config_path};
     use subbake_agent::{AgentEngine, ConfigApplyAfter, ConfigChange, ConfigFieldId};
 
     #[test]
@@ -520,9 +499,9 @@ mod tests {
         engine.start_session().expect("start session");
         engine.set_config_path(Some(&path)).expect("pin config");
 
-        prepare_profile_backend(&engine, Some(&path), "bad")
-            .err()
-            .expect("invalid backend must fail before switching");
+        engine
+            .select_profile("bad")
+            .expect_err("invalid backend must fail before switching");
         assert_eq!(
             engine.active_profile(),
             None,

@@ -11,10 +11,20 @@ impl PlanCoordinator {
             message: message.to_owned(),
             tool_calls,
             created_at: iso_now(),
+            in_flight_call_id: None,
         });
     }
 
     pub(crate) fn next_call(session: &AgentSession) -> AgentResult<Option<ToolCallDraft>> {
+        if session
+            .pending_plan
+            .as_ref()
+            .is_some_and(|plan| plan.in_flight_call_id.is_some())
+        {
+            return Err(crate::AgentError::invalid_state(
+                "the previous plan operation was interrupted or failed; its outcome may be partial. Inspect the files or use /undo, then revise or reject the plan before continuing",
+            ));
+        }
         session
             .pending_plan
             .as_ref()
@@ -22,19 +32,34 @@ impl PlanCoordinator {
             .map(|plan| plan.tool_calls.first().cloned())
     }
 
-    pub(crate) fn commit_completed_call(
+    pub(crate) fn begin_call(
         store: &AgentSessionStore,
         session: &mut AgentSession,
+        call_id: String,
     ) -> AgentResult<()> {
-        let plan = session
+        let mut candidate = session.clone();
+        let plan = candidate
             .pending_plan
             .as_mut()
             .ok_or_else(|| std::io::Error::other("pending plan disappeared"))?;
         if plan.tool_calls.is_empty() {
-            return Err(std::io::Error::other("pending plan has no completed call").into());
+            return Err(std::io::Error::other("pending plan has no next call").into());
         }
-        plan.tool_calls.remove(0);
-        store.save(session)
+        plan.in_flight_call_id = Some(call_id);
+        store.save(&candidate)?;
+        *session = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn complete_call(session: &mut AgentSession, call_id: &str) {
+        if let Some(plan) = session.pending_plan.as_mut()
+            && plan.in_flight_call_id.as_deref() == Some(call_id)
+        {
+            if !plan.tool_calls.is_empty() {
+                plan.tool_calls.remove(0);
+            }
+            plan.in_flight_call_id = None;
+        }
     }
 
     pub(crate) fn finish(session: &mut AgentSession) {

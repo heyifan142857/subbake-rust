@@ -50,6 +50,11 @@ impl UndoService {
         if let Some(path) = session.config_path.as_deref() {
             guard.protect_path(Path::new(path))?;
         }
+        // A conflict anywhere in a grouped operation must not partially undo it.
+        for &index in &indices {
+            cancellation.check()?;
+            verify_unchanged(&guard, &file_operation(&session.events[index])?)?;
+        }
         for index in indices.iter().rev().copied() {
             let data = file_operation(&session.events[index])?;
             restore_event(&guard, &data, cancellation)?;
@@ -60,6 +65,28 @@ impl UndoService {
         }
         Ok(indices.len())
     }
+}
+
+fn verify_unchanged(guard: &FileGuard, event: &FileOpEventData) -> AgentResult<()> {
+    for (path, expected) in std::iter::once((event.path.as_str(), Some(&event.post_state))).chain(
+        event
+            .new_path
+            .as_deref()
+            .map(|path| (path, event.new_path_post_state.as_ref())),
+    ) {
+        let actual = guard.file_state(Path::new(path))?;
+        let expected = expected.ok_or_else(|| {
+            crate::AgentError::invalid_state(format!(
+                "invalid file operation for `{path}`: missing destination fingerprint"
+            ))
+        })?;
+        if &actual != expected {
+            return Err(crate::AgentError::invalid_state(format!(
+                "undo conflict: `{path}` changed after the recorded operation; current content was preserved"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn file_operation(event: &crate::session::AgentEvent) -> AgentResult<FileOpEventData> {
@@ -117,9 +144,8 @@ fn restore_event(
                 subtitle_backup_path,
                 subtitle_format,
             } => {
-                let subtitle_format = subbake_adapters::SubtitlePayloadFormat::parse(
-                    subtitle_format.as_deref().unwrap_or("srt"),
-                )?;
+                let subtitle_format =
+                    subbake_adapters::SubtitlePayloadFormat::parse(&subtitle_format)?;
                 let subtitle_backup_path = guard.resolve_undo_backup(&subtitle_backup_path)?;
                 subbake_adapters::restore_embedded_subtitle(
                     &target_path,
@@ -135,20 +161,6 @@ fn restore_event(
 
     match event.action.as_str() {
         "created" => guard.remove_for_undo(Path::new(&event.path))?,
-        "renamed" => {
-            let new_path = event
-                .new_path
-                .as_deref()
-                .ok_or_else(|| std::io::Error::other("renamed undo is missing new_path"))?;
-            if guard.resolve_undo_target(Path::new(new_path))? == target_path {
-                return Err(std::io::Error::other("rename undo targets must differ").into());
-            }
-            let backup = required_backup(event)?;
-            guard.restore_for_undo(&backup, Path::new(&event.path))?;
-            // Restore first. If removing the renamed path then fails, retrying
-            // is safe and the user's only surviving copy was never destroyed.
-            guard.remove_for_undo(Path::new(new_path))?;
-        }
         "deleted" | "modified" | "appended" => {
             let backup = required_backup(event)?;
             guard.restore_for_undo(&backup, Path::new(&event.path))?;
@@ -249,6 +261,11 @@ mod tests {
             backup_path: None,
             semantic_undo: None,
             group_id: None,
+            post_state: FileGuard::new(root.clone())
+                .expect("guard")
+                .file_state(Path::new("created.txt"))
+                .expect("file state"),
+            new_path_post_state: None,
             undone: false,
         }));
 
@@ -278,6 +295,11 @@ mod tests {
             backup_path: None,
             semantic_undo: None,
             group_id: None,
+            post_state: FileGuard::new(root.clone())
+                .expect("guard")
+                .file_state(Path::new("modified.txt"))
+                .expect("file state"),
+            new_path_post_state: None,
             undone: false,
         }));
 
@@ -309,6 +331,8 @@ mod tests {
             ),
             semantic_undo: None,
             group_id: None,
+            post_state: crate::guard::FileState::Missing,
+            new_path_post_state: None,
             undone: false,
         }));
 
@@ -336,6 +360,8 @@ mod tests {
             backup_path: None,
             semantic_undo: None,
             group_id: None,
+            post_state: crate::guard::FileState::Missing,
+            new_path_post_state: None,
             undone: false,
         }));
 
@@ -371,6 +397,8 @@ mod tests {
             backup_path: None,
             semantic_undo: None,
             group_id: None,
+            post_state: crate::guard::FileState::Missing,
+            new_path_post_state: None,
             undone: false,
         }));
 

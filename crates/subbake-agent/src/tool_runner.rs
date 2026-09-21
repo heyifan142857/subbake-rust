@@ -10,8 +10,9 @@ use crate::guard::{FileOpAction, FileOpResult, SemanticUndo};
 use crate::profile_coordinator::ProfileCoordinator;
 use crate::services::AgentServices;
 use crate::tool_execution::{
-    execute_adapter_tool_with_services, execute_command_tool_with_services, execute_local_tool,
-    execute_session_tool, execute_translation_tool_with_services,
+    TranslationToolExecution, execute_adapter_tool_with_services,
+    execute_command_tool_with_services, execute_local_tool, execute_session_tool,
+    execute_translation_tool_with_commits,
 };
 use crate::tools::{ToolExecutor, ValidatedToolCall};
 
@@ -59,7 +60,7 @@ impl ToolRunner {
                 services,
             )?;
             let group_id = (outcome.file_operations.len() > 1)
-                .then(|| format!("run-command-{}", crate::session::iso_now()));
+                .then(|| format!("run-command-{}", crate::decision::new_activity_id()));
             for operation in &outcome.file_operations {
                 Self::record_file_operation(engine, operation, group_id.clone())?;
             }
@@ -75,7 +76,7 @@ impl ToolRunner {
                 })?;
             let outcome = crate::patch::apply_patch(patch, &engine.guard)?;
             let group_id = (outcome.file_operations.len() > 1)
-                .then(|| format!("apply-patch-{}", crate::session::iso_now()));
+                .then(|| format!("apply-patch-{}", crate::decision::new_activity_id()));
             for operation in &outcome.file_operations {
                 Self::record_file_operation(engine, operation, group_id.clone())?;
             }
@@ -136,23 +137,34 @@ impl ToolRunner {
         ) {
             let settings = ProfileCoordinator::new(&engine.project_root, engine.session.as_ref())
                 .active_settings()?;
-            let outcome = execute_translation_tool_with_services(
+            let guard = engine.guard.clone();
+            let cancellation = engine.operation_guard.clone();
+            let progress = engine.progress.clone();
+            let batch_group = format!("translate-series-{}", crate::decision::new_activity_id());
+            let outcome = execute_translation_tool_with_commits(
                 executor,
                 args,
-                &engine.guard,
-                &engine.operation_guard,
-                engine.progress.clone(),
+                &guard,
+                &cancellation,
+                progress,
                 settings,
-                services,
+                TranslationToolExecution {
+                    services,
+                    record_file_operation: &mut |operation| {
+                        Self::record_file_operation(engine, operation, Some(batch_group.clone()))
+                    },
+                },
             )?
             .ok_or_else(|| AgentError::InvalidState {
                 message: "translation tool executor rejected its tool".to_owned(),
             })?;
             let group_id = outcome
                 .group_file_operations
-                .then(|| format!("translate-series-{}", crate::session::iso_now()));
-            for operation in &outcome.file_operations {
-                Self::record_file_operation(engine, operation, group_id.clone())?;
+                .then(|| format!("translate-series-{}", crate::decision::new_activity_id()));
+            if executor != ToolExecutor::TranslateSeries {
+                for operation in &outcome.file_operations {
+                    Self::record_file_operation(engine, operation, group_id.clone())?;
+                }
             }
             return Ok(outcome.outcome);
         }
@@ -182,17 +194,33 @@ impl ToolRunner {
                     message: "session tool executor rejected its tool".to_owned(),
                 })?;
             if let Some(profile_switch) = outcome.profile_switch {
-                let session = engine
+                engine.check_cancelled()?;
+                let candidate_backend =
+                    services.build_decision_backend(&profile_switch.settings)?;
+                let policy = crate::AgentRuntimePolicy::new(
+                    profile_switch.settings.agent.max_steps,
+                    profile_switch.settings.agent.auto_approve_commands,
+                )?;
+                let mut candidate = engine
                     .session
-                    .as_mut()
+                    .clone()
                     .ok_or_else(|| AgentError::invalid_state("no active session"))?;
-                session.profile = Some(profile_switch.name.clone());
-                session.config_path =
-                    Some(profile_switch.config_path.to_string_lossy().to_string());
-                engine.save()?;
-                engine.record_if_active(EventKind::Profile {
-                    name: profile_switch.name,
-                })?;
+                candidate.profile = Some(profile_switch.name.clone());
+                candidate.config_path =
+                    Some(profile_switch.config_path.to_string_lossy().into_owned());
+                candidate
+                    .events
+                    .push(crate::session::AgentEvent::from_kind(&EventKind::Profile {
+                        name: profile_switch.name,
+                    }));
+                candidate.updated_at = crate::session::iso_now();
+                engine.check_cancelled()?;
+                engine.session_store.save(&candidate)?;
+                engine.session = Some(candidate);
+                engine.profile_backend = Some(candidate_backend);
+                engine.profile_backend_changed = true;
+                engine.pending_native_continuation = None;
+                engine.set_runtime_policy(policy);
             }
             return Ok(outcome.outcome);
         }
@@ -237,6 +265,12 @@ impl ToolRunner {
                 other => other,
             }),
             group_id,
+            post_state: engine.guard.file_state(&result.path)?,
+            new_path_post_state: result
+                .new_path
+                .as_deref()
+                .map(|path| engine.guard.file_state(path))
+                .transpose()?,
             undone: false,
         }))
     }

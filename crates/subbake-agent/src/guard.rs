@@ -83,8 +83,7 @@ pub enum SemanticUndo {
     RestoreEmbeddedSubtitle {
         title: String,
         subtitle_backup_path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subtitle_format: Option<String>,
+        subtitle_format: String,
     },
 }
 
@@ -95,6 +94,14 @@ pub enum FileOpAction {
     Modified,
     Renamed,
     Deleted,
+}
+
+/// The state an undo operation is authorized to replace, including absence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileState {
+    Missing,
+    File { sha256: String },
 }
 
 /// Safe file operations within a project root.
@@ -244,6 +251,7 @@ impl FileGuard {
         if let Some(path) = subbake_adapters::discover_config_path() {
             guard.protect_path(&path)?;
         }
+        guard.ensure_private_directory(&guard.backup_root, false)?;
         Ok(guard)
     }
 
@@ -277,6 +285,76 @@ impl FileGuard {
 
     pub(crate) fn project_root(&self) -> &Path {
         &self.project_root
+    }
+
+    /// Internal state bypasses protected-name filtering, never containment or
+    /// symlink checks. Check every component, including existing parents.
+    fn ensure_private_directory(&self, path: &Path, create: bool) -> FileGuardResult<()> {
+        let current_identity =
+            identify_existing(&self.project_root, "validate storage project root")?;
+        if current_identity.resolved() != self.project_identity.resolved() {
+            return Err(FileGuardError::PathEscape {
+                root: self.project_root.clone(),
+                path: current_identity.resolved().to_path_buf(),
+            });
+        }
+        let relative = path
+            .strip_prefix(&self.project_root)
+            .or_else(|_| path.strip_prefix(self.project_identity.resolved()))
+            .map_err(|_| FileGuardError::PathEscape {
+                root: self.project_root.clone(),
+                path: path.to_path_buf(),
+            })?;
+        let mut current = self.project_root.clone();
+        for component in relative.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(FileGuardError::PathEscape {
+                    root: self.project_root.clone(),
+                    path: path.to_path_buf(),
+                });
+            }
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(FileGuardError::Io {
+                        operation: "validate private storage directory",
+                        path: Some(current),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "private storage must contain only real directories, not symbolic links",
+                        ),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                    std::fs::create_dir(&current)?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn file_state(&self, path: &Path) -> FileGuardResult<FileState> {
+        let path = self.resolve_undo_target(path)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileState::Missing),
+            Err(error) => Err(error.into()),
+            Ok(metadata) if metadata.is_file() => {
+                let sha256 = subbake_adapters::fs::file_content_sha256(&path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                Ok(FileState::File { sha256 })
+            }
+            Ok(_) => Err(FileGuardError::Io {
+                operation: "inspect undo file state",
+                path: Some(path),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "undo target must be a regular file",
+                ),
+            }),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -440,7 +518,7 @@ impl FileGuard {
             .project_root
             .join(".subbake/agent/command-runs")
             .join(format!("{}", nanos_since_epoch()));
-        std::fs::create_dir_all(&path)?;
+        self.ensure_private_directory(&path, true)?;
         Ok(path)
     }
 
@@ -501,6 +579,7 @@ impl FileGuard {
         let transaction_root = self
             .backup_root
             .join(format!("command-{}", nanos_since_epoch()));
+        self.ensure_private_directory(&transaction_root, true)?;
         let backups = prepared
             .iter()
             .map(|(staged, destination)| {
@@ -512,7 +591,7 @@ impl FileGuard {
                     std::fs::set_permissions(staged, permissions)?;
                     let backup = transaction_root.join(&destination.relative);
                     if let Some(parent) = backup.parent() {
-                        std::fs::create_dir_all(parent)?;
+                        self.ensure_private_directory(parent, true)?;
                     }
                     Ok(Some(backup))
                 } else {
@@ -569,6 +648,16 @@ impl FileGuard {
         contents: &[u8],
         subtitle_format: &str,
     ) -> FileGuardResult<PathBuf> {
+        if !matches!(
+            subtitle_format,
+            "srt" | "ass" | "ssa" | "vtt" | "webvtt" | "ttml" | "dfxp" | "txt"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid subtitle backup format",
+            )
+            .into());
+        }
         let safe = self.resolve(container_path)?;
         let mut payload_path = self
             .backup_root
@@ -580,7 +669,7 @@ impl FileGuard {
             .unwrap_or("container");
         payload_path.set_file_name(format!("{name}.previous.{subtitle_format}"));
         if let Some(parent) = payload_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.ensure_private_directory(parent, true)?;
         }
         std::fs::write(&payload_path, contents)?;
         Ok(payload_path)
@@ -662,6 +751,10 @@ impl FileGuard {
         } else {
             self.project_root.join(path)
         };
+        let parent = anchored
+            .parent()
+            .ok_or_else(|| std::io::Error::other("backup has no parent"))?;
+        self.ensure_private_directory(parent, false)?;
         let metadata =
             std::fs::symlink_metadata(&anchored).map_err(|source| FileGuardError::Io {
                 operation: "inspect undo backup",
@@ -855,7 +948,7 @@ impl FileGuard {
         let backup_path = self.backup_root.join(format!("{ts}")).join(&path.relative);
 
         if let Some(parent) = backup_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.ensure_private_directory(parent, true)?;
         }
         std::fs::copy(&path.io, &backup_path)?;
         Ok(backup_path)
@@ -1272,22 +1365,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_embedded_subtitle_undo_defaults_to_srt_at_restore_time() {
+    fn embedded_subtitle_undo_requires_an_explicit_format() {
         let value = serde_json::json!({
             "kind": "restore_embedded_subtitle",
             "title": "zh-Hans (SubBake translation)",
             "subtitle_backup_path": "backup.srt"
         });
 
-        let undo: SemanticUndo = serde_json::from_value(value).expect("legacy semantic undo");
-
-        assert!(matches!(
-            undo,
-            SemanticUndo::RestoreEmbeddedSubtitle {
-                subtitle_format: None,
-                ..
-            }
-        ));
+        assert!(serde_json::from_value::<SemanticUndo>(value).is_err());
     }
 
     #[test]

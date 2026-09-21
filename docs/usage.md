@@ -310,7 +310,7 @@ Important interactive controls include:
 - `/profile` and `/model` for backend/profile selection;
 - `/sessions` and `/history` for persisted session navigation;
 - `/plan` or Shift+Tab to toggle plan mode;
-- `/undo` to restore the latest supported mutation;
+- `/undo` to restore the latest supported mutation when its files are unchanged;
 - `/clear`, `/help`, and `/exit`;
 - while work is active, Enter queues the composer input for the next turn;
 - while work is active, Esc sends non-empty composer input into the current
@@ -340,7 +340,27 @@ overflow; structured responses are never silently truncated. Cancellation and
 command timeouts cover pipe draining after the main process exits.
 
 Undo of an overwrite rename restores both the source and the previous
-destination. Renaming a path to itself is rejected.
+destination. Renaming a path to itself is rejected. Undo checks recorded content
+fingerprints, including both rename paths, before modifying any member of a
+group. A conflict preserves current files. Agent sessions use version 3 and
+require these fingerprints. Older sessions are excluded from the session list
+and cannot be resumed; start a new session after upgrading.
+
+Agent batch translation processes only its authorized file selection. It does
+not follow directory symlinks or enter protected directories. Each completed
+output is recorded immediately and remains undoable if a later file fails or
+the batch is cancelled. Internal backup and command staging directories reject
+symbolic links, including links introduced after the session starts.
+
+Plans persist an operation ID before executing each tool. Successful completion
+and plan progress are saved together. If an operation fails or is interrupted
+with an uncertain outcome, inspect its results or use `/undo`, then revise or
+reject the plan; approving it again does not blindly repeat the operation.
+
+Profile switching through either the picker, `/profile`, or a model tool builds
+the replacement backend before saving the change. A failed build or save keeps
+the previous profile and backend. Successful model-tool switches use the new
+backend for subsequent model requests, including within the same turn.
 
 Before the agent translates or transcribes a specific MKV, MP4/M4V/MOV, or
 WebM file, it performs a read-only ffprobe inspection of embedded subtitle

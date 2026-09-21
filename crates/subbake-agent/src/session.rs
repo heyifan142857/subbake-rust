@@ -1,6 +1,6 @@
 // Agent session — event log (the source of truth for undo, replay, and resume).
 //
-// Version 2 of the persisted agent-session JSON contract. The session JSON
+// Version 3 of the persisted agent-session JSON contract. The session JSON
 // lives at `<project_root>/.subbake/agent/sessions/<id>.json`.
 
 use std::path::{Component, Path, PathBuf};
@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AgentError, AgentResult};
 use crate::event::{EventKind, PendingAgentTurn, PendingCommandApproval, PendingPlan};
 
-pub const SESSION_VERSION: u64 = 2;
+pub const SESSION_VERSION: u64 = 3;
 
-/// Stable discriminants for the v2 wire-format event kinds. `Unknown` keeps
+/// Stable discriminants for the v3 wire-format event kinds. `Unknown` keeps
 /// future events readable without allowing ad-hoc comparisons in runtime logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventTag {
@@ -223,7 +223,7 @@ impl AgentEvent {
         }
     }
 
-    /// Recover the typed runtime event while keeping unknown future v2 event
+    /// Recover the typed runtime event while keeping unknown future v3 event
     /// kinds readable through the persisted `AgentEvent` representation.
     pub fn typed(&self) -> Option<EventKind> {
         let string = |key: &str| self.data.get(key)?.as_str().map(str::to_owned);
@@ -413,6 +413,7 @@ impl AgentSessionStore {
                 session.version
             )));
         }
+        self.validate_events(session, &path)?;
         if session.events.is_empty() {
             self.ensure_storage_root(false)?;
             reject_symlink_or_non_file(&path)?;
@@ -450,18 +451,29 @@ impl AgentSessionStore {
             path: Some(path.clone()),
             source,
         })?;
+        #[derive(Deserialize)]
+        struct SessionVersion {
+            version: u64,
+        }
+        let header: SessionVersion =
+            serde_json::from_str(&json).map_err(|source| AgentError::SessionData {
+                operation: "read session version",
+                path: path.clone(),
+                source,
+            })?;
+        if header.version != SESSION_VERSION {
+            return Err(AgentError::UnsupportedSessionVersion {
+                id: id.to_owned(),
+                version: header.version,
+                expected: SESSION_VERSION,
+            });
+        }
         let session: AgentSession =
             serde_json::from_str(&json).map_err(|source| AgentError::SessionData {
                 operation: "parse session",
                 path: path.clone(),
                 source,
             })?;
-        if session.version != SESSION_VERSION {
-            return Err(AgentError::invalid_state(format!(
-                "session `{id}` uses unsupported version {}; expected version {SESSION_VERSION}",
-                session.version
-            )));
-        }
         if session.id != id {
             return Err(AgentError::invalid_state(format!(
                 "session file `{}` contains mismatched id `{}`",
@@ -469,7 +481,40 @@ impl AgentSessionStore {
                 session.id
             )));
         }
+        self.validate_events(&session, &path)?;
         Ok(session)
+    }
+
+    fn validate_events(&self, session: &AgentSession, path: &Path) -> AgentResult<()> {
+        for event in &session.events {
+            if event.tag() != EventTag::FileOperation {
+                continue;
+            }
+            let operation: crate::event::FileOpEventData =
+                serde_json::from_value(event.data.clone()).map_err(|source| {
+                    AgentError::SessionData {
+                        operation: "validate file operation",
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                })?;
+            if operation.new_path.is_some() != operation.new_path_post_state.is_some() {
+                return Err(AgentError::invalid_state(
+                    "file operation destination and fingerprint must be recorded together",
+                ));
+            }
+            if operation.action == "renamed"
+                && !matches!(
+                    operation.semantic_undo,
+                    Some(crate::guard::SemanticUndo::RestoreRenamed { .. })
+                )
+            {
+                return Err(AgentError::invalid_state(
+                    "renamed file operation requires restore_renamed undo data",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn latest(&self) -> AgentResult<Option<AgentSession>> {
@@ -516,8 +561,11 @@ impl AgentSessionStore {
                     message: format!("session filename is not valid UTF-8: {}", path.display()),
                 }
             })?;
-            let session = self.load(id)?;
-            sessions.push(session);
+            match self.load(id) {
+                Ok(session) => sessions.push(session),
+                Err(AgentError::UnsupportedSessionVersion { .. }) => continue,
+                Err(error) => return Err(error),
+            }
         }
         sessions.sort_by(|a, b| {
             b.updated_at
@@ -699,34 +747,26 @@ mod tests {
     }
 
     #[test]
-    fn session_mode_keeps_the_v2_string_wire_shape() {
+    fn session_mode_uses_a_string_wire_shape() {
         assert_eq!(
             serde_json::to_value(SessionMode::Plan).expect("serialize mode"),
             serde_json::json!("plan")
         );
         assert_eq!(
-            serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read v2 mode"),
+            serde_json::from_value::<SessionMode>(serde_json::json!("chat")).expect("read mode"),
             SessionMode::Chat
         );
     }
 
     #[test]
-    fn legacy_command_approval_defaults_to_a_normal_command_prompt() {
-        let pending: crate::event::PendingCommandApproval =
-            serde_json::from_value(serde_json::json!({
-                "tool_call": {
-                    "tool_name": "run_command",
-                    "arguments": {"command": "printf hello"}
-                },
-                "call_id": "legacy-call",
-                "remaining_tool_calls": [],
-                "reason": "legacy approval",
-                "created_at": "2026-08-24T00:00:00Z"
-            }))
-            .expect("read legacy approval");
-
-        assert_eq!(pending.kind, crate::event::PendingApprovalKind::Command);
-        assert!(pending.purpose.is_empty());
+    fn command_approval_requires_current_fields() {
+        let incomplete = serde_json::json!({
+            "tool_call": {"tool_name":"run_command", "arguments":{"command":"printf hello"}},
+            "call_id":"call", "remaining_tool_calls":[], "reason":"approval", "created_at":"2026-09-16T00:00:00Z"
+        });
+        assert!(
+            serde_json::from_value::<crate::event::PendingCommandApproval>(incomplete).is_err()
+        );
     }
 
     #[test]
@@ -903,7 +943,7 @@ mod tests {
             .load(&session.id)
             .expect_err("old session versions must be rejected");
         assert!(error.to_string().contains("unsupported version 1"));
-        assert!(error.to_string().contains("expected version 2"));
+        assert!(error.to_string().contains("expected version 3"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -982,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_tool_lifecycle_round_trips_through_the_v2_wire_shape() {
+    fn typed_tool_lifecycle_round_trips_through_the_current_wire_shape() {
         let started = EventKind::ToolStarted {
             call_id: "call-1".to_owned(),
             tool_name: "read_file".to_owned(),

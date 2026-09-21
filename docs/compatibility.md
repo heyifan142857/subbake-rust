@@ -28,9 +28,8 @@ distinguishes user data from command-line conveniences.
 - Stable transcribed cue IDs and boundaries change. Recognition artifacts use
   a new versioned, content-addressed namespace; streaming pipeline contract
   version 3 does not reuse older shards. Old files remain untouched.
-- Existing subtitle, memory, translation cache, failure-log, and session readers
-  are retained. Historical session transcription outcomes may omit the new
-  diagnostics report.
+- Existing subtitle, memory, translation cache, and failure-log readers are
+  retained. Agent sessions follow the version 3 contract described below.
 
 ## Persisted data
 
@@ -41,7 +40,10 @@ Readers therefore retain the already implemented versioned compatibility for:
 - request, review, and terminology caches;
 - glossary and translation-memory data;
 - failure and model-repair logs;
-- overnight manifests and session metadata.
+- overnight manifests.
+
+Agent sessions are an explicit exception: only version 3 is supported. Versions
+1 and 2 are rejected without migration and excluded from session discovery.
 
 When a persisted shape changes, SubBake must either retain a backwards-compatible
 reader or provide an explicit migration. It must never silently reinterpret an
@@ -49,15 +51,24 @@ older shape as a different current value.
 
 ## Checkpoint and undo updates
 
+- Agent sessions use version 3. File-operation `post_state` fingerprints are
+  mandatory; rename destinations require their own fingerprint and semantic
+  undo data. Pending plans must explicitly store `in_flight_call_id` (null when
+  idle). Incomplete current-version data is rejected when loading or saving.
+  An existing in-flight ID with no completion requires inspection and plan
+  revision or rejection, rather than automatic replay. Old session and undo
+  shapes have no fallback reader.
+- Completed batch outputs are recorded individually, including before batch
+  cancellation. Undo group IDs are unique across operations even within one
+  clock second. Backup paths must remain within real project storage directories;
+  symlinked internal storage is rejected.
 - New run-state files use version 6 with immutable `shards-v1` content references
   and SHA-256 integrity checks. Readers retain versions 1 through 5 and their
   padded or inline batch representations. Upgrading a checkpoint leaves legacy
   files intact; older executables cannot resume a version 6 checkpoint.
-- New rename events include a `restore_renamed` semantic undo payload containing
-  the prior destination backup, when present. New backup references are project
-  relative. Existing absolute backup references and historical rename events
-  remain readable; old events cannot recover destination backups they did not
-  record.
+- Rename events require a `restore_renamed` semantic undo payload containing
+  the prior destination backup, when present. Persisted backup references are
+  project relative.
 - Agent file protection now includes default and pinned configuration files.
   Linux command execution uses a filtered filesystem view and no longer exposes
   project symlinks, protected VCS/runtime directories, or arbitrary host paths.
@@ -76,6 +87,7 @@ removed merely because a symbol or test uses the word `legacy` or `fallback`:
 ## Removal policy during 0.x
 
 Breaking CLI or configuration changes require a changelog entry and release-note
-warning. Persisted-data readers should only be removed after a migration exists
+warning. Except for the explicit agent-session reset above, persisted-data readers
+should only be removed after a migration exists
 and every public release that could have written the older shape has reached the
 documented end of its support window.

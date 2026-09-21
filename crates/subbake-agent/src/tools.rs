@@ -819,11 +819,11 @@ pub(crate) const ALL_TOOL_HANDLERS: &[ToolHandler] = &[
     tool!(
         "switch_profile",
         Profile,
-        false,
+        true,
         false,
         false,
         true,
-        "Switch the active provider profile after validating it.",
+        "Build and validate the replacement backend, then switch the active profile and backend together.",
         SWITCH_PROFILE_ARGS,
         SwitchProfile
     ),

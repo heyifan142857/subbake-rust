@@ -37,6 +37,7 @@ pub use engine::{
 pub use error::{AgentError, AgentResult};
 pub use guard::FileGuard;
 pub use presentation::{ProfileChoice, SessionChoice};
+pub use services::build_decision_backend;
 pub use session::*;
 pub use steering::TurnSteering;
 pub use subbake_core::{CancellationGuard, CancellationToken};
@@ -57,3 +58,6 @@ pub struct AgentAction {
     pub kind: AgentActionKind,
     pub session_id: Option<String>,
 }
+
+#[cfg(test)]
+mod safety_regressions;

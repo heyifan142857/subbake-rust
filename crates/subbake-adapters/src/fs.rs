@@ -1,6 +1,27 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Stream a content fingerprint without loading media-sized files into memory.
+pub fn file_content_sha256(path: &Path) -> AdapterResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 

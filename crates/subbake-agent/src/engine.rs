@@ -155,7 +155,7 @@ pub(crate) const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         command: "/undo",
-        description: "undo the last file operation",
+        description: "undo the last file operation if files are unchanged",
         suggest: true,
     },
     SlashCommandSpec {
@@ -296,6 +296,8 @@ pub struct AgentEngine {
     pub(crate) runtime_policy: AgentRuntimePolicy,
     pub(crate) services: Arc<dyn AgentServices>,
     pub(crate) tool_registry: ToolRegistry,
+    pub(crate) profile_backend: Option<Box<dyn subbake_core::ports::LlmBackend>>,
+    pub(crate) profile_backend_changed: bool,
 }
 
 pub(crate) struct PendingNativeContinuation {
@@ -371,6 +373,8 @@ impl AgentEngine {
             runtime_policy: AgentRuntimePolicy::default(),
             services,
             tool_registry: ToolRegistry::new(capabilities),
+            profile_backend: None,
+            profile_backend_changed: false,
         })
     }
 
@@ -385,6 +389,12 @@ impl AgentEngine {
 
     pub fn project_root(&self) -> &std::path::Path {
         &self.project_root
+    }
+
+    /// Transfer an already validated replacement to the composition root.
+    pub fn take_profile_backend(&mut self) -> Option<Box<dyn subbake_core::ports::LlmBackend>> {
+        self.profile_backend_changed = false;
+        self.profile_backend.take()
     }
 
     pub fn active_profile(&self) -> Option<&str> {
@@ -442,12 +452,16 @@ impl AgentEngine {
     /// Create a new session and mark it active.
     pub fn start_session(&mut self) -> AgentResult<()> {
         self.pending_native_continuation = None;
+        self.profile_backend = None;
+        self.profile_backend_changed = false;
         SessionController::new(&self.session_store, &mut self.session).start()
     }
 
     /// Resume an existing session by id (or the latest if `None`).
     pub fn resume_session(&mut self, id: Option<&str>) -> AgentResult<()> {
         self.pending_native_continuation = None;
+        self.profile_backend = None;
+        self.profile_backend_changed = false;
         SessionController::new(&self.session_store, &mut self.session).resume(id)
     }
 
@@ -634,18 +648,22 @@ impl AgentEngine {
                 ));
             }
 
-            let result = self.run_observed_tool(&call.tool_name, &call.arguments)?;
+            self.check_cancelled()?;
+            let call_id = crate::decision::new_activity_id();
+            PlanCoordinator::begin_call(
+                &self.session_store,
+                self.session
+                    .as_mut()
+                    .ok_or_else(|| AgentError::invalid_state("no active session"))?,
+                call_id.clone(),
+            )?;
+            let result =
+                self.run_observed_tool_with_id(&call.tool_name, &call.arguments, &call_id)?;
             outputs.push(format!(
                 "{}: {}",
                 call.tool_name,
                 render_tool_outcome(&result)
             ));
-
-            let session = self
-                .session
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("no active session"))?;
-            PlanCoordinator::commit_completed_call(&self.session_store, session)?;
         }
 
         let session = self
@@ -964,7 +982,7 @@ mod error_persistence_tests {
     }
 
     #[test]
-    fn command_approval_without_a_v2_agent_turn_is_rejected() {
+    fn command_approval_without_a_persisted_agent_turn_is_rejected() {
         let root = std::env::temp_dir().join(format!(
             "subbake-agent-command-approval-{}",
             crate::session::iso_now().replace([':', '.'], "-")
