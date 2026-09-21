@@ -41,6 +41,8 @@ breaking changes when they are called out in advance.
 
 ### Fixed
 
+- Update locked TLS dependencies to rustls 0.23.45 and rustls-webpki 0.103.15
+  to address RUSTSEC-2026-0285, and replace yanked chacha20 0.10.1 with 0.10.2.
 - Keep agent batch translation within its authorized file selection, excluding
   protected directories and symlink escapes; record each completed output before
   processing another file so cancellation retains its undo history.
